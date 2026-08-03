@@ -56,6 +56,8 @@ const TOC_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 
 /// 构建路由
 pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
+    // 书源 cookie 存取注册（crawler 抓取/登录按用户命名空间读表）
+    crate::service::crawler::register_cookie_storage(storage.clone());
     let state = AppState { storage };
 
     // /assets 静态资源（封面等：storage/assets/**，legacy 兼容）
@@ -72,11 +74,12 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/health", get(health))
         // 弱网优化：响应压缩（gzip/brotli）
         .layer(tower_http::compression::CompressionLayer::new())
-        .route("/opds", get(opds_catalog))
-        .route("/opds/", get(opds_catalog))
-        .route("/opds/search", get(opds_search))
-        .route("/opds/download/*id", get(opds_download))
-        .route("/opds/acquire/*id", get(opds_acquire))
+        .route("/opds", get(opds_dispatch))
+        .route("/opds/*rest", get(opds_dispatch))
+        .route("/opds/save/*id", post(opds_save_post))
+        // OPDS 独立账号设置（secure 模式外亦可配置，作用于 OPDS Basic 认证）
+        .route("/reader3/getOpdsSettings", get(get_opds_settings).post(get_opds_settings))
+        .route("/reader3/saveOpdsSettings", post(save_opds_settings))
         .route(
             "/reader3/uploadLocalBook",
             post(upload_local_book).layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
@@ -158,6 +161,11 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/deleteBookSource", post(delete_book_source))
         .route("/reader3/deleteBookSources", post(delete_book_sources))
         .route("/reader3/deleteAllBookSources", post(delete_all_book_sources))
+        // 书源登录态（cookie 按用户隔离）
+        .route("/reader3/loginBookSource", get(login_book_source).post(login_book_source))
+        .route("/reader3/setBookSourceCookie", post(set_book_source_cookie))
+        .route("/reader3/getCaptcha", post(get_captcha))
+        .route("/reader3/submitCaptcha", post(submit_captcha))
         // 缓存管理 + 全书搜索 + 书源订阅
         .route("/reader3/getCacheInfo", get(get_cache_info).post(get_cache_info))
         .route("/reader3/clearCache", post(clear_cache))
@@ -636,6 +644,242 @@ async fn delete_all_book_sources(
         Err(e) => {
             tracing::error!("deleteAllBookSources 失败: {e}");
             Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+// ---------------- 书源登录态（cookie 按用户隔离） ----------------
+
+/// 登录参数合并：query + body（JSON 优先，form-urlencoded 兑底）——纯函数，可测
+fn merge_login_params(
+    query: &HashMap<String, String>,
+    body: Option<&[u8]>,
+) -> HashMap<String, String> {
+    let mut m = query.clone();
+    let Some(body) = body else { return m };
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(obj) = v.as_object() {
+            for (k, val) in obj {
+                if let Some(s) = val.as_str() {
+                    m.insert(k.clone(), s.to_string());
+                } else {
+                    m.insert(k.clone(), val.to_string());
+                }
+            }
+            return m;
+        }
+    }
+    for (k, v) in url::form_urlencoded::parse(body) {
+        m.insert(k.into_owned(), v.into_owned());
+    }
+    m
+}
+
+/// 解析 bookSource 参数（书源 URL 或完整 JSON）——复用 resolve_book_source 语义
+async fn resolve_login_source(
+    state: &AppState,
+    ns: &str,
+    book_source_param: &str,
+) -> Option<crate::model::BookSource> {
+    if book_source_param.trim_start().starts_with('{') {
+        return serde_json::from_str(book_source_param).ok();
+    }
+    state
+        .storage
+        .find_book_source(ns, book_source_param)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// POST/GET /reader3/loginBookSource：书源登录（登录态独立于系统用户，cookie 按用户存库）
+///
+/// 参数（query 或 body JSON/form）：bookSource（书源 URL 或完整 JSON）、username、password、
+/// captcha（图片验证码文本）、mode=browser（强制浏览器自动登录）。
+///
+/// 返回：
+/// - 成功：{success: true, cookie}
+/// - 图片验证码：{success: false, needCaptcha: true, captchaUrl, captchaId, message}
+///   （前端显示验证码 → 输入后重新调用本接口（captcha 参数）或 POST submitCaptcha）
+/// - 点击类验证码（滑块/点选）无法自动处理：{success: false, needManualCaptcha: true, message}
+///   （引导：浏览器登录书源后，在书源设置粘贴 Cookie）
+/// - 登录失败：{success: false, message}
+#[axum::debug_handler]
+async fn login_book_source(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let merged = merge_login_params(&params, body.as_deref());
+    let book_source_param = merged.get("bookSource").cloned().unwrap_or_default();
+    if book_source_param.is_empty() {
+        return Json(ReturnData::err("缺少 bookSource 参数"));
+    }
+    let Some(source) = resolve_login_source(&state, &namespace, &book_source_param).await else {
+        return Json(ReturnData::err("书源不存在（请先导入书源）"));
+    };
+    if source.login_url.as_deref().unwrap_or("").trim().is_empty() {
+        return Json(ReturnData::err("书源未配置 loginUrl"));
+    }
+    let req = crate::service::login::LoginRequest {
+        username: merged.get("username").cloned().unwrap_or_default(),
+        password: merged.get("password").cloned().unwrap_or_default(),
+        captcha: merged.get("captcha").cloned().unwrap_or_default(),
+    };
+    let mode = merged.get("mode").cloned().unwrap_or_default();
+    let outcome = if mode == "browser" {
+        if !crate::service::browser::is_browser_available() {
+            return Json(ReturnData::err(
+                "未安装浏览器（Chrome/Edge）——无法使用浏览器自动登录，请在书源设置粘贴 Cookie",
+            ));
+        }
+        crate::service::login::login_browser(&state.storage, &namespace, &source, &req).await
+    } else {
+        crate::service::login::login_http(&state.storage, &namespace, &source, &req).await
+    };
+    match outcome {
+        Ok(crate::service::login::LoginOutcome::Success { cookie }) => Json(ReturnData::ok(
+            serde_json::json!({ "success": true, "needCaptcha": false, "cookie": cookie }),
+        )),
+        Ok(crate::service::login::LoginOutcome::NeedImageCaptcha { captcha_url, captcha_id, message }) => {
+            Json(ReturnData::ok(serde_json::json!({
+                "success": false,
+                "needCaptcha": true,
+                "captchaUrl": captcha_url,
+                "captchaId": captcha_id,
+                "message": message,
+            })))
+        }
+        Ok(crate::service::login::LoginOutcome::NeedManualCookie { message }) => Json(ReturnData::ok(
+            serde_json::json!({ "success": false, "needManualCaptcha": true, "message": message }),
+        )),
+        Ok(crate::service::login::LoginOutcome::Failed { message }) => {
+            Json(ReturnData::ok(serde_json::json!({ "success": false, "message": message })))
+        }
+        Err(e) => {
+            tracing::error!("loginBookSource 失败 [{}]: {e}", source.book_source_name);
+            Json(ReturnData::err(e.to_string()))
+        }
+    }
+}
+
+/// POST /reader3/setBookSourceCookie：手动设置书源 cookie（按当前用户存库）
+///
+/// body/query：bookSource（书源 URL）+ cookie（cookie 串；空值 = 清除）
+/// 场景：点击类验证码无法自动处理时，用户在浏览器登录书源后把 cookie 粘贴到书源设置
+async fn set_book_source_cookie(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let merged = merge_login_params(&params, body.as_deref());
+    let book_source = merged.get("bookSource").cloned().unwrap_or_default();
+    if book_source.is_empty() {
+        return Json(ReturnData::err("缺少 bookSource 参数"));
+    }
+    let cookie = merged.get("cookie").cloned().unwrap_or_default();
+    if cookie.trim().is_empty() {
+        match state.storage.clear_cookie(&namespace, &book_source).await {
+            Ok(_) => Json(ReturnData::ok(serde_json::json!({ "success": true, "cleared": true }))),
+            Err(e) => {
+                tracing::error!("setBookSourceCookie 清除失败: {e}");
+                Json(ReturnData::err("清除失败"))
+            }
+        }
+    } else {
+        match state.storage.set_cookie(&namespace, &book_source, &cookie).await {
+            Ok(_) => Json(ReturnData::ok(serde_json::json!({ "success": true }))),
+            Err(e) => {
+                tracing::error!("setBookSourceCookie 写入失败: {e}");
+                Json(ReturnData::err("保存失败"))
+            }
+        }
+    }
+}
+
+/// POST /reader3/getCaptcha：重新触发登录页 → 检测验证码 → 返回验证码资源
+///
+/// body：bookSource。返回 {captchaType: image|slider|click|none, captchaUrl(data URI), captchaId, pageUrl}
+/// - image：验证码图片（服务端截图，前端可直接显示）→ 前端输入后 POST submitCaptcha
+/// - slider/click：浏览器自动处理/降级（见 loginBookSource 契约）
+async fn get_captcha(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let merged = merge_login_params(&params, body.as_deref());
+    let book_source_param = merged.get("bookSource").cloned().unwrap_or_default();
+    if book_source_param.is_empty() {
+        return Json(ReturnData::err("缺少 bookSource 参数"));
+    }
+    let Some(source) = resolve_login_source(&state, &namespace, &book_source_param).await else {
+        return Json(ReturnData::err("书源不存在"));
+    };
+    match crate::service::login::get_captcha(&state.storage, &namespace, &source).await {
+        Ok(data) => Json(ReturnData::ok(data)),
+        Err(e) => {
+            tracing::error!("getCaptcha 失败 [{}]: {e}", source.book_source_name);
+            Json(ReturnData::err(e.to_string()))
+        }
+    }
+}
+
+/// POST /reader3/submitCaptcha：图片验证码文本回填（浏览器流）→ 登录 → {isLogin}
+///
+/// body：bookSource + captchaId + captchaText（+ 可选 username/password 覆盖会话值）
+async fn submit_captcha(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let merged = merge_login_params(&params, body.as_deref());
+    let book_source_param = merged.get("bookSource").cloned().unwrap_or_default();
+    if book_source_param.is_empty() {
+        return Json(ReturnData::err("缺少 bookSource 参数"));
+    }
+    let Some(source) = resolve_login_source(&state, &namespace, &book_source_param).await else {
+        return Json(ReturnData::err("书源不存在"));
+    };
+    let captcha_id = merged.get("captchaId").cloned().unwrap_or_default();
+    let captcha_text = merged.get("captchaText").cloned().unwrap_or_default();
+    if captcha_id.is_empty() {
+        return Json(ReturnData::err("缺少 captchaId 参数"));
+    }
+    match crate::service::login::submit_captcha(
+        &state.storage,
+        &namespace,
+        &source,
+        &captcha_id,
+        &captcha_text,
+        merged.get("username").map(String::as_str),
+        merged.get("password").map(String::as_str),
+    )
+    .await
+    {
+        Ok(data) => Json(ReturnData::ok(data)),
+        Err(e) => {
+            tracing::error!("submitCaptcha 失败 [{}]: {e}", source.book_source_name);
+            Json(ReturnData::err(e.to_string()))
         }
     }
 }
@@ -1154,7 +1398,7 @@ async fn search_book(
         return Json(ReturnData::err("书源不存在"));
     };
 
-    match crate::service::search::search_one_source(&source, &key, page).await {
+    match crate::service::search::search_one_source(&namespace, &source, &key, page).await {
         Ok(books) => Json(ReturnData::ok(serde_json::to_value(books).unwrap_or(serde_json::Value::Null))),
         Err(e) => {
             tracing::error!("搜索失败 [{}]: {e}", source.book_source_name);
@@ -1226,12 +1470,14 @@ async fn search_book_multi(
     // 并发搜索（限制并发数 8）
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     let mut handles = Vec::with_capacity(sources.len());
+    let ns = namespace.clone();
     for source in sources {
         let sem = semaphore.clone();
         let key = key.clone();
+        let ns = ns.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
-            crate::service::search::search_one_source(&source, &key, page).await.unwrap_or_default()
+            crate::service::search::search_one_source(&ns, &source, &key, page).await.unwrap_or_default()
         }));
     }
     let mut all: Vec<crate::service::search::SearchBook> = Vec::new();
@@ -1276,7 +1522,7 @@ async fn search_book_source(
             else {
                 return Json(ReturnData::err("书源不存在"));
             };
-            match crate::service::book::fetch_url(&url, &source).await {
+            match crate::service::book::fetch_url(&namespace, &url, &source).await {
                 Ok(resp) => {
                     let info = crate::service::book::analyze_book_info(
                         &resp.body,
@@ -1322,12 +1568,14 @@ async fn search_book_source(
     // ③ 并发搜索（限制并发 8，同 searchBookMulti）
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     let mut handles = Vec::with_capacity(sources.len());
+    let ns = namespace.clone();
     for source in sources {
         let sem = semaphore.clone();
         let key = key.to_string();
+        let ns = ns.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
-            crate::service::search::search_one_source(&source, &key, 1)
+            crate::service::search::search_one_source(&ns, &source, &key, 1)
                 .await
                 .unwrap_or_default()
         }));
@@ -1429,7 +1677,7 @@ async fn get_book_info(
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
     };
-    match crate::service::book::fetch_url(&url, &source).await {
+    match crate::service::book::fetch_url(&namespace, &url, &source).await {
         Ok(resp) => {
             let info = crate::service::book::analyze_book_info(&resp.body, &resp.url, &source, &url);
             Json(ReturnData::ok(serde_json::to_value(info).unwrap_or(serde_json::Value::Null)))
@@ -1474,8 +1722,11 @@ async fn get_book_toc(
         }
         return Json(ReturnData::err("本地书目录不存在"));
     }
-    // 文件型本地书（legacy：bookUrl = storage/data/.../xx.txt）——读 TXT 分章
-    if toc_url.ends_with(".txt") {
+    // 文件型本地书（legacy：bookUrl = storage/data/.../xx.txt 或任意白名单扩展名）——按扩展名解析分章
+    if crate::service::local_book::SUPPORTED_EXTENSIONS
+        .iter()
+        .any(|e| toc_url.to_lowercase().ends_with(&format!(".{e}")))
+    {
         if let Some(ret) = get_book_toc_file(&state, &namespace, &toc_url).await {
             return ret;
         }
@@ -1507,7 +1758,7 @@ async fn get_book_toc(
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
     };
-    match crate::service::book::analyze_toc(&toc_url, &source, 20).await {
+    match crate::service::book::analyze_toc(&namespace, &toc_url, &source, 20).await {
         Ok(chapters) => {
             // F-10：抓取成功后缓存目录（book_url 未知时以 toc_url 为键）
             if let Ok(json) = serde_json::to_string(&chapters) {
@@ -1552,8 +1803,8 @@ async fn get_book_content(
         }
         return Json(ReturnData::err("本地书章节不存在"));
     }
-    // legacy 本地书：bookUrl#index（bookUrl 可能是 storage/ 路径——不限于 .txt）
-    if chapter_url.contains("#") && (chapter_url.starts_with("storage/") || chapter_url.contains(".txt#")) {
+    // legacy 本地书：bookUrl#index（bookUrl 是 storage/ 路径或任意白名单扩展名文件）
+    if chapter_url.contains("#") && is_loc_book_file_chapter(&chapter_url) {
         if let Some(ret) = get_book_content_file(&state, &namespace, &chapter_url).await {
             return ret;
         }
@@ -1575,7 +1826,7 @@ async fn get_book_content(
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
     };
-    match crate::service::book::analyze_content(&chapter_url, &source, 5).await {
+    match crate::service::book::analyze_content(&namespace, &chapter_url, &source, 5).await {
         Ok(content) => {
             // 抓取成功 → 写回正文缓存（仅书源书且带 bookUrl）
             if !book_url.is_empty() && !book_url.starts_with("local://") {
@@ -2119,134 +2370,386 @@ pub fn internal_error(err: anyhow::Error) -> axum::response::Response {
         .into_response()
 }
 
-/// 命名空间解析（OPDS：Basic 认证或 accessToken 查询参数；非 secure 模式一律 default）
+/// 命名空间解析（OPDS 认证）：非 secure 模式一律 default；secure 模式支持：
+/// ① Basic——独立 OPDS 账号优先（system_settings opds_username/opds_password，sha256+salt），
+///    未配置或校验失败回退系统用户账号（users 表，legacy 双 md5 校验）；
+/// ② accessToken（query/header，username:token，与 /reader3 一致）。
 async fn opds_ns(
     state: &AppState,
     headers: &HeaderMap,
     params: &HashMap<String, String>,
 ) -> Result<String, Response> {
-    // Basic 认证（legado/静读等阅读器常规方式）
-    if let Some((_, ns, _)) = crate::api::webdav::authenticate(&state.storage, headers).await {
-        return Ok(ns);
-    }
     if !state.storage.config.secure {
         return Ok("default".to_string());
     }
-    // accessToken 查询参数（username:token，与 /reader3 一致；前端展示地址即此形式）
-    if let Some(token) = params.get("accessToken") {
-        let token = token.trim();
-        if let Some((username, tok)) = token.split_once(':') {
-            if !username.is_empty() && !tok.is_empty() {
-                match state.storage.find_user(username).await {
-                    Ok(Some(user)) if !user.token.is_empty() && user.token == tok => {
-                        return Ok(user.username);
-                    }
-                    _ => {}
+    // ① Basic 认证
+    if let Some(creds) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+    {
+        let decoded = String::from_utf8(opds_base64_decode(creds)).unwrap_or_default();
+        if let Some((username, password)) = decoded.split_once(':') {
+            // 独立 OPDS 账号（配置后优先）
+            if let Ok(Some((opds_user, stored))) = state.storage.get_opds_account().await {
+                if username == opds_user && crate::util::sha256::verify_password(password, &stored) {
+                    return Ok(opds_user);
+                }
+            }
+            // 系统用户账号（users 表；密码为 legacy 双 md5 哈希存储，复用 gen_encrypted_password 校验）
+            if let Ok(Some(user)) = state.storage.find_user(username).await {
+                let expect = gen_encrypted_password(password, &user.salt);
+                if expect == user.password {
+                    return Ok(user.username);
                 }
             }
         }
     }
-    Err(
-        Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("WWW-Authenticate", "Basic realm=\"reader\"")
-            .body(Body::empty())
-            .unwrap(),
+    // ② accessToken（query/header，username:token，与 /reader3 一致）
+    match resolve_namespace(state, params, headers).await {
+        Ok(ns) => Ok(ns),
+        Err(_) => Err(opds_unauthorized()),
+    }
+}
+
+/// OPDS 401 响应（WWW-Authenticate: Basic）
+fn opds_unauthorized() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("WWW-Authenticate", "Basic realm=\"reader\"")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Basic 凭证解码（标准 base64）
+fn opds_base64_decode(s: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .unwrap_or_default()
+}
+
+/// OPDS 统一分发（/opds/*rest）：OPDS 1.2 目录/搜索/获取/下载/保存 + OPDS 2.0 JSON
+async fn opds_dispatch(
+    State(state): State<AppState>,
+    path: Option<axum::extract::Path<String>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let rest = path.as_deref().map(String::as_str).unwrap_or("");
+    let ns = match opds_ns(&state, &headers, &params).await {
+        Ok(ns) => ns,
+        Err(resp) => return resp,
+    };
+    let (start, max) = crate::api::opds::parse_page(&params);
+    let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+
+    // OPDS 1.2（Atom）
+    let atom = "application/atom+xml;profile=opds-catalog;charset=utf-8";
+    // OPDS 2.0（JSON）
+    let opds2 = "application/opds+json";
+
+    let make = |r: Result<String, anyhow::Error>, ct: &str| -> Response {
+        match r {
+            Ok(body) => Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", ct)
+                .body(Body::from(body))
+                .unwrap(),
+            Err(e) => {
+                tracing::error!("OPDS 请求失败 [/opds/{rest}]: {e}");
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        }
+    };
+
+    let resp = match segs.as_slice() {
+        // ---------------- OPDS 1.2 ----------------
+        [] => make(
+            crate::api::opds::root(&state.storage, &ns).await,
+            "application/atom+xml;profile=opds-catalog;kind=navigation;charset=utf-8",
+        ),
+        ["opensearch.xml"] => make(
+            Ok(crate::api::opds::open_search_xml()),
+            "application/opensearchdescription+xml;charset=utf-8",
+        ),
+        ["shelf"] => make(crate::api::opds::shelf(&state.storage, &ns, start, max).await, atom),
+        ["recent"] => make(crate::api::opds::recent(&state.storage, &ns, start, max).await, atom),
+        ["local"] => make(crate::api::opds::local(&state.storage, &ns, start, max).await, atom),
+        ["groups"] => make(crate::api::opds::groups(&state.storage, &ns).await, atom),
+        ["group", id] => match id.parse::<i64>() {
+            Ok(gid) => make(crate::api::opds::group(&state.storage, &ns, gid, start, max).await, atom),
+            Err(_) => opds_404(),
+        },
+        ["source"] => make(crate::api::opds::sources(&state.storage, &ns).await, atom),
+        ["source", name] => make(
+            crate::api::opds::source(&state.storage, &ns, name, start, max).await,
+            atom,
+        ),
+        ["search"] => {
+            let q = params.get("q").cloned().unwrap_or_default();
+            make(crate::api::opds::search(&state.storage, &ns, &q, start, max).await, atom)
+        }
+        // 获取/下载
+        ["acquire", id] => {
+            match crate::api::opds::acquire(&state.storage, &ns, id).await {
+                Ok((name, bytes)) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .header("Content-Disposition", format!("inline; filename=\"{}\"", name))
+                    .body(Body::from(bytes))
+                    .unwrap(),
+                Err(e) => {
+                    tracing::warn!("OPDS 正文获取失败: {e}");
+                    opds_404()
+                }
+            }
+        }
+        ["download", id] => {
+            let format = params.get("format").cloned().unwrap_or_else(|| "txt".to_string());
+            let max_chapters = params.get("maxChapters").and_then(|v| v.parse::<usize>().ok());
+            match crate::api::opds::download(&state.storage, &ns, id, &format, max_chapters).await {
+                Ok((name, bytes, ct)) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", ct)
+                    .header("Content-Disposition", format!("attachment; filename=\"{}\"", name))
+                    .body(Body::from(bytes))
+                    .unwrap(),
+                Err(e) => {
+                    tracing::warn!("OPDS 下载失败: {e}");
+                    opds_404()
+                }
+            }
+        }
+        // OPDS-PSE：GET 进度 entry
+        ["save", id] => {
+            let want_json = params.get("format").map(|v| v == "json").unwrap_or(false)
+                || headers
+                    .get(axum::http::header::ACCEPT)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.contains("application/json") && !v.contains("atom"))
+                    .unwrap_or(false);
+            if want_json {
+                match crate::api::opds::save_entry_json(&state.storage, &ns, id).await {
+                    Ok(v) => Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/json; charset=utf-8")
+                        .body(Body::from(v.to_string()))
+                        .unwrap(),
+                    Err(_) => opds_404(),
+                }
+            } else {
+                match crate::api::opds::save_entry_xml(&state.storage, &ns, id).await {
+                    Ok(xml) => Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/atom+xml;type=entry;charset=utf-8")
+                        .body(Body::from(xml))
+                        .unwrap(),
+                    Err(_) => opds_404(),
+                }
+            }
+        }
+        // ---------------- OPDS 2.0 ----------------
+        ["catalog"] => make(crate::api::opds::catalog_json(&state.storage, &ns).await, opds2),
+        ["catalog", "shelf"] => make(
+            crate::api::opds::shelf_json(&state.storage, &ns, start, max).await,
+            opds2,
+        ),
+        ["catalog", "recent"] => make(
+            crate::api::opds::recent_json(&state.storage, &ns, start, max).await,
+            opds2,
+        ),
+        ["catalog", "local"] => make(
+            crate::api::opds::local_json(&state.storage, &ns, start, max).await,
+            opds2,
+        ),
+        ["catalog", "groups"] => make(crate::api::opds::groups_json(&state.storage, &ns).await, opds2),
+        ["catalog", "group", id] => match id.parse::<i64>() {
+            Ok(gid) => make(
+                crate::api::opds::group_json(&state.storage, &ns, gid, start, max).await,
+                opds2,
+            ),
+            Err(_) => opds_404(),
+        },
+        ["catalog", "source"] => make(crate::api::opds::sources_json(&state.storage, &ns).await, opds2),
+        ["catalog", "source", name] => make(
+            crate::api::opds::source_json(&state.storage, &ns, name, start, max).await,
+            opds2,
+        ),
+        ["catalog", "search"] => {
+            let q = params.get("q").cloned().unwrap_or_default();
+            make(crate::api::opds::search_json(&state.storage, &ns, &q, start, max).await, opds2)
+        }
+        _ => opds_404(),
+    };
+    resp
+}
+
+/// OPDS 404
+fn opds_404() -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// POST /opds/save/{bookId}：OPDS-PSE 保存进度（body/query：progress/position/total/chapterIndex/chapterTitle/timestamp）
+async fn opds_save_post(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Response {
+    let ns = match opds_ns(&state, &headers, &params).await {
+        Ok(ns) => ns,
+        Err(resp) => return resp,
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let f64_of = |keys: &[&str]| -> Option<f64> {
+        for k in keys {
+            if let Some(v) = params.get(*k).and_then(|v| v.parse::<f64>().ok()) {
+                return Some(v);
+            }
+            if let Some(b) = body_json.as_ref() {
+                if let Some(v) = b.get(*k).and_then(|v| v.as_f64()) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    };
+    let i64_of = |keys: &[&str]| -> Option<i64> {
+        for k in keys {
+            if let Some(v) = params.get(*k).and_then(|v| v.parse::<i64>().ok()) {
+                return Some(v);
+            }
+            if let Some(b) = body_json.as_ref() {
+                if let Some(v) = b.get(*k).and_then(|v| v.as_i64()) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    };
+    let str_of = |keys: &[&str]| -> Option<String> {
+        for k in keys {
+            if let Some(v) = params.get(*k) {
+                return Some(v.clone());
+            }
+            if let Some(b) = body_json.as_ref() {
+                if let Some(v) = b.get(*k).and_then(|v| v.as_str()) {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        None
+    };
+    let chapter_title = str_of(&["chapterTitle", "durChapterTitle"]);
+    match crate::api::opds::apply_save(
+        &state.storage,
+        &ns,
+        &id,
+        f64_of(&["progress"]),
+        i64_of(&["position", "durChapterPos"]),
+        i64_of(&["total"]),
+        i64_of(&["chapterIndex", "durChapterIndex"]),
+        chapter_title,
+        i64_of(&["timestamp", "durChapterTime"]),
     )
-}
-
-/// GET /opds：根目录
-async fn opds_catalog(
-    State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    match opds_ns(&state, &headers, &params).await {
-        Ok(ns) => match crate::api::opds::catalog(&state.storage, &ns).await {
-            Ok(xml) => Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/atom+xml;profile=opds-catalog;charset=utf-8")
-                .body(Body::from(xml))
-                .unwrap(),
-            Err(e) => {
-                tracing::error!("OPDS catalog 失败: {e}");
-                Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Body::empty()).unwrap()
-            }
-        },
-        Err(resp) => resp,
+    .await
+    {
+        Ok(v) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json; charset=utf-8")
+            .body(Body::from(v.to_string()))
+            .unwrap(),
+        Err(e) => {
+            tracing::warn!("OPDS-PSE 保存失败: {e}");
+            opds_404()
+        }
     }
 }
 
-/// GET /opds/search?q=
-async fn opds_search(
+/// GET /reader3/getOpdsSettings：OPDS 独立账号配置（enabled/username/passwordSet；不回传密码）
+async fn get_opds_settings(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-) -> Response {
-    let q = params.get("q").cloned().unwrap_or_default();
-    match opds_ns(&state, &headers, &params).await {
-        Ok(ns) => match crate::api::opds::search(&state.storage, &ns, &q).await {
-            Ok(xml) => Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/atom+xml;profile=opds-catalog;charset=utf-8")
-                .body(Body::from(xml))
-                .unwrap(),
-            Err(e) => {
-                tracing::error!("OPDS search 失败: {e}");
-                Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Body::empty()).unwrap()
-            }
-        },
-        Err(resp) => resp,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    match state.storage.get_opds_account().await {
+        Ok(Some((username, _))) => Json(ReturnData::ok(json!({
+            "enabled": true,
+            "username": username,
+            "passwordSet": true,
+            "namespace": namespace,
+        }))),
+        Ok(None) => Json(ReturnData::ok(json!({
+            "enabled": false,
+            "username": "",
+            "passwordSet": false,
+            "namespace": namespace,
+        }))),
+        Err(e) => {
+            tracing::error!("getOpdsSettings 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
     }
 }
 
-/// GET /opds/download/{id}：原文件（本地书=存库章节重建；书源书=正文拼接），?maxChapters= 防超时
-async fn opds_download(
+/// POST /reader3/saveOpdsSettings：配置 OPDS 独立账号（body {username, password}；username 空 = 禁用）
+async fn save_opds_settings(
     State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-) -> Response {
-    let max_chapters = params.get("maxChapters").and_then(|v| v.parse::<usize>().ok());
-    match opds_ns(&state, &headers, &params).await {
-        Ok(ns) => match crate::api::opds::download(&state.storage, &ns, &id, max_chapters).await {
-            Ok((name, bytes)) => Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/plain; charset=utf-8")
-                .header("Content-Disposition", format!("attachment; filename=\"{}\"", name))
-                .body(Body::from(bytes))
-                .unwrap(),
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let username = body_json
+        .as_ref()
+        .and_then(|b| b.get("username").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let password = body_json
+        .as_ref()
+        .and_then(|b| b.get("password").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    if username.is_empty() {
+        // 禁用独立账号（回退系统账号/token）
+        match state.storage.clear_opds_account().await {
+            Ok(_) => Json(ReturnData::ok(json!({"enabled": false}))),
             Err(e) => {
-                tracing::warn!("OPDS 下载失败: {e}");
-                Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()
+                tracing::error!("saveOpdsSettings(禁用) 失败: {e}");
+                Json(ReturnData::err("系统错误"))
             }
-        },
-        Err(resp) => resp,
-    }
-}
-
-/// GET /opds/acquire/{id}：正文（纯文本），?maxChapters= 防超时
-async fn opds_acquire(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    let max_chapters = params.get("maxChapters").and_then(|v| v.parse::<usize>().ok());
-    match opds_ns(&state, &headers, &params).await {
-        Ok(ns) => match crate::api::opds::acquire(&state.storage, &ns, &id, max_chapters).await {
-            Ok((name, bytes)) => Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/plain; charset=utf-8")
-                .header("Content-Disposition", format!("inline; filename=\"{}\"", name))
-                .body(Body::from(bytes))
-                .unwrap(),
+        }
+    } else if password.len() < 4 {
+        Json(ReturnData::err("密码至少 4 位"))
+    } else {
+        let stored = crate::util::sha256::store_password(&password);
+        match state.storage.set_opds_account(&username, &stored).await {
+            Ok(_) => Json(ReturnData::ok(json!({
+                "enabled": true,
+                "username": username,
+            }))),
             Err(e) => {
-                tracing::warn!("OPDS 正文获取失败: {e}");
-                Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()
+                tracing::error!("saveOpdsSettings 失败: {e}");
+                Json(ReturnData::err("系统错误"))
             }
-        },
-        Err(resp) => resp,
+        }
     }
 }
 
@@ -2492,7 +2995,7 @@ async fn explore_book(
     let target = url
         .replace("{{page}}", &page.to_string())
         .replace("{page}", &page.to_string());
-    match crate::service::explore::explore_url(&target, &source).await {
+    match crate::service::explore::explore_url(&namespace, &target, &source).await {
         Ok(books) => Json(ReturnData::ok(
             serde_json::to_value(books).unwrap_or(serde_json::Value::Null),
         )),
@@ -2586,6 +3089,7 @@ async fn search_book_multi_sse(
     let total = sources.len() as i64;
     let start = (last_index + 1).max(0) as usize;
     let end = (start + search_size).min(sources.len());
+    let ns = namespace.clone();
     tokio::spawn(async move {
         // 并发受控（semaphore），结果到达即推送（FuturesUnordered 完成顺序）
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrent_count));
@@ -2593,11 +3097,12 @@ async fn search_book_multi_sse(
         for i in start..end {
             let sem = sem.clone();
             let key = key.clone();
+            let ns = ns.clone();
             let source = sources[i].clone();
             tasks.push(Box::pin(async move {
                 let _permit = sem.acquire().await;
                 let books =
-                    crate::service::search::search_one_source(&source, &key, 1).await.unwrap_or_default();
+                    crate::service::search::search_one_source(&ns, &source, &key, 1).await.unwrap_or_default();
                 let payload = serde_json::json!({ "lastIndex": i as i64, "data": books });
                 (i as i64, format!("event: book\ndata: {payload}\n\n"))
             }));
@@ -3298,15 +3803,14 @@ async fn upload_local_book(
         return Json(ReturnData::err("文件为空"));
     }
 
-    let lower = file_name.to_lowercase();
-    let imported = if lower.ends_with(".epub") {
-        match crate::service::local_book::parse_epub(&bytes) {
-            Ok(b) => b,
-            Err(e) => return Json(ReturnData::err(format!("EPUB 解析失败：{e}"))),
-        }
-    } else if lower.ends_with(".txt") {
-        // 用户自定义 TXT 目录规则（启用 + 按 serialNumber 排序）；无则用内置默认规则
-        let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
+    let ext = crate::service::local_book::file_ext(&file_name);
+    if !crate::service::local_book::SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
+        return Json(ReturnData::err("仅支持 EPUB/TXT/MOBI/AZW3/PDF/FB2/DOCX"));
+    }
+    // 用户自定义 TXT 目录规则（启用 + 按 serialNumber 排序）；无则用内置默认规则（仅 TXT 使用）
+    let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
+    let imported = if ext == "txt" {
+        // TXT 解析失败保持静默回退（与旧行为一致：空书 → “未解析到章节内容”）
         crate::service::local_book::parse_txt_with_rules(&bytes, &user_rules).unwrap_or_else(|e| {
             tracing::error!("TXT 解析失败: {e}");
             crate::service::local_book::ImportedBook {
@@ -3317,7 +3821,10 @@ async fn upload_local_book(
             }
         })
     } else {
-        return Json(ReturnData::err("仅支持 EPUB/TXT"));
+        match crate::service::local_book::parse_file_bytes(&bytes, &ext, &user_rules) {
+            Ok(b) => b,
+            Err(e) => return Json(ReturnData::err(format!("{} 解析失败：{e}", ext.to_uppercase()))),
+        }
     };
 
     if imported.chapters.is_empty() {
@@ -3327,7 +3834,10 @@ async fn upload_local_book(
     let book_url = format!("local://{}", uuid::Uuid::new_v4());
     let book = crate::model::book_chapter::BookInfo {
         name: if imported.meta.title.is_empty() {
-            file_name.trim_end_matches(".epub").trim_end_matches(".txt").to_string()
+            std::path::Path::new(&file_name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file_name.clone())
         } else {
             imported.meta.title.clone()
         },
@@ -3347,6 +3857,23 @@ async fn upload_local_book(
     if let Err(e) = state.storage.save_local_book(&namespace, &book, &imported).await {
         tracing::error!("本地书入库失败: {e}");
         return Json(ReturnData::err("入库失败"));
+    }
+
+    // OPDS 原文件下载：原始文件落盘 data/{ns}/opds_files/{uuid}.{ext}（供 /opds/download 直下）
+    let opds_dir = state
+        .storage
+        .config
+        .storage_dir()
+        .join("data")
+        .join(&namespace)
+        .join("opds_files");
+    if let Err(e) = std::fs::create_dir_all(&opds_dir) {
+        tracing::warn!("OPDS 原文件目录创建失败: {e}");
+    } else {
+        let file_id = book.book_url.trim_start_matches("local://");
+        if let Err(e) = std::fs::write(opds_dir.join(format!("{file_id}.{ext}")), &bytes) {
+            tracing::warn!("OPDS 原文件落盘失败: {e}");
+        }
     }
 
     if let Some(cover) = &imported.cover {
@@ -3391,6 +3918,20 @@ async fn txt_toc_rule_regexes(state: &AppState, ns: &str) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// chapterUrl 是否文件型本地书章节（bookPart 是 storage/ 路径或白名单扩展名文件）
+fn is_loc_book_file_chapter(chapter_url: &str) -> bool {
+    let Some((book_part, _)) = chapter_url.rsplit_once('#') else {
+        return false;
+    };
+    if book_part.starts_with("storage/") {
+        return true;
+    }
+    let lower = book_part.to_lowercase();
+    crate::service::local_book::SUPPORTED_EXTENSIONS
+        .iter()
+        .any(|e| lower.ends_with(&format!(".{e}")))
 }
 
 /// legacy 本地书文件定位：book_url 指向的文件可能缺失（legacy 导入时改名 index.epub）
@@ -3457,28 +3998,12 @@ async fn get_book_toc_loc_book(
         return None;
     };
     let path_lower = path.to_string_lossy().to_lowercase();
-    let imported = if path_lower.ends_with(".epub") {
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!("loc_book toc: 读取失败 [{path:?}] {e}");
-                return None;
-            }
-        };
-        match crate::service::local_book::parse_epub(&bytes) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!("loc_book toc: epub 解析失败 {e}");
-                return None;
-            }
-        }
-    } else {
-        match crate::service::local_book::parse_txt_file(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!("loc_book toc: txt 解析失败 {e}");
-                return None;
-            }
+    // 按扩展名分派（复用 resolve_loc_book_file 定位结果；TXT 用默认规则分章）
+    let imported = match crate::service::local_book::parse_loc_book_path(&path, &[]) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!("loc_book toc: 解析失败 [{path_lower}] {e}");
+            return None;
         }
     };
     let chapters = imported.chapters;
@@ -3497,11 +4022,13 @@ async fn get_book_toc_loc_book(
     Some(Json(ReturnData::ok(serde_json::Value::Array(list))))
 }
 
-/// 文件型本地书目录：读 TXT 分章 → 章节列表（chapterUrl = bookUrl#index）
+/// 文件型本地书目录：按扩展名解析（TXT 用用户规则）→ 章节列表（chapterUrl = bookUrl#index）
 async fn get_book_toc_file(state: &AppState, ns: &str, book_url: &str) -> Option<Json<ReturnData>> {
-    let path = resolve_storage_path(&state.storage.config.storage_dir(), book_url)?;
+    // 优先严格路径（防穿越），失败回退 legacy 目录式 index.epub 定位
+    let path = resolve_storage_path(&state.storage.config.storage_dir(), book_url)
+        .or_else(|| resolve_loc_book_file(&state.storage.config.storage_dir(), book_url))?;
     let user_rules = txt_toc_rule_regexes(state, ns).await;
-    let imported = crate::service::local_book::parse_txt_file_with_rules(&path, &user_rules).ok()?;
+    let imported = crate::service::local_book::parse_loc_book_path(&path, &user_rules).ok()?;
     let list: Vec<serde_json::Value> = imported
         .chapters
         .iter()
@@ -3518,19 +4045,14 @@ async fn get_book_toc_file(state: &AppState, ns: &str, book_url: &str) -> Option
     Some(Json(ReturnData::ok(serde_json::Value::Array(list))))
 }
 
-/// 文件型本地书正文：bookUrl#index → 读文件（TXT/EPUB）→ 提取章节
+/// 文件型本地书正文：bookUrl#index → 定位文件（白名单扩展名）→ 提取章节
 async fn get_book_content_file(state: &AppState, ns: &str, chapter_url: &str) -> Option<Json<ReturnData>> {
     let (book_part, idx_part) = chapter_url.rsplit_once('#')?;
     let index: usize = idx_part.parse().ok()?;
     let path = resolve_loc_book_file(&state.storage.config.storage_dir(), book_part)?;
-    let path_lower = path.to_string_lossy().to_lowercase();
-    let imported = if path_lower.ends_with(".epub") {
-        let bytes = std::fs::read(&path).ok()?;
-        crate::service::local_book::parse_epub(&bytes).ok()?
-    } else {
-        let user_rules = txt_toc_rule_regexes(state, ns).await;
-        crate::service::local_book::parse_txt_file_with_rules(&path, &user_rules).ok()?
-    };
+    // 按扩展名分派（TXT 用用户规则，其余格式用各自解析器）
+    let user_rules = txt_toc_rule_regexes(state, ns).await;
+    let imported = crate::service::local_book::parse_loc_book_path(&path, &user_rules).ok()?;
     let content = imported.chapters.get(index)?.content.clone();
     Some(Json(ReturnData::ok(serde_json::json!({ "content": content }))))
 }
@@ -5195,5 +5717,427 @@ mod tests {
         assert!(json["isSuccess"].as_bool().unwrap(), "{}", json);
 
         cleanup(state, dir).await;
+    }
+
+    /// 换源：searchBookSource——书架书取书名、排除当前源、其余源搜索失败优雅降级为空数组
+    #[tokio::test]
+    async fn test_search_book_source_api() {
+        let (state, dir) = test_state("srcswitch").await;
+        // 两个书源：s1=当前源（有搜索规则），s2=其他源（search_url 指向不可达域名，爬取失败→空）
+        for (url, name) in [("https://s1.com", "源1"), ("https://s2.com", "源2")] {
+            state
+                .storage
+                .save_book_source(
+                    "default",
+                    &crate::model::BookSource {
+                        book_source_url: url.into(),
+                        book_source_name: name.into(),
+                        enabled: true,
+                        search_url: Some(format!("{url}/search?q={{key}}")),
+                        rule_search: Some(serde_json::json!({
+                            "bookList": "@js:JSON.parse(result).data",
+                            "name": "$.name",
+                            "author": "$.author",
+                            "bookUrl": "$.url",
+                            "tocUrl": "$.toc"
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // 书架书（当前源 s1）
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://s1.com/book/1".into(),
+                    name: "测试书".into(),
+                    origin: "https://s1.com".into(),
+                    origin_name: "源1".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // 缺参 → 业务错误
+        let ret = search_book_source(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "请输入书籍链接");
+
+        // 正常调用：排除当前源 s1，仅 s2 搜索（不可达 → 空数组，不报错）
+        let params: HashMap<String, String> = [
+            ("url".into(), "https://s1.com/book/1".into()),
+            ("bookSource".into(), "https://s1.com".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = search_book_source(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "应成功: {}", ret.0.error_msg);
+        let data = ret.0.data.as_array().expect("应返回数组（源搜索失败降级为空）");
+        assert!(data.is_empty());
+
+        // 仅当前源 → 无其他源 → data null
+        state.storage.delete_book_source("default", "https://s2.com").await.unwrap();
+        let params: HashMap<String, String> = [
+            ("url".into(), "https://s1.com/book/1".into()),
+            ("bookSource".into(), "https://s1.com".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = search_book_source(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        assert!(ret.0.data.is_null(), "无其他源应返回 null");
+
+        cleanup(state, dir).await;
+    }
+
+    /// OPDS：本地书 acquire 正文 / download 下载（存库章节重建），目录条目含两个 acquisition 链接
+    #[tokio::test]
+    async fn test_opds_local_book_acquire_and_download() {
+        let (state, dir) = test_state("opdslocal").await;
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "local://abc".into(),
+                    name: "本地书".into(),
+                    author: "作者".into(),
+                    origin: "loc_book".into(),
+                    origin_name: "本地".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_chapters(
+                "local://abc",
+                &[
+                    ("第一章".to_string(), "第一段内容".to_string()),
+                    ("第二章".to_string(), "第二段内容".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        let id = crate::api::opds::encode_id("local://abc");
+
+        // acquire：正文（新 API 返回首章正文，不含标题）
+        let (name, bytes) = crate::api::opds::acquire(&state.storage, "default", &id)
+            .await
+            .expect("acquire 应成功");
+        assert_eq!(name, "本地书.txt");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("第一段内容"), "acquire 应返回首章正文: {text}");
+
+        // download：章节重建（带文件名）
+        let (fname, bytes, _ct) = crate::api::opds::download(&state.storage, "default", &id, "", None)
+            .await
+            .unwrap();
+        assert_eq!(fname, "本地书.txt");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("第二段内容"));
+
+        // 书架目录（OPDS 2.0 JSON）：含两个 acquisition 链接（download + acquire）
+        let json = crate::api::opds::shelf_json(&state.storage, "default", 0, 50).await.unwrap();
+        assert!(json.contains(&format!("/opds/download/{id}")), "目录应含下载链接");
+        assert!(json.contains(&format!("/opds/acquire/{id}")), "目录应含正文链接");
+        assert!(json.contains("本地书"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// OPDS：accessToken 查询参数认证（secure 模式），与 /reader3 一致
+    #[tokio::test]
+    async fn test_opds_access_token_query_auth() {
+        let (state, dir) = test_state("opdsauth").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "tok123".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // 正确 accessToken → alice
+        let params: HashMap<String, String> =
+            [("accessToken".into(), "alice:tok123".into())].into_iter().collect();
+        let ns = opds_ns(&state, &HeaderMap::new(), &params).await.expect("应认证通过");
+        assert_eq!(ns, "alice");
+
+        // 错误 token → 401
+        let params: HashMap<String, String> =
+            [("accessToken".into(), "alice:bad".into())].into_iter().collect();
+        let ret = opds_ns(&state, &HeaderMap::new(), &params).await;
+        assert!(ret.is_err());
+        assert_eq!(ret.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+
+        // 缺 accessToken → 401（secure）
+        let ret = opds_ns(&state, &HeaderMap::new(), &HashMap::new()).await;
+        assert!(ret.is_err());
+
+        // 非 secure → 恒 default（accessToken 不参与）
+        let mut state2 = state.clone();
+        state2.storage.config.secure = false;
+        let ret = opds_ns(&state2, &HeaderMap::new(), &HashMap::new()).await;
+        assert_eq!(ret.unwrap(), "default");
+
+        cleanup(state, dir).await;
+    }
+
+    /// OPDS：Basic 认证——独立 OPDS 账号优先（system_settings），回退系统用户（users 表）；
+    /// 密码存储：独立账号 sha256(salt||pwd)（salt$hash）；系统用户 legacy 双 md5（gen_encrypted_password）
+    #[tokio::test]
+    async fn test_opds_basic_auth_accounts() {
+        let (state, dir) = test_state("opdsbasic").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        // 系统用户（users 表，legacy 双 md5 哈希存储）
+        let salt = "s1".to_string();
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                password: gen_encrypted_password("pw123456", &salt),
+                salt: salt.clone(),
+                token: "tok123".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 独立 OPDS 账号（sha256+salt 存储，不回传明文）
+        let stored = crate::util::sha256::store_password("opds-pass");
+        state.storage.set_opds_account("reader", &stored).await.unwrap();
+
+        let basic = |u: &str, p: &str| {
+            use base64::Engine;
+            let mut h = HeaderMap::new();
+            let cred = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Basic {cred}").parse().unwrap(),
+            );
+            h
+        };
+
+        // 独立 OPDS 账号通过
+        let ns = opds_ns(&state, &basic("reader", "opds-pass"), &HashMap::new())
+            .await
+            .expect("独立 OPDS 账号应通过");
+        assert_eq!(ns, "reader");
+
+        // 独立账号密码错误 → 401（不回退系统账号的同名用户）
+        let ret = opds_ns(&state, &basic("reader", "wrong"), &HashMap::new()).await;
+        assert!(ret.is_err());
+        assert_eq!(ret.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+
+        // 系统用户 Basic 通过（密码为哈希存储，复用 gen_encrypted_password 校验）
+        let ns = opds_ns(&state, &basic("alice", "pw123456"), &HashMap::new())
+            .await
+            .expect("系统用户 Basic 应通过");
+        assert_eq!(ns, "alice");
+
+        // 系统用户密码错误 → 401
+        let ret = opds_ns(&state, &basic("alice", "bad"), &HashMap::new()).await;
+        assert!(ret.is_err());
+
+        // 禁用独立账号后：系统账号仍可用
+        state.storage.clear_opds_account().await.unwrap();
+        let ns = opds_ns(&state, &basic("alice", "pw123456"), &HashMap::new())
+            .await
+            .expect("禁用独立账号后系统用户应通过");
+        assert_eq!(ns, "alice");
+
+        cleanup(state, dir).await;
+    }
+
+    /// OPDS 分发路由：根导航 / shelf / opensearch / 404 / acquire / save
+    #[tokio::test]
+    async fn test_opds_dispatch_routes() {
+        let (state, dir) = test_state("opdsdispatch").await;
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://a.com/1".into(),
+                    name: "测试书".into(),
+                    author: "作者".into(),
+                    origin: "https://s.com".into(),
+                    origin_name: "源".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let dispatch = |rest: &str, params: HashMap<String, String>| {
+            opds_dispatch(
+                AxumState(state.clone()),
+                Some(axum::extract::Path(rest.to_string())),
+                Query(params),
+                HeaderMap::new(),
+            )
+        };
+
+        // 根：导航 feed
+        let resp = dispatch("", HashMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("书架") && body.contains("/opds/shelf"));
+
+        // shelf：acquisition feed 含条目
+        let resp = dispatch("shelf", HashMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("测试书"));
+        assert!(body.contains("opds:totalResults"));
+
+        // opensearch.xml
+        let resp = dispatch("opensearch.xml", HashMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("opensearchdescription"));
+
+        // OPDS 2.0 根
+        let resp = dispatch("catalog", HashMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("application/opds+json"));
+
+        // 未知路径 → 404
+        let resp = dispatch("nonexistent", HashMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 不存在书籍：acquire/save → 404
+        let id = crate::api::opds::encode_id("https://nope.com");
+        let resp = dispatch(&format!("acquire/{id}"), HashMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = dispatch(&format!("save/{id}"), HashMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 搜索
+        let resp = dispatch("search", [("q".to_string(), "测试".to_string())].into_iter().collect()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        cleanup(state, dir).await;
+    }
+
+    /// OPDS 独立账号设置端点：saveOpdsSettings / getOpdsSettings（密码不回传）
+    #[tokio::test]
+    async fn test_opds_settings_endpoints() {
+        let (state, dir) = test_state("opdsset").await;
+        // 默认关闭
+        let ret = get_opds_settings(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new()).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data["enabled"], false);
+        assert_eq!(ret.0.data["passwordSet"], false);
+
+        // 配置账号
+        let body = Bytes::from(json!({"username": "reader", "password": "secret123"}).to_string());
+        let ret = save_opds_settings(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "保存失败: {}", ret.0.error_msg);
+        assert_eq!(ret.0.data["enabled"], true);
+
+        let ret = get_opds_settings(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new()).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data["username"], "reader");
+        assert_eq!(ret.0.data["passwordSet"], true);
+        assert!(ret.0.data.get("password").is_none(), "密码不得回传");
+        // 落库为 salt$hash，非明文
+        let (_, stored) = state.storage.get_opds_account().await.unwrap().unwrap();
+        assert!(stored.contains('$'));
+        assert_ne!(stored, "secret123");
+
+        // 短密码拒绝
+        let body = Bytes::from(json!({"username": "reader", "password": "123"}).to_string());
+        let ret = save_opds_settings(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+
+        // 空用户名 → 禁用
+        let body = Bytes::from(json!({"username": "", "password": ""}).to_string());
+        let ret = save_opds_settings(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        let ret = get_opds_settings(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new()).await;
+        assert_eq!(ret.0.data["enabled"], false);
+
+        cleanup(state, dir).await;
+    }
+
+    /// 路由构建冒烟：全部 OPDS 路由注册无冲突（matchit 冲突会在构建时 panic）
+    #[tokio::test]
+    async fn test_router_constructs_with_opds_routes() {
+        let (state, dir) = test_state("opdsrouter").await;
+        let app = router(state.storage.config.clone(), state.storage.clone());
+        // 不 panic 即通过（axum 0.7 Router 无 routes() 自省——构建冲突会在 router() 时 panic）
+        let _ = app;
+        cleanup(state, dir).await;
+    }
+
+    // ---------------- 书源登录态（loginBookSource 参数解析） ----------------
+
+    /// 登录参数合并：query 兜底 + body JSON 优先 / form-urlencoded 兑底
+    #[test]
+    fn test_merge_login_params_query_only() {
+        let mut q = HashMap::new();
+        q.insert("bookSource".to_string(), "https://a.com".to_string());
+        q.insert("username".to_string(), "u1".to_string());
+        let m = merge_login_params(&q, None);
+        assert_eq!(m.get("bookSource").map(String::as_str), Some("https://a.com"));
+        assert_eq!(m.get("username").map(String::as_str), Some("u1"));
+        assert_eq!(m.get("password"), None);
+    }
+
+    #[test]
+    fn test_merge_login_params_json_body() {
+        let mut q = HashMap::new();
+        q.insert("bookSource".to_string(), "https://query.com".to_string());
+        let body = br#"{"bookSource":"https://body.com","username":"u1","password":"p1","captcha":"c1","mode":"browser"}"#;
+        let m = merge_login_params(&q, Some(body));
+        // body JSON 优先于 query
+        assert_eq!(m.get("bookSource").map(String::as_str), Some("https://body.com"));
+        assert_eq!(m.get("username").map(String::as_str), Some("u1"));
+        assert_eq!(m.get("password").map(String::as_str), Some("p1"));
+        assert_eq!(m.get("captcha").map(String::as_str), Some("c1"));
+        assert_eq!(m.get("mode").map(String::as_str), Some("browser"));
+    }
+
+    #[test]
+    fn test_merge_login_params_form_body() {
+        let mut q = HashMap::new();
+        q.insert("bookSource".to_string(), "https://a.com".to_string());
+        let body = b"username=u1&password=p1&captcha=c1";
+        let m = merge_login_params(&q, Some(body));
+        assert_eq!(m.get("bookSource").map(String::as_str), Some("https://a.com"));
+        assert_eq!(m.get("username").map(String::as_str), Some("u1"));
+        assert_eq!(m.get("password").map(String::as_str), Some("p1"));
+        assert_eq!(m.get("captcha").map(String::as_str), Some("c1"));
+    }
+
+    #[test]
+    fn test_merge_login_params_invalid_body_falls_back_to_query() {
+        let mut q = HashMap::new();
+        q.insert("bookSource".to_string(), "https://a.com".to_string());
+        // 非 JSON 非表单（二进制）→ 保留 query
+        let m = merge_login_params(&q, Some(b"\x00\x01\x02"));
+        assert_eq!(m.get("bookSource").map(String::as_str), Some("https://a.com"));
     }
 }

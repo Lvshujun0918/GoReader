@@ -334,12 +334,15 @@ async function runClearCache() {
 }
 
 /* ================= OPDS 访问 ================= */
-/** OPDS 地址 = 当前 host + /opds */
-const opdsUrl = `${window.location.origin}/opds`
+/** OPDS 地址 = 当前 host + /opds（secure 模式附带 accessToken=用户名:token，外部阅读器免输入密码） */
+const opdsUrl = computed(() => {
+  const base = `${window.location.origin}/opds`
+  return store.accessToken ? `${base}?accessToken=${encodeURIComponent(store.accessToken)}` : base
+})
 const opdsCopied = ref(false)
 
 async function copyOpdsUrl() {
-  const text = opdsUrl
+  const text = opdsUrl.value
   try {
     await navigator.clipboard.writeText(text)
   } catch {
@@ -497,7 +500,7 @@ async function downloadBackup() {
             {{ opdsCopied ? '已复制' : '复制' }}
           </button>
         </div>
-        <p class="card-note">外部阅读器（如 legado、静读天下等）可通过此地址连接书架，账号密码与本应用登录一致。</p>
+        <p class="card-note">外部阅读器（如 legado、静读天下等）可通过此地址连接书架；已在地址中附带 accessToken，复制后粘贴到阅读器 OPDS 地址栏即可（未登录时不附带）。</p>
       </section>
 
       <!-- 数据备份 -->

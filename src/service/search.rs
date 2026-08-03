@@ -241,6 +241,7 @@ fn concurrent_rate_sleep_ms(rate: Option<&str>) -> u64 {
 
 /// 执行单个书源搜索
 pub async fn search_one_source(
+    ns: &str,
     source: &BookSource,
     key: &str,
     page: i64,
@@ -286,15 +287,13 @@ pub async fn search_one_source(
             .replace("{key}", key)
             .replace("{page}", &page.to_string())
     });
-    let resp = crawler::fetch(
-        &url,
-        &req_headers,
-        15,
-        suffix.method.as_deref().unwrap_or("GET"),
-        post_body.as_deref(),
-        suffix.charset.as_deref(),
-    )
-    .await?;
+    // 书源抓取（自动带书源 cookie——按用户命名空间）
+    let method = suffix.method.as_deref().unwrap_or("GET");
+    let resp = if method.eq_ignore_ascii_case("POST") {
+        crawler::http_post(ns, &url, &req_headers, 15, post_body.as_deref(), suffix.charset.as_deref()).await?
+    } else {
+        crawler::http_get(ns, &url, &req_headers, 15).await?
+    };
     let base = resp.url.clone();
     // bodyJs：对响应体执行 JS 后作为新响应体
     let body = apply_body_js(&resp.body, &suffix, key, page, &source.book_source_url, &req_headers)?;

@@ -142,6 +142,11 @@ function isSupported(file: File): boolean {
   return (
     name.endsWith('.epub') ||
     name.endsWith('.txt') ||
+    name.endsWith('.mobi') ||
+    name.endsWith('.azw3') ||
+    name.endsWith('.pdf') ||
+    name.endsWith('.fb2') ||
+    name.endsWith('.docx') ||
     file.type === 'application/epub+zip' ||
     file.type === 'text/plain' ||
     file.type.startsWith('text/')
@@ -170,7 +175,7 @@ function addFiles(files: File[]) {
   const valid = files.filter(isSupported)
   const ignored = files.length - valid.length
   for (const f of valid) importItems.value.push({ file: f, status: 'pending', progress: 0 })
-  acceptTip.value = ignored > 0 ? `已忽略 ${ignored} 个不支持的文件（仅支持 .epub / .txt）` : ''
+  acceptTip.value = ignored > 0 ? `已忽略 ${ignored} 个不支持的文件（支持 .epub / .txt / .mobi / .azw3 / .pdf / .fb2 / .docx）` : ''
   if (valid.length > 0) {
     importDone.value = false
     importSummary.value = ''
@@ -233,6 +238,46 @@ async function startUpload() {
     failed > 0 ? `导入完成：${ok} 本成功，${failed} 本失败` : `导入完成，共 ${ok} 本`
   await load() // 刷新书架（getBookshelf）
   if (failed === 0) window.setTimeout(() => closeImport(), 800)
+}
+
+/* ================= OPDS 服务器入口（外部阅读器：legado/静读等） ================= */
+const opdsOpen = ref(false)
+const opdsCopied = ref(false)
+
+/** OPDS 地址 = 当前 host + /opds（secure 模式附带 accessToken=用户名:token） */
+const opdsUrl = computed(() => {
+  const base = `${window.location.origin}/opds`
+  return store.accessToken ? `${base}?accessToken=${encodeURIComponent(store.accessToken)}` : base
+})
+
+function openOpds() {
+  opdsOpen.value = true
+  opdsCopied.value = false
+  document.body.style.overflow = 'hidden'
+}
+
+function closeOpds() {
+  opdsOpen.value = false
+  document.body.style.overflow = ''
+}
+
+async function copyOpdsUrl() {
+  const text = opdsUrl.value
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // 剪贴板 API 不可用（非 https 等）：textarea 降级
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+  }
+  opdsCopied.value = true
+  window.setTimeout(() => (opdsCopied.value = false), 1600)
 }
 
 onBeforeUnmount(() => {
@@ -840,6 +885,7 @@ onMounted(() => {
         <button class="nav-link" type="button" @click="router.push('/rules')">替换规则</button>
         <button class="nav-link" type="button" @click="router.push('/rss')">RSS</button>
         <button class="nav-link" type="button" @click="router.push('/files')">文件</button>
+        <button class="nav-link" type="button" title="OPDS 服务器（外部阅读器连接）" @click="openOpds">OPDS</button>
         <button v-if="secureMode" class="nav-link" type="button" @click="router.push('/users')">用户</button>
         <span class="user-chip">{{ store.username || '未登录' }}</span>
         <button class="logout-btn" type="button" @click="logout">退出</button>
@@ -1045,12 +1091,12 @@ onMounted(() => {
                 <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
               </svg>
               <p class="dz-text">点击选择文件，或将文件拖拽到此处</p>
-              <p class="dz-sub">支持 .epub / .txt · 可多选</p>
+              <p class="dz-sub">支持 .epub / .txt / .mobi / .azw3 / .pdf / .fb2 / .docx · 可多选</p>
               <input
                 ref="fileInput"
                 class="file-input"
                 type="file"
-                accept=".epub,.txt,application/epub+zip,text/plain"
+                accept=".epub,.txt,.mobi,.azw3,.pdf,.fb2,.docx,application/epub+zip,text/plain"
                 multiple
                 @change="onPick"
               />
@@ -1113,6 +1159,38 @@ onMounted(() => {
                   {{ uploadBusy ? '导入中…' : hasPending ? `开始导入（${hasPendingCount}）` : '开始导入' }}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- OPDS 服务器弹窗（外部阅读器连接地址 + 复制） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="opdsOpen" class="dlg-overlay" @click.self="closeOpds">
+          <div
+            class="dlg dlg-opds"
+            role="dialog"
+            aria-modal="true"
+            aria-label="OPDS 服务器"
+            tabindex="-1"
+            @keydown.esc="closeOpds"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">OPDS 服务器</h2>
+              <button class="dlg-close" type="button" title="关闭" @click="closeOpds">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <p class="opds-tip">将以下地址粘贴到外部阅读器（legado、静读天下等）的 OPDS 地址栏，即可同步书架与阅读。地址已附带登录凭证，请勿分享给他人。</p>
+            <div class="opds-row">
+              <span class="opds-url mono" :title="opdsUrl">{{ opdsUrl }}</span>
+              <button class="accent-btn" type="button" @click="copyOpdsUrl">
+                {{ opdsCopied ? '已复制' : '复制' }}
+              </button>
             </div>
           </div>
         </div>
@@ -2030,6 +2108,36 @@ onMounted(() => {
   display: flex;
   gap: 8px;
   margin-left: auto;
+}
+
+/* ================= OPDS 弹窗 ================= */
+.dlg-opds {
+  width: min(520px, 100%);
+}
+.opds-tip {
+  margin: 0 0 14px;
+  font-size: 12px;
+  font-weight: 300;
+  line-height: 1.8;
+  color: var(--text-3);
+}
+.opds-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+.opds-url {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .ghost-btn {
   padding: 7px 16px;

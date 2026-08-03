@@ -53,10 +53,10 @@ pub struct ContentRule {
     pub init: Option<String>,
 }
 
-/// 抓取（复用搜索的 URL 附加参数处理）
-pub async fn fetch_url(url: &str, source: &BookSource) -> Result<crawler::FetchResponse> {
+/// 抓取（复用搜索的 URL 附加参数处理；自动带书源 cookie——按用户命名空间）
+pub async fn fetch_url(ns: &str, url: &str, source: &BookSource) -> Result<crawler::FetchResponse> {
     let headers = source.header.as_deref().map(crawler::parse_header).unwrap_or_default();
-    crawler::fetch(url, &headers, 15, "GET", None, None).await
+    crawler::http_get(ns, url, &headers, 15).await
 }
 
 /// 详情解析（ruleBookInfo 字段应用于详情页 HTML）
@@ -95,6 +95,7 @@ pub fn analyze_book_info(html: &str, base_url: &str, source: &BookSource, book_u
 
 /// 目录解析（ruleToc：chapterList 定位 + 字段规则；多页 nextTocUrl 循环）
 pub async fn analyze_toc(
+    ns: &str,
     toc_url: &str,
     source: &BookSource,
     max_pages: usize,
@@ -103,7 +104,7 @@ pub async fn analyze_toc(
     let mut current_url = toc_url.to_string();
 
     for _page in 0..max_pages {
-        let resp = fetch_url(&current_url, source).await?;
+        let resp = fetch_url(ns, &current_url, source).await?;
         let base = resp.url.clone();
         let rule: TocRule = source
             .rule_toc
@@ -159,6 +160,7 @@ pub async fn analyze_toc(
 
 /// 正文解析（ruleContent：content 字段 + sourceRegex 清洗 + 多页）
 pub async fn analyze_content(
+    ns: &str,
     chapter_url: &str,
     source: &BookSource,
     max_pages: usize,
@@ -167,7 +169,7 @@ pub async fn analyze_content(
     let mut current_url = chapter_url.to_string();
 
     for _page in 0..max_pages {
-        let resp = fetch_url(&current_url, source).await?;
+        let resp = fetch_url(ns, &current_url, source).await?;
         let base = resp.url.clone();
         let content = analyze_content_from(&resp.body, source);
         if !content.is_empty() {

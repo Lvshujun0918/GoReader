@@ -170,6 +170,7 @@ fn percent_decode(s: &str) -> String {
 
 /// 单页发现：抓取 + 解析（复用搜索的 SearchRule 语义）
 pub async fn explore_url(
+    ns: &str,
     url: &str,
     source: &BookSource,
 ) -> Result<Vec<SearchBook>> {
@@ -191,15 +192,13 @@ pub async fn explore_url(
         }
     }
     let post_body = suffix.body.as_ref().map(|b| b.replace("{{page}}", "1").replace("{page}", "1"));
-    let resp = crawler::fetch(
-        &final_url,
-        &headers,
-        15,
-        suffix.method.as_deref().unwrap_or("GET"),
-        post_body.as_deref(),
-        suffix.charset.as_deref(),
-    )
-    .await
+    // 书源抓取（自动带书源 cookie——按用户命名空间）
+    let method = suffix.method.as_deref().unwrap_or("GET");
+    let resp = if method.eq_ignore_ascii_case("POST") {
+        crawler::http_post(ns, &final_url, &headers, 15, post_body.as_deref(), suffix.charset.as_deref()).await
+    } else {
+        crawler::http_get(ns, &final_url, &headers, 15).await
+    }
     .map_err(|e| anyhow::anyhow!("抓取失败（{}）: {}", final_url, e))?;
 
     let rule: crate::service::search::SearchRule = match &source.rule_explore {

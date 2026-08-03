@@ -121,6 +121,36 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     .execute(&pool)
     .await?;
 
+    // OPDS 独立账号等系统设置（键值表）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at INTEGER DEFAULT 0
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // 书源登录态 cookie（按用户隔离：user_namespace + source_url 联合主键）
+    // user_agent 列：FlareSolverr 返回的 userAgent 与库中不同时一并记录（部分站点 UA 绑定 cookie）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS book_source_cookies (
+            user_namespace TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            cookie TEXT NOT NULL DEFAULT '',
+            user_agent TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER DEFAULT 0,
+            PRIMARY KEY (user_namespace, source_url)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     // 兼容旧库：books 表缺 user_namespace 列时补列
     let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('users')")
         .fetch_all(&pool)
@@ -443,6 +473,63 @@ impl Storage {
         Ok(user)
     }
 
+    // ---------------- OPDS 设置（system_settings 键值表） ----------------
+
+    /// 系统设置读取（无则 None）
+    pub async fn get_system_setting(&self, key: &str) -> Result<Option<String>> {
+        let r: Option<(String,)> = sqlx::query_as("SELECT value FROM system_settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    /// 系统设置写入（INSERT OR REPLACE）
+    pub async fn set_system_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO system_settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 系统设置删除（返回删除行数）
+    pub async fn delete_system_setting(&self, key: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM system_settings WHERE key = ?1")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// OPDS 独立账号：读取 (username, 存储串 `salt$hash`)。未配置返回 None。
+    pub async fn get_opds_account(&self) -> Result<Option<(String, String)>> {
+        let username = self.get_system_setting("opds_username").await?;
+        let password = self.get_system_setting("opds_password").await?;
+        match (username, password) {
+            (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => Ok(Some((u, p))),
+            _ => Ok(None),
+        }
+    }
+
+    /// OPDS 独立账号写入（password 为已生成的 `salt$hash` 存储串）
+    pub async fn set_opds_account(&self, username: &str, stored_password: &str) -> Result<()> {
+        self.set_system_setting("opds_username", username).await?;
+        self.set_system_setting("opds_password", stored_password).await?;
+        Ok(())
+    }
+
+    /// OPDS 独立账号清除（禁用；回退系统账号/token 认证）
+    pub async fn clear_opds_account(&self) -> Result<()> {
+        self.delete_system_setting("opds_username").await?;
+        self.delete_system_setting("opds_password").await?;
+        Ok(())
+    }
+
     /// 书源列表（按命名空间；无则回退 default）
     pub async fn get_book_sources(&self, ns: &str) -> Result<Vec<crate::model::BookSource>> {
         let rows = sqlx::query_as::<_, crate::model::BookSource>(
@@ -507,14 +594,22 @@ impl Storage {
     }
 
     /// 删除书源（按 URL 精确匹配，仅限本命名空间）；返回受影响行数
+    /// 连带删除该书源的登录态 cookie（按用户）
     pub async fn delete_book_source(&self, ns: &str, url: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
         let r = sqlx::query(
             "DELETE FROM book_sources WHERE user_namespace = ?1 AND book_source_url = ?2",
         )
         .bind(ns)
         .bind(url)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM book_source_cookies WHERE user_namespace = ?1 AND source_url = ?2")
+            .bind(ns)
+            .bind(url)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(r.rows_affected())
     }
 
@@ -555,13 +650,123 @@ impl Storage {
         Ok(r.rows_affected())
     }
 
-    /// 清空命名空间全部书源
+    /// 清空命名空间全部书源（连带清理书源 cookie）
     pub async fn delete_all_book_sources(&self, ns: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
         let r = sqlx::query("DELETE FROM book_sources WHERE user_namespace = ?1")
             .bind(ns)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM book_source_cookies WHERE user_namespace = ?1")
+            .bind(ns)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(r.rows_affected())
+    }
+
+    // ---------------- 书源登录态 cookie（按用户隔离） ----------------
+
+    /// 读取书源 cookie（精确 source_url 键；无则 None）
+    pub async fn get_cookie(&self, ns: &str, source_url: &str) -> Result<Option<String>> {
+        let r: Option<(String,)> = sqlx::query_as(
+            "SELECT cookie FROM book_source_cookies WHERE user_namespace = ?1 AND source_url = ?2",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(r.map(|x| x.0).filter(|c| !c.is_empty()))
+    }
+
+    /// 写入书源 cookie（INSERT OR REPLACE；空值等价清除）
+    pub async fn set_cookie(&self, ns: &str, source_url: &str, cookie: &str) -> Result<()> {
+        if cookie.trim().is_empty() {
+            self.clear_cookie(ns, source_url).await?;
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT OR REPLACE INTO book_source_cookies (user_namespace, source_url, cookie, user_agent, updated_at)
+             VALUES (?1, ?2, ?3, COALESCE((SELECT user_agent FROM book_source_cookies WHERE user_namespace = ?1 AND source_url = ?2), ''), ?4)",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .bind(cookie)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 清除书源 cookie（返回删除行数）
+    pub async fn clear_cookie(&self, ns: &str, source_url: &str) -> Result<u64> {
+        let r = sqlx::query(
+            "DELETE FROM book_source_cookies WHERE user_namespace = ?1 AND source_url = ?2",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 记录书源 user_agent（FlareSolverr 返回 UA 与库中不同时更新——部分站点 UA 绑定 cookie）
+    pub async fn set_cookie_user_agent(&self, ns: &str, source_url: &str, user_agent: &str) -> Result<()> {
+        if user_agent.trim().is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO book_source_cookies (user_namespace, source_url, cookie, user_agent, updated_at)
+             VALUES (?1, ?2, '', ?3, ?4)
+             ON CONFLICT(user_namespace, source_url) DO UPDATE SET user_agent = ?3",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .bind(user_agent)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 读取书源登录态会话（cookie + user_agent）
+    pub async fn get_source_session(
+        &self,
+        ns: &str,
+        source_url: &str,
+    ) -> Result<Option<(String, String)>> {
+        let r: Option<(String, String)> = sqlx::query_as(
+            "SELECT cookie, user_agent FROM book_source_cookies WHERE user_namespace = ?1 AND source_url = ?2",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(r.map(|(c, ua)| (c, ua)))
+    }
+
+    /// 按 baseUrl 匹配书源 cookie（crawler 抓取用：请求 URL 的 base 与书源
+    /// source_url 的 base 一致即命中——source_url 可能带 `##` 备用地址后缀）。
+    /// 仅查本命名空间（书源 cookie 按用户隔离）。
+    pub async fn get_cookie_by_base(&self, ns: &str, base_url: &str) -> Result<Option<String>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source_url, cookie FROM book_source_cookies WHERE user_namespace = ?1",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        let target = normalize_base(base_url);
+        for (source_url, cookie) in rows {
+            // `##` 后缀：主地址/备用地址都算同源（与 book_sources 语义一致）——任一段命中即可
+            if cookie.is_empty() {
+                continue;
+            }
+            let any_match = source_url.split("##").any(|part| normalize_base(part) == target);
+            if any_match {
+                return Ok(Some(cookie));
+            }
+        }
+        Ok(None)
     }
 
     // ---------------- RSS ----------------
@@ -1843,7 +2048,7 @@ pub async fn run_shelf_update(storage: &Storage) -> Result<usize> {
         else {
             continue;
         };
-        match crate::service::book::analyze_toc(&book.toc_url, &source, 20).await {
+        match crate::service::book::analyze_toc(&book.user_namespace, &book.toc_url, &source, 20).await {
             Ok(chapters) if !chapters.is_empty() => {
                 let non_volume: Vec<&crate::model::book_chapter::BookChapter> =
                     chapters.iter().filter(|c| !c.is_volume).collect();
@@ -1872,6 +2077,25 @@ pub async fn run_shelf_update(storage: &Storage) -> Result<usize> {
 }
 
 /// 幂等补列：列不存在则 ALTER TABLE ADD COLUMN（旧库升级用）
+/// 规范化 baseUrl（scheme://host[:port]，去尾斜杠/路径/查询）——
+/// 书源 cookie 按 base 匹配：请求 https://a.com/book/1 命中 source_url https://a.com
+pub(crate) fn normalize_base(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    // 无 scheme 时补 https://（容忍裸 host 写法）
+    let with_scheme = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("https://{url}")
+    };
+    let parsed = url::Url::parse(&with_scheme).ok()?;
+    let host = parsed.host_str()?;
+    let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Some(format!("{}://{host}{port}", parsed.scheme()))
+}
+
 async fn ensure_column(pool: &SqlitePool, table: &str, column: &str) -> anyhow::Result<()> {
     let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"))
         .fetch_one(pool)
@@ -3508,5 +3732,169 @@ mod tests {
         assert_eq!(storage.rename_book_group("alice", g2.id, "越权改名").await.unwrap(), 0);
 
         cleanup(storage, "grpfin").await;
+    }
+
+    // ---------------- 书源登录态 cookie（按用户隔离） ----------------
+
+    #[tokio::test]
+    async fn test_cookie_roundtrip_and_namespace_isolation() {
+        let storage = test_storage("cookie").await;
+
+        // 初始无 cookie
+        assert_eq!(
+            storage.get_cookie("default", "https://a.com").await.unwrap(),
+            None
+        );
+
+        // 写入 → 读回
+        storage
+            .set_cookie("default", "https://a.com", "sid=abc; token=xyz")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_cookie("default", "https://a.com").await.unwrap(),
+            Some("sid=abc; token=xyz".to_string())
+        );
+
+        // 覆盖写
+        storage.set_cookie("default", "https://a.com", "sid=def").await.unwrap();
+        assert_eq!(
+            storage.get_cookie("default", "https://a.com").await.unwrap(),
+            Some("sid=def".to_string())
+        );
+
+        // 按用户隔离：alice 读不到 default 的 cookie
+        assert_eq!(storage.get_cookie("alice", "https://a.com").await.unwrap(), None);
+        storage
+            .set_cookie("alice", "https://a.com", "sid=alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_cookie("default", "https://a.com").await.unwrap(),
+            Some("sid=def".to_string())
+        );
+        assert_eq!(
+            storage.get_cookie("alice", "https://a.com").await.unwrap(),
+            Some("sid=alice".to_string())
+        );
+
+        // 清除
+        assert_eq!(storage.clear_cookie("alice", "https://a.com").await.unwrap(), 1);
+        assert_eq!(storage.get_cookie("alice", "https://a.com").await.unwrap(), None);
+        assert_eq!(storage.clear_cookie("alice", "https://a.com").await.unwrap(), 0);
+
+        cleanup(storage, "cookie").await;
+    }
+
+    #[tokio::test]
+    async fn test_cookie_by_base_matching() {
+        let storage = test_storage("cookiebase").await;
+        storage
+            .set_cookie("default", "https://a.com", "sid=abc")
+            .await
+            .unwrap();
+        // `##` 备用地址后缀：主地址命中
+        storage
+            .set_cookie("default", "https://b.com##https://b2.com", "sid=bbb")
+            .await
+            .unwrap();
+
+        // 请求 URL 的 base 命中书源 source_url base（含端口/路径差异）
+        assert_eq!(
+            storage.get_cookie_by_base("default", "https://a.com").await.unwrap(),
+            Some("sid=abc".to_string())
+        );
+        assert_eq!(
+            storage.get_cookie_by_base("default", "https://a.com/book/1?x=2").await.unwrap(),
+            Some("sid=abc".to_string())
+        );
+        assert_eq!(
+            storage.get_cookie_by_base("default", "https://b2.com/path").await.unwrap(),
+            Some("sid=bbb".to_string())
+        );
+        // 不匹配
+        assert_eq!(storage.get_cookie_by_base("default", "https://c.com").await.unwrap(), None);
+        assert_eq!(storage.get_cookie_by_base("alice", "https://a.com").await.unwrap(), None);
+        // 端口不同不命中
+        storage
+            .set_cookie("default", "https://d.com:8443", "sid=dd")
+            .await
+            .unwrap();
+        assert_eq!(storage.get_cookie_by_base("default", "https://d.com").await.unwrap(), None);
+        assert_eq!(
+            storage.get_cookie_by_base("default", "https://d.com:8443/x").await.unwrap(),
+            Some("sid=dd".to_string())
+        );
+
+        cleanup(storage, "cookiebase").await;
+    }
+
+    #[tokio::test]
+    async fn test_cookie_user_agent_record() {
+        let storage = test_storage("cookieua").await;
+        storage.set_cookie("default", "https://a.com", "sid=1").await.unwrap();
+        storage
+            .set_cookie_user_agent("default", "https://a.com", "fs-ua/1.0")
+            .await
+            .unwrap();
+        let (cookie, ua) = storage
+            .get_source_session("default", "https://a.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cookie, "sid=1");
+        assert_eq!(ua, "fs-ua/1.0");
+        // set_cookie 覆盖不丢 UA
+        storage.set_cookie("default", "https://a.com", "sid=2").await.unwrap();
+        let (cookie, ua) = storage
+            .get_source_session("default", "https://a.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cookie, "sid=2");
+        assert_eq!(ua, "fs-ua/1.0");
+        cleanup(storage, "cookieua").await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_book_source_cleans_cookie() {
+        let storage = test_storage("cookiedel").await;
+        storage
+            .set_cookie("default", "https://a.com", "sid=1")
+            .await
+            .unwrap();
+        let s = source("https://a.com", "A源", None);
+        storage.save_book_source("default", &s).await.unwrap();
+
+        assert_eq!(storage.delete_book_source("default", "https://a.com").await.unwrap(), 1);
+        assert_eq!(storage.get_cookie("default", "https://a.com").await.unwrap(), None);
+
+        // delete_all 清理
+        storage
+            .set_cookie("default", "https://a.com", "sid=2")
+            .await
+            .unwrap();
+        storage
+            .set_cookie("default", "https://b.com", "sid=3")
+            .await
+            .unwrap();
+        storage.save_book_source("default", &source("https://a.com", "A", None)).await.unwrap();
+        storage.save_book_source("default", &source("https://b.com", "B", None)).await.unwrap();
+        storage.delete_all_book_sources("default").await.unwrap();
+        assert_eq!(storage.get_cookie("default", "https://a.com").await.unwrap(), None);
+        assert_eq!(storage.get_cookie("default", "https://b.com").await.unwrap(), None);
+
+        cleanup(storage, "cookiedel").await;
+    }
+
+    #[test]
+    fn test_normalize_base() {
+        assert_eq!(normalize_base("https://a.com").as_deref(), Some("https://a.com"));
+        assert_eq!(normalize_base("https://a.com/").as_deref(), Some("https://a.com"));
+        assert_eq!(normalize_base("https://a.com/book/1?x=2").as_deref(), Some("https://a.com"));
+        assert_eq!(normalize_base("https://a.com:8443/x").as_deref(), Some("https://a.com:8443"));
+        assert_eq!(normalize_base("http://a.com").as_deref(), Some("http://a.com"));
+        assert_eq!(normalize_base("a.com").as_deref(), Some("https://a.com"));
+        assert_eq!(normalize_base("").is_none(), true);
     }
 }
