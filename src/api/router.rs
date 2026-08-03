@@ -963,6 +963,9 @@ async fn clear_cache(
             }
         }
     }
+    if cache_type.is_empty() {
+        cache_type = "all".to_string();
+    }
     if cache_type != "toc" && cache_type != "chapters" && cache_type != "all" {
         return Json(ReturnData::err("参数错误"));
     }
