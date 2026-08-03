@@ -121,6 +121,52 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS book_sources (
+            book_source_url TEXT PRIMARY KEY,
+            book_source_name TEXT DEFAULT '',
+            book_source_group TEXT,
+            book_source_type INTEGER DEFAULT 0,
+            book_url_pattern TEXT,
+            custom_order INTEGER DEFAULT 0,
+            enabled INTEGER DEFAULT 1,
+            enabled_explore INTEGER DEFAULT 1,
+            enabled_cookie_jar INTEGER,
+            concurrent_rate TEXT,
+            header TEXT,
+            login_url TEXT,
+            login_ui TEXT,
+            login_check_js TEXT,
+            login_js TEXT,
+            book_source_comment TEXT,
+            variable_comment TEXT,
+            last_update_time INTEGER DEFAULT 0,
+            respond_time INTEGER DEFAULT 0,
+            weight INTEGER DEFAULT 0,
+            explore_url TEXT,
+            rule_explore TEXT,
+            rule_search TEXT,
+            rule_book_info TEXT,
+            rule_toc TEXT,
+            rule_content TEXT,
+            search_rule TEXT,
+            explore_rule TEXT,
+            book_info_rule TEXT,
+            toc_rule TEXT,
+            content_rule TEXT,
+            key TEXT,
+            tag TEXT,
+            logger TEXT,
+            variable TEXT,
+            user_namespace TEXT DEFAULT '',
+            raw_json TEXT
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     // 幂等补列（兼容旧库：缺列则 ALTER TABLE 补上）
     let columns = [
         ("users", &["token_map", "raw_json"][..]),
@@ -155,6 +201,26 @@ impl Storage {
             .fetch_optional(&self.pool)
             .await?;
         Ok(user)
+    }
+
+    /// 书源列表（按命名空间；无则回退 default）
+    pub async fn get_book_sources(&self, ns: &str) -> Result<Vec<crate::model::BookSource>> {
+        let rows = sqlx::query_as::<_, crate::model::BookSource>(
+            "SELECT * FROM book_sources WHERE user_namespace = ?1 ORDER BY custom_order, book_source_name",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        if !rows.is_empty() || ns == "default" {
+            return Ok(rows);
+        }
+        // 回退 default 命名空间（legacy 语义：用户无书源时用系统书源）
+        sqlx::query_as::<_, crate::model::BookSource>(
+            "SELECT * FROM book_sources WHERE user_namespace = 'default' ORDER BY custom_order, book_source_name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// 用户总数（注册上限校验）

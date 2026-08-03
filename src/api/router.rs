@@ -55,6 +55,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     axum::Router::new()
         .route("/health", get(health))
         .route("/reader3/getBookshelf", get(get_bookshelf))
+        .route("/reader3/getBookSources", get(get_book_sources))
         .route("/reader3/login", post(login))
         .with_state(state)
         // TODO: 挂载 legacy 前端静态资源（rust-embed，兼容阶段复用 legacy dist）
@@ -210,6 +211,25 @@ async fn register(
     }
     tracing::info!("新用户注册: {username}");
     Json(ReturnData::ok(format_user(&user)))
+}
+
+/// GET /reader3/getBookSources：按命名空间返回书源（legacy 语义：用户无书源回退 default）
+async fn get_book_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    match state.storage.get_book_sources(&namespace).await {
+        Ok(sources) => Json(ReturnData::ok(serde_json::to_value(sources).unwrap_or(serde_json::Value::Null))),
+        Err(e) => {
+            tracing::error!("getBookSources [{namespace}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
 }
 
 /// GET /reader3/getBookshelf：按命名空间返回书架（user_namespace 取自 accessToken；非 secure 用 default）

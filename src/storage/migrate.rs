@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::SqlitePool;
 
-use crate::model::{Book, User};
+use crate::model::{Book, BookSource, User};
 use crate::storage::Storage;
 
 /// 启动时检测并执行 JSON → SQLite 迁移（幂等：users 表非空即跳过）
@@ -50,10 +50,14 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
     namespaces.extend(usernames.iter().cloned());
     let book_count = migrate_bookshelves(&storage.pool, &data_dir, &namespaces).await?;
 
+    // 4. 各命名空间 bookSource.json → book_sources 表（ns = default + 各用户名）
+    let source_count = migrate_book_sources(&storage.pool, &data_dir, &namespaces).await?;
+
     tracing::info!(
-        "JSON→SQLite 迁移完成：{} 个用户，{} 本书（备份：{}）",
+        "JSON→SQLite 迁移完成：{} 个用户，{} 本书，{} 个书源（备份：{}）",
         usernames.len(),
         book_count,
+        source_count,
         backup_dir.display()
     );
     Ok(())
@@ -242,4 +246,110 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 各命名空间 bookSource.json → book_sources 表（全字段 + raw_json 保底）；返回迁移的书源总数
+async fn migrate_book_sources(
+    pool: &SqlitePool,
+    data_dir: &Path,
+    namespaces: &[String],
+) -> Result<usize> {
+    let mut total = 0usize;
+    for ns in namespaces {
+        let path = data_dir.join(ns).join("bookSource.json");
+        if !path.exists() {
+            tracing::debug!("{ns} 无 bookSource.json，跳过");
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("读取 {} 失败（{}），跳过该命名空间", path.display(), e);
+                continue;
+            }
+        };
+        let sources: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("解析 {} 失败（{}），跳过该命名空间", path.display(), e);
+                continue;
+            }
+        };
+        let mut count = 0usize;
+        let mut tx = pool.begin().await?;
+        for value in sources {
+            let mut src: BookSource = match serde_json::from_value(value.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("解析书源失败（{}），跳过", e);
+                    continue;
+                }
+            };
+            if src.book_source_url.trim().is_empty() {
+                continue; // 无主键的脏数据跳过
+            }
+            src.raw_json = Some(value.to_string());
+            src.user_namespace = ns.clone();
+            let val = |v: &Option<serde_json::Value>| v.as_ref().map(|x| x.to_string());
+            sqlx::query(
+                r#"
+                INSERT OR REPLACE INTO book_sources
+                    (book_source_url, book_source_name, book_source_group, book_source_type,
+                     book_url_pattern, custom_order, enabled, enabled_explore, enabled_cookie_jar,
+                     concurrent_rate, header, login_url, login_ui, login_check_js, login_js,
+                     book_source_comment, variable_comment, last_update_time, respond_time,
+                     weight, explore_url, rule_explore, rule_search, rule_book_info, rule_toc,
+                     rule_content, search_rule, explore_rule, book_info_rule, toc_rule,
+                     content_rule, key, tag, logger, variable, user_namespace, raw_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                        ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+                        ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
+                "#,
+            )
+            .bind(&src.book_source_url)
+            .bind(&src.book_source_name)
+            .bind(&src.book_source_group)
+            .bind(src.book_source_type)
+            .bind(&src.book_url_pattern)
+            .bind(src.custom_order)
+            .bind(src.enabled)
+            .bind(src.enabled_explore)
+            .bind(src.enabled_cookie_jar)
+            .bind(&src.concurrent_rate)
+            .bind(&src.header)
+            .bind(&src.login_url)
+            .bind(&src.login_ui)
+            .bind(&src.login_check_js)
+            .bind(&src.login_js)
+            .bind(&src.book_source_comment)
+            .bind(&src.variable_comment)
+            .bind(src.last_update_time)
+            .bind(src.respond_time)
+            .bind(src.weight)
+            .bind(&src.explore_url)
+            .bind(&val(&src.rule_explore))
+            .bind(&val(&src.rule_search))
+            .bind(&val(&src.rule_book_info))
+            .bind(&val(&src.rule_toc))
+            .bind(&val(&src.rule_content))
+            .bind(&val(&src.search_rule))
+            .bind(&val(&src.explore_rule))
+            .bind(&val(&src.book_info_rule))
+            .bind(&val(&src.toc_rule))
+            .bind(&val(&src.content_rule))
+            .bind(&src.key)
+            .bind(&src.tag)
+            .bind(&val(&src.logger))
+            .bind(&val(&src.variable))
+            .bind(&src.user_namespace)
+            .bind(&src.raw_json)
+            .execute(&mut *tx)
+            .await?;
+            count += 1;
+        }
+        tx.commit().await?;
+        tracing::info!("迁移书源 [{ns}]：{} 个", count);
+        total += count;
+    }
+    Ok(total)
 }
