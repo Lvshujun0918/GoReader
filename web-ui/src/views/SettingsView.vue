@@ -1,18 +1,32 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import { deleteHttpTts, getHttpTtsList, saveHttpTts } from '@/api/httpTts'
 import { backupToWebdav } from '@/api/backup'
+import { getSystemInfo } from '@/api/system'
+import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
 import { useUserStore } from '@/stores/user'
-import type { HttpTts } from '@/types'
+import type { HttpTts, SystemInfo, TxtTocRule } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
 
 /** 版本号与 package.json 保持一致 */
 const VERSION = '0.1.0'
+
+/** 系统信息（/reader3/getSystemInfo，设置页「关于」区展示） */
+const sysInfo = ref<SystemInfo | null>(null)
+
+async function loadSysInfo() {
+  try {
+    const res = await getSystemInfo()
+    sysInfo.value = res.data ?? null
+  } catch {
+    sysInfo.value = null // 后端不可用时静默（版本仍显示前端常量）
+  }
+}
 
 const showToken = ref(false)
 
@@ -128,7 +142,137 @@ function closeDeleteTts() {
   document.body.style.overflow = ''
 }
 
-onMounted(loadTtsList)
+/* ================= txtTocRule（自定义 TXT 目录规则，后端 /reader3/getTxtTocRules 等） ================= */
+const tocRules = ref<TxtTocRule[]>([])
+const tocLoading = ref(true)
+
+async function loadTxtTocRules() {
+  tocLoading.value = true
+  try {
+    const res = await getTxtTocRules()
+    tocRules.value = res.data ?? []
+  } catch {
+    tocRules.value = []
+  } finally {
+    tocLoading.value = false
+  }
+}
+
+const customTocRules = computed(() => tocRules.value.filter((r) => !r.id.startsWith('default-')))
+
+function newTocId(): string {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+}
+
+/* 新增弹窗 */
+const tocDialogOpen = ref(false)
+const tocBusy = ref(false)
+const tocForm = ref<{ name: string; rule: string; enable: boolean }>({ name: '', rule: '', enable: true })
+
+function openAddToc() {
+  tocForm.value = { name: '', rule: '', enable: true }
+  tocDialogOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeAddToc() {
+  if (tocBusy.value) return
+  tocDialogOpen.value = false
+  document.body.style.overflow = ''
+}
+
+async function confirmAddToc() {
+  if (tocBusy.value) return
+  const rule = tocForm.value.rule.trim()
+  if (!rule) {
+    ElMessage.warning('规则正则不能为空')
+    return
+  }
+  tocBusy.value = true
+  try {
+    await saveTxtTocRule({
+      id: newTocId(),
+      name: tocForm.value.name.trim() || rule,
+      rule,
+      enable: tocForm.value.enable,
+      serialNumber: customTocRules.value.length,
+    })
+    await loadTxtTocRules()
+    closeAddToc()
+  } finally {
+    tocBusy.value = false
+  }
+}
+
+/* 启用开关（默认规则只读，仅自定义规则可切换） */
+const tocToggling = ref<Set<string>>(new Set())
+
+async function toggleTocRule(r: TxtTocRule) {
+  if (tocToggling.value.has(r.id) || r.id.startsWith('default-')) return
+  tocToggling.value.add(r.id)
+  const prev = r.enable
+  r.enable = !prev
+  try {
+    await saveTxtTocRule({ ...r, enable: !prev })
+  } catch {
+    r.enable = prev
+  } finally {
+    tocToggling.value.delete(r.id)
+  }
+}
+
+/* 删除（仅自定义规则） */
+const deletingToc = ref<TxtTocRule | null>(null)
+const deleteTocBusy = ref(false)
+
+function askDeleteToc(r: TxtTocRule) {
+  if (r.id.startsWith('default-')) return
+  deletingToc.value = r
+  document.body.style.overflow = 'hidden'
+}
+
+async function confirmDeleteToc() {
+  const r = deletingToc.value
+  if (!r || deleteTocBusy.value) return
+  deleteTocBusy.value = true
+  try {
+    await deleteTxtTocRule(r.id)
+    tocRules.value = tocRules.value.filter((x) => x.id !== r.id)
+    closeDeleteToc()
+  } catch {
+    // 已提示
+  } finally {
+    deleteTocBusy.value = false
+  }
+}
+
+function closeDeleteToc() {
+  deletingToc.value = null
+  document.body.style.overflow = ''
+}
+
+/* 导入默认规则 */
+const tocImportBusy = ref(false)
+
+async function runImportDefaultToc() {
+  if (tocImportBusy.value) return
+  tocImportBusy.value = true
+  try {
+    const res = await importDefaultTxtTocRules()
+    ElMessage.success(`已导入 ${res.data?.count ?? 0} 条默认规则`)
+    await loadTxtTocRules()
+  } catch {
+    // 已提示
+  } finally {
+    tocImportBusy.value = false
+  }
+}
+
+onMounted(() => {
+  loadTtsList()
+  loadSysInfo()
+  loadTxtTocRules()
+})
 
 /* ================= OPDS 访问 ================= */
 /** OPDS 地址 = 当前 host + /opds */
@@ -241,7 +385,7 @@ async function runBackup() {
       <section class="card">
         <div class="card-head">
           <h2 class="card-title">听书设置</h2>
-          <span class="card-sub">HttpTTS 朗读源 · 本地占位存储（后端就绪后同步，见 api/httpTts.ts 契约注释）</span>
+          <span class="card-sub">HttpTTS 朗读源 · 已接入服务端（账号内多设备一致；服务不可用时降级本地）</span>
           <button class="row-action" type="button" @click="openAddTts">新增听书源</button>
         </div>
         <ul v-if="ttsList.length" class="tts-list">
@@ -292,15 +436,50 @@ async function runBackup() {
         <p v-if="backupPath" class="card-note mono backup-path">已备份至：{{ backupPath }}</p>
       </section>
 
-      <!-- txtTocRule -->
+      <!-- txtTocRule（自定义 TXT 目录规则） -->
       <section class="card">
-        <h2 class="card-title">txtTocRule</h2>
-        <div class="row">
-          <span class="row-label">txtTocRule</span>
-          <span class="row-value">后端实现中 · 替换规则页在 /rules</span>
-          <button class="row-action" type="button" @click="router.push('/rules')">前往</button>
+        <div class="card-head">
+          <h2 class="card-title">txtTocRule</h2>
+          <span class="card-sub">TXT 分章正则 · {{ customTocRules.length }} 条自定义</span>
+          <button class="row-action" type="button" :disabled="tocImportBusy" @click="runImportDefaultToc">
+            {{ tocImportBusy ? '导入中…' : '导入默认规则' }}
+          </button>
+          <button class="row-action" type="button" @click="openAddToc">新增规则</button>
         </div>
-        <p class="card-note">TXT 文本目录解析规则（txtTocRule）后端实现中；现有「替换规则」在 /rules 页维护，txtTocRule 就绪后将在此一并管理。</p>
+        <p class="card-note">上传 TXT 本地书时按启用的规则分章（无自定义规则时使用内置默认规则）。默认规则只读，可导入为自定义后编辑。</p>
+        <p v-if="tocLoading" class="tts-empty">加载中…</p>
+        <ul v-else-if="tocRules.length" class="tts-list toc-list">
+          <li v-for="r in tocRules" :key="r.id" class="tts-row">
+            <span class="tts-name" :title="r.name">{{ r.name }}</span>
+            <span class="tts-url mono" :title="r.rule">{{ r.rule }}</span>
+            <span class="tts-type">{{ r.id.startsWith('default-') ? '默认' : `#${r.serialNumber}` }}</span>
+            <button
+              class="switch"
+              :class="{ on: r.enable }"
+              type="button"
+              role="switch"
+              :aria-checked="r.enable"
+              :title="r.id.startsWith('default-') ? '默认规则不可单独停用' : (r.enable ? '停用' : '启用')"
+              @click="toggleTocRule(r)"
+            >
+              <span class="switch-knob"></span>
+            </button>
+            <button
+              v-if="!r.id.startsWith('default-')"
+              class="tts-del"
+              type="button"
+              title="删除规则"
+              @click="askDeleteToc(r)"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 7h16" />
+                <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                <path d="M6.5 7l.8 12a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12" />
+              </svg>
+            </button>
+          </li>
+        </ul>
+        <p v-else class="tts-empty">暂无自定义规则。可「导入默认规则」或新增正则（匹配行作为章节标题）。</p>
       </section>
 
       <!-- 关于 -->
@@ -312,8 +491,26 @@ async function runBackup() {
         </div>
         <div class="row">
           <span class="row-label">版本</span>
-          <span class="row-value">v{{ VERSION }}</span>
+          <span class="row-value">v{{ sysInfo?.version || VERSION }}</span>
         </div>
+        <template v-if="sysInfo">
+          <div class="row">
+            <span class="row-label">服务端口</span>
+            <span class="row-value mono">{{ sysInfo.port }}</span>
+          </div>
+          <div class="row">
+            <span class="row-label">用户数</span>
+            <span class="row-value">{{ sysInfo.userCount }}</span>
+          </div>
+          <div class="row">
+            <span class="row-label">书籍数</span>
+            <span class="row-value">{{ sysInfo.bookCount }}</span>
+          </div>
+          <div class="row">
+            <span class="row-label">书源数</span>
+            <span class="row-value">{{ sysInfo.bookSourceCount }}</span>
+          </div>
+        </template>
       </section>
     </main>
     <!-- 新增听书源弹窗 -->
@@ -345,7 +542,7 @@ async function runBackup() {
                   <option :value="1">1 · 本地引擎</option>
                 </select>
               </label>
-              <p class="field-tip">后端就绪后接入朗读（契约 POST /reader3/saveHttpTTS，见 api/httpTts.ts）</p>
+              <p class="field-tip">听书源已接入服务端（POST /reader3/saveHttpTTS）；离线时降级本地存储</p>
               <div class="dlg-actions">
                 <button class="ghost-btn" type="button" :disabled="ttsBusy" @click="closeAddTts">取消</button>
                 <button class="accent-btn" type="submit" :disabled="ttsBusy || !ttsForm.url.trim()">
@@ -371,6 +568,74 @@ async function runBackup() {
               <button class="ghost-btn" type="button" :disabled="deleteTtsBusy" @click="closeDeleteTts">取消</button>
               <button class="danger-btn" type="button" :disabled="deleteTtsBusy" @click="confirmDeleteTts">
                 {{ deleteTtsBusy ? '删除中…' : '删除' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 新增 txtTocRule 弹窗 -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="tocDialogOpen" class="dlg-overlay" @click.self="closeAddToc">
+          <div class="dlg" role="dialog" aria-modal="true" aria-label="新增 txtTocRule" tabindex="-1" @keydown.esc="closeAddToc">
+            <div class="dlg-head">
+              <h2 class="dlg-title">新增 txtTocRule</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="tocBusy" @click="closeAddToc">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="confirmAddToc">
+              <label class="field">
+                <span class="field-label">名称</span>
+                <input v-model="tocForm.name" class="field-input" type="text" placeholder="留空则使用正则内容" maxlength="40" spellcheck="false" />
+              </label>
+              <label class="field">
+                <span class="field-label">正则规则<em>*</em></span>
+                <input v-model="tocForm.rule" class="field-input mono" type="text" placeholder="如 ^第.+章$" spellcheck="false" />
+              </label>
+              <div class="field">
+                <span class="field-label">启用</span>
+                <button
+                  class="switch"
+                  :class="{ on: tocForm.enable }"
+                  type="button"
+                  role="switch"
+                  :aria-checked="tocForm.enable"
+                  @click="tocForm.enable = !tocForm.enable"
+                >
+                  <span class="switch-knob"></span>
+                </button>
+              </div>
+              <p class="field-tip">正则按行匹配（MULTILINE），匹配到的行作为章节标题；上传 TXT 时按启用的规则分章。</p>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="tocBusy" @click="closeAddToc">取消</button>
+                <button class="accent-btn" type="submit" :disabled="tocBusy || !tocForm.rule.trim()">
+                  {{ tocBusy ? '保存中…' : '保存' }}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 删除 txtTocRule 确认弹窗 -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="deletingToc" class="dlg-overlay" @click.self="closeDeleteToc">
+          <div class="dlg dlg-confirm" role="alertdialog" aria-modal="true" aria-label="删除 txtTocRule" tabindex="-1" @keydown.esc="closeDeleteToc">
+            <div class="dlg-head">
+              <h2 class="dlg-title">删除规则</h2>
+            </div>
+            <p class="confirm-text">确定删除「{{ deletingToc.name }}」吗？此操作不可恢复。</p>
+            <div class="dlg-actions">
+              <button class="ghost-btn" type="button" :disabled="deleteTocBusy" @click="closeDeleteToc">取消</button>
+              <button class="danger-btn" type="button" :disabled="deleteTocBusy" @click="confirmDeleteToc">
+                {{ deleteTocBusy ? '删除中…' : '删除' }}
               </button>
             </div>
           </div>
@@ -578,6 +843,52 @@ async function runBackup() {
   width: 12px;
   height: 12px;
 }
+
+/* 极简开关（txtTocRule 启用切换） */
+.switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: none;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+  vertical-align: middle;
+}
+.switch .switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-3);
+  transition:
+    transform 0.2s ease,
+    background-color 0.2s ease;
+}
+.switch:hover {
+  border-color: var(--accent);
+}
+.switch.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.switch.on .switch-knob {
+  transform: translateX(16px);
+  background: var(--accent);
+}
+.toc-list .tts-name {
+  max-width: 110px;
+}
+.toc-list .tts-url {
+  font-size: 11.5px;
+}
+
 .tts-empty {
   margin: 12px 0 0;
   font-size: 12px;

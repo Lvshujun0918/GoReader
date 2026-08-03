@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { deleteBookSource, getBookSources, saveBookSource, saveBookSources } from '@/api/sources'
 import { loadSourceSubs, persistSourceSubs } from '@/api/sourceSubs'
+import { exportBookSources } from '@/api/system'
 import type { BookSource, SourceSub } from '@/types'
 
 const router = useRouter()
@@ -385,6 +386,7 @@ onMounted(() => {
         <span class="count">{{ sources.length }} 个 · {{ enabledCount }} 启用</span>
         <div class="head-actions">
           <button class="ghost-btn" type="button" @click="openImport">远程导入</button>
+          <button class="ghost-btn" type="button" title="下载当前账号全部书源（bookSource.json）" @click="exportBookSources">导出</button>
           <button class="accent-outline-btn" type="button" @click="openAdd">新增书源</button>
         </div>
       </div>

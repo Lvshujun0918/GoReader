@@ -113,6 +113,23 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/getBookGroups", get(get_book_groups).post(get_book_groups))
         .route("/reader3/saveBookGroup", post(save_book_group))
         .route("/reader3/updateBookGroupId", post(update_book_group_id))
+        // F-28 替换规则
+        .route("/reader3/getReplaceRules", get(get_replace_rules).post(get_replace_rules))
+        .route("/reader3/saveReplaceRule", post(save_replace_rule))
+        .route("/reader3/saveReplaceRules", post(save_replace_rules))
+        .route("/reader3/deleteReplaceRule", post(delete_replace_rule))
+        // F-26 HttpTTS 听书源管理
+        .route("/reader3/getHttpTTSList", get(get_http_tts_list).post(get_http_tts_list))
+        .route("/reader3/saveHttpTTS", post(save_http_tts))
+        .route("/reader3/deleteHttpTTS", post(delete_http_tts))
+        // 自定义 TXT 目录规则（对齐 legado TxtTocRule）
+        .route("/reader3/getTxtTocRules", get(get_txt_toc_rules).post(get_txt_toc_rules))
+        .route("/reader3/saveTxtTocRule", post(save_txt_toc_rule))
+        .route("/reader3/deleteTxtTocRule", post(delete_txt_toc_rule))
+        .route("/reader3/importDefaultTxtTocRules", post(import_default_txt_toc_rules))
+        // 系统信息 + 书源导出
+        .route("/reader3/getSystemInfo", get(get_system_info))
+        .route("/reader3/exportBookSources", get(export_book_sources))
         // SPA fallback：未匹配路由 → webdav 分流 / API 404 / 前端
         .fallback(fallback_handler)
         .route("/reader3/getBookshelf", get(get_bookshelf))
@@ -1048,7 +1065,7 @@ async fn get_book_toc(
     }
     // 文件型本地书（legacy：bookUrl = storage/data/.../xx.txt）——读 TXT 分章
     if toc_url.ends_with(".txt") {
-        if let Some(ret) = get_book_toc_file(&state, &toc_url).await {
+        if let Some(ret) = get_book_toc_file(&state, &namespace, &toc_url).await {
             return ret;
         }
         return Json(ReturnData::err("本地书文件不存在"));
@@ -1115,7 +1132,7 @@ async fn get_book_content(
     }
     // 文件型本地书：bookUrl#index
     if chapter_url.contains(".txt#") {
-        if let Some(ret) = get_book_content_file(&state, &chapter_url).await {
+        if let Some(ret) = get_book_content_file(&state, &namespace, &chapter_url).await {
             return ret;
         }
         return Json(ReturnData::err("本地书章节不存在"));
@@ -1979,6 +1996,415 @@ async fn update_book_group_id(
     }
 }
 
+// ---------------- F-28 替换规则 ----------------
+
+/// GET/POST /reader3/getReplaceRules：替换规则列表（用户命名空间，无则回退 default）
+async fn get_replace_rules(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = body;
+    match state.storage.get_replace_rules(&namespace).await {
+        Ok(rules) => Json(ReturnData::ok(
+            serde_json::to_value(rules).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("getReplaceRules [{namespace}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/saveReplaceRule：保存单条替换规则（body = 完整规则 JSON；id 缺失自动补 uuid）
+async fn save_replace_rule(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let mut rule: crate::model::ReplaceRule = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    if rule.name.trim().is_empty() {
+        return Json(ReturnData::err("名称不能为空"));
+    }
+    if rule.find.trim().is_empty() {
+        return Json(ReturnData::err("规则不能为空"));
+    }
+    if rule.id.trim().is_empty() {
+        rule.id = format!("rule-{}", uuid::Uuid::new_v4());
+    }
+    rule.user_namespace = namespace.clone();
+    match state.storage.save_replace_rule(&namespace, &rule).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveReplaceRule 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/saveReplaceRules：批量保存（body = 规则数组；逐条校验，id 缺失自动补）
+async fn save_replace_rules(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let mut rules: Vec<crate::model::ReplaceRule> = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    if rules.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    for rule in &mut rules {
+        if rule.name.trim().is_empty() || rule.find.trim().is_empty() {
+            return Json(ReturnData::err("参数错误"));
+        }
+        if rule.id.trim().is_empty() {
+            rule.id = format!("rule-{}", uuid::Uuid::new_v4());
+        }
+        rule.user_namespace = namespace.clone();
+    }
+    match state.storage.save_replace_rules(&namespace, &rules).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::json!({ "count": rules.len() }))),
+        Err(e) => {
+            tracing::error!("saveReplaceRules 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/deleteReplaceRule：删除替换规则（body/query：id）
+async fn delete_replace_rule(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let id = param_of(&params, body_json.as_ref(), "id");
+    if id.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_replace_rule(&namespace, &id).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("deleteReplaceRule 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+// ---------------- F-26 HttpTTS ----------------
+
+/// HttpTTS 输出 JSON：id 与 url 同值（前端 HttpTts 类型兼容）
+fn http_tts_json(tts: &crate::model::HttpTts) -> serde_json::Value {
+    serde_json::json!({
+        "id": tts.url,
+        "url": tts.url,
+        "name": tts.name,
+        "type": tts.tts_type,
+    })
+}
+
+/// GET/POST /reader3/getHttpTTSList：HttpTTS 听书源列表（用户命名空间，无则回退 default）
+async fn get_http_tts_list(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = body;
+    match state.storage.get_http_tts_list(&namespace).await {
+        Ok(list) => {
+            let arr: Vec<serde_json::Value> = list.iter().map(http_tts_json).collect();
+            Json(ReturnData::ok(serde_json::Value::Array(arr)))
+        }
+        Err(e) => {
+            tracing::error!("getHttpTTSList [{namespace}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/saveHttpTTS：保存听书源（body：url/name/type；url 缺失时用 id 兜底）
+async fn save_http_tts(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let mut tts: crate::model::HttpTts = match serde_json::from_value(json.clone()) {
+        Ok(t) => t,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    // url 主键；前端可能只传 id（旧契约），用 id 兜底
+    if tts.url.trim().is_empty() {
+        if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+            tts.url = id.to_string();
+        }
+    }
+    if tts.url.trim().is_empty() {
+        return Json(ReturnData::err("链接不能为空"));
+    }
+    if tts.name.trim().is_empty() {
+        return Json(ReturnData::err("名称不能为空"));
+    }
+    tts.user_namespace = namespace.clone();
+    match state.storage.save_http_tts(&namespace, &tts).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveHttpTTS 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/deleteHttpTTS：删除听书源（body/query：id 或 url）
+async fn delete_http_tts(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let mut url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        url = param_of(&params, body_json.as_ref(), "id");
+    }
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_http_tts(&namespace, &url).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("deleteHttpTTS 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+// ---------------- 自定义 TXT 目录规则 ----------------
+
+/// GET/POST /reader3/getTxtTocRules：TXT 目录规则列表（legacy 语义：内置默认规则 + 用户自定义规则）
+async fn get_txt_toc_rules(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = body;
+    let mut rules: Vec<serde_json::Value> = Vec::new();
+    // 内置默认规则（id 固定 default-{i}，可被 importDefaultTxtTocRules 导入为用户规则）
+    for (i, rule) in crate::service::local_book::DEFAULT_TOC_RULES.iter().enumerate() {
+        rules.push(serde_json::json!({
+            "id": format!("default-{}", i + 1),
+            "name": format!("默认规则{}", i + 1),
+            "rule": rule,
+            "enable": true,
+            "serialNumber": i as i64,
+        }));
+    }
+    // 用户自定义规则（含导入的默认规则副本）
+    match state.storage.get_txt_toc_rules(&namespace).await {
+        Ok(custom) => {
+            for rule in custom {
+                rules.push(serde_json::to_value(rule).unwrap_or(serde_json::Value::Null));
+            }
+            Json(ReturnData::ok(serde_json::Value::Array(rules)))
+        }
+        Err(e) => {
+            tracing::error!("getTxtTocRules [{namespace}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/saveTxtTocRule：保存自定义 TXT 目录规则（body：id?/name/rule/enable/serialNumber）
+async fn save_txt_toc_rule(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let mut rule: crate::model::TxtTocRule = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    if rule.name.trim().is_empty() {
+        return Json(ReturnData::err("名称不能为空"));
+    }
+    if rule.rule.trim().is_empty() {
+        return Json(ReturnData::err("规则不能为空"));
+    }
+    if rule.id.trim().is_empty() {
+        rule.id = format!("toc-{}", uuid::Uuid::new_v4());
+    }
+    rule.user_namespace = namespace.clone();
+    match state.storage.save_txt_toc_rule(&namespace, &rule).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveTxtTocRule 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/deleteTxtTocRule：删除自定义 TXT 目录规则（body/query：id）
+async fn delete_txt_toc_rule(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let id = param_of(&params, body_json.as_ref(), "id");
+    if id.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_txt_toc_rule(&namespace, &id).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("deleteTxtTocRule 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+/// POST /reader3/importDefaultTxtTocRules：内置默认规则导入为用户规则（幂等，返回导入条数）
+async fn import_default_txt_toc_rules(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = body;
+    match state.storage.import_default_txt_toc_rules(&namespace).await {
+        Ok(count) => Json(ReturnData::ok(serde_json::json!({ "count": count }))),
+        Err(e) => {
+            tracing::error!("importDefaultTxtTocRules [{namespace}] 失败: {e}");
+            Json(ReturnData::err("导入失败"))
+        }
+    }
+}
+
+// ---------------- 系统信息 + 书源导出 ----------------
+
+/// GET /reader3/getSystemInfo：系统信息（版本/端口/用户数/书数/书源数 + legacy 兼容内存字段）
+async fn get_system_info(
+    State(state): State<AppState>,
+    Query(_params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<ReturnData> {
+    let _ = headers;
+    let user_count = state.storage.count_users().await.unwrap_or(0);
+    let book_count = state.storage.count_books().await.unwrap_or(0);
+    let source_count = state.storage.count_all_book_sources().await.unwrap_or(0);
+    let version = env!("CARGO_PKG_VERSION");
+    Json(ReturnData::ok(serde_json::json!({
+        "version": version,
+        "port": state.storage.config.port,
+        "userCount": user_count,
+        "bookCount": book_count,
+        "bookSourceCount": source_count,
+        // legacy 兼容字段（内存统计：暂不引入系统探针依赖，置 0）
+        "freeMemory": "0M",
+        "totalMemory": "0M",
+        "maxMemory": "0M",
+    })))
+}
+
+/// GET /reader3/exportBookSources：当前命名空间书源 JSON 下载（attachment）
+async fn export_book_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret).into_response(),
+    };
+    let sources = match state.storage.get_book_sources(&namespace).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("exportBookSources [{namespace}] 失败: {e}");
+            return Json(ReturnData::err("系统错误")).into_response();
+        }
+    };
+    let bytes = serde_json::to_vec_pretty(&sources).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .header("Content-Disposition", "attachment; filename=bookSource.json")
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
 /// POST /reader3/uploadLocalBook：导入本地书（multipart：file）
 async fn upload_local_book(
     State(state): State<AppState>,
@@ -2014,7 +2440,9 @@ async fn upload_local_book(
             Err(e) => return Json(ReturnData::err(format!("EPUB 解析失败：{e}"))),
         }
     } else if lower.ends_with(".txt") {
-        crate::service::local_book::parse_txt(&bytes).unwrap_or_else(|e| {
+        // 用户自定义 TXT 目录规则（启用 + 按 serialNumber 排序）；无则用内置默认规则
+        let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
+        crate::service::local_book::parse_txt_with_rules(&bytes, &user_rules).unwrap_or_else(|e| {
             tracing::error!("TXT 解析失败: {e}");
             crate::service::local_book::ImportedBook {
                 meta: Default::default(),
@@ -2085,10 +2513,26 @@ fn resolve_storage_path(storage_dir: &std::path::Path, book_url: &str) -> Option
     }
 }
 
+/// 用户 TXT 目录规则正则列表（启用 + 按 serialNumber 排序；失败/无规则返回空 → 调用方回退默认）
+async fn txt_toc_rule_regexes(state: &AppState, ns: &str) -> Vec<String> {
+    match state.storage.get_txt_toc_rules(ns).await {
+        Ok(rules) => rules
+            .into_iter()
+            .filter(|r| r.enable && !r.rule.trim().is_empty())
+            .map(|r| r.rule)
+            .collect(),
+        Err(e) => {
+            tracing::warn!("getTxtTocRules 失败（回退默认规则）: {e}");
+            Vec::new()
+        }
+    }
+}
+
 /// 文件型本地书目录：读 TXT 分章 → 章节列表（chapterUrl = bookUrl#index）
-async fn get_book_toc_file(state: &AppState, book_url: &str) -> Option<Json<ReturnData>> {
+async fn get_book_toc_file(state: &AppState, ns: &str, book_url: &str) -> Option<Json<ReturnData>> {
     let path = resolve_storage_path(&state.storage.config.storage_dir(), book_url)?;
-    let imported = crate::service::local_book::parse_txt_file(&path).ok()?;
+    let user_rules = txt_toc_rule_regexes(state, ns).await;
+    let imported = crate::service::local_book::parse_txt_file_with_rules(&path, &user_rules).ok()?;
     let list: Vec<serde_json::Value> = imported
         .chapters
         .iter()
@@ -2106,11 +2550,12 @@ async fn get_book_toc_file(state: &AppState, book_url: &str) -> Option<Json<Retu
 }
 
 /// 文件型本地书正文：bookUrl#index → 读 TXT → 提取章节
-async fn get_book_content_file(state: &AppState, chapter_url: &str) -> Option<Json<ReturnData>> {
+async fn get_book_content_file(state: &AppState, ns: &str, chapter_url: &str) -> Option<Json<ReturnData>> {
     let (book_part, idx_part) = chapter_url.rsplit_once('#')?;
     let index: usize = idx_part.parse().ok()?;
     let path = resolve_storage_path(&state.storage.config.storage_dir(), book_part)?;
-    let imported = crate::service::local_book::parse_txt_file(&path).ok()?;
+    let user_rules = txt_toc_rule_regexes(state, ns).await;
+    let imported = crate::service::local_book::parse_txt_file_with_rules(&path, &user_rules).ok()?;
     let content = imported.chapters.get(index)?.content.clone();
     Some(Json(ReturnData::ok(serde_json::json!({ "content": content }))))
 }
@@ -2501,6 +2946,363 @@ mod tests {
             "路径: {path}"
         );
         assert!(std::path::Path::new(path).exists());
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-28：替换规则 API——保存（缺 id 自动补）/列表/批量/删除/校验
+    #[tokio::test]
+    async fn test_replace_rules_api() {
+        let (state, dir) = test_state("replapi").await;
+
+        // 空名称/空 find → 校验失败
+        let body = Bytes::from(r#"{"name":"","find":"a"}"#);
+        let ret = save_replace_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "名称不能为空");
+        let body = Bytes::from(r#"{"name":"规则","find":""}"#);
+        let ret = save_replace_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "规则不能为空");
+
+        // 保存（无 id → 后端补 uuid）
+        let body = Bytes::from(r#"{"name":"净化","find":"口口","replace":"","enabled":true,"order":1}"#);
+        let ret = save_replace_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "保存应成功: {}", ret.0.error_msg);
+
+        // 列表
+        let ret = get_replace_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "净化");
+        assert_eq!(arr[0]["find"], "口口");
+        assert!(arr[0]["id"].as_str().unwrap().starts_with("rule-"), "缺 id 应自动补: {arr:?}");
+
+        // 批量
+        let batch = serde_json::json!([
+            { "id": "b1", "name": "批量1", "find": "x", "replace": "y", "enabled": true, "order": 0 },
+            { "name": "批量2", "find": "z", "enabled": false, "order": 1 },
+        ]);
+        let ret = save_replace_rules(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            Some(Bytes::from(batch.to_string())),
+        )
+        .await;
+        assert!(ret.0.is_success, "批量保存应成功: {}", ret.0.error_msg);
+        assert_eq!(ret.0.data["count"], 2);
+        let ret = get_replace_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data.as_array().unwrap().len(), 3);
+
+        // 批量含空 find → 整批拒绝
+        let batch = serde_json::json!([{ "name": "a", "find": "" }]);
+        let ret = save_replace_rules(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            Some(Bytes::from(batch.to_string())),
+        )
+        .await;
+        assert!(!ret.0.is_success);
+
+        // 删除
+        let body = Bytes::from(r#"{"id":"b1"}"#);
+        let ret = delete_replace_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        let ret = get_replace_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data.as_array().unwrap().len(), 2);
+        // query 参数删除
+        let params: HashMap<String, String> = [("id".into(), "b1".into())].into_iter().collect();
+        let ret = delete_replace_rule(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "重复删除不报错");
+        // 缺 id
+        let ret = delete_replace_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-26：HttpTTS API——保存（id 兜底 url）/列表（id+url 双字段）/删除
+    #[tokio::test]
+    async fn test_http_tts_api() {
+        let (state, dir) = test_state("ttsapi").await;
+
+        // 校验：缺 url/name
+        let body = Bytes::from(r#"{"name":"甲"}"#);
+        let ret = save_http_tts(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "链接不能为空");
+        let body = Bytes::from(r#"{"url":"https://t.com/a"}"#);
+        let ret = save_http_tts(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "名称不能为空");
+
+        // 保存
+        let body = Bytes::from(r#"{"name":"引擎甲","url":"https://t.com/a","type":0}"#);
+        let ret = save_http_tts(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "保存应成功: {}", ret.0.error_msg);
+        // 只传 id（旧契约）→ url 兜底
+        let body = Bytes::from(r#"{"id":"https://t.com/b","name":"引擎乙","type":1}"#);
+        let ret = save_http_tts(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+
+        // 列表：id 与 url 同值
+        let ret = get_http_tts_list(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let a = arr.iter().find(|v| v["name"] == "引擎甲").expect("应含引擎甲");
+        assert_eq!(a["id"], a["url"]);
+        assert_eq!(a["type"], 0);
+
+        // 同 url 覆盖不新增
+        let body = Bytes::from(r#"{"name":"引擎甲v2","url":"https://t.com/a","type":0}"#);
+        let ret = save_http_tts(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        let ret = get_http_tts_list(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data.as_array().unwrap().len(), 2);
+
+        // 删除（按 id）
+        let body = Bytes::from(r#"{"id":"https://t.com/a"}"#);
+        let ret = delete_http_tts(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        let ret = get_http_tts_list(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data.as_array().unwrap().len(), 1);
+
+        cleanup(state, dir).await;
+    }
+
+    /// 自定义 TXT 目录规则 API：默认规则 + 用户规则合并列表/保存/删除/导入默认
+    #[tokio::test]
+    async fn test_txt_toc_rules_api() {
+        let (state, dir) = test_state("tocapi").await;
+        let default_len = crate::service::local_book::DEFAULT_TOC_RULES.len();
+
+        // 初始：仅内置默认规则
+        let ret = get_txt_toc_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), default_len);
+        assert_eq!(arr[0]["id"], "default-1");
+        assert!(arr[0]["enable"].as_bool().unwrap());
+
+        // 保存自定义规则
+        let body = Bytes::from(r#"{"name":"我的规则","rule":"^第.+章$","enable":true,"serialNumber":0}"#);
+        let ret = save_txt_toc_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "保存应成功: {}", ret.0.error_msg);
+        // 校验：空 name/rule
+        let body = Bytes::from(r#"{"name":"","rule":"x"}"#);
+        let ret = save_txt_toc_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "名称不能为空");
+        let body = Bytes::from(r#"{"name":"x","rule":""}"#);
+        let ret = save_txt_toc_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+
+        // 列表：默认 + 自定义（自定义在尾部）
+        let ret = get_txt_toc_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), default_len + 1);
+        let last = arr.last().unwrap();
+        assert_eq!(last["name"], "我的规则");
+        assert_eq!(last["serialNumber"], 0);
+        assert!(last["id"].as_str().unwrap().starts_with("toc-"), "缺 id 应自动补");
+
+        // 删除
+        let id = last["id"].as_str().unwrap();
+        let body = Bytes::from(format!(r#"{{"id":"{id}"}}"#));
+        let ret = delete_txt_toc_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        let ret = get_txt_toc_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data.as_array().unwrap().len(), default_len);
+
+        // 导入默认规则（用户规则中出现 default-* 副本）
+        let ret = import_default_txt_toc_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data["count"], default_len as i64);
+        let ret = get_txt_toc_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), default_len * 2, "默认规则 + 用户导入副本");
+        // 重复导入幂等
+        let ret = import_default_txt_toc_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data["count"], default_len as i64);
+        let ret = get_txt_toc_rules(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data.as_array().unwrap().len(), default_len * 2);
+
+        cleanup(state, dir).await;
+    }
+
+    /// getSystemInfo：版本/端口/用户数/书数/书源数
+    #[tokio::test]
+    async fn test_get_system_info() {
+        let (state, dir) = test_state("sysapi").await;
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://book.com/a".into(),
+                    name: "测试书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "https://s.com".into(),
+                    book_source_name: "源A".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let ret = get_system_info(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new()).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(ret.0.data["port"], 8080, "默认端口");
+        assert_eq!(ret.0.data["userCount"], 0);
+        assert_eq!(ret.0.data["bookCount"], 1);
+        assert_eq!(ret.0.data["bookSourceCount"], 1);
+        assert!(ret.0.data["freeMemory"].is_string());
+
+        cleanup(state, dir).await;
+    }
+
+    /// 书源导出：attachment + 内容为当前命名空间书源 JSON
+    #[tokio::test]
+    async fn test_export_book_sources() {
+        let (state, dir) = test_state("expapi").await;
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "https://s1.com".into(),
+                    book_source_name: "源一".into(),
+                    search_url: Some("https://s1.com/search".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "https://s2.com".into(),
+                    book_source_name: "源二".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let resp = export_book_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Disposition").and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=bookSource.json")
+        );
+        assert_eq!(resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()), Some("application/json; charset=utf-8"));
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr.iter().any(|v| v["bookSourceUrl"] == "https://s1.com" && v["bookSourceName"] == "源一"));
+        // 空命名空间 → 合法空数组（含 default 回退，此处 default 有数据）
+        let params: HashMap<String, String> =
+            [("accessToken".into(), "ghost:tok".into())].into_iter().collect();
+        let resp = export_book_sources(AxumState(state.clone()), Query(params), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 2, "非 secure 模式 accessToken 无效，仍走 default");
+
+        cleanup(state, dir).await;
+    }
+
+    /// 文件型本地书 TXT 目录：用户自定义规则生效（无规则回退默认规则）
+    #[tokio::test]
+    async fn test_txt_toc_rules_in_local_book_toc() {
+        let (state, dir) = test_state("localtoc").await;
+        // 写一个文件型本地书（storage/data/default/books/示例.txt）
+        let file_dir = state.storage.config.storage_dir().join("data/default/books");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        let txt = "第一章 起点\n内容一。\n第二章 成长\n内容二。";
+        std::fs::write(file_dir.join("示例.txt"), txt).unwrap();
+        let book_url = "storage/data/default/books/示例.txt";
+
+        // 无用户规则 → 默认规则分章（两章）
+        let ret = get_book_toc_file(&state, "default", book_url).await.expect("默认规则应可解析");
+        let titles: Vec<&str> = ret
+            .0
+            .data
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(titles, vec!["第一章 起点", "第二章 成长"]);
+
+        // 用户规则只匹配「第二章」→ 第一章内容并入前置「正文」章
+        state
+            .storage
+            .save_txt_toc_rule(
+                "default",
+                &crate::model::TxtTocRule {
+                    id: "t1".into(),
+                    name: "仅第二章".into(),
+                    rule: r"^第二章.*$".into(),
+                    enable: true,
+                    serial_number: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let ret = get_book_toc_file(&state, "default", book_url).await.expect("自定义规则应可解析");
+        let arr = ret.0.data.as_array().unwrap();
+        let titles: Vec<&str> = arr.iter().map(|v| v["title"].as_str().unwrap()).collect();
+        assert_eq!(titles, vec!["正文", "第二章 成长"], "用户规则应替代默认规则");
+        // 正文按同一规则读取（章索引一致）
+        let url = arr[1]["url"].as_str().unwrap();
+        let ret = get_book_content_file(&state, "default", url).await.expect("正文应可解析");
+        assert_eq!(ret.0.data["content"], "内容二。");
+
+        // 禁用规则 → 回退默认
+        state
+            .storage
+            .save_txt_toc_rule(
+                "default",
+                &crate::model::TxtTocRule {
+                    id: "t1".into(),
+                    name: "仅第二章".into(),
+                    rule: r"^第二章.*$".into(),
+                    enable: false,
+                    serial_number: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let ret = get_book_toc_file(&state, "default", book_url).await.unwrap();
+        let titles: Vec<&str> = ret
+            .0
+            .data
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(titles, vec!["第一章 起点", "第二章 成长"], "禁用规则后回退默认");
 
         cleanup(state, dir).await;
     }

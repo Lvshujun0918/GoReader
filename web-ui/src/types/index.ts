@@ -165,6 +165,29 @@ export interface HttpTts {
   [key: string]: unknown
 }
 
+/** TXT 目录规则（/reader3/getTxtTocRules → TxtTocRule，对齐 legado TxtTocRule：id/name/rule/enable/serialNumber） */
+export interface TxtTocRule {
+  id: string
+  name: string
+  rule: string
+  enable: boolean
+  serialNumber: number
+  [key: string]: unknown
+}
+
+/** 系统信息（/reader3/getSystemInfo：版本/端口/用户数/书数/书源数） */
+export interface SystemInfo {
+  version: string
+  port: number
+  userCount: number
+  bookCount: number
+  bookSourceCount: number
+  freeMemory?: string
+  totalMemory?: string
+  maxMemory?: string
+  [key: string]: unknown
+}
+
 /** 书源订阅（当前 localStorage: reader_source_subs；占位实现，见 api/sourceSubs.ts；enabled=启用订阅，启用时重新拉取并批量导入书源） */
 export interface SourceSub {
   url: string

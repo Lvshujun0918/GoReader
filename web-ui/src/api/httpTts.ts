@@ -1,13 +1,16 @@
+import { get, post } from './request'
 import type { HttpTts, ReturnData } from '@/types'
 
 /**
- * HttpTTS 听书源存储层 —— 当前为 localStorage 占位实现，后端就绪后切换为真实请求。
+ * HttpTTS 听书源存储层 —— 后端为主（/reader3/getHttpTTSList 等），localStorage 为降级缓存：
+ * - 后端可用：读写走服务端（账号内多设备一致）
+ * - 后端失败：降级 localStorage，功能不中断
  *
- * ============================ 后端契约（约定，待后端实现） ============================
+ * ============================ 后端契约 ============================
  * GET  /reader3/getHttpTTSList    → ReturnData<HttpTts[]>
  * POST /reader3/saveHttpTTS       body: HttpTts         → ReturnData<null>
  * POST /reader3/deleteHttpTTS     body: { id: string }  → ReturnData<null>
- * ==============================================================================
+ * ================================================================
  * localStorage key: reader_http_tts_list（值为 HttpTts[] 的 JSON）
  * type 参考 legado HttpTTS：0=在线合成（http 请求音频），1=本地引擎（预留）
  */
@@ -35,23 +38,63 @@ function persistHttpTtsList(list: HttpTts[]): void {
   }
 }
 
-/** GET /reader3/getHttpTTSList（占位：读 localStorage） */
-export function getHttpTtsList(): Promise<ReturnData<HttpTts[]>> {
-  return Promise.resolve({ isSuccess: true, errorMsg: '', data: loadHttpTtsList() })
+/** 后端不可达标志（本模块内短路，避免每次操作都等超时） */
+let backendDown = false
+
+/** GET /reader3/getHttpTTSList（后端优先；失败降级 localStorage 并镜像缓存） */
+export async function getHttpTtsList(): Promise<ReturnData<HttpTts[]>> {
+  if (backendDown) {
+    return { isSuccess: true, errorMsg: '', data: loadHttpTtsList() }
+  }
+  try {
+    const res = await get<HttpTts[]>('/getHttpTTSList')
+    persistHttpTtsList(res.data ?? [])
+    return res
+  } catch {
+    backendDown = true
+    return { isSuccess: true, errorMsg: '', data: loadHttpTtsList() }
+  }
 }
 
-/** POST /reader3/saveHttpTTS（占位：写 localStorage，id 相同则覆盖） */
-export function saveHttpTts(tts: HttpTts): Promise<ReturnData<null>> {
+/** POST /reader3/saveHttpTTS（后端优先；失败降级 localStorage，id 相同则覆盖） */
+export async function saveHttpTts(tts: HttpTts): Promise<ReturnData<null>> {
+  if (!backendDown) {
+    try {
+      const res = await post<null>('/saveHttpTTS', tts)
+      const list = loadHttpTtsList()
+      const i = list.findIndex((t) => t.id === tts.id)
+      if (i >= 0) list[i] = tts
+      else list.push(tts)
+      persistHttpTtsList(list)
+      return res
+    } catch {
+      backendDown = true
+    }
+  }
   const list = loadHttpTtsList()
   const i = list.findIndex((t) => t.id === tts.id)
   if (i >= 0) list[i] = tts
   else list.push(tts)
   persistHttpTtsList(list)
-  return Promise.resolve({ isSuccess: true, errorMsg: '', data: null })
+  return { isSuccess: true, errorMsg: '', data: null }
 }
 
-/** POST /reader3/deleteHttpTTS（占位：按 id 删除 localStorage 记录） */
-export function deleteHttpTts(id: string): Promise<ReturnData<null>> {
+/** POST /reader3/deleteHttpTTS（后端优先；失败降级 localStorage） */
+export async function deleteHttpTts(id: string): Promise<ReturnData<null>> {
+  if (!backendDown) {
+    try {
+      const res = await post<null>('/deleteHttpTTS', { id })
+      persistHttpTtsList(loadHttpTtsList().filter((t) => t.id !== id))
+      return res
+    } catch {
+      backendDown = true
+    }
+  }
   persistHttpTtsList(loadHttpTtsList().filter((t) => t.id !== id))
-  return Promise.resolve({ isSuccess: true, errorMsg: '', data: null })
+  return { isSuccess: true, errorMsg: '', data: null }
+}
+
+/** 恢复后端调用（登录态变化/网络恢复时由上层调用） */
+export function resetBackendFlag(): void {
+  backendDown = false
 }

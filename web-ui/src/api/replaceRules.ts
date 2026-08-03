@@ -1,14 +1,18 @@
+import { get, post } from './request'
 import type { ReplaceRule, ReturnData } from '@/types'
 
 /**
- * 替换规则存储层 —— 当前为 localStorage 占位实现，后端就绪后切换为真实请求。
+ * 替换规则存储层 —— 后端为主（GET/POST /reader3/*ReplaceRule*），localStorage 为降级缓存：
+ * - 后端可用：读写走服务端（账号内多设备一致），成功后镜像写 localStorage（阅读页渲染
+ *   走同步的 loadReplaceRules，无需等待网络）
+ * - 后端失败（未启动/接口异常）：读写降级到 localStorage，功能不中断
  *
- * ============================ 后端契约（约定，待后端实现） ============================
+ * ============================ 后端契约 ============================
  * GET  /reader3/getReplaceRules    → ReturnData<ReplaceRule[]>
  * POST /reader3/saveReplaceRule    body: ReplaceRule        → ReturnData<null>
  * POST /reader3/saveReplaceRules   body: ReplaceRule[]      → ReturnData<{ count: number }>
  * POST /reader3/deleteReplaceRule  body: { id: string }     → ReturnData<null>
- * ==============================================================================
+ * ================================================================
  * localStorage key: reader_replace_rules（值为 ReplaceRule[] 的 JSON）
  */
 
@@ -27,7 +31,7 @@ export function loadReplaceRules(): ReplaceRule[] {
   }
 }
 
-/** 同步持久化整表 */
+/** 同步持久化整表（后端成功后的本地镜像 / 后端失败时的降级存储） */
 export function persistReplaceRules(rules: ReplaceRule[]): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(rules))
@@ -36,23 +40,80 @@ export function persistReplaceRules(rules: ReplaceRule[]): void {
   }
 }
 
-/** GET /reader3/getReplaceRules（占位：读 localStorage） */
-export function getReplaceRules(): Promise<ReturnData<ReplaceRule[]>> {
-  return Promise.resolve({ isSuccess: true, errorMsg: '', data: loadReplaceRules() })
+/** 后端不可达标志（本模块内短路，避免每次操作都等 15s 超时） */
+let backendDown = false
+
+/** GET /reader3/getReplaceRules（后端优先；失败降级 localStorage 并镜像缓存） */
+export async function getReplaceRules(): Promise<ReturnData<ReplaceRule[]>> {
+  if (backendDown) {
+    return { isSuccess: true, errorMsg: '', data: loadReplaceRules() }
+  }
+  try {
+    const res = await get<ReplaceRule[]>('/getReplaceRules')
+    persistReplaceRules(res.data ?? []) // 镜像到本地（阅读页同步渲染）
+    return res
+  } catch {
+    backendDown = true
+    return { isSuccess: true, errorMsg: '', data: loadReplaceRules() }
+  }
 }
 
-/** POST /reader3/saveReplaceRule（占位：写 localStorage，id 相同则覆盖） */
-export function saveReplaceRule(rule: ReplaceRule): Promise<ReturnData<null>> {
+/** POST /reader3/saveReplaceRule（后端优先；失败降级 localStorage） */
+export async function saveReplaceRule(rule: ReplaceRule): Promise<ReturnData<null>> {
+  if (!backendDown) {
+    try {
+      const res = await post<null>('/saveReplaceRule', rule)
+      // 镜像更新本地缓存
+      const list = loadReplaceRules()
+      const i = list.findIndex((r) => r.id === rule.id)
+      if (i >= 0) list[i] = rule
+      else list.push(rule)
+      persistReplaceRules(list)
+      return res
+    } catch {
+      backendDown = true
+    }
+  }
+  // 降级：本地增改
   const list = loadReplaceRules()
   const i = list.findIndex((r) => r.id === rule.id)
   if (i >= 0) list[i] = rule
   else list.push(rule)
   persistReplaceRules(list)
-  return Promise.resolve({ isSuccess: true, errorMsg: '', data: null })
+  return { isSuccess: true, errorMsg: '', data: null }
 }
 
-/** POST /reader3/deleteReplaceRule（占位：按 id 删除 localStorage 记录） */
-export function deleteReplaceRule(id: string): Promise<ReturnData<null>> {
+/** POST /reader3/saveReplaceRules（批量；后端失败降级为整表本地覆盖） */
+export async function saveReplaceRules(rules: ReplaceRule[]): Promise<ReturnData<{ count: number }>> {
+  if (!backendDown) {
+    try {
+      const res = await post<{ count: number }>('/saveReplaceRules', rules)
+      persistReplaceRules(rules)
+      return res
+    } catch {
+      backendDown = true
+    }
+  }
+  persistReplaceRules(rules)
+  return { isSuccess: true, errorMsg: '', data: { count: rules.length } }
+}
+
+/** POST /reader3/deleteReplaceRule（后端优先；失败降级 localStorage） */
+export async function deleteReplaceRule(id: string): Promise<ReturnData<null>> {
+  if (!backendDown) {
+    try {
+      const res = await post<null>('/deleteReplaceRule', { id })
+      persistReplaceRules(loadReplaceRules().filter((r) => r.id !== id))
+      return res
+    } catch {
+      backendDown = true
+    }
+  }
   persistReplaceRules(loadReplaceRules().filter((r) => r.id !== id))
-  return Promise.resolve({ isSuccess: true, errorMsg: '', data: null })
+  return { isSuccess: true, errorMsg: '', data: null }
+}
+
+/** 恢复后端调用（登录态变化/网络恢复时由上层调用） */
+export function resetBackendFlag(): void {
+  backendDown = false
 }

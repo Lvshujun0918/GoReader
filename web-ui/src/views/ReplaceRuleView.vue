@@ -220,7 +220,7 @@ onMounted(load)
         </table>
       </div>
 
-      <p class="foot-tip">规则保存在本地浏览器（后端就绪后自动切换为账号同步，见 api/replaceRules.ts 契约注释）</p>
+      <p class="foot-tip">规则已同步到服务端（登录账号内多设备一致）；服务不可用时自动降级为本地浏览器存储</p>
     </main>
 
     <!-- 新增 / 编辑规则弹窗 -->

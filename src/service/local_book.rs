@@ -100,8 +100,13 @@ pub fn parse_epub(bytes: &[u8]) -> Result<ImportedBook> {
     })
 }
 
-/// TXT 解析（编码检测 + 分章）
+/// TXT 解析（编码检测 + 分章；使用内置默认规则）
 pub fn parse_txt(bytes: &[u8]) -> Result<ImportedBook> {
+    parse_txt_with_rules(bytes, &[])
+}
+
+/// TXT 解析（编码检测 + 分章；rules 为空时用内置 DEFAULT_TOC_RULES，否则用用户自定义规则）
+pub fn parse_txt_with_rules(bytes: &[u8], user_rules: &[String]) -> Result<ImportedBook> {
     // 编码检测：UTF-8 优先，失败用 GBK/GB18030
     let text = match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
@@ -114,8 +119,12 @@ pub fn parse_txt(bytes: &[u8]) -> Result<ImportedBook> {
     // 去掉 BOM
     let text = text.trim_start_matches('\u{feff}').to_string();
 
-    // 分章：内置默认 TXT 目录规则（后续可接用户自定义 txtTocRule）
-    let rules: Vec<String> = DEFAULT_TOC_RULES.iter().map(|s| s.to_string()).collect();
+    // 分章：优先用户自定义 TXT 目录规则（txt_toc_rules），无则用内置默认规则
+    let rules: Vec<String> = if user_rules.is_empty() {
+        DEFAULT_TOC_RULES.iter().map(|s| s.to_string()).collect()
+    } else {
+        user_rules.to_vec()
+    };
     let mut chapters = split_by_rules(&text, &rules);
     if chapters.is_empty() && !text.trim().is_empty() {
         // 无章节标记的长文本：按 10000 字分章（避免单章过大渲染卡顿）
@@ -163,22 +172,23 @@ pub fn parse_txt(bytes: &[u8]) -> Result<ImportedBook> {
 pub const DEFAULT_TOC_RULES: &[&str] = &[
     // 第X章 / 第X节 / 第X卷 第X章 等（常见中文格式）
     r"^\s*第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节卷回集部篇][^
-]{0,40}\s*$",
+]{0,40}[ 	]*$",
     // 卷标题（"第X卷" 或 "第一卷 标题"）
     r"^\s*第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*卷[^
-]{0,40}\s*$",
+]{0,40}[ 	]*$",
     // 序章/楔子/番外/后记/尾声/前言/引子/正文 等
     r"^\s*(序章|楔子|番外|后记|尾声|前言|引子|正文|终章)[^
-]{0,40}\s*$",
+]{0,40}[ 	]*$",
     // 英文 Chapter / CHAPTER
     r"^\s*[Cc][Hh][Aa][Pp][Tt][Ee][Rr]\s+\d+[^
-]{0,40}\s*$",
+]{0,40}[ 	]*$",
     // 数字+空格+标题（常见"1 标题"格式）
     r"^\s*\d{1,4}[\s、.．:：][^
-]{0,40}\s*$",
+]{0,40}[ 	]*$",
 ];
 
 /// 用规则列表分章（txtTocRule 语义——正则匹配行作为章节标题）
+/// 规则按 legado TextFile 语义以 MULTILINE 编译（`^`/`$` 按行锚定，规则匹配整行章节标题）
 fn split_by_rules(text: &str, rules: &[String]) -> Vec<Chapter> {
     let mut chapters = Vec::new();
     let mut last_pos = 0usize;
@@ -186,7 +196,7 @@ fn split_by_rules(text: &str, rules: &[String]) -> Vec<Chapter> {
     // 收集所有规则匹配
     let mut matches: Vec<(usize, usize, String)> = Vec::new();
     for rule in rules {
-        if let Ok(re) = regex::Regex::new(rule) {
+        if let Ok(re) = regex::RegexBuilder::new(rule).multi_line(true).build() {
             for cap in re.captures_iter(text) {
                 if let Some(m) = cap.get(0) {
                     let title = m.as_str().trim().to_string();
@@ -199,6 +209,10 @@ fn split_by_rules(text: &str, rules: &[String]) -> Vec<Chapter> {
     }
     matches.sort_by_key(|m| m.0);
     matches.dedup_by_key(|m| m.0);
+    // 无任何匹配 → 返回空（调用方回退：长文本按字数分块，短文本整本一章）
+    if matches.is_empty() {
+        return Vec::new();
+    }
     for (start, end, title) in matches {
         let content = text[last_pos..start].trim().to_string();
         if !content.is_empty() {
@@ -224,6 +238,12 @@ fn split_by_rules(text: &str, rules: &[String]) -> Vec<Chapter> {
 pub fn parse_txt_file(path: &std::path::Path) -> Result<ImportedBook> {
     let bytes = std::fs::read(path)?;
     parse_txt(&bytes)
+}
+
+/// 读 TXT 文件并分章（用户自定义规则版本）
+pub fn parse_txt_file_with_rules(path: &std::path::Path, user_rules: &[String]) -> Result<ImportedBook> {
+    let bytes = std::fs::read(path)?;
+    parse_txt_with_rules(&bytes, user_rules)
 }
 
 /// 判断是否本地书（local:// 或文件路径型 legacy 本地书）
@@ -372,4 +392,59 @@ fn extract_title(html: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "第一章 起点\n内容一。\n第二章 成长\n内容二。\n尾声\n结局。";
+
+    /// 默认规则分章：第X章 + 尾声
+    #[test]
+    fn test_parse_txt_default_rules() {
+        let book = parse_txt(SAMPLE.as_bytes()).unwrap();
+        let titles: Vec<&str> = book.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, vec!["第一章 起点", "第二章 成长", "尾声"]);
+        assert_eq!(book.chapters[1].content, "内容二。");
+        assert_eq!(book.chapters[2].content, "结局。");
+    }
+
+    /// 用户自定义规则分章（规则传入时替代默认规则）
+    #[test]
+    fn test_parse_txt_custom_rules() {
+        // 用户规则只匹配「第X章」（不匹配尾声）→ 尾声并入上一章
+        let rules = vec![r"^\s*第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节卷回集部篇].*".to_string()];
+        let book = parse_txt_with_rules(SAMPLE.as_bytes(), &rules).unwrap();
+        let titles: Vec<&str> = book.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, vec!["第一章 起点", "第二章 成长"]);
+        assert_eq!(book.chapters[1].content, "内容二。\n尾声\n结局。");
+    }
+
+    /// 空规则列表回退默认规则
+    #[test]
+    fn test_parse_txt_empty_rules_falls_back() {
+        let book = parse_txt_with_rules(SAMPLE.as_bytes(), &[]).unwrap();
+        let titles: Vec<&str> = book.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, vec!["第一章 起点", "第二章 成长", "尾声"]);
+    }
+
+    /// 无章节标记长文本按 10000 字分块
+    #[test]
+    fn test_parse_txt_long_text_chunked() {
+        let body = "字".repeat(25_000);
+        let book = parse_txt(body.as_bytes()).unwrap();
+        assert_eq!(book.chapters.len(), 3);
+        assert!(book.chapters.iter().all(|c| c.title.starts_with("第 ") && c.title.ends_with(" 部分")));
+    }
+
+    /// GBK 编码文本可解析
+    #[test]
+    fn test_parse_txt_gbk() {
+        let text = "第一章 测试\n内容。";
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode(text);
+        let book = parse_txt(&gbk_bytes).unwrap();
+        assert_eq!(book.chapters[0].title, "第一章 测试");
+        assert_eq!(book.chapters[0].content, "内容。");
+    }
 }

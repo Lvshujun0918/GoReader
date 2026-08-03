@@ -273,6 +273,53 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     .execute(&pool)
     .await?;
 
+    // F-28 替换规则（前端生成字符串 id；order 为 SQLite 关键字 → order_num）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS replace_rules (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            find TEXT NOT NULL DEFAULT '',
+            replace TEXT NOT NULL DEFAULT '',
+            enable INTEGER DEFAULT 1,
+            order_num INTEGER DEFAULT 0,
+            user_namespace TEXT DEFAULT ''
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // F-26 HttpTTS 听书源（url 主键；type 0=在线合成 / 1=本地引擎）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS http_tts_list (
+            url TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            type INTEGER DEFAULT 0,
+            user_namespace TEXT DEFAULT ''
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // 自定义 TXT 目录规则（对齐 legado TxtTocRule：name/rule/serialNumber/enable）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS txt_toc_rules (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            rule TEXT NOT NULL DEFAULT '',
+            enable INTEGER DEFAULT 1,
+            serial_number INTEGER DEFAULT 0,
+            user_namespace TEXT DEFAULT ''
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     // 幂等补列（兼容旧库：缺列则 ALTER TABLE 补上）
     let columns = [
         ("users", &["token_map", "raw_json"][..]),
@@ -899,6 +946,197 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected())
+    }
+
+    // ---------------- F-28 替换规则 ----------------
+
+    /// 替换规则列表（按 order_num, id 排序；无用户规则回退 default，同书源语义）
+    pub async fn get_replace_rules(&self, ns: &str) -> Result<Vec<crate::model::ReplaceRule>> {
+        let rows = sqlx::query_as::<_, crate::model::ReplaceRule>(
+            "SELECT * FROM replace_rules WHERE user_namespace = ?1 ORDER BY order_num, id",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        if !rows.is_empty() || ns == "default" {
+            return Ok(rows);
+        }
+        sqlx::query_as::<_, crate::model::ReplaceRule>(
+            "SELECT * FROM replace_rules WHERE user_namespace = 'default' ORDER BY order_num, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// 保存单条替换规则（INSERT OR REPLACE，按 id 主键覆盖）
+    pub async fn save_replace_rule(&self, ns: &str, rule: &crate::model::ReplaceRule) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO replace_rules (id, name, find, replace, enable, order_num, user_namespace)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&rule.id)
+        .bind(&rule.name)
+        .bind(&rule.find)
+        .bind(&rule.replace)
+        .bind(rule.enabled)
+        .bind(rule.order)
+        .bind(ns)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 批量保存替换规则（单事务：全部成功或全部回滚）
+    pub async fn save_replace_rules(&self, ns: &str, rules: &[crate::model::ReplaceRule]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for rule in rules {
+            sqlx::query(
+                "INSERT OR REPLACE INTO replace_rules (id, name, find, replace, enable, order_num, user_namespace)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(&rule.id)
+            .bind(&rule.name)
+            .bind(&rule.find)
+            .bind(&rule.replace)
+            .bind(rule.enabled)
+            .bind(rule.order)
+            .bind(ns)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 删除替换规则（按 id，仅限本命名空间）；返回受影响行数
+    pub async fn delete_replace_rule(&self, ns: &str, id: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM replace_rules WHERE user_namespace = ?1 AND id = ?2")
+            .bind(ns)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    // ---------------- F-26 HttpTTS ----------------
+
+    /// HttpTTS 听书源列表（按名称排序；无用户数据回退 default，同书源语义）
+    pub async fn get_http_tts_list(&self, ns: &str) -> Result<Vec<crate::model::HttpTts>> {
+        let rows = sqlx::query_as::<_, crate::model::HttpTts>(
+            "SELECT * FROM http_tts_list WHERE user_namespace = ?1 ORDER BY name",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        if !rows.is_empty() || ns == "default" {
+            return Ok(rows);
+        }
+        sqlx::query_as::<_, crate::model::HttpTts>(
+            "SELECT * FROM http_tts_list WHERE user_namespace = 'default' ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// 保存 HttpTTS（INSERT OR REPLACE，按 url 主键覆盖）
+    pub async fn save_http_tts(&self, ns: &str, tts: &crate::model::HttpTts) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO http_tts_list (url, name, type, user_namespace)              VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&tts.url)
+        .bind(&tts.name)
+        .bind(tts.tts_type)
+        .bind(ns)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 删除 HttpTTS（按 url，仅限本命名空间）；返回受影响行数
+    pub async fn delete_http_tts(&self, ns: &str, url: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM http_tts_list WHERE user_namespace = ?1 AND url = ?2")
+            .bind(ns)
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    // ---------------- 自定义 TXT 目录规则 ----------------
+
+    /// 用户自定义 TXT 目录规则（按 serial_number, id 排序；仅用户自有，无 default 回退）
+    pub async fn get_txt_toc_rules(&self, ns: &str) -> Result<Vec<crate::model::TxtTocRule>> {
+        let rows = sqlx::query_as::<_, crate::model::TxtTocRule>(
+            "SELECT * FROM txt_toc_rules WHERE user_namespace = ?1 ORDER BY serial_number, id",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 保存单条 TXT 目录规则（INSERT OR REPLACE，按 id 主键覆盖）
+    pub async fn save_txt_toc_rule(&self, ns: &str, rule: &crate::model::TxtTocRule) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO txt_toc_rules (id, name, rule, enable, serial_number, user_namespace)              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&rule.id)
+        .bind(&rule.name)
+        .bind(&rule.rule)
+        .bind(rule.enable)
+        .bind(rule.serial_number)
+        .bind(ns)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 删除 TXT 目录规则（按 id，仅限本命名空间）；返回受影响行数
+    pub async fn delete_txt_toc_rule(&self, ns: &str, id: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM txt_toc_rules WHERE user_namespace = ?1 AND id = ?2")
+            .bind(ns)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 导入内置默认规则为用户规则（id 固定 default-{i}，幂等可重复导入）；返回导入条数
+    pub async fn import_default_txt_toc_rules(&self, ns: &str) -> Result<usize> {
+        let defaults = crate::service::local_book::DEFAULT_TOC_RULES;
+        let mut tx = self.pool.begin().await?;
+        for (i, rule) in defaults.iter().enumerate() {
+            sqlx::query(
+                "INSERT OR REPLACE INTO txt_toc_rules (id, name, rule, enable, serial_number, user_namespace)                  VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+            )
+            .bind(format!("default-{}", i + 1))
+            .bind(format!("默认规则{}", i + 1))
+            .bind(*rule)
+            .bind(i as i64)
+            .bind(ns)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(defaults.len())
+    }
+
+    // ---------------- getSystemInfo 统计 ----------------
+
+    /// 全部命名空间书籍总数
+    pub async fn count_books(&self) -> Result<i64> {
+        let count = sqlx::query_scalar("SELECT COUNT(*) FROM books")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// 全部命名空间书源总数
+    pub async fn count_all_book_sources(&self) -> Result<i64> {
+        let count = sqlx::query_scalar("SELECT COUNT(*) FROM book_sources")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
     }
 
     /// 本地书入库（books + 章节）
@@ -2280,5 +2518,189 @@ mod tests {
         let book = storage.find_book("default", "https://book.com/nosrc").await.unwrap().unwrap();
         assert_eq!(book.last_check_count, 0);
         cleanup(storage, "shelfrun").await;
+    }
+
+    /// F-28：替换规则 CRUD 往返 + 命名空间隔离 + default 回退
+    #[tokio::test]
+    async fn test_replace_rules_roundtrip() {
+        let storage = test_storage("replrule").await;
+        use crate::model::ReplaceRule;
+        let rule = |id: &str, name: &str, order: i64| ReplaceRule {
+            id: id.into(),
+            name: name.into(),
+            find: format!("找{name}"),
+            replace: format!("替{name}"),
+            enabled: true,
+            order,
+            ..Default::default()
+        };
+
+        // 保存两条（order 逆序）→ 按 order_num 排序返回
+        storage.save_replace_rule("default", &rule("r1", "一", 2)).await.unwrap();
+        storage.save_replace_rule("default", &rule("r2", "二", 1)).await.unwrap();
+        let list = storage.get_replace_rules("default").await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "r2", "应按 order_num 排序");
+        assert_eq!(list[1].id, "r1");
+        assert_eq!(list[0].find, "找二");
+        assert_eq!(list[0].user_namespace, "default");
+
+        // 覆盖保存（同 id）
+        let mut r = rule("r1", "一v2", 2);
+        r.enabled = false;
+        storage.save_replace_rule("default", &r).await.unwrap();
+        let list = storage.get_replace_rules("default").await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(!list[1].enabled);
+        assert_eq!(list[1].name, "一v2");
+
+        // 批量保存（事务）
+        storage
+            .save_replace_rules("default", &[rule("r3", "三", 3), rule("r4", "四", 4)])
+            .await
+            .unwrap();
+        assert_eq!(storage.get_replace_rules("default").await.unwrap().len(), 4);
+
+        // 删除
+        assert_eq!(storage.delete_replace_rule("default", "r3").await.unwrap(), 1);
+        assert_eq!(storage.delete_replace_rule("default", "ghost").await.unwrap(), 0);
+        assert_eq!(storage.get_replace_rules("default").await.unwrap().len(), 3);
+
+        // 命名空间隔离：alice 无规则时回退 default
+        assert_eq!(storage.get_replace_rules("alice").await.unwrap().len(), 3);
+        storage.save_replace_rule("alice", &rule("a1", "爱丽丝", 0)).await.unwrap();
+        let alice = storage.get_replace_rules("alice").await.unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].name, "爱丽丝");
+        // 删除只影响本命名空间
+        assert_eq!(storage.delete_replace_rule("alice", "r1").await.unwrap(), 0);
+        assert_eq!(storage.get_replace_rules("default").await.unwrap().len(), 3);
+
+        cleanup(storage, "replrule").await;
+    }
+
+    /// F-26：HttpTTS CRUD 往返 + 命名空间隔离 + default 回退
+    #[tokio::test]
+    async fn test_http_tts_roundtrip() {
+        let storage = test_storage("httptts").await;
+        use crate::model::HttpTts;
+        let tts = |url: &str, name: &str, ty: i64| HttpTts {
+            url: url.into(),
+            name: name.into(),
+            tts_type: ty,
+            ..Default::default()
+        };
+
+        storage.save_http_tts("default", &tts("https://tts.example.com/a", "引擎甲", 0)).await.unwrap();
+        storage.save_http_tts("default", &tts("https://tts.example.com/b", "引擎乙", 1)).await.unwrap();
+        let list = storage.get_http_tts_list("default").await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "引擎乙", "应按名称排序");
+        assert_eq!(list[0].tts_type, 1);
+        assert_eq!(list[1].url, "https://tts.example.com/a");
+
+        // 同 url 覆盖
+        storage.save_http_tts("default", &tts("https://tts.example.com/a", "引擎甲v2", 0)).await.unwrap();
+        let list = storage.get_http_tts_list("default").await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().any(|t| t.name == "引擎甲v2"));
+
+        // 删除
+        assert_eq!(storage.delete_http_tts("default", "https://tts.example.com/a").await.unwrap(), 1);
+        assert_eq!(storage.get_http_tts_list("default").await.unwrap().len(), 1);
+
+        // 命名空间隔离 + default 回退
+        assert_eq!(storage.get_http_tts_list("alice").await.unwrap().len(), 1, "空命名空间回退 default");
+        storage.save_http_tts("alice", &tts("https://tts.example.com/x", "爱丽丝引擎", 0)).await.unwrap();
+        assert_eq!(storage.get_http_tts_list("alice").await.unwrap().len(), 1);
+        assert_eq!(storage.delete_http_tts("alice", "https://tts.example.com/b").await.unwrap(), 0);
+
+        cleanup(storage, "httptts").await;
+    }
+
+    /// 自定义 TXT 目录规则：保存/排序/删除/导入默认规则 + 命名空间隔离
+    #[tokio::test]
+    async fn test_txt_toc_rules_flow() {
+        let storage = test_storage("txttoc").await;
+        use crate::model::TxtTocRule;
+        let rule = |id: &str, name: &str, re: &str, sn: i64| TxtTocRule {
+            id: id.into(),
+            name: name.into(),
+            rule: re.into(),
+            enable: true,
+            serial_number: sn,
+            ..Default::default()
+        };
+
+        // 初始无用户规则
+        assert!(storage.get_txt_toc_rules("default").await.unwrap().is_empty());
+
+        // 保存（乱序 serialNumber → 按序返回）
+        storage.save_txt_toc_rule("default", &rule("t1", "自定义A", r"^第.+章$", 5)).await.unwrap();
+        storage.save_txt_toc_rule("default", &rule("t2", "自定义B", r"^楔子$", 1)).await.unwrap();
+        let list = storage.get_txt_toc_rules("default").await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "t2", "应按 serial_number 排序");
+        assert_eq!(list[1].name, "自定义A");
+        assert_eq!(list[1].user_namespace, "default");
+
+        // 覆盖 + 禁用
+        let mut r = rule("t1", "自定义Av2", r"^第.+章$", 5);
+        r.enable = false;
+        storage.save_txt_toc_rule("default", &r).await.unwrap();
+        let list = storage.get_txt_toc_rules("default").await.unwrap();
+        assert!(!list[1].enable);
+
+        // 删除
+        assert_eq!(storage.delete_txt_toc_rule("default", "t2").await.unwrap(), 1);
+        assert_eq!(storage.get_txt_toc_rules("default").await.unwrap().len(), 1);
+
+        // 导入默认规则（幂等）
+        let count = storage.import_default_txt_toc_rules("default").await.unwrap();
+        assert_eq!(count, crate::service::local_book::DEFAULT_TOC_RULES.len());
+        let list = storage.get_txt_toc_rules("default").await.unwrap();
+        let default_ids = list.iter().filter(|r| r.id.starts_with("default-")).count();
+        assert_eq!(default_ids, crate::service::local_book::DEFAULT_TOC_RULES.len());
+        assert_eq!(storage.import_default_txt_toc_rules("default").await.unwrap(), count, "重复导入不新增");
+        assert_eq!(storage.get_txt_toc_rules("default").await.unwrap().len(), list.len());
+
+        // 命名空间隔离：alice 无规则（不查 default）
+        assert!(storage.get_txt_toc_rules("alice").await.unwrap().is_empty());
+
+        cleanup(storage, "txttoc").await;
+    }
+
+    /// getSystemInfo 统计：用户数/书数/书源数（全命名空间）
+    #[tokio::test]
+    async fn test_system_info_counts() {
+        let storage = test_storage("sysinfo").await;
+        storage
+            .insert_user(&User {
+                username: "alice".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .upsert_book("default", &shelf_book("https://book.com/a", "A"))
+            .await
+            .unwrap();
+        storage
+            .upsert_book("alice", &shelf_book("https://book.com/b", "B"))
+            .await
+            .unwrap();
+        storage
+            .save_book_source("default", &source("https://s.com", "源A", None))
+            .await
+            .unwrap();
+        storage
+            .save_book_source("alice", &source("https://s2.com", "源B", None))
+            .await
+            .unwrap();
+
+        assert_eq!(storage.count_users().await.unwrap(), 1);
+        assert_eq!(storage.count_books().await.unwrap(), 2);
+        assert_eq!(storage.count_all_book_sources().await.unwrap(), 2);
+        cleanup(storage, "sysinfo").await;
     }
 }
