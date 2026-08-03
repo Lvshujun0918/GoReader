@@ -1026,6 +1026,217 @@ impl Storage {
         .await?;
         Ok(books)
     }
+
+    // ---------------- F-7 书源数上限 ----------------
+
+    /// 某命名空间现有书源数（仅用户自有书源，不含 default 回退）
+    pub async fn count_book_sources(&self, ns: &str) -> Result<i64> {
+        let count = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM book_sources WHERE user_namespace = ?1",
+        )
+        .bind(ns)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// 用户书源上限（users.book_source_limit；用户不存在返回 None——非 secure 模式不限制）
+    pub async fn book_source_limit_for(&self, ns: &str) -> Result<Option<i64>> {
+        let limit = sqlx::query_scalar(
+            "SELECT book_source_limit FROM users WHERE username = ?1",
+        )
+        .bind(ns)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(limit)
+    }
+
+    // ---------------- F-25/F-34 用户会话 ----------------
+
+    /// F-25 退出登录：清空用户 token（token 立即失效）
+    pub async fn logout_user(&self, username: &str) -> Result<u64> {
+        let r = sqlx::query("UPDATE users SET token = '' WHERE username = ?1")
+            .bind(username)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// F-34 清理不活跃用户：删除 last_login_at < before_ms 的 users 行（简化：仅删用户行，
+    /// 用户数据目录/命名空间数据保留；except 用户受保护不删）。返回被删用户名列表
+    pub async fn clear_inactive_users(&self, before_ms: i64, except: Option<&str>) -> Result<Vec<String>> {
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE last_login_at < ?1")
+                .bind(before_ms)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut deleted = Vec::new();
+        for username in rows {
+            if except == Some(username.as_str()) {
+                continue;
+            }
+            sqlx::query("DELETE FROM users WHERE username = ?1")
+                .bind(&username)
+                .execute(&mut *tx)
+                .await?;
+            deleted.push(username);
+        }
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    // ---------------- F-35 定时书架更新 ----------------
+
+    /// F-35 可更新书架书（can_update=1，全命名空间）
+    pub async fn list_updatable_books(&self) -> Result<Vec<Book>> {
+        let books = sqlx::query_as::<_, Book>("SELECT * FROM books WHERE can_update = 1")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(books)
+    }
+
+    /// F-35 回写更新检查结果：最新章节标题/总数/检查时间/检查次数
+    pub async fn update_book_update_info(
+        &self,
+        ns: &str,
+        book_url: &str,
+        latest_title: Option<&str>,
+        total_num: i64,
+        checked_at: i64,
+    ) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE books SET                 latest_chapter_title = COALESCE(?3, latest_chapter_title),                 latest_chapter_time = CASE WHEN ?3 IS NOT NULL THEN ?4 ELSE latest_chapter_time END,                 total_chapter_num = ?5,                 last_check_time = ?6,                 last_check_count = last_check_count + 1                 WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .bind(latest_title)
+        .bind(checked_at)
+        .bind(total_num)
+        .bind(checked_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    // ---------------- F-39 WebDAV 备份 ----------------
+
+    /// F-39 书架数据打包 zip（bookshelf/bookSource/bookmark/bookGroup/rssSources）写入
+    /// storage/data/{ns}/webdav/legado/backup-{ts}.zip；返回 zip 文件路径
+    pub async fn create_backup_zip(&self, ns: &str) -> Result<String> {
+        let legado = self
+            .config
+            .storage_dir()
+            .join("data")
+            .join(ns)
+            .join("webdav")
+            .join("legado");
+        std::fs::create_dir_all(&legado)?;
+        let ts = chrono::Utc::now().format("%Y-%m-%d-%H%M%S");
+        let zip_path = legado.join(format!("backup-{ts}.zip"));
+
+        // 收集数据（legacy backupFileNames 子集：Rust 有对应表/模型的部分）
+        let books = self.list_books(ns).await?;
+        let sources = self.get_book_sources(ns).await?;
+        let bookmarks = sqlx::query_as::<_, crate::model::Bookmark>(
+            "SELECT * FROM bookmarks WHERE user_namespace = ?1 ORDER BY created_at DESC, rowid DESC",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        let groups = self.list_book_groups(ns).await?;
+        let rss_sources = self.get_rss_sources(ns).await?;
+
+        let file = std::fs::File::create(&zip_path)?;
+        let mut writer = zip::ZipWriter::new(file);
+        write_zip_entry(&mut writer, "bookshelf.json", &serde_json::to_vec_pretty(&books)?)?;
+        write_zip_entry(&mut writer, "bookSource.json", &serde_json::to_vec_pretty(&sources)?)?;
+        write_zip_entry(&mut writer, "bookmark.json", &serde_json::to_vec_pretty(&bookmarks)?)?;
+        write_zip_entry(&mut writer, "bookGroup.json", &serde_json::to_vec_pretty(&groups)?)?;
+        write_zip_entry(&mut writer, "rssSources.json", &serde_json::to_vec_pretty(&rss_sources)?)?;
+        writer.finish()?;
+
+        tracing::info!("备份完成 [{ns}]: {}", zip_path.display());
+        Ok(zip_path.to_string_lossy().into_owned())
+    }
+}
+
+/// zip 单条目写入（F-39）
+fn write_zip_entry(
+    writer: &mut zip::ZipWriter<std::fs::File>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::io::Write;
+    writer.start_file(name, zip::write::FileOptions::default())?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+/// F-35：启动定时书架更新检查（tokio interval，每 10 分钟一轮）
+pub fn spawn_shelf_update_job(storage: Storage) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match run_shelf_update(&storage).await {
+                Ok(n) => tracing::info!("书架更新检查完成：更新 {n} 本"),
+                Err(e) => tracing::warn!("书架更新检查失败: {e:#}"),
+            }
+        }
+    });
+}
+
+/// F-35：扫描 books 表 can_update=1 的书 → analyze_toc → 回写
+/// latest_chapter_title / total_chapter_num（单本失败跳过，不影响其余）
+pub async fn run_shelf_update(storage: &Storage) -> Result<usize> {
+    let books = storage.list_updatable_books().await?;
+    let mut updated = 0usize;
+    for book in books {
+        // 本地书（local:// 或 storage 文件型）无书源可抓，跳过
+        if book.origin == "local"
+            || book.book_url.starts_with("local://")
+            || book.book_url.ends_with(".txt")
+        {
+            continue;
+        }
+        if book.toc_url.trim().is_empty() {
+            continue;
+        }
+        // 书源缺失（用户/系统均无）→ 无法抓取，跳过
+        let Ok(Some(source)) = storage
+            .find_book_source(&book.user_namespace, &book.origin)
+            .await
+        else {
+            continue;
+        };
+        match crate::service::book::analyze_toc(&book.toc_url, &source, 20).await {
+            Ok(chapters) if !chapters.is_empty() => {
+                let non_volume: Vec<&crate::model::book_chapter::BookChapter> =
+                    chapters.iter().filter(|c| !c.is_volume).collect();
+                let latest = non_volume.last().map(|c| c.title.clone());
+                let total = non_volume.len() as i64;
+                let now = chrono::Utc::now().timestamp_millis();
+                match storage
+                    .update_book_update_info(
+                        &book.user_namespace,
+                        &book.book_url,
+                        latest.as_deref(),
+                        total,
+                        now,
+                    )
+                    .await
+                {
+                    Ok(_) => updated += 1,
+                    Err(e) => tracing::warn!("书架更新回写失败 [{}]: {e:#}", book.book_url),
+                }
+            }
+            Ok(_) => {} // 无章节规则/空目录：无可更新内容，跳过
+            Err(e) => tracing::warn!("书架更新跳过 [{}]: {e:#}", book.book_url),
+        }
+    }
+    Ok(updated)
 }
 
 /// 幂等补列：列不存在则 ALTER TABLE ADD COLUMN（旧库升级用）
@@ -1881,5 +2092,193 @@ mod tests {
         assert!(storage.get_rss_article("https://feed.example.com/nope").await.unwrap().is_none());
 
         cleanup(storage, "rssart").await;
+    }
+
+    /// F-7：书源计数（不含 default 回退）+ 用户书源上限读取
+    #[tokio::test]
+    async fn test_book_source_limit_helpers() {
+        let storage = test_storage("bslimit").await;
+        storage
+            .insert_user(&User {
+                username: "alice".into(),
+                book_source_limit: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(storage.book_source_limit_for("alice").await.unwrap(), Some(5));
+        assert_eq!(storage.book_source_limit_for("ghost").await.unwrap(), None);
+        for i in 0..3 {
+            storage
+                .save_book_source("alice", &source(&format!("https://s{i}.com"), "S", None))
+                .await
+                .unwrap();
+        }
+        assert_eq!(storage.count_book_sources("alice").await.unwrap(), 3);
+        assert_eq!(storage.count_book_sources("default").await.unwrap(), 0, "计数不含 default 回退");
+        cleanup(storage, "bslimit").await;
+    }
+
+    /// F-25：logout 清空 token，重复 logout 影响 0 行
+    #[tokio::test]
+    async fn test_logout_user() {
+        let storage = test_storage("logout").await;
+        storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(storage.logout_user("alice").await.unwrap(), 1);
+        assert!(storage.find_user("alice").await.unwrap().unwrap().token.is_empty());
+        assert_eq!(storage.logout_user("ghost").await.unwrap(), 0);
+        cleanup(storage, "logout").await;
+    }
+
+    /// F-34：不活跃用户清理（简化：仅删 users 行；except 保护）
+    #[tokio::test]
+    async fn test_clear_inactive_users() {
+        let storage = test_storage("inactive").await;
+        let mk = |name: &str, last: i64| User {
+            username: name.into(),
+            last_login_at: last,
+            ..Default::default()
+        };
+        storage.insert_user(&mk("old", 1000)).await.unwrap();
+        storage.insert_user(&mk("mid", 5000)).await.unwrap();
+        storage.insert_user(&mk("new", 9999)).await.unwrap();
+
+        let deleted = storage.clear_inactive_users(6000, None).await.unwrap();
+        assert_eq!(deleted, vec!["old", "mid"]);
+        assert!(storage.find_user("old").await.unwrap().is_none());
+        assert!(storage.find_user("mid").await.unwrap().is_none());
+        assert!(storage.find_user("new").await.unwrap().is_some());
+
+        // except 用户受保护
+        let deleted = storage.clear_inactive_users(99999, Some("new")).await.unwrap();
+        assert!(deleted.is_empty());
+        assert!(storage.find_user("new").await.unwrap().is_some());
+        cleanup(storage, "inactive").await;
+    }
+
+    /// F-35：可更新书扫描（仅 can_update=1）+ 更新信息回写（含 None 标题不覆盖 latest_chapter_time）
+    #[tokio::test]
+    async fn test_updatable_books_and_update_info() {
+        let storage = test_storage("shelfupd").await;
+        let mut b1 = shelf_book("https://book.com/a", "A");
+        b1.can_update = true;
+        let mut b2 = shelf_book("https://book.com/b", "B");
+        b2.can_update = false;
+        storage.upsert_book("default", &b1).await.unwrap();
+        storage.upsert_book("default", &b2).await.unwrap();
+
+        let updatable = storage.list_updatable_books().await.unwrap();
+        assert_eq!(updatable.len(), 1);
+        assert_eq!(updatable[0].book_url, "https://book.com/a");
+
+        let affected = storage
+            .update_book_update_info("default", "https://book.com/a", Some("第99章"), 99, 123456)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+        let book = storage.find_book("default", "https://book.com/a").await.unwrap().unwrap();
+        assert_eq!(book.latest_chapter_title.as_deref(), Some("第99章"));
+        assert_eq!(book.total_chapter_num, 99);
+        assert_eq!(book.latest_chapter_time, 123456);
+        assert_eq!(book.last_check_time, 123456);
+        assert_eq!(book.last_check_count, 1);
+
+        // 无最新章节（None）→ 标题/时间保持原值，仅检查计数 +1
+        storage
+            .update_book_update_info("default", "https://book.com/a", None, 99, 888888)
+            .await
+            .unwrap();
+        let book = storage.find_book("default", "https://book.com/a").await.unwrap().unwrap();
+        assert_eq!(book.latest_chapter_title.as_deref(), Some("第99章"));
+        assert_eq!(book.latest_chapter_time, 123456);
+        assert_eq!(book.last_check_time, 888888);
+        assert_eq!(book.last_check_count, 2);
+        // 不存在的书 → 0 行
+        assert_eq!(
+            storage
+                .update_book_update_info("default", "https://nope.com", Some("x"), 1, 1)
+                .await
+                .unwrap(),
+            0
+        );
+        cleanup(storage, "shelfupd").await;
+    }
+
+    /// F-39：备份 zip 打包（bookshelf/bookSource 等条目；路径在 webdav/legado 下）
+    #[tokio::test]
+    async fn test_backup_zip() {
+        let storage = test_storage("backup").await;
+        storage
+            .upsert_book("default", &shelf_book("https://book.com/a", "备份书"))
+            .await
+            .unwrap();
+        storage
+            .save_book_source("default", &source("https://s.com", "源A", None))
+            .await
+            .unwrap();
+
+        let path = storage.create_backup_zip("default").await.unwrap();
+        let zip_path = std::path::PathBuf::from(&path);
+        assert!(zip_path.exists(), "zip 文件应已生成: {path}");
+        let name = zip_path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("backup-") && name.ends_with(".zip"), "文件名应为 backup-*.zip: {name}");
+        assert!(
+            zip_path.parent().and_then(|p| p.file_name()).map(|n| n == "legado").unwrap_or(false),
+            "zip 应在 webdav/legado 下: {path}"
+        );
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        for expect in ["bookshelf.json", "bookSource.json", "bookmark.json", "bookGroup.json", "rssSources.json"] {
+            assert!(names.iter().any(|n| n == expect), "zip 应含 {expect}: {names:?}");
+        }
+        let mut entry = archive.by_name("bookshelf.json").unwrap();
+        let mut content = String::new();
+        use std::io::Read;
+        entry.read_to_string(&mut content).unwrap();
+        assert!(content.contains("备份书"), "bookshelf.json 应含书架书");
+        drop(entry);
+        let mut entry = archive.by_name("bookSource.json").unwrap();
+        let mut content = String::new();
+        entry.read_to_string(&mut content).unwrap();
+        assert!(content.contains("源A"), "bookSource.json 应含书源");
+
+        cleanup(storage, "backup").await;
+    }
+
+    /// F-35：定时任务主循环（本地书/无书源书跳过；网络书源缺失时静默跳过不报错）
+    #[tokio::test]
+    async fn test_run_shelf_update_skips() {
+        let storage = test_storage("shelfrun").await;
+        // 本地书（跳过）
+        storage
+            .upsert_book("default", &shelf_book("local://abc", "本地书"))
+            .await
+            .unwrap();
+        // 无 tocUrl（跳过）
+        let mut b = shelf_book("https://book.com/notoc", "无目录");
+        b.toc_url = String::new();
+        storage.upsert_book("default", &b).await.unwrap();
+        // 无书源（跳过）
+        storage
+            .upsert_book("default", &shelf_book("https://book.com/nosrc", "无源"))
+            .await
+            .unwrap();
+
+        // 不应报错、不应更新任何书
+        assert_eq!(run_shelf_update(&storage).await.unwrap(), 0);
+        let book = storage.find_book("default", "https://book.com/nosrc").await.unwrap().unwrap();
+        assert_eq!(book.last_check_count, 0);
+        cleanup(storage, "shelfrun").await;
     }
 }

@@ -467,7 +467,9 @@ onMounted(() => load())
       <div class="user-area">
         <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
         <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
+        <button class="nav-link" type="button" @click="router.push('/rules')">替换规则</button>
         <button class="nav-link" type="button" @click="router.push('/rss')">RSS</button>
+        <button class="nav-link" type="button" @click="router.push('/files')">文件</button>
         <span class="user-chip">{{ store.username || '未登录' }}</span>
         <button class="logout-btn" type="button" @click="logout">退出</button>
       </div>

@@ -78,6 +78,27 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
             "/reader3/uploadLocalBook",
             post(upload_local_book).layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
         )
+        // F-4 远程书源订阅导入
+        .route("/reader3/saveFromRemoteSource", post(save_from_remote_source))
+        // F-13 书架单书
+        .route("/reader3/getShelfBook", get(get_shelf_book).post(get_shelf_book))
+        // F-25 退出登录
+        .route("/reader3/logout", post(logout))
+        // F-34 不活跃用户清理（secure + secureKey）
+        .route("/reader3/clearInactiveUsers", post(clear_inactive_users))
+        // F-39 手动备份到 WebDAV（书架数据 zip）
+        .route("/reader3/backupToWebdav", post(backup_to_webdav))
+        // F-38 文件管理（home 语义对齐 legacy FileController）
+        .route("/reader3/file/list", get(crate::api::files::list))
+        .route("/reader3/file/get", get(crate::api::files::get))
+        .route("/reader3/file/save", post(crate::api::files::save))
+        .route("/reader3/file/mkdir", post(crate::api::files::mkdir))
+        .route("/reader3/file/download", get(crate::api::files::download))
+        .route(
+            "/reader3/file/upload",
+            post(crate::api::files::upload).layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
+        .route("/reader3/file/delete", post(crate::api::files::delete))
         .route("/reader3/deleteBook", post(delete_book))
         .route("/reader3/saveBook", post(save_book))
         .route("/reader3/saveBookProgress", post(save_book_progress))
@@ -334,6 +355,30 @@ async fn save_book_source(
     if source.book_source_url.is_empty() {
         return Json(ReturnData::err("参数错误"));
     }
+    // F-7 书源数上限（users.book_source_limit；limit<=0 不限制；已存在覆盖不计名额）
+    if let Some(limit) = state.storage.book_source_limit_for(&namespace).await.ok().flatten() {
+        if limit > 0 {
+            let exists = state
+                .storage
+                .find_book_source(&namespace, &source.book_source_url)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if !exists {
+                let count = match state.storage.count_book_sources(&namespace).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("统计书源数失败: {e}");
+                        return Json(ReturnData::err("系统错误"));
+                    }
+                };
+                if count >= limit {
+                    return Json(ReturnData::err("超过书源数上限"));
+                }
+            }
+        }
+    }
     match state.storage.save_book_source(&namespace, &source).await {
         Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
         Err(e) => {
@@ -359,10 +404,115 @@ async fn save_book_sources(
         Ok(s) => s,
         Err(_) => return Json(ReturnData::err("参数错误")),
     };
+    if sources.iter().any(|s| s.book_source_url.is_empty()) {
+        return Json(ReturnData::err("参数错误"));
+    }
+    // F-7 书源数上限：逐条统计新增数（已存在覆盖不计名额），超限整批拒绝
+    if let Some(limit) = state.storage.book_source_limit_for(&namespace).await.ok().flatten() {
+        if limit > 0 {
+            let mut new_count = 0i64;
+            for s in &sources {
+                let exists = state
+                    .storage
+                    .find_book_source(&namespace, &s.book_source_url)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if !exists {
+                    new_count += 1;
+                }
+            }
+            let count = match state.storage.count_book_sources(&namespace).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("统计书源数失败: {e}");
+                    return Json(ReturnData::err("系统错误"));
+                }
+            };
+            if count + new_count > limit {
+                return Json(ReturnData::err("超过书源数上限"));
+            }
+        }
+    }
     match state.storage.save_book_sources(&namespace, &sources).await {
         Ok(_) => Json(ReturnData::ok(serde_json::json!({ "count": sources.len() }))),
         Err(e) => {
             tracing::error!("saveBookSources 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// F-4：POST /reader3/saveFromRemoteSource：远程书源订阅导入
+/// body/query {url} → 抓取 JSON → 校验书源数组 → save_book_sources 批量入库（已存在覆盖）
+async fn save_from_remote_source(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("请输入远程书源链接"));
+    }
+    let headers_map: HashMap<String, String> = HashMap::new();
+    let resp = match crate::service::crawler::fetch(&url, &headers_map, 15, "GET", None, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("saveFromRemoteSource 抓取失败 [{url}]: {e}");
+            return Json(ReturnData::err("远程书源链接错误"));
+        }
+    };
+    // 校验：必须是书源数组（每项含 bookSourceUrl）
+    let json: serde_json::Value = match serde_json::from_str(&resp.body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("书源数据格式错误")),
+    };
+    let sources: Vec<crate::model::BookSource> = match serde_json::from_value(json) {
+        Ok(s) => s,
+        Err(_) => return Json(ReturnData::err("书源数据格式错误")),
+    };
+    if sources.is_empty() || sources.iter().any(|s| s.book_source_url.trim().is_empty()) {
+        return Json(ReturnData::err("书源数据格式错误"));
+    }
+    // F-7 书源数上限（同 saveBookSources）
+    if let Some(limit) = state.storage.book_source_limit_for(&namespace).await.ok().flatten() {
+        if limit > 0 {
+            let mut new_count = 0i64;
+            for s in &sources {
+                let exists = state
+                    .storage
+                    .find_book_source(&namespace, &s.book_source_url)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if !exists {
+                    new_count += 1;
+                }
+            }
+            match state.storage.count_book_sources(&namespace).await {
+                Ok(count) if count + new_count > limit => {
+                    return Json(ReturnData::err("超过书源数上限"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("统计书源数失败: {e}");
+                    return Json(ReturnData::err("系统错误"));
+                }
+            }
+        }
+    }
+    match state.storage.save_book_sources(&namespace, &sources).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::json!({ "count": sources.len() }))),
+        Err(e) => {
+            tracing::error!("saveFromRemoteSource 入库失败: {e}");
             Json(ReturnData::err("保存失败"))
         }
     }
@@ -1005,6 +1155,140 @@ async fn get_bookshelf(
     }
 }
 
+/// F-13：GET/POST /reader3/getShelfBook：书架单书（url 参数；不存在报“书籍不存在”）
+async fn get_shelf_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("书源链接不能为空"));
+    }
+    match state.storage.find_book(&namespace, &url).await {
+        Ok(Some(book)) => Json(ReturnData::ok(
+            serde_json::to_value(book).unwrap_or(serde_json::Value::Null),
+        )),
+        Ok(None) => Json(ReturnData::err("书籍不存在")),
+        Err(e) => {
+            tracing::error!("getShelfBook 失败 [{url}]: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// F-25：POST /reader3/logout：退出登录（清 token，token 立即失效）
+async fn logout(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let _ = body;
+    // 非 secure 模式无会话概念（legacy：不支持的操作）
+    if !state.storage.config.secure {
+        return Json(ReturnData::err("不支持的操作"));
+    }
+    let username = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    match state.storage.logout_user(&username).await {
+        Ok(_) => {
+            tracing::info!("用户退出登录: {username}");
+            Json(ReturnData::ok(serde_json::Value::Null))
+        }
+        Err(e) => {
+            tracing::error!("logout 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// F-34：POST /reader3/clearInactiveUsers：清理不活跃用户（secure + secureKey 校验）
+/// body/query：inactiveDay（默认 0）；简化：仅删 users 行，返回被删用户名列表
+async fn clear_inactive_users(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let config = &state.storage.config;
+    if !config.secure || config.secure_key.is_empty() {
+        return Json(ReturnData::err("不支持的操作"));
+    }
+    // 需登录（legacy checkAuth）
+    let username = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    // secureKey 管理校验（legacy checkManagerAuth）
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let secure_key = param_of(&params, body_json.as_ref(), "secureKey");
+    if secure_key != config.secure_key {
+        return Json(ReturnData {
+            is_success: false,
+            error_msg: "请输入管理密码".to_string(),
+            data: json!("NEED_SECURE_KEY"),
+        });
+    }
+    let inactive_day = params
+        .get("inactiveDay")
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| body_json.as_ref().and_then(|b| b.get("inactiveDay").and_then(|v| v.as_i64())))
+        .unwrap_or(0);
+    let before = now_millis() - inactive_day * 86400 * 1000;
+    match state.storage.clear_inactive_users(before, Some(&username)).await {
+        Ok(deleted) => {
+            tracing::info!("clearInactiveUsers：删除 {} 个不活跃用户: {deleted:?}", deleted.len());
+            Json(ReturnData::ok(json!({
+                "deleted": deleted,
+                "count": deleted.len(),
+            })))
+        }
+        Err(e) => {
+            tracing::error!("clearInactiveUsers 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// F-39：POST /reader3/backupToWebdav：书架数据 zip 打包写入
+/// storage/data/{ns}/webdav/legado/backup-{ts}.zip（secure 模式需开启 webdav 权限）
+async fn backup_to_webdav(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    if state.storage.config.secure {
+        let user = match state.storage.find_user(&namespace).await {
+            Ok(Some(u)) => u,
+            _ => return Json(ReturnData::err("请登录后使用")),
+        };
+        if !user.enable_webdav {
+            return Json(ReturnData::err("未开启webdav功能"));
+        }
+    }
+    match state.storage.create_backup_zip(&namespace).await {
+        Ok(path) => Json(ReturnData::ok(json!({ "path": path }))),
+        Err(e) => {
+            tracing::error!("backupToWebdav 失败 [{namespace}]: {e}");
+            Json(ReturnData::err("备份失败"))
+        }
+    }
+}
+
 /// 未登录返回（兼容 legacy checkAuth 失败：errorMsg=请登录后使用，data=NEED_LOGIN）
 fn login_required() -> ReturnData {
     ReturnData {
@@ -1017,7 +1301,7 @@ fn login_required() -> ReturnData {
 /// 解析命名空间：
 /// - 非 secure → "default"
 /// - secure → 从 query/header 解析 accessToken（username:token）并校验 token，合法则返回用户名
-async fn resolve_namespace(
+pub(crate) async fn resolve_namespace(
     state: &AppState,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
@@ -1942,4 +2226,280 @@ fn webdav_status_404() -> Response {
         .status(StatusCode::NOT_FOUND)
         .body(Body::empty())
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use axum::extract::State as AxumState;
+
+    /// 独立临时目录存储（避免污染真实 storage/reader.db）
+    async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "reader-router-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = crate::AppConfig::from_env();
+        config.work_dir = dir.to_string_lossy().into_owned();
+        let storage = crate::storage::init(&config).await.unwrap();
+        (AppState { storage }, dir)
+    }
+
+    async fn cleanup(state: AppState, dir: std::path::PathBuf) {
+        state.storage.pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn source_json(i: i64) -> serde_json::Value {
+        serde_json::json!({
+            "bookSourceUrl": format!("https://s{i}.com"),
+            "bookSourceName": format!("源{i}"),
+        })
+    }
+
+    /// F-7：saveBookSource / saveBookSources 书源数上限（users.book_source_limit）
+    #[tokio::test]
+    async fn test_save_book_source_limit() {
+        let (state, dir) = test_state("bslimit").await;
+        state
+            .storage
+            .insert_user(&User {
+                username: "default".into(),
+                book_source_limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // 单个保存：前两个成功
+        for i in 1..=2 {
+            let body = Bytes::from(source_json(i).to_string());
+            let ret = save_book_source(
+                AxumState(state.clone()),
+                Query(HashMap::new()),
+                HeaderMap::new(),
+                Some(body),
+            )
+            .await;
+            assert!(ret.0.is_success, "第 {i} 个书源应保存成功: {}", ret.0.error_msg);
+        }
+        // 第三个超限
+        let body = Bytes::from(source_json(3).to_string());
+        let ret = save_book_source(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "超过书源数上限");
+        // 覆盖已存在的不计名额
+        let body = Bytes::from(source_json(1).to_string());
+        let ret = save_book_source(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "覆盖已存在书源应成功");
+
+        // 批量：3 个新源超限整批拒绝
+        let batch = serde_json::json!([source_json(10), source_json(11), source_json(12)]);
+        let ret = save_book_sources(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            Some(Bytes::from(batch.to_string())),
+        )
+        .await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "超过书源数上限");
+        // 上限提到 3：批量 1 个新源 + 已存在源 → 成功
+        state
+            .storage
+            .insert_user(&User {
+                username: "default".into(),
+                book_source_limit: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let batch = serde_json::json!([source_json(1), source_json(10)]);
+        let ret = save_book_sources(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            Some(Bytes::from(batch.to_string())),
+        )
+        .await;
+        assert!(ret.0.is_success, "新增 1 个不超限应成功: {}", ret.0.error_msg);
+
+        // limit=0（无用户行/不限制）→ 放行
+        state
+            .storage
+            .insert_user(&User {
+                username: "default".into(),
+                book_source_limit: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let body = Bytes::from(source_json(20).to_string());
+        let ret = save_book_source(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-13：getShelfBook 返回书架单书 / 不存在报“书籍不存在”
+    #[tokio::test]
+    async fn test_get_shelf_book() {
+        let (state, dir) = test_state("shelf").await;
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://book.com/a".into(),
+                    name: "测试书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let params: HashMap<String, String> =
+            [("url".into(), "https://book.com/a".into())].into_iter().collect();
+        let ret = get_shelf_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data["bookUrl"], "https://book.com/a");
+        assert_eq!(ret.0.data["name"], "测试书");
+
+        let params: HashMap<String, String> =
+            [("url".into(), "https://nope.com".into())].into_iter().collect();
+        let ret = get_shelf_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "书籍不存在");
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-25：logout——非 secure 拒绝；secure 清 token 且 token 立即失效
+    #[tokio::test]
+    async fn test_logout_clears_token() {
+        let (state, dir) = test_state("logout").await;
+        // 非 secure → 不支持的操作
+        let ret = logout(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "不支持的操作");
+
+        // secure：登录用户 logout 后 token 清空、旧 token 失效
+        let mut state = state;
+        state.storage.config.secure = true;
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "tok123".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let params: HashMap<String, String> =
+            [("accessToken".into(), "alice:tok123".into())].into_iter().collect();
+        let ret = logout(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "logout 应成功: {}", ret.0.error_msg);
+        assert!(state.storage.find_user("alice").await.unwrap().unwrap().token.is_empty());
+
+        // 旧 token 再次访问 → NEED_LOGIN
+        let ret = logout(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.data, json!("NEED_LOGIN"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-34：clearInactiveUsers——secureKey 校验 + 仅删超期用户（调用者受保护）
+    #[tokio::test]
+    async fn test_clear_inactive_users() {
+        let (state, dir) = test_state("inactive").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.secure_key = "sk".into();
+        let mk = |name: &str, last: i64| User {
+            username: name.into(),
+            token: "t".into(),
+            last_login_at: last,
+            ..Default::default()
+        };
+        state.storage.insert_user(&mk("old", 1000)).await.unwrap();
+        state.storage.insert_user(&mk("new", now_millis())).await.unwrap();
+
+        // 缺 secureKey → NEED_SECURE_KEY（需先登录，legacy checkAuth 优先）
+        let body = Bytes::from(r#"{"inactiveDay":1}"#);
+        let auth_params: HashMap<String, String> =
+            [("accessToken".into(), "new:t".into())].into_iter().collect();
+        let ret = clear_inactive_users(
+            AxumState(state.clone()),
+            Query(auth_params),
+            HeaderMap::new(),
+            Some(body.clone()),
+        )
+        .await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.data, json!("NEED_SECURE_KEY"));
+
+        // 带 secureKey（登录 accessToken）→ 删除 old，保留 new
+        let params: HashMap<String, String> = [
+            ("accessToken".into(), "new:t".into()),
+            ("secureKey".into(), "sk".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = clear_inactive_users(AxumState(state.clone()), Query(params), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "清理应成功: {}", ret.0.error_msg);
+        assert_eq!(ret.0.data["deleted"], json!(["old"]));
+        assert_eq!(ret.0.data["count"], 1);
+        assert!(state.storage.find_user("old").await.unwrap().is_none());
+        assert!(state.storage.find_user("new").await.unwrap().is_some());
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-39：backupToWebdav——secure 未开启 webdav 拒绝；成功返回 zip 路径
+    #[tokio::test]
+    async fn test_backup_to_webdav() {
+        let (state, dir) = test_state("backup").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t1".into(),
+                enable_webdav: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let params: HashMap<String, String> =
+            [("accessToken".into(), "alice:t1".into())].into_iter().collect();
+        // 未开启 webdav → 拒绝
+        let ret = backup_to_webdav(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "未开启webdav功能");
+        // 开启 webdav → 打包成功，zip 在 webdav/legado 下
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t1".into(),
+                enable_webdav: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ret = backup_to_webdav(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "备份应成功: {}", ret.0.error_msg);
+        let path = ret.0.data["path"].as_str().expect("应返回 zip 路径");
+        assert!(
+            path.contains("legado") && path.contains("backup-") && path.ends_with(".zip"),
+            "路径: {path}"
+        );
+        assert!(std::path::Path::new(path).exists());
+
+        cleanup(state, dir).await;
+    }
 }

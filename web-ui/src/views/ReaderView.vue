@@ -4,8 +4,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getBookshelf, deleteBook } from '@/api/bookshelf'
 import { getBookInfo, getBookToc, getBookContent } from '@/api/books'
+import { loadReplaceRules } from '@/api/replaceRules'
 import { simplized, traditionalized } from '@/utils/chinese'
-import type { Book, BookChapter } from '@/types'
+import type { Book, BookChapter, ReplaceRule } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -84,6 +85,18 @@ const MAX_WEIGHT = 500
 
 const fontSize = ref<number>(18)
 const lineHeight = ref(1.9)
+/** 正文宽度档位（窄/适中/宽——max-width） */
+const WIDTH_OPTIONS = [
+  { label: '窄', value: '720px' },
+  { label: '适中', value: '900px' },
+  { label: '宽', value: '1080px' },
+]
+const contentWidth = ref(WIDTH_OPTIONS[1].value)
+contentWidth.value = localStorage.getItem('reader_content_width') ?? WIDTH_OPTIONS[1].value
+function setWidth(v: string) {
+  contentWidth.value = v
+  localStorage.setItem('reader_content_width', v)
+}
 const paraSpacing = ref(1)
 const fontWeight = ref(400)
 {
@@ -246,6 +259,100 @@ function toggleHan() {
 const hanConvert = (text: string) => (hanTrad.value ? traditionalized(text) : simplized(text))
 const hanTargetLabel = computed(() => (hanTrad.value ? '简' : '繁'))
 
+/* ---------------- 6. 替换规则（localStorage: reader_replace_rules，见 api/replaceRules.ts 契约注释） ---------------- */
+
+const REPLACE_KEY = 'reader_replace_enabled'
+/** 阅读页总开关：是否应用替换规则（默认开；规则页另有每条规则的启用开关） */
+const replaceEnabled = ref(true)
+{
+  const raw = localStorage.getItem(REPLACE_KEY)
+  if (raw === '0') replaceEnabled.value = false
+}
+/** 当前生效的规则（仅 enabled 且 find 非空） */
+const replaceRules = ref<ReplaceRule[]>([])
+
+function refreshReplaceRules() {
+  replaceRules.value = loadReplaceRules().filter((r) => r.enabled && r.find && r.find.trim().length > 0)
+}
+
+/** 逐条 replaceAll（字面替换，非正则）；空 find 已在上层过滤 */
+function applyReplace(text: string): string {
+  let out = text
+  for (const r of replaceRules.value) {
+    out = out.split(r.find).join(r.replace ?? '')
+  }
+  return out
+}
+
+watch(replaceEnabled, (v) => {
+  persist(REPLACE_KEY, v ? '1' : '0')
+  if (v) refreshReplaceRules()
+})
+
+/* ---------------- 7. 听书（浏览器 SpeechSynthesis 极简实现；HttpTTS 源见设置页，后端就绪后接入） ---------------- */
+
+const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window
+const ttsPlaying = ref(false)
+let ttsVoice: SpeechSynthesisVoice | null = null
+
+function pickZhVoice(): SpeechSynthesisVoice | null {
+  const voices = window.speechSynthesis.getVoices()
+  const zh = voices.filter((v) => v.lang.toLowerCase().startsWith('zh'))
+  if (zh.length === 0) return null
+  return zh.find((v) => v.lang.toLowerCase() === 'zh-cn') ?? zh[0]
+}
+
+if (ttsSupported) {
+  // voices 异步加载：首次 getVoices 可能为空，监听 onvoiceschanged 补充
+  ttsVoice = pickZhVoice()
+  window.speechSynthesis.onvoiceschanged = () => {
+    ttsVoice = pickZhVoice()
+  }
+}
+
+function stopTts() {
+  if (!ttsSupported) return
+  window.speechSynthesis.cancel()
+  ttsPlaying.value = false
+}
+
+function startTts() {
+  if (!ttsSupported) {
+    ElMessage.info('当前浏览器不支持语音朗读')
+    return
+  }
+  const text = paragraphs.value.join('。')
+  if (!text) {
+    ElMessage.info('本章暂无内容可朗读')
+    return
+  }
+  // Chrome 兼容：cancel 后立即 speak 可能被吞，稍作延迟再播
+  window.speechSynthesis.cancel()
+  window.setTimeout(() => {
+    if (!ttsVoice) ttsVoice = pickZhVoice()
+    const u = new SpeechSynthesisUtterance(text)
+    u.lang = ttsVoice?.lang ?? 'zh-CN'
+    if (ttsVoice) u.voice = ttsVoice
+    u.rate = 1
+    u.onend = () => {
+      ttsPlaying.value = false
+    }
+    u.onerror = () => {
+      ttsPlaying.value = false
+    }
+    window.speechSynthesis.speak(u)
+    ttsPlaying.value = true
+  }, 60)
+}
+
+function toggleTts() {
+  if (ttsPlaying.value) stopTts()
+  else startTts()
+}
+
+/** 切换章节 / 离开页面时停止朗读 */
+watch(chapterIndex, () => stopTts())
+
 /* ---------------- 目录/章节 ---------------- */
 
 /** 有效章节（跳过卷标题分隔行） */
@@ -264,7 +371,7 @@ const paragraphs = computed(() =>
     .split(/\n+/)
     .map((s) => s.trim())
     .filter(Boolean)
-    .map((p) => hanConvert(p)),
+    .map((p) => applyReplace(hanConvert(p))),
 )
 const displayBookName = computed(() => hanConvert(bookName.value))
 const displayChapterTitle = computed(() => (currentChapter.value ? hanConvert(currentChapter.value.title) : ''))
@@ -450,6 +557,8 @@ async function init() {
     if (!found.tocUrl) found.tocUrl = found.bookUrl
     shelfBook.value = found
     bookName.value = found.name
+    // 替换规则：进入阅读页时读取一次（localStorage 占位；后端就绪后走 GET /reader3/getReplaceRules）
+    if (replaceEnabled.value) refreshReplaceRules()
 
     // 目录 + 详情并行拉取
     const [tocRes, infoRes] = await Promise.allSettled([
@@ -538,6 +647,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('touchend', onTouchEnd)
   window.clearTimeout(saveTimer)
   window.clearTimeout(removeTimer)
+  stopTts()
   saveProgress()
 })
 </script>
@@ -584,6 +694,16 @@ onBeforeUnmount(() => {
         </button>
         <button class="font-btn" type="button" :title="`主题：${theme}（点击切换）`" @click="cycleTheme">
           {{ THEME_LABEL[theme] }}
+        </button>
+        <button
+          class="font-btn tts-btn"
+          type="button"
+          :class="{ active: ttsPlaying }"
+          :title="ttsPlaying ? '停止朗读' : '听书（浏览器语音朗读本章）'"
+          :disabled="!ttsSupported"
+          @click="toggleTts"
+        >
+          {{ ttsPlaying ? '停止' : '听书' }}
         </button>
         <button class="font-btn" type="button" title="排版设置" @click="settingsOpen = true">
           排版
@@ -635,6 +755,7 @@ onBeforeUnmount(() => {
             fontSize: `${fontSize}px`,
             lineHeight: `${lineHeight}`,
             fontWeight: `${fontWeight}`,
+            maxWidth: contentWidth,
           }"
         >
           <p
@@ -790,6 +911,41 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <div class="set-row">
+            <span class="set-label">替换规则</span>
+            <div class="set-controls">
+              <button
+                class="switch"
+                :class="{ on: replaceEnabled }"
+                type="button"
+                role="switch"
+                :aria-checked="replaceEnabled"
+                :title="replaceEnabled ? '关闭正文替换' : '开启正文替换'"
+                @click="replaceEnabled = !replaceEnabled"
+              >
+                <span class="switch-knob"></span>
+              </button>
+              <button class="manage-link" type="button" title="管理替换规则" @click="router.push('/rules')">
+                管理
+              </button>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <span class="set-label">宽度</span>
+            <div class="seg-row">
+              <button
+                v-for="opt in WIDTH_OPTIONS"
+                :key="opt.value"
+                type="button"
+                class="seg-btn"
+                :class="{ active: contentWidth === opt.value }"
+                @click="setWidth(opt.value)"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
+          </div>
           <div class="set-foot">
             <button class="text-btn" type="button" @click="resetTypography">恢复默认</button>
             <button
@@ -918,6 +1074,11 @@ onBeforeUnmount(() => {
 .font-btn:hover:not(:disabled) {
   color: var(--accent);
   border-color: var(--accent);
+}
+.font-btn.tts-btn.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 .font-btn:disabled {
   opacity: 0.4;
@@ -1056,9 +1217,11 @@ onBeforeUnmount(() => {
   transform: translateX(-50%);
   z-index: 30;
   width: min(680px, 100%);
-  padding: 0 24px 10px;
+  padding: 10px 24px 10px;
   border: none;
-  background: none;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.04);
   cursor: pointer;
   font-family: inherit;
   text-align: center;
@@ -1087,6 +1250,31 @@ onBeforeUnmount(() => {
 }
 .progress-bar:hover .progress-text {
   color: var(--accent);
+}
+
+.seg-row {
+  display: flex;
+  gap: 6px;
+}
+.seg-btn {
+  padding: 4px 14px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-2);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.seg-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.seg-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 
 /* ================= 弹层（设置 / 跳章） ================= */
@@ -1217,6 +1405,62 @@ onBeforeUnmount(() => {
 .set-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+/* 极简开关（替换规则） */
+.switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: none;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.switch .switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-3);
+  transition:
+    transform 0.2s ease,
+    background-color 0.2s ease;
+}
+.switch:hover {
+  border-color: var(--accent);
+}
+.switch.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.switch.on .switch-knob {
+  transform: translateX(16px);
+  background: var(--accent);
+}
+.manage-link {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
+.manage-link:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 .set-value {
   min-width: 34px;

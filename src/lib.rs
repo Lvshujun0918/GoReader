@@ -84,6 +84,8 @@ impl AppConfig {
     /// 启动服务（axum）
     pub async fn serve(self) -> anyhow::Result<()> {
         let storage = storage::init(&self).await?;
+        // F-35：定时书架更新检查（每 10 分钟扫描 can_update=1 的书）
+        storage::spawn_shelf_update_job(storage.clone());
         let app = api::router(self.clone(), storage);
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         tracing::info!("reader-dev (Rust) listening on {addr}");

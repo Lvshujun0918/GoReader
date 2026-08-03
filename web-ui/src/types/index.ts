@@ -114,6 +114,36 @@ export interface RssArticle {
   [key: string]: unknown
 }
 
+/** 文件管理（/reader3/file/list → FileItem，camelCase；isDirectory=目录） */
+export interface FileItem {
+  name: string
+  size: number
+  path: string
+  lastModified: number | string
+  isDirectory: boolean
+  [key: string]: unknown
+}
+
+/** 替换规则（当前 localStorage: reader_replace_rules；后端就绪后 ↔ POST /reader3/saveReplaceRule 等，见 api/replaceRules.ts 契约注释） */
+export interface ReplaceRule {
+  id: string
+  name: string
+  find: string
+  replace: string
+  enabled: boolean
+  order: number
+  [key: string]: unknown
+}
+
+/** HttpTTS 听书源（当前 localStorage: reader_http_tts_list；后端就绪后 ↔ POST /reader3/saveHttpTTS 等，见 api/httpTts.ts 契约注释；type 0=在线合成 / 1=本地引擎预留） */
+export interface HttpTts {
+  id: string
+  name: string
+  url: string
+  type: number
+  [key: string]: unknown
+}
+
 /** 书源（/reader3/getBookSources → BookSource，legado 兼容 camelCase） */
 export interface BookSource {
   bookSourceUrl: string

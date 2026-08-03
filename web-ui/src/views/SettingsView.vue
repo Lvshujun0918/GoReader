@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
+import { deleteHttpTts, getHttpTtsList, saveHttpTts } from '@/api/httpTts'
 import { useUserStore } from '@/stores/user'
+import type { HttpTts } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
@@ -33,6 +35,99 @@ async function logout() {
   ElMessage.success('已退出登录')
   void router.replace('/login')
 }
+/* ================= 听书设置（HttpTTS，localStorage 占位，见 api/httpTts.ts 契约注释） ================= */
+
+const TTS_TYPE_LABEL: Record<number, string> = { 0: '在线合成', 1: '本地引擎' }
+const ttsList = ref<HttpTts[]>([])
+
+async function loadTtsList() {
+  try {
+    const res = await getHttpTtsList()
+    ttsList.value = res.data ?? []
+  } catch {
+    ttsList.value = []
+  }
+}
+
+function ttsTypeLabel(t: number): string {
+  return TTS_TYPE_LABEL[t] ?? `类型 ${t}`
+}
+
+function newTtsId(): string {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+}
+
+/* 新增弹窗 */
+const ttsDialogOpen = ref(false)
+const ttsBusy = ref(false)
+const ttsForm = ref<{ name: string; url: string; type: number }>({ name: '', url: '', type: 0 })
+
+function openAddTts() {
+  ttsForm.value = { name: '', url: '', type: 0 }
+  ttsDialogOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeAddTts() {
+  if (ttsBusy.value) return
+  ttsDialogOpen.value = false
+  document.body.style.overflow = ''
+}
+
+async function confirmAddTts() {
+  if (ttsBusy.value) return
+  const url = ttsForm.value.url.trim()
+  if (!url) {
+    ElMessage.warning('URL 不能为空')
+    return
+  }
+  ttsBusy.value = true
+  try {
+    // 当前为 localStorage 占位；后端就绪后走 POST /reader3/saveHttpTTS（见 api/httpTts.ts）
+    await saveHttpTts({
+      id: newTtsId(),
+      name: ttsForm.value.name.trim() || url,
+      url,
+      type: ttsForm.value.type,
+    })
+    await loadTtsList()
+    closeAddTts()
+  } finally {
+    ttsBusy.value = false
+  }
+}
+
+/* 删除 */
+const deletingTts = ref<HttpTts | null>(null)
+const deleteTtsBusy = ref(false)
+
+function askDeleteTts(t: HttpTts) {
+  deletingTts.value = t
+  document.body.style.overflow = 'hidden'
+}
+
+async function confirmDeleteTts() {
+  const t = deletingTts.value
+  if (!t || deleteTtsBusy.value) return
+  deleteTtsBusy.value = true
+  try {
+    // 当前为 localStorage 占位；后端就绪后走 POST /reader3/deleteHttpTTS（见 api/httpTts.ts）
+    await deleteHttpTts(t.id)
+    ttsList.value = ttsList.value.filter((x) => x.id !== t.id)
+    closeDeleteTts()
+  } catch {
+    // 已提示
+  } finally {
+    deleteTtsBusy.value = false
+  }
+}
+
+function closeDeleteTts() {
+  deletingTts.value = null
+  document.body.style.overflow = ''
+}
+
+onMounted(loadTtsList)
 </script>
 
 <template>
@@ -48,6 +143,7 @@ async function logout() {
         <button class="nav-link" type="button" @click="router.push('/')">书架</button>
         <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
         <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
+        <button class="nav-link" type="button" @click="router.push('/rules')">替换规则</button>
         <button class="nav-link active" type="button" @click="router.push('/settings')">设置</button>
         <span class="user-chip">{{ store.username || '未登录' }}</span>
       </div>
@@ -93,6 +189,35 @@ async function logout() {
         </div>
       </section>
 
+      <!-- 听书设置 -->
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">听书设置</h2>
+          <span class="card-sub">HttpTTS 朗读源 · 本地占位存储（后端就绪后同步，见 api/httpTts.ts 契约注释）</span>
+          <button class="row-action" type="button" @click="openAddTts">新增听书源</button>
+        </div>
+        <ul v-if="ttsList.length" class="tts-list">
+          <li v-for="t in ttsList" :key="t.id" class="tts-row">
+            <span class="tts-name" :title="t.name">{{ t.name }}</span>
+            <span class="tts-url mono" :title="t.url">{{ t.url }}</span>
+            <span class="tts-type">{{ ttsTypeLabel(t.type) }}</span>
+            <button class="tts-del" type="button" title="删除听书源" @click="askDeleteTts(t)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 7h16" />
+                <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                <path d="M6.5 7l.8 12a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12" />
+              </svg>
+            </button>
+          </li>
+        </ul>
+        <p v-else class="tts-empty">暂无听书源。当前阅读页「听书」使用浏览器自带语音朗读。</p>
+        <div class="row">
+          <span class="row-label">阅读页听书</span>
+          <span class="row-value">浏览器语音（SpeechSynthesis）</span>
+          <span class="row-hint">阅读页顶栏「听书」按钮</span>
+        </div>
+      </section>
+
       <!-- 关于 -->
       <section class="card">
         <h2 class="card-title">关于</h2>
@@ -106,6 +231,67 @@ async function logout() {
         </div>
       </section>
     </main>
+    <!-- 新增听书源弹窗 -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="ttsDialogOpen" class="dlg-overlay" @click.self="closeAddTts">
+          <div class="dlg" role="dialog" aria-modal="true" aria-label="新增听书源" tabindex="-1" @keydown.esc="closeAddTts">
+            <div class="dlg-head">
+              <h2 class="dlg-title">新增听书源</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="ttsBusy" @click="closeAddTts">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="confirmAddTts">
+              <label class="field">
+                <span class="field-label">URL<em>*</em></span>
+                <input v-model="ttsForm.url" class="field-input" type="text" placeholder="https://…/tts?text=" spellcheck="false" />
+              </label>
+              <label class="field">
+                <span class="field-label">名称</span>
+                <input v-model="ttsForm.name" class="field-input" type="text" placeholder="留空则使用 URL" maxlength="40" spellcheck="false" />
+              </label>
+              <label class="field">
+                <span class="field-label">类型</span>
+                <select v-model.number="ttsForm.type" class="field-input field-select">
+                  <option :value="0">0 · 在线合成</option>
+                  <option :value="1">1 · 本地引擎</option>
+                </select>
+              </label>
+              <p class="field-tip">后端就绪后接入朗读（契约 POST /reader3/saveHttpTTS，见 api/httpTts.ts）</p>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="ttsBusy" @click="closeAddTts">取消</button>
+                <button class="accent-btn" type="submit" :disabled="ttsBusy || !ttsForm.url.trim()">
+                  {{ ttsBusy ? '保存中…' : '保存' }}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 删除听书源确认弹窗 -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="deletingTts" class="dlg-overlay" @click.self="closeDeleteTts">
+          <div class="dlg dlg-confirm" role="alertdialog" aria-modal="true" aria-label="删除听书源" tabindex="-1" @keydown.esc="closeDeleteTts">
+            <div class="dlg-head">
+              <h2 class="dlg-title">删除听书源</h2>
+            </div>
+            <p class="confirm-text">确定删除「{{ deletingTts.name }}」吗？此操作不可恢复。</p>
+            <div class="dlg-actions">
+              <button class="ghost-btn" type="button" :disabled="deleteTtsBusy" @click="closeDeleteTts">取消</button>
+              <button class="danger-btn" type="button" :disabled="deleteTtsBusy" @click="confirmDeleteTts">
+                {{ deleteTtsBusy ? '删除中…' : '删除' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -222,6 +408,308 @@ async function logout() {
   letter-spacing: 1px;
   color: var(--text-3);
 }
+.card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.card-head .card-title {
+  margin: 0;
+}
+.card-sub {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+
+/* 听书源列表 */
+.tts-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tts-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.tts-name {
+  flex-shrink: 0;
+  max-width: 140px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tts-url {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tts-type {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.tts-del {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.tts-del:hover {
+  color: #cf4444;
+  background: rgba(207, 68, 68, 0.08);
+}
+.tts-del svg {
+  width: 12px;
+  height: 12px;
+}
+.tts-empty {
+  margin: 12px 0 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+
+/* ================= 弹窗（新增 / 删除听书源） ================= */
+.dlg-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(24, 24, 27, 0.35);
+}
+.dlg {
+  width: min(420px, 100%);
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+  outline: none;
+}
+.dlg-confirm {
+  width: min(360px, 100%);
+}
+.dlg-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.dlg-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-1);
+}
+.dlg-close {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.dlg-close:hover:not(:disabled) {
+  color: var(--text-1);
+  background: var(--hover);
+}
+.dlg-close:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+.dlg-close svg {
+  width: 13px;
+  height: 13px;
+}
+.dlg-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.field-label {
+  font-size: 12.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-2);
+}
+.field-label em {
+  font-style: normal;
+  color: #cf4444;
+  margin-left: 2px;
+}
+.field-input {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+.field-input::placeholder {
+  color: var(--text-3);
+  font-weight: 300;
+}
+.field-input:focus {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+.field-select {
+  cursor: pointer;
+}
+.field-tip {
+  margin: -4px 0 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.dlg-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 6px;
+}
+.ghost-btn {
+  padding: 7px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
+.ghost-btn:hover:not(:disabled) {
+  color: var(--text-1);
+  border-color: var(--border-strong);
+}
+.accent-btn {
+  padding: 7px 18px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease;
+}
+.accent-btn:hover:not(:disabled) {
+  background: var(--accent-deep);
+  border-color: var(--accent-deep);
+}
+.ghost-btn:disabled,
+.accent-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.danger-btn {
+  padding: 7px 18px;
+  border-radius: var(--radius);
+  border: 1px solid #cf4444;
+  background: none;
+  color: #cf4444;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease;
+}
+.danger-btn:hover:not(:disabled) {
+  background: rgba(207, 68, 68, 0.08);
+}
+.danger-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.confirm-text {
+  margin: 0 0 18px;
+  font-size: 13px;
+  font-weight: 300;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+.dlg-enter-active,
+.dlg-leave-active {
+  transition: opacity 0.2s ease;
+}
+.dlg-enter-from,
+.dlg-leave-to {
+  opacity: 0;
+}
+.dlg-enter-active .dlg,
+.dlg-leave-active .dlg {
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+.dlg-enter-from .dlg,
+.dlg-leave-to .dlg {
+  opacity: 0;
+  transform: translateY(6px);
+}
 .row {
   display: flex;
   align-items: center;
@@ -252,6 +740,9 @@ async function logout() {
 .row-value.mono {
   font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
   font-size: 12px;
+}
+.mono {
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
 }
 .row-hint {
   flex-shrink: 0;

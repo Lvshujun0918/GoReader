@@ -41,6 +41,12 @@ const router = createRouter({
       meta: { title: '书源管理' },
     },
     {
+      path: '/rules',
+      name: 'rules',
+      component: () => import('@/views/ReplaceRuleView.vue'),
+      meta: { title: '替换规则' },
+    },
+    {
       path: '/rss',
       name: 'rss',
       component: () => import('@/views/RssView.vue'),
@@ -51,6 +57,12 @@ const router = createRouter({
       name: 'settings',
       component: () => import('@/views/SettingsView.vue'),
       meta: { title: '设置' },
+    },
+    {
+      path: '/files',
+      name: 'files',
+      component: () => import('@/views/FileManageView.vue'),
+      meta: { title: '文件' },
     },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
