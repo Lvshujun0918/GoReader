@@ -322,6 +322,15 @@ impl Storage {
         Ok(r.rows_affected())
     }
 
+    /// 清空命名空间全部书源
+    pub async fn delete_all_book_sources(&self, ns: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM book_sources WHERE user_namespace = ?1")
+            .bind(ns)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     /// 用户总数（注册上限校验）
     pub async fn count_users(&self) -> Result<i64> {
         let count = sqlx::query_scalar("SELECT COUNT(*) FROM users")

@@ -55,7 +55,13 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     axum::Router::new()
         .route("/health", get(health))
         .route("/reader3/getBookshelf", get(get_bookshelf))
-        .route("/reader3/getBookSources", get(get_book_sources))
+        .route("/reader3/getBookSources", get(get_book_sources).post(get_book_sources))
+        .route("/reader3/getBookSource", get(get_book_source).post(get_book_source))
+        .route("/reader3/saveBookSource", post(save_book_source))
+        .route("/reader3/saveBookSources", post(save_book_sources))
+        .route("/reader3/deleteBookSource", post(delete_book_source))
+        .route("/reader3/deleteBookSources", post(delete_book_sources))
+        .route("/reader3/deleteAllBookSources", post(delete_all_book_sources))
         .route("/reader3/searchBook", get(search_book).post(search_book))
         .route("/reader3/searchBookMulti", get(search_book_multi).post(search_book_multi))
         .route("/reader3/getBookInfo", get(get_book_info).post(get_book_info))
@@ -233,6 +239,162 @@ async fn get_book_sources(
         Err(e) => {
             tracing::error!("getBookSources [{namespace}] 失败: {e}");
             Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST/GET /reader3/getBookSource：单个书源（url 参数）
+async fn get_book_source(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "bookSourceUrl");
+    let url = if url.is_empty() {
+        param_of(&params, body_json.as_ref(), "url")
+    } else {
+        url
+    };
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.find_book_source(&namespace, &url).await {
+        Ok(Some(s)) => Json(ReturnData::ok(serde_json::to_value(s).unwrap_or(serde_json::Value::Null))),
+        Ok(None) => Json(ReturnData::err("书源不存在")),
+        Err(_) => Json(ReturnData::err("系统错误")),
+    }
+}
+
+/// POST /reader3/saveBookSource：保存单个书源（body = 完整书源 JSON）
+async fn save_book_source(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else { return Json(ReturnData::err("参数错误")) };
+    let source: crate::model::BookSource = match serde_json::from_slice(&body) {
+        Ok(s) => s,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    if source.book_source_url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.save_book_source(&namespace, &source).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveBookSource 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/saveBookSources：批量保存（body = 书源数组）
+async fn save_book_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else { return Json(ReturnData::err("参数错误")) };
+    let sources: Vec<crate::model::BookSource> = match serde_json::from_slice(&body) {
+        Ok(s) => s,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    match state.storage.save_book_sources(&namespace, &sources).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::json!({ "count": sources.len() }))),
+        Err(e) => {
+            tracing::error!("saveBookSources 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/deleteBookSource：删除书源（body/query bookSourceUrl）
+async fn delete_book_source(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "bookSourceUrl");
+    let url = if url.is_empty() {
+        param_of(&params, body_json.as_ref(), "url")
+    } else {
+        url
+    };
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_book_source(&namespace, &url).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("deleteBookSource 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+/// POST /reader3/deleteBookSources：批量删除（body = [bookSourceUrl]）
+async fn delete_book_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else { return Json(ReturnData::err("参数错误")) };
+    let urls: Vec<String> = match serde_json::from_slice(&body) {
+        Ok(u) => u,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let mut deleted = 0u64;
+    for url in &urls {
+        if let Ok(n) = state.storage.delete_book_source(&namespace, url).await {
+            deleted += n;
+        }
+    }
+    Json(ReturnData::ok(serde_json::json!({ "deleted": deleted })))
+}
+
+/// POST /reader3/deleteAllBookSources：清空用户书源
+async fn delete_all_book_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    match state.storage.delete_all_book_sources(&namespace).await {
+        Ok(n) => Json(ReturnData::ok(serde_json::json!({ "deleted": n }))),
+        Err(e) => {
+            tracing::error!("deleteAllBookSources 失败: {e}");
+            Json(ReturnData::err("删除失败"))
         }
     }
 }
