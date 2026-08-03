@@ -168,6 +168,20 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS book_chapters (
+            book_url TEXT NOT NULL,
+            chapter_index INTEGER NOT NULL,
+            title TEXT DEFAULT '',
+            content TEXT,
+            PRIMARY KEY (book_url, chapter_index)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     // 幂等补列（兼容旧库：缺列则 ALTER TABLE 补上）
     let columns = [
         ("users", &["token_map", "raw_json"][..]),
@@ -331,7 +345,165 @@ impl Storage {
         Ok(r.rows_affected())
     }
 
-    /// 用户总数（注册上限校验）
+    /// 保存章节（本地书）
+    pub async fn save_chapters(&self, book_url: &str, chapters: &[(String, String)]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (i, (title, content)) in chapters.iter().enumerate() {
+            sqlx::query(
+                "INSERT OR REPLACE INTO book_chapters (book_url, chapter_index, title, content) VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(book_url)
+            .bind(i as i64)
+            .bind(title)
+            .bind(content)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 本地书章节列表
+    pub async fn list_chapters(&self, book_url: &str) -> Result<Vec<(i64, String)>> {
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            "SELECT chapter_index, title FROM book_chapters WHERE book_url = ?1 ORDER BY chapter_index",
+        )
+        .bind(book_url)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 章节正文
+    pub async fn get_chapter_content(&self, book_url: &str, index: i64) -> Result<Option<String>> {
+        let r: Option<(String,)> = sqlx::query_as(
+            "SELECT content FROM book_chapters WHERE book_url = ?1 AND chapter_index = ?2",
+        )
+        .bind(book_url)
+        .bind(index)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    /// 删除本地书（含章节）
+    pub async fn delete_local_book(&self, book_url: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
+            .bind(book_url)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM books WHERE book_url = ?1")
+            .bind(book_url)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 删除书（书源书或本地书——本地书含章节）
+    pub async fn delete_book(&self, ns: &str, book_url: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
+            .bind(book_url)
+            .execute(&mut *tx)
+            .await?;
+        let r = sqlx::query("DELETE FROM books WHERE user_namespace = ?1 AND book_url = ?2")
+            .bind(ns)
+            .bind(book_url)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 更新书字段（编辑：name/author/coverUrl/group）
+    pub async fn update_book(
+        &self,
+        ns: &str,
+        book_url: &str,
+        name: Option<&str>,
+        author: Option<&str>,
+        cover_url: Option<&str>,
+        group: Option<i64>,
+    ) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE books SET name = COALESCE(?3, name), author = COALESCE(?4, author),              cover_url = COALESCE(?5, cover_url), group_name = COALESCE(?6, group_name)              WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .bind(name)
+        .bind(author)
+        .bind(cover_url)
+        .bind(group)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 本地书入库（books + 章节）
+    pub async fn save_local_book(
+        &self,
+        ns: &str,
+        info: &crate::model::book_chapter::BookInfo,
+        imported: &crate::service::local_book::ImportedBook,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"INSERT OR REPLACE INTO books
+            (book_url, name, author, kind, intro, language, publisher, published_at,
+             cover_url, toc_url, origin, origin_name, group_name, type, user_namespace, created_at)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,1,?13,?14)"#,
+        )
+        .bind(&info.book_url)
+        .bind(&info.name)
+        .bind(&info.author)
+        .bind(&info.kind)
+        .bind(&info.intro)
+        .bind(&info.language)
+        .bind(&info.publisher)
+        .bind(&info.published_at)
+        .bind(&info.cover_url)
+        .bind(&info.toc_url)
+        .bind(&info.origin)
+        .bind(&info.origin_name)
+        .bind(ns)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&mut *tx)
+        .await?;
+        let chapters: Vec<(String, String)> = imported
+            .chapters
+            .iter()
+            .map(|c| (c.title.clone(), c.content.clone()))
+            .collect();
+        for (i, (title, content)) in chapters.iter().enumerate() {
+            sqlx::query(
+                "INSERT OR REPLACE INTO book_chapters (book_url, chapter_index, title, content) VALUES (?1,?2,?3,?4)",
+            )
+            .bind(&info.book_url)
+            .bind(i as i64)
+            .bind(title)
+            .bind(content)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 更新封面 URL（导入后写封面文件）
+    pub async fn update_book_cover(&self, ns: &str, book_url: &str, cover_url: &str) -> Result<u64> {
+        let r = sqlx::query("UPDATE books SET cover_url = ?3 WHERE user_namespace = ?1 AND book_url = ?2")
+            .bind(ns)
+            .bind(book_url)
+            .bind(cover_url)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 本地书入库（books + 章节）
+        /// 用户总数（注册上限校验）
     pub async fn count_users(&self) -> Result<i64> {
         let count = sqlx::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(&self.pool)
@@ -386,7 +558,7 @@ impl Storage {
             SELECT *
             FROM books
             WHERE user_namespace = ?1
-            ORDER BY rowid ASC
+            ORDER BY dur_chapter_time DESC, rowid DESC
             "#,
         )
         .bind(namespace)

@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import LogoMark from '@/components/LogoMark.vue'
 import { getBookshelf } from '@/api/bookshelf'
+import { uploadLocalBook } from '@/api/upload'
 import { useUserStore } from '@/stores/user'
 import type { Book } from '@/types'
 
@@ -14,6 +15,145 @@ const loading = ref(true)
 const refreshing = ref(false)
 const keyword = ref('')
 const failedCovers = ref<Set<string>>(new Set())
+
+/* ================= 导入本地书 ================= */
+interface ImportItem {
+  file: File
+  status: 'pending' | 'uploading' | 'done' | 'error'
+  progress: number
+  error?: string
+}
+
+const importOpen = ref(false)
+const dialogRef = ref<HTMLElement | null>(null)
+const fileInput = ref<HTMLInputElement | null>(null)
+const isDragOver = ref(false)
+const uploadBusy = ref(false)
+const uploadIndex = ref(0)
+const importDone = ref(false)
+const importSummary = ref('')
+const acceptTip = ref('')
+const importItems = ref<ImportItem[]>([])
+
+/** 整体进度：按文件大小加权 */
+const totalProgress = computed(() => {
+  const items = importItems.value
+  if (!items.length) return 0
+  const totalSize = items.reduce((s, it) => s + it.file.size, 0) || 1
+  const loaded = items.reduce((s, it) => s + (it.file.size * it.progress) / 100, 0)
+  return Math.min(99, Math.round((loaded / totalSize) * 100))
+})
+const hasPending = computed(() => importItems.value.some((it) => it.status === 'pending'))
+const hasPendingCount = computed(() => importItems.value.filter((it) => it.status === 'pending').length)
+const failedCount = computed(() => importItems.value.filter((it) => it.status === 'error').length)
+
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+function isSupported(file: File): boolean {
+  const name = file.name.toLowerCase()
+  return (
+    name.endsWith('.epub') ||
+    name.endsWith('.txt') ||
+    file.type === 'application/epub+zip' ||
+    file.type === 'text/plain' ||
+    file.type.startsWith('text/')
+  )
+}
+
+function openImport() {
+  importOpen.value = true
+  uploadBusy.value = false
+  importDone.value = false
+  importSummary.value = ''
+  acceptTip.value = ''
+  importItems.value = []
+  document.body.style.overflow = 'hidden'
+  void nextTick(() => dialogRef.value?.focus())
+}
+
+function closeImport() {
+  if (uploadBusy.value) return
+  importOpen.value = false
+  document.body.style.overflow = ''
+}
+
+function addFiles(files: File[]) {
+  if (uploadBusy.value) return
+  const valid = files.filter(isSupported)
+  const ignored = files.length - valid.length
+  for (const f of valid) importItems.value.push({ file: f, status: 'pending', progress: 0 })
+  acceptTip.value = ignored > 0 ? `已忽略 ${ignored} 个不支持的文件（仅支持 .epub / .txt）` : ''
+  if (valid.length > 0) {
+    importDone.value = false
+    importSummary.value = ''
+  }
+}
+
+function onPick(e: Event) {
+  const input = e.target as HTMLInputElement
+  addFiles(Array.from(input.files ?? []))
+  input.value = '' // 清空以便重复选择同一文件
+}
+
+function onDragOver(e: DragEvent) {
+  e.preventDefault()
+  isDragOver.value = true
+}
+
+function onDragLeave(e: DragEvent) {
+  const cur = e.currentTarget as HTMLElement | null
+  if (!cur || !cur.contains(e.relatedTarget as Node | null)) isDragOver.value = false
+}
+
+function onDrop(e: DragEvent) {
+  e.preventDefault()
+  isDragOver.value = false
+  if (uploadBusy.value) return
+  addFiles(Array.from(e.dataTransfer?.files ?? []))
+}
+
+function removeItem(i: number) {
+  if (uploadBusy.value) return
+  importItems.value.splice(i, 1)
+}
+
+/** 逐个上传（每个文件一次 multipart POST），完成后自动刷新书架 */
+async function startUpload() {
+  if (uploadBusy.value || importItems.value.length === 0) return
+  uploadBusy.value = true
+  importDone.value = false
+  let ok = 0
+  for (let i = 0; i < importItems.value.length; i++) {
+    const item = importItems.value[i]
+    uploadIndex.value = i
+    item.status = 'uploading'
+    item.progress = 0
+    try {
+      await uploadLocalBook(item.file, (p) => (item.progress = p))
+      item.status = 'done'
+      item.progress = 100
+      ok++
+    } catch (err) {
+      item.status = 'error'
+      item.error = err instanceof Error ? err.message : '导入失败'
+    }
+  }
+  uploadBusy.value = false
+  importDone.value = true
+  const failed = importItems.value.length - ok
+  importSummary.value =
+    failed > 0 ? `导入完成：${ok} 本成功，${failed} 本失败` : `导入完成，共 ${ok} 本`
+  await load() // 刷新书架（getBookshelf）
+  if (failed === 0) window.setTimeout(() => closeImport(), 800)
+}
+
+onBeforeUnmount(() => {
+  document.body.style.overflow = ''
+})
 
 /** 封面占位 = 莫兰迪低饱和纯色块（按书名 hash 取色） */
 const MORANDI = [
@@ -141,6 +281,14 @@ onMounted(() => load())
       <div class="section-head">
         <h1 class="section-title">我的书架</h1>
         <span class="count">{{ books.length }} 本</span>
+        <button class="import-btn" type="button" title="导入本地书" @click="openImport">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 16V4" />
+            <path d="M7 9l5-5 5 5" />
+            <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+          </svg>
+          <span>导入本地书</span>
+        </button>
         <button
           class="refresh-btn"
           type="button"
@@ -197,6 +345,117 @@ onMounted(() => load())
         </div>
       </div>
     </main>
+
+    <!-- 导入本地书弹窗（自写轻量，无 Element Plus 重组件） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="importOpen" class="dlg-overlay" @click.self="closeImport">
+          <div
+            ref="dialogRef"
+            class="dlg"
+            role="dialog"
+            aria-modal="true"
+            aria-label="导入本地书籍"
+            tabindex="-1"
+            @keydown.esc="closeImport"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">导入本地书籍</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="uploadBusy" @click="closeImport">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+
+            <!-- 虚线拖拽区：点击选择 / 拖入文件 -->
+            <div
+              class="dropzone"
+              :class="{ over: isDragOver, busy: uploadBusy }"
+              @click="!uploadBusy && fileInput?.click()"
+              @dragover="onDragOver"
+              @dragleave="onDragLeave"
+              @drop="onDrop"
+            >
+              <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 16V4" />
+                <path d="M7 9l5-5 5 5" />
+                <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+              </svg>
+              <p class="dz-text">点击选择文件，或将文件拖拽到此处</p>
+              <p class="dz-sub">支持 .epub / .txt · 可多选</p>
+              <input
+                ref="fileInput"
+                class="file-input"
+                type="file"
+                accept=".epub,.txt,application/epub+zip,text/plain"
+                multiple
+                @change="onPick"
+              />
+            </div>
+            <p v-if="acceptTip" class="accept-tip">{{ acceptTip }}</p>
+
+            <!-- 文件列表：逐个状态 + 细字进度 -->
+            <ul v-if="importItems.length" class="file-list">
+              <li v-for="(item, i) in importItems" :key="`${item.file.name}-${i}`" class="file-row">
+                <span class="file-name" :title="item.file.name">{{ item.file.name }}</span>
+                <span class="file-size">{{ fmtSize(item.file.size) }}</span>
+                <span class="file-state" :class="item.status">
+                  <template v-if="item.status === 'pending'">待导入</template>
+                  <template v-else-if="item.status === 'uploading'">
+                    <svg class="mini-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                      <path d="M21 12a9 9 0 1 1-6.2-8.56" />
+                    </svg>
+                    {{ item.progress }}%
+                  </template>
+                  <svg v-else-if="item.status === 'done'" class="state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4.5 12.5l5 5L19.5 7" />
+                  </svg>
+                  <template v-else>{{ item.error || '导入失败' }}</template>
+                </span>
+                <button
+                  v-if="item.status === 'pending' && !uploadBusy"
+                  class="file-remove"
+                  type="button"
+                  title="移除"
+                  @click="removeItem(i)"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                    <path d="M6 6l12 12M18 6L6 18" />
+                  </svg>
+                </button>
+              </li>
+            </ul>
+
+            <!-- 底部：整体进度 / 摘要 + 操作 -->
+            <div class="dlg-foot">
+              <div v-if="uploadBusy" class="overall">
+                <svg class="mini-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                  <path d="M21 12a9 9 0 1 1-6.2-8.56" />
+                </svg>
+                <span>正在导入 {{ uploadIndex + 1 }} / {{ importItems.length }} · {{ totalProgress }}%</span>
+              </div>
+              <div v-else-if="importDone" class="overall" :class="{ hasError: failedCount > 0 }">
+                {{ importSummary }}
+              </div>
+              <div v-else class="overall"></div>
+
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="uploadBusy" @click="closeImport">取消</button>
+                <button
+                  class="accent-btn"
+                  type="button"
+                  :disabled="uploadBusy || !hasPending"
+                  @click="startUpload"
+                >
+                  {{ uploadBusy ? '导入中…' : hasPending ? `开始导入（${hasPendingCount}）` : '开始导入' }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -367,8 +626,39 @@ onMounted(() => load())
   font-weight: 300;
   color: var(--text-3);
 }
-.refresh-btn {
+
+/* 导入本地书按钮（细字描边，hover 加深） */
+.import-btn {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+  background: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.import-btn:hover {
+  color: var(--accent-deep);
+  border-color: var(--accent-deep);
+  background: var(--accent-soft);
+}
+.import-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.refresh-btn {
   width: 32px;
   height: 32px;
   display: flex;
@@ -523,8 +813,322 @@ onMounted(() => load())
   }
 }
 
+/* ================= 导入本地书弹窗（自写轻量） ================= */
+.dlg-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(24, 24, 27, 0.35);
+}
+.dlg {
+  width: min(460px, 100%);
+  max-height: calc(100vh - 64px);
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+  outline: none;
+}
+.dlg-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.dlg-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-1);
+}
+.dlg-close {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.dlg-close:hover:not(:disabled) {
+  color: var(--text-1);
+  background: #f4f4f5;
+}
+.dlg-close:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+.dlg-close svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* 虚线拖拽区：hover 变强调色 */
+.dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 34px 16px;
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.dropzone:hover,
+.dropzone.over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.dropzone.busy {
+  cursor: default;
+  opacity: 0.6;
+}
+.dz-icon {
+  width: 26px;
+  height: 26px;
+  color: var(--text-3);
+  transition: color 0.2s ease;
+}
+.dropzone:hover .dz-icon,
+.dropzone.over .dz-icon {
+  color: var(--accent);
+}
+.dz-text {
+  margin: 8px 0 0;
+  font-size: 13.5px;
+  font-weight: 400;
+  color: var(--text-2);
+}
+.dz-sub {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.file-input {
+  display: none;
+}
+.accept-tip {
+  margin: 10px 2px 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: #cf4444;
+}
+
+/* 文件列表 */
+.file-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.file-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-size {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.file-state {
+  flex-shrink: 0;
+  min-width: 52px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.file-state.uploading {
+  color: var(--accent);
+  font-weight: 400;
+}
+.file-state.done {
+  color: #529b2e;
+}
+.file-state.error {
+  color: #cf4444;
+  min-width: 0;
+  max-width: 130px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.state-icon {
+  width: 12px;
+  height: 12px;
+}
+.mini-spin {
+  width: 12px;
+  height: 12px;
+  animation: spin 0.8s linear infinite;
+}
+.file-remove {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.file-remove:hover {
+  color: #cf4444;
+}
+.file-remove svg {
+  width: 10px;
+  height: 10px;
+}
+
+/* 底部：进度 / 摘要 + 操作 */
+.dlg-foot {
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.overall {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+}
+.overall.hasError {
+  color: #cf4444;
+}
+.dlg-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+.ghost-btn {
+  padding: 7px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
+.ghost-btn:hover:not(:disabled) {
+  color: var(--text-1);
+  border-color: var(--border-strong);
+}
+.ghost-btn:disabled,
+.accent-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.accent-btn {
+  padding: 7px 18px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease;
+}
+.accent-btn:hover:not(:disabled) {
+  background: var(--accent-deep);
+  border-color: var(--accent-deep);
+}
+
+/* 弹窗动画：fade 200ms（遮罩 + 面板轻微上移） */
+.dlg-enter-active,
+.dlg-leave-active {
+  transition: opacity 0.2s ease;
+}
+.dlg-enter-from,
+.dlg-leave-to {
+  opacity: 0;
+}
+.dlg-enter-active .dlg,
+.dlg-leave-active .dlg {
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+.dlg-enter-from .dlg,
+.dlg-leave-to .dlg {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
 /* ================= 响应式 ================= */
 @media (max-width: 720px) {
+  .dlg-overlay {
+    padding: 16px;
+  }
+  .dlg {
+    max-height: calc(100vh - 32px);
+  }
+  .import-btn {
+    padding: 6px 12px;
+    font-size: 12.5px;
+  }
+  .import-btn span {
+    display: none;
+  }
   .topbar {
     flex-wrap: wrap;
     gap: 12px;

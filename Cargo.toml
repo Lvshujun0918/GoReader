@@ -50,6 +50,7 @@ futures = "0.3"
 rand = "0.8"
 once_cell = "1"
 encoding_rs = "0.8"       # 编码检测（兼容 EncodingDetect）
+zip = { version = "0.6", default-features = false, features = ["deflate"] }  # EPUB 解包
 
 [profile.release]
 lto = true

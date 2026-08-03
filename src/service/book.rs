@@ -87,6 +87,9 @@ pub fn analyze_book_info(html: &str, base_url: &str, source: &BookSource, book_u
         book_url: book_url.to_string(),
         origin: source.book_source_url.clone(),
         origin_name: source.book_source_name.clone(),
+        language: None,
+        publisher: None,
+        published_at: None,
     }
 }
 

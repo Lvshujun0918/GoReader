@@ -70,6 +70,12 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/opds/", get(opds_catalog))
         .route("/opds/search", get(opds_search))
         .route("/opds/download/*id", get(opds_download))
+        .route(
+            "/reader3/uploadLocalBook",
+            post(upload_local_book).layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
+        .route("/reader3/deleteBook", post(delete_book))
+        .route("/reader3/saveBook", post(save_book))
         // SPA fallback：未匹配路由 → webdav 分流 / API 404 / 前端
         .fallback(fallback_handler)
         .route("/reader3/getBookshelf", get(get_bookshelf))
@@ -590,6 +596,35 @@ async fn get_book_info(
     if url.is_empty() {
         return Json(ReturnData::err("请输入书籍链接"));
     }
+    // 本地书（local://）——查书架返回信息，不走书源
+    if url.starts_with("local://") {
+        let books = match state.storage.list_books(&namespace).await {
+            Ok(b) => b,
+            Err(_) => return Json(ReturnData::err("系统错误")),
+        };
+        if let Some(book) = books.iter().find(|b| b.book_url == url) {
+            let info = crate::model::book_chapter::BookInfo {
+                name: book.name.clone(),
+                author: book.author.clone(),
+                kind: book.kind.clone(),
+                intro: book.intro.clone(),
+                cover_url: book
+                    .custom_cover_url
+                    .clone()
+                    .or_else(|| book.cover_url.clone()),
+                toc_url: Some(book.toc_url.clone()),
+                book_url: book.book_url.clone(),
+                origin: book.origin.clone(),
+                origin_name: book.origin_name.clone(),
+                language: book.language.clone(),
+                publisher: book.publisher.clone(),
+                published_at: book.published_at.clone(),
+                ..Default::default()
+            };
+            return Json(ReturnData::ok(serde_json::to_value(info).unwrap_or(serde_json::Value::Null)));
+        }
+        return Json(ReturnData::err("未找到这本书（可能不在书架中）"));
+    }
     let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
@@ -627,6 +662,18 @@ async fn get_book_toc(
     if toc_url.is_empty() {
         return Json(ReturnData::err("请输入目录链接"));
     }
+    // 本地书（local://）——不走书源解析
+    if toc_url.starts_with("local://") {
+        let book_id = toc_url
+            .trim_start_matches("local://")
+            .split('/')
+            .next()
+            .unwrap_or("");
+        if let Some(ret) = get_book_toc_local(&state, &namespace, &format!("local://{book_id}")).await {
+            return ret;
+        }
+        return Json(ReturnData::err("本地书目录不存在"));
+    }
     let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
@@ -660,6 +707,13 @@ async fn get_book_content(
     };
     if chapter_url.is_empty() {
         return Json(ReturnData::err("请输入章节链接"));
+    }
+    // 本地书（local://）——不走书源解析
+    if chapter_url.starts_with("local://") {
+        if let Some(ret) = get_book_content_local(&state, &chapter_url).await {
+            return ret;
+        }
+        return Json(ReturnData::err("本地书章节不存在"));
     }
     let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
@@ -858,6 +912,199 @@ async fn opds_download(
         },
         Err(resp) => resp,
     }
+}
+
+/// POST /reader3/deleteBook：移出书架（bookUrl）
+async fn delete_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    let book_url = if book_url.is_empty() {
+        param_of(&params, body_json.as_ref(), "url")
+    } else {
+        book_url
+    };
+    if book_url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_book(&namespace, &book_url).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("deleteBook 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+/// POST /reader3/saveBook：编辑书（bookUrl/name/author/coverUrl/group）
+async fn save_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    if book_url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    let name = body_json.as_ref().and_then(|b| b.get("name").and_then(|v| v.as_str()));
+    let author = body_json.as_ref().and_then(|b| b.get("author").and_then(|v| v.as_str()));
+    let cover_url = body_json.as_ref().and_then(|b| b.get("coverUrl").and_then(|v| v.as_str()));
+    let group = body_json.as_ref().and_then(|b| b.get("group").and_then(|v| v.as_i64()));
+    match state
+        .storage
+        .update_book(&namespace, &book_url, name, author, cover_url, group)
+        .await
+    {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveBook 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/uploadLocalBook：导入本地书（multipart：file）
+async fn upload_local_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name = String::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("file") {
+            file_name = field.file_name().unwrap_or("book").to_string();
+            if let Ok(bytes) = field.bytes().await {
+                file_bytes = Some(bytes.to_vec());
+            }
+        }
+    }
+    let Some(bytes) = file_bytes else {
+        return Json(ReturnData::err("未收到文件"));
+    };
+    if bytes.is_empty() {
+        return Json(ReturnData::err("文件为空"));
+    }
+
+    let lower = file_name.to_lowercase();
+    let imported = if lower.ends_with(".epub") {
+        match crate::service::local_book::parse_epub(&bytes) {
+            Ok(b) => b,
+            Err(e) => return Json(ReturnData::err(format!("EPUB 解析失败：{e}"))),
+        }
+    } else if lower.ends_with(".txt") {
+        crate::service::local_book::parse_txt(&bytes).unwrap_or_else(|e| {
+            tracing::error!("TXT 解析失败: {e}");
+            crate::service::local_book::ImportedBook {
+                meta: Default::default(),
+                chapters: vec![],
+                cover: None,
+                format: "txt".into(),
+            }
+        })
+    } else {
+        return Json(ReturnData::err("仅支持 EPUB/TXT"));
+    };
+
+    if imported.chapters.is_empty() {
+        return Json(ReturnData::err("未解析到章节内容"));
+    }
+
+    let book_url = format!("local://{}", uuid::Uuid::new_v4());
+    let book = crate::model::book_chapter::BookInfo {
+        name: if imported.meta.title.is_empty() {
+            file_name.trim_end_matches(".epub").trim_end_matches(".txt").to_string()
+        } else {
+            imported.meta.title.clone()
+        },
+        author: imported.meta.author.clone(),
+        kind: imported.meta.subjects.first().cloned(),
+        intro: imported.meta.description.clone(),
+        language: imported.meta.language.clone(),
+        publisher: imported.meta.publisher.clone(),
+        published_at: imported.meta.published_at.clone(),
+        toc_url: Some(format!("{book_url}/toc")),
+        book_url: book_url.clone(),
+        origin: "local".to_string(),
+        origin_name: "本地书".to_string(),
+        ..Default::default()
+    };
+
+    if let Err(e) = state.storage.save_local_book(&namespace, &book, &imported).await {
+        tracing::error!("本地书入库失败: {e}");
+        return Json(ReturnData::err("入库失败"));
+    }
+
+    if let Some(cover) = &imported.cover {
+        let cover_dir = state.storage.config.storage_dir().join("assets").join(&namespace).join("covers");
+        let _ = std::fs::create_dir_all(&cover_dir);
+        let file_id = format!("{}.jpg", uuid::Uuid::new_v4());
+        if std::fs::write(cover_dir.join(&file_id), cover).is_ok() {
+            let _ = state
+                .storage
+                .update_book_cover(&namespace, &book_url, &format!("/assets/{namespace}/covers/{file_id}"))
+                .await;
+        }
+    }
+
+    tracing::info!("本地书导入 [{namespace}]：{}（{} 章）", book.name, imported.chapters.len());
+    Json(ReturnData::ok(serde_json::to_value(book).unwrap_or(serde_json::Value::Null)))
+}
+
+/// 本地书目录（local://book_id/toc）
+async fn get_book_toc_local(
+    state: &AppState,
+    _namespace: &str,
+    book_url: &str,
+) -> Option<Json<ReturnData>> {
+    let chapters = state.storage.list_chapters(book_url).await.ok()?;
+    let list: Vec<serde_json::Value> = chapters
+        .iter()
+        .map(|(idx, title)| {
+            serde_json::json!({
+                "title": title,
+                "url": format!("{book_url}/{idx}"),
+                "isVolume": false,
+                "index": idx,
+            })
+        })
+        .collect();
+    Some(Json(ReturnData::ok(serde_json::Value::Array(list))))
+}
+
+/// 本地书正文（local://book_id/index）
+async fn get_book_content_local(
+    state: &AppState,
+    chapter_url: &str,
+) -> Option<Json<ReturnData>> {
+    let rest = chapter_url.trim_start_matches("local://");
+    let (book_id, idx_str) = rest.rsplit_once('/')?;
+    let index: i64 = idx_str.parse().ok()?;
+    let content = state
+        .storage
+        .get_chapter_content(&format!("local://{book_id}"), index)
+        .await
+        .ok()??;
+    Some(Json(ReturnData::ok(serde_json::json!({ "content": content }))))
 }
 
 /// fallback：webdav 分流 / API 404 JSON / 前端 SPA（index.html）

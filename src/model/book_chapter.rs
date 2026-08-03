@@ -17,6 +17,13 @@ pub struct BookInfo {
     pub book_url: String,
     pub origin: String,
     pub origin_name: String,
+    /// 语言（本地书/EPUB）
+    pub language: Option<String>,
+    /// 出版社
+    pub publisher: Option<String>,
+    /// 出版时间
+    #[serde(rename = "publishedAt")]
+    pub published_at: Option<String>,
 }
 
 /// 章节（兼容 legacy BookChapter）
