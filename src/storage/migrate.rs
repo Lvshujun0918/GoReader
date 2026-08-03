@@ -31,6 +31,19 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
         .await?;
     if user_count > 0 {
         tracing::info!("users 表已有 {} 条记录，跳过 JSON 迁移", user_count);
+        // 补迁书源：book_sources 空且 data 目录有 bookSource.json 时导入（生产数据同步场景）
+        let src_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_sources")
+            .fetch_one(&storage.pool)
+            .await?;
+        if src_count == 0 {
+            let namespaces = scan_source_namespaces(&data_dir);
+            if !namespaces.is_empty() {
+                match migrate_book_sources(&storage.pool, &data_dir, &namespaces).await {
+                    Ok(n) => tracing::info!("补迁书源：{} 个（命名空间 {:?}）", n, namespaces),
+                    Err(e) => tracing::warn!("补迁书源失败：{e}"),
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -353,4 +366,22 @@ async fn migrate_book_sources(
         total += count;
     }
     Ok(total)
+}
+
+/// 扫描 data 目录中含 bookSource.json 的命名空间
+fn scan_source_namespaces(data_dir: &Path) -> Vec<String> {
+    let mut namespaces = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for e in entries.flatten() {
+            if !e.path().is_dir() {
+                continue;
+            }
+            if e.path().join("bookSource.json").exists() {
+                if let Some(name) = e.file_name().to_str() {
+                    namespaces.push(name.to_string());
+                }
+            }
+        }
+    }
+    namespaces
 }

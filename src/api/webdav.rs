@@ -56,8 +56,8 @@ pub async fn handle(
     }
 }
 
-/// Basic 认证 → (username, user_namespace, webdav_home)
-async fn authenticate(storage: &Storage, headers: &HeaderMap) -> Option<(String, String, PathBuf)> {
+/// Basic 认证 → (username, user_namespace, user_home)
+pub(crate) async fn authenticate(storage: &Storage, headers: &HeaderMap) -> Option<(String, String, PathBuf)> {
     if !storage.config.secure {
         let home = storage.config.storage_dir().join("data").join("default").join("webdav");
         return Some(("default".into(), "default".into(), home));

@@ -66,6 +66,10 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     axum::Router::new()
         .nest_service("/assets", assets_service)
         .route("/health", get(health))
+        .route("/opds", get(opds_catalog))
+        .route("/opds/", get(opds_catalog))
+        .route("/opds/search", get(opds_search))
+        .route("/opds/download/*id", get(opds_download))
         // SPA fallback：未匹配路由 → webdav 分流 / API 404 / 前端
         .fallback(fallback_handler)
         .route("/reader3/getBookshelf", get(get_bookshelf))
@@ -773,6 +777,89 @@ pub fn internal_error(err: anyhow::Error) -> axum::response::Response {
         .into_response()
 }
 
+/// 命名空间解析（OPDS：Basic 认证或非 secure default）
+async fn opds_ns(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+    match crate::api::webdav::authenticate(&state.storage, headers).await {
+        Some((_, ns, _)) => Ok(ns),
+        None => Err(
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("WWW-Authenticate", "Basic realm=\"reader\"")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    }
+}
+
+/// GET /opds：根目录
+async fn opds_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    match opds_ns(&state, &headers).await {
+        Ok(ns) => match crate::api::opds::catalog(&state.storage, &ns).await {
+            Ok(xml) => Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/atom+xml;profile=opds-catalog;charset=utf-8")
+                .body(Body::from(xml))
+                .unwrap(),
+            Err(e) => {
+                tracing::error!("OPDS catalog 失败: {e}");
+                Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Body::empty()).unwrap()
+            }
+        },
+        Err(resp) => resp,
+    }
+}
+
+/// GET /opds/search?q=
+async fn opds_search(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let q = params.get("q").cloned().unwrap_or_default();
+    match opds_ns(&state, &headers).await {
+        Ok(ns) => match crate::api::opds::search(&state.storage, &ns, &q).await {
+            Ok(xml) => Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/atom+xml;profile=opds-catalog;charset=utf-8")
+                .body(Body::from(xml))
+                .unwrap(),
+            Err(e) => {
+                tracing::error!("OPDS search 失败: {e}");
+                Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Body::empty()).unwrap()
+            }
+        },
+        Err(resp) => resp,
+    }
+}
+
+/// GET /opds/books/{id}/download?format=txt
+async fn opds_download(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let _format = params.get("format").cloned().unwrap_or_else(|| "txt".to_string());
+    match opds_ns(&state, &headers).await {
+        Ok(ns) => match crate::api::opds::download(&state.storage, &ns, &id, 100).await {
+            Ok((name, bytes)) => Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .header("Content-Disposition", format!("attachment; filename=\"{}\"", name))
+                .body(Body::from(bytes))
+                .unwrap(),
+            Err(e) => {
+                tracing::warn!("OPDS 下载失败: {e}");
+                Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()
+            }
+        },
+        Err(resp) => resp,
+    }
+}
+
 /// fallback：webdav 分流 / API 404 JSON / 前端 SPA（index.html）
 async fn fallback_handler(
     State(state): State<AppState>,
@@ -782,6 +869,7 @@ async fn fallback_handler(
     body: axum::body::Bytes,
 ) -> Response {
     let path = uri.path();
+    tracing::debug!("fallback: {} {}", method, path);
     // WebDAV
     if path.starts_with("/reader3/webdav") {
         return crate::api::webdav::handle(&state.storage, method, path, &headers, body).await;
