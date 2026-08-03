@@ -3,11 +3,13 @@
 //! 端点：
 //! - GET /opds                    根目录（书架 → 书籍条目）
 //! - GET /opds/search?q={key}     搜索
-//! - GET /opds/books/{id}/download TXT 导出下载（正文拼接）
+//! - GET /opds/download/{id}      原文件（本地书=存库章节重建 TXT；书源书=爬取正文拼接）
+//! - GET /opds/acquire/{id}       正文（纯文本，可带 maxChapters 上限）
 
 use anyhow::Result;
 use chrono::Utc;
 
+use crate::model::Book;
 use crate::storage::Storage;
 
 /// 生成 OPDS 根目录（书架书籍列表）
@@ -112,43 +114,53 @@ fn book_entry(book: &crate::model::Book, ns: &str) -> String {
                 xml_escape(kind), xml_escape(kind)));
         }
     }
-    // acquisition：TXT 下载
+    // acquisition：原文件下载 + 正文获取（两个 acquisition 链接，外部阅读器按需取用）
     entry.push_str(&format!(
-        "    <link rel=\"http://opds-spec.org/acquisition\" href=\"/opds/download/{id}?format=txt\" type=\"text/plain\"/>\n",
+        "    <link rel=\"http://opds-spec.org/acquisition\" href=\"/opds/download/{id}\" type=\"text/plain\" title=\"下载（原文件）\"/>\n",
+    ));
+    entry.push_str(&format!(
+        "    <link rel=\"http://opds-spec.org/acquisition\" href=\"/opds/acquire/{id}\" type=\"text/plain\" title=\"正文\"/>\n",
     ));
     let _ = ns;
     entry.push_str("  </entry>\n");
     entry
 }
 
-/// 下载：TXT 导出（目录 + 正文拼接，上限章节防超时）
-pub async fn download(storage: &Storage, ns: &str, book_id: &str, max_chapters: Option<usize>) -> Result<(String, Vec<u8>)> {
+/// 正文拼接：本地书（local://）→ 存库章节；书源书 → 爬取目录+正文（上限章节防超时）
+pub async fn build_text(
+    storage: &Storage,
+    ns: &str,
+    book: &Book,
+    max_chapters: Option<usize>,
+) -> Result<String> {
     let max_chapters = max_chapters.unwrap_or(usize::MAX);
-    let book_url = decode_id(book_id);
-    let book = storage
-        .list_books(ns)
-        .await?
-        .into_iter()
-        .find(|b| b.book_url == book_url)
-        .ok_or_else(|| anyhow::anyhow!("书籍不存在"))?;
+    let mut txt = String::new();
 
-    // 书源
+    // 本地书：章节已入库（导入时解析），直接重建
+    if crate::service::local_book::is_local_book(&book.book_url, &book.origin) {
+        let chapters = storage.list_chapters(&book.book_url).await?;
+        let mut count = 0usize;
+        for (i, title) in chapters.iter().take(max_chapters) {
+            if let Some(content) = storage.get_chapter_content(&book.book_url, *i).await? {
+                txt.push_str(&format!("\n{}\n\n{}", title, content));
+                count += 1;
+            }
+        }
+        tracing::info!("OPDS 正文(本地) [{ns}] {}：{count} 章", book.name);
+        return Ok(txt);
+    }
+
+    // 书源书：爬取目录 + 正文
     let source = storage
         .find_book_source(ns, &book.origin)
         .await?
         .ok_or_else(|| anyhow::anyhow!("书源不存在"))?;
-
-    // 目录
     let toc_url = if book.toc_url.is_empty() {
         book.book_url.clone()
     } else {
         book.toc_url.clone()
     };
     let chapters = crate::service::book::analyze_toc(&toc_url, &source, 20).await?;
-
-    // 正文（限前 max_chapters 章）
-    let mut txt = String::new();
-    txt.push_str(&format!("{}\n{}\n\n", book.name, book.author));
     let mut count = 0usize;
     for ch in chapters.iter().take(max_chapters) {
         if ch.is_volume || ch.url.is_empty() {
@@ -164,8 +176,44 @@ pub async fn download(storage: &Storage, ns: &str, book_id: &str, max_chapters: 
             }
         }
     }
-    tracing::info!("OPDS 下载 [{ns}] {}：{count} 章", book.name);
-    Ok((format!("{}.txt", book.name), txt.into_bytes()))
+    tracing::info!("OPDS 正文(书源) [{ns}] {}：{count} 章", book.name);
+    Ok(txt)
+}
+
+/// 下载：原文件（本地书=章节重建 TXT；书源书=正文拼接导出），带文件名响应头
+pub async fn download(
+    storage: &Storage,
+    ns: &str,
+    book_id: &str,
+    max_chapters: Option<usize>,
+) -> Result<(String, Vec<u8>)> {
+    let book_url = decode_id(book_id);
+    let book = storage
+        .list_books(ns)
+        .await?
+        .into_iter()
+        .find(|b| b.book_url == book_url)
+        .ok_or_else(|| anyhow::anyhow!("书籍不存在"))?;
+    let body = build_text(storage, ns, &book, max_chapters).await?;
+    Ok((format!("{}.txt", book.name), body.into_bytes()))
+}
+
+/// 正文获取：/opds/acquire/{id}——返回纯文本正文（无文件名头，供阅读器直接读取）
+pub async fn acquire(
+    storage: &Storage,
+    ns: &str,
+    book_id: &str,
+    max_chapters: Option<usize>,
+) -> Result<(String, Vec<u8>)> {
+    let book_url = decode_id(book_id);
+    let book = storage
+        .list_books(ns)
+        .await?
+        .into_iter()
+        .find(|b| b.book_url == book_url)
+        .ok_or_else(|| anyhow::anyhow!("书籍不存在"))?;
+    let body = build_text(storage, ns, &book, max_chapters).await?;
+    Ok((book.name, body.into_bytes()))
 }
 
 /// bookUrl → base64url（URL 安全，无 / 等特殊字符——Path 单段可匹配）
