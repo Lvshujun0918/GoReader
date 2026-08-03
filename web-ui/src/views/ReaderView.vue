@@ -1330,7 +1330,8 @@ onBeforeUnmount(() => {
                     :style="{ fontFamily: FONT_STACK[opt.value] || undefined }"
                     @click="fontKind = opt.value; fontOpen = false"
                   >
-                    {{ opt.label }} — 阅读字体预览
+                    <span class="font-item-name">{{ opt.label }}</span>
+                    <span class="font-item-demo">永州之野产异蛇，黑质而白章</span>
                   </button>
                 </div>
               </transition>
@@ -1861,10 +1862,10 @@ onBeforeUnmount(() => {
 .font-menu {
   position: absolute;
   top: calc(100% + 6px);
-  left: 0;
   right: 0;
   z-index: 50;
-  max-height: 280px;
+  min-width: 300px;
+  max-height: 300px;
   overflow-y: auto;
   background: var(--bg-float);
   border: 1px solid var(--border);
@@ -1873,7 +1874,10 @@ onBeforeUnmount(() => {
   padding: 4px;
 }
 .font-item {
-  display: block;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
   width: 100%;
   padding: 9px 12px;
   font-size: 13px;
@@ -1885,6 +1889,17 @@ onBeforeUnmount(() => {
   text-align: left;
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
+}
+.font-item-name {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.font-item-demo {
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .font-item:hover {
   background: var(--accent-soft);
@@ -1948,6 +1963,7 @@ onBeforeUnmount(() => {
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface);
+  overflow: visible;
 }
 .pop-title {
   margin: 0;
