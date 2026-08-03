@@ -187,6 +187,35 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/getBookInfo", get(get_book_info).post(get_book_info))
         .route("/reader3/getBookToc", get(get_book_toc).post(get_book_toc))
         .route("/reader3/getBookContent", get(get_book_content).post(get_book_content))
+        // 差距补全批：多格式导出 / 书源调试 / 整书缓存 / 用户配置 / 本地书刷新 / 批量接口 / 书源健康 / 阅读统计
+        .route("/reader3/exportBook", get(export_book))
+        .route("/reader3/bookSourceDebugSSE", get(book_source_debug_sse).post(book_source_debug_sse))
+        .route("/reader3/cacheBookOnServer", post(cache_book_on_server))
+        .route("/reader3/cacheBookSSE", get(cache_book_sse).post(cache_book_sse))
+        .route("/reader3/cancelCacheBook", get(cancel_cache_book).post(cancel_cache_book))
+        .route("/reader3/getUserConfig", get(get_user_config).post(get_user_config))
+        .route("/reader3/saveUserConfig", post(save_user_config))
+        .route("/reader3/refreshLocalBook", post(refresh_local_book))
+        .route("/reader3/deleteBooks", post(delete_books))
+        .route("/reader3/deleteBookmarks", post(delete_bookmarks))
+        .route("/reader3/saveRssSources", post(save_rss_sources))
+        .route("/reader3/saveBookmarks", post(save_bookmarks))
+        .route("/reader3/addBookGroupMulti", post(add_book_group_multi))
+        .route("/reader3/removeBookGroupMulti", post(remove_book_group_multi))
+        .route("/reader3/saveBookGroupOrder", post(save_book_group_order))
+        .route("/reader3/getAvailableBookSource", get(get_available_book_source).post(get_available_book_source))
+        .route("/reader3/getInvalidBookSources", get(get_invalid_book_sources).post(get_invalid_book_sources))
+        .route("/reader3/setAsDefaultBookSources", post(set_as_default_book_sources))
+        .route("/reader3/searchBookSourceSSE", get(search_book_source_sse).post(search_book_source_sse))
+        .route("/reader3/getReadingStats", get(get_reading_stats).post(get_reading_stats))
+        // 命名兼容批 2（legacy 别名路由——外部客户端兼容）
+        .route("/reader3/resetPassword", post(reset_user_password))
+        .route("/reader3/httpTTS", get(tts_synthesize).post(tts_synthesize))
+        .route(
+            "/reader3/uploadFile",
+            post(crate::api::files::upload)
+                .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
         .route("/reader3/login", post(login))
         .with_state(state)
         // TODO: 挂载 legacy 前端静态资源（rust-embed，兼容阶段复用 legacy dist）
@@ -1846,6 +1875,1142 @@ async fn get_book_content(
     }
 }
 
+// ==================== 差距补全批：导出 / 调试 / 缓存 / 配置 / 刷新 / 批量 / 健康 / 统计 ====================
+
+/// GET /reader3/exportBook：多格式导出（url 单本 + format=txt|epub|html）
+/// txt=章节拼接、epub=zip 构造（mimetype/container.xml/OPF/spine）、html=单页
+async fn export_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Response {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret).into_response(),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("请输入书籍链接")).into_response();
+    }
+    let format = param_of(&params, body_json.as_ref(), "format");
+    let format = if format.is_empty() { "txt" } else { format.as_str() };
+    if !matches!(format, "txt" | "epub" | "html") {
+        return Json(ReturnData::err("不支持的导出格式（txt|epub|html）")).into_response();
+    }
+    let (title, author, chapters) =
+        match collect_export_chapters(&state, &namespace, &url, &params, body_json.as_ref()).await
+        {
+            Ok(v) => v,
+            Err(msg) => return Json(ReturnData::err(msg)).into_response(),
+        };
+    if chapters.is_empty() {
+        return Json(ReturnData::err("没有可导出的章节")).into_response();
+    }
+    let export_chapters: Vec<crate::service::export_book::ExportChapter> = chapters
+        .iter()
+        .map(|(t, c)| crate::service::export_book::ExportChapter {
+            title: t.clone(),
+            content: c.clone(),
+        })
+        .collect();
+    let (bytes, mime, ext) = match format {
+        "epub" => (
+            crate::service::export_book::build_epub(&title, &author, &export_chapters),
+            "application/epub+zip",
+            "epub",
+        ),
+        "html" => (
+            crate::service::export_book::build_html(&title, &export_chapters).into_bytes(),
+            "text/html; charset=utf-8",
+            "html",
+        ),
+        _ => (
+            crate::service::export_book::build_txt(&title, &export_chapters).into_bytes(),
+            "text/plain; charset=utf-8",
+            "txt",
+        ),
+    };
+    let filename = sanitize_filename(&title);
+    let filename = if filename.is_empty() { "export".to_string() } else { filename };
+    // RFC 5987：非 ASCII 文件名百分号编码（HeaderValue 需可见 ASCII）
+    let encoded = percent_encode_filename(&filename);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", mime)
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{encoded}.{ext}\""),
+        )
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+/// 文件名百分号编码（保留 ASCII 字母数字与 -_. 空格，其余 UTF-8 字节 %XX）
+fn percent_encode_filename(name: &str) -> String {
+    let mut out = String::new();
+    for &b in name.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b' ') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// 收集导出章节：(书名, 作者, [(章节标题, 正文)])——本地书/文件书/书源书统一入口
+async fn collect_export_chapters(
+    state: &AppState,
+    ns: &str,
+    url: &str,
+    params: &HashMap<String, String>,
+    body_json: Option<&serde_json::Value>,
+) -> Result<(String, String, Vec<(String, String)>), String> {
+    let shelf = state.storage.find_book(ns, url).await.ok().flatten();
+    let is_local = url.starts_with("local://");
+    let is_file = url.starts_with("storage/")
+        || crate::service::local_book::SUPPORTED_EXTENSIONS
+            .iter()
+            .any(|e| url.to_lowercase().ends_with(&format!(".{e}")));
+
+    // ① 本地书（local://）：章节表直读
+    if is_local {
+        let book = shelf.ok_or_else(|| "书籍不存在（请先加入书架）".to_string())?;
+        let rows = state
+            .storage
+            .list_chapters(url)
+            .await
+            .map_err(|e| format!("读取章节失败: {e}"))?;
+        let mut chapters = Vec::with_capacity(rows.len());
+        for (idx, title) in rows {
+            let content = state
+                .storage
+                .get_chapter_content(url, idx)
+                .await
+                .map_err(|e| format!("读取章节失败: {e}"))?
+                .unwrap_or_default();
+            chapters.push((title, content));
+        }
+        return Ok((book.name, book.author, chapters));
+    }
+    // ② 文件型本地书：解析原文件（TXT 用用户规则）
+    if is_file {
+        let path = resolve_export_file_path(&state.storage.config.storage_dir(), url)
+            .ok_or_else(|| "本地书文件不存在".to_string())?;
+        let user_rules = txt_toc_rule_regexes(state, ns).await;
+        let imported = crate::service::local_book::parse_loc_book_path(&path, &user_rules)
+            .map_err(|e| format!("解析失败: {e}"))?;
+        let name = shelf
+            .as_ref()
+            .map(|b| b.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| imported.meta.title.clone());
+        let chapters: Vec<(String, String)> = imported
+            .chapters
+            .iter()
+            .map(|c| (c.title.clone(), c.content.clone()))
+            .collect();
+        return Ok((name, imported.meta.author, chapters));
+    }
+    // ③ 书源书：书架 origin 定位书源（兜底 bookSource 参数）→ 目录 → 逐章正文（优先缓存）
+    let book = shelf.ok_or_else(|| "书籍不存在（请先加入书架）".to_string())?;
+    let mut source = if !book.origin.is_empty() {
+        state
+            .storage
+            .find_book_source(ns, &book.origin)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    if source.is_none() {
+        let bs = param_of(params, body_json, "bookSource");
+        if !bs.is_empty() {
+            source = resolve_book_source(state, ns, &bs).await;
+        }
+    }
+    let Some(source) = source else {
+        return Err("书源不存在".to_string());
+    };
+    let toc_url = if book.toc_url.is_empty() {
+        url.to_string()
+    } else {
+        book.toc_url.clone()
+    };
+    let toc = crate::service::book::analyze_toc(ns, &toc_url, &source, 20)
+        .await
+        .map_err(|e| format!("获取目录失败: {e}"))?;
+    let mut chapters = Vec::with_capacity(toc.len());
+    for ch in toc {
+        if ch.is_volume {
+            continue;
+        }
+        let idx = crate::util::md5::chapter_url_hash(&ch.url);
+        let content = match state.storage.get_chapter_content(url, idx).await.ok().flatten() {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => crate::service::book::analyze_content(ns, &ch.url, &source, 5)
+                .await
+                .map_err(|e| format!("获取正文失败: {e}"))?,
+        };
+        chapters.push((ch.title, content));
+    }
+    Ok((book.name, book.author, chapters))
+}
+
+/// 文件名净化（去路径分隔符/非法字符，截断 80 字符）
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(80)
+        .collect()
+}
+
+/// 文件型本地书路径解析（严格防穿越 + legacy 目录式兜底）
+pub(crate) fn resolve_export_file_path(
+    storage_dir: &std::path::Path,
+    book_url: &str,
+) -> Option<std::path::PathBuf> {
+    resolve_storage_path(storage_dir, book_url)
+        .or_else(|| resolve_loc_book_file(storage_dir, book_url))
+}
+
+/// GET/POST /reader3/bookSourceDebugSSE：逐规则执行测试（SSE 事件流）
+/// 参数：bookSource（必填）+ action=search|explore|toc|content + key + url/chapterUrl
+/// 输出：{type:step,message:{ruleName,url,elapsedMs,resultLen,error,detail}} → {type:result,data}
+async fn book_source_debug_sse(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Response {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return sse_error(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let action = param_of(&params, body_json.as_ref(), "action");
+    let key = param_of(&params, body_json.as_ref(), "key");
+    let mut target = param_of(&params, body_json.as_ref(), "chapterUrl");
+    if target.is_empty() {
+        target = param_of(&params, body_json.as_ref(), "url");
+    }
+    if !matches!(action.as_str(), "search" | "explore" | "toc" | "content") {
+        return sse_error(ReturnData::err("请输入调试动作（search|explore|toc|content）"));
+    }
+    if action == "search" && key.is_empty() {
+        return sse_error(ReturnData::err("请输入搜索关键字"));
+    }
+    let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
+    let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
+        return sse_error(ReturnData::err("书源不存在"));
+    };
+
+    let (tx, rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::convert::Infallible>>();
+    let ns = namespace.clone();
+    tokio::spawn(async move {
+        let send = |tx: &tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::convert::Infallible>>,
+                    payload: &serde_json::Value| {
+            let text = format!("data: {payload}\n\n");
+            let _ = tx.send(Ok(Bytes::from(text)));
+        };
+        send(
+            &tx,
+            &json!({
+                "type": "start",
+                "message": { "action": action, "bookSource": source.book_source_name },
+            }),
+        );
+        let result = crate::service::debug::run_debug(
+            &ns,
+            &source,
+            &action,
+            &key,
+            &target,
+            |step| {
+                send(&tx, &json!({ "type": "step", "message": step }));
+            },
+        )
+        .await;
+        match result {
+            Ok(data) => send(&tx, &json!({ "type": "result", "data": data })),
+            Err(e) => send(&tx, &json!({ "type": "error", "message": e.to_string() })),
+        }
+    });
+
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream; charset=utf-8")
+        .header("Cache-Control", "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// POST /reader3/cacheBookOnServer：后台整书缓存（目录 → 逐章正文 → 缓存表，并发 3）
+async fn cache_book_on_server(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    if state.storage.find_book(&namespace, &url).await.ok().flatten().is_none() {
+        return Json(ReturnData::err("书籍不存在（请先加入书架）"));
+    }
+    let progress = crate::service::cache_job::start(&namespace, &url, state.storage.clone());
+    let p = progress.lock().unwrap_or_else(|e| e.into_inner());
+    Json(ReturnData::ok(json!({
+        "started": !p.finished,
+        "url": url,
+        "cached": p.cached,
+        "total": p.total,
+        "title": p.title,
+    })))
+}
+
+/// GET/POST /reader3/cacheBookSSE：缓存进度流 {cached,total,title,finished,error,cancelled}
+async fn cache_book_sse(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Response {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return sse_error(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return sse_error(ReturnData::err("参数错误"));
+    }
+    let Some(progress) = crate::service::cache_job::progress_of(&url) else {
+        return sse_error(ReturnData::err("缓存任务不存在"));
+    };
+
+    let (tx, rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::convert::Infallible>>();
+    let progress_for_task = progress.clone();
+    tokio::spawn(async move {
+        loop {
+            let (payload, finished) = {
+                let p = progress_for_task.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    json!({
+                        "cached": p.cached,
+                        "total": p.total,
+                        "title": p.title,
+                        "finished": p.finished,
+                        "cancelled": p.cancelled,
+                        "error": p.error,
+                    }),
+                    p.finished,
+                )
+            };
+            let text = format!("data: {payload}\n\n");
+            if tx.send(Ok(Bytes::from(text))).is_err() {
+                return; // 客户端断开
+            }
+            if finished {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    });
+
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream; charset=utf-8")
+        .header("Cache-Control", "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// GET/POST /reader3/cancelCacheBook：取消后台缓存任务（内存任务表）
+async fn cancel_cache_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    let cancelled = crate::service::cache_job::cancel(&url);
+    Json(ReturnData::ok(json!({ "cancelled": cancelled })))
+}
+
+/// GET/POST /reader3/getUserConfig：用户配置读取（按用户 + 配置命名空间；key/ns 参数，默认 global）
+async fn get_user_config(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let mut key = param_of(&params, body_json.as_ref(), "key");
+    if key.is_empty() {
+        key = param_of(&params, body_json.as_ref(), "ns");
+    }
+    if key.is_empty() {
+        key = "global".to_string();
+    }
+    match state.storage.get_user_config(&namespace, &key).await {
+        Ok(Some(raw)) => {
+            // 配置为 JSON 文本 → 解析返回（解析失败原样返回字符串）
+            let data = serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or(serde_json::Value::String(raw));
+            Json(ReturnData::ok(json!({ "ns": key, "config": data })))
+        }
+        Ok(None) => Json(ReturnData::ok(json!({ "ns": key, "config": serde_json::Value::Null }))),
+        Err(e) => {
+            tracing::error!("getUserConfig [{namespace}/{key}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/saveUserConfig：用户配置保存（body：{ns?, config: JSON} 或裸 JSON 整体）
+async fn save_user_config(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    // 键：body.ns/key → query → global
+    let mut key = json
+        .get("ns")
+        .or_else(|| json.get("key"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if key.is_empty() {
+        key = params.get("ns").cloned().unwrap_or_else(|| "global".to_string());
+    }
+    // 配置：body.config（任意 JSON）→ 序列化；无 config 键则整体为配置
+    let config = json.get("config").cloned().unwrap_or(json);
+    let raw = match &config {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+    };
+    match state.storage.save_user_config(&namespace, &key, &raw).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveUserConfig [{namespace}/{key}] 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/refreshLocalBook：重扫本地书（local:// 重解析原文件；文件书重解析）
+async fn refresh_local_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    let book = match state.storage.find_book(&namespace, &url).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return Json(ReturnData::err("书籍不存在")),
+        Err(e) => {
+            tracing::error!("refreshLocalBook 查询失败: {e}");
+            return Json(ReturnData::err("系统错误"));
+        }
+    };
+    let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
+    let is_file = url.starts_with("storage/")
+        || crate::service::local_book::SUPPORTED_EXTENSIONS
+            .iter()
+            .any(|e| url.to_lowercase().ends_with(&format!(".{e}")));
+    let imported = if url.starts_with("local://") {
+        // 原文件：storage/data/{ns}/opds_files/{id}.{ext}
+        let id = url.trim_start_matches("local://").split('/').next().unwrap_or("").to_string();
+        let dir = state
+            .storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join(&namespace)
+            .join("opds_files");
+        let mut found = None;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let stem = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let ext_ok = crate::service::local_book::SUPPORTED_EXTENSIONS.iter().any(|ext| {
+                    p.to_string_lossy().to_lowercase().ends_with(&format!(".{ext}"))
+                });
+                if stem == id && ext_ok {
+                    found = Some(p);
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(path) => match crate::service::local_book::parse_loc_book_path(&path, &user_rules) {
+                Ok(b) => b,
+                Err(e) => return Json(ReturnData::err(format!("解析失败：{e}"))),
+            },
+            None => return Json(ReturnData::err("本地书原文件不存在")),
+        }
+    } else if is_file {
+        let path = match resolve_export_file_path(&state.storage.config.storage_dir(), &url) {
+            Some(p) => p,
+            None => return Json(ReturnData::err("本地书文件不存在")),
+        };
+        match crate::service::local_book::parse_loc_book_path(&path, &user_rules) {
+            Ok(b) => b,
+            Err(e) => return Json(ReturnData::err(format!("解析失败：{e}"))),
+        }
+    } else {
+        return Json(ReturnData::err("仅支持本地书刷新"));
+    };
+    if imported.chapters.is_empty() {
+        return Json(ReturnData::err("未解析到章节内容"));
+    }
+    let pairs: Vec<(String, String)> = imported
+        .chapters
+        .iter()
+        .map(|c| (c.title.clone(), c.content.clone()))
+        .collect();
+    if let Err(e) = state.storage.save_chapters(&url, &pairs).await {
+        tracing::error!("refreshLocalBook 章节入库失败: {e}");
+        return Json(ReturnData::err("刷新失败"));
+    }
+    // 更新 total_chapter_num（书名缺失时用解析出的标题补）
+    let mut patch = serde_json::Map::new();
+    patch.insert("totalChapterNum".to_string(), json!(pairs.len() as i64));
+    if book.name.is_empty() && !imported.meta.title.is_empty() {
+        patch.insert("name".to_string(), json!(imported.meta.title));
+    }
+    let _ = state.storage.patch_book(&namespace, &url, &patch).await;
+    tracing::info!("refreshLocalBook [{namespace}] {url}: {} 章", pairs.len());
+    Json(ReturnData::ok(json!({
+        "bookUrl": url,
+        "name": book.name,
+        "chapterCount": pairs.len(),
+    })))
+}
+
+/// POST /reader3/deleteBooks：批量删除（body：{bookUrls:[]}）
+async fn delete_books(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = params;
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let urls: Vec<String> = json
+        .get("bookUrls")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if urls.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_books(&namespace, &urls).await {
+        Ok(count) => Json(ReturnData::ok(json!({ "count": count }))),
+        Err(e) => {
+            tracing::error!("deleteBooks 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+/// POST /reader3/deleteBookmarks：批量删书签（body：{bookUrl, ids:[]}——ids 为书签标题）
+async fn delete_bookmarks(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = params;
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let book_url = json.get("bookUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let ids: Vec<String> = json
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if book_url.is_empty() || ids.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_bookmarks(&namespace, &book_url, &ids).await {
+        Ok(count) => Json(ReturnData::ok(json!({ "count": count }))),
+        Err(e) => {
+            tracing::error!("deleteBookmarks 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+/// POST /reader3/saveRssSources：批量保存 RSS 源（body = 数组）
+async fn save_rss_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = params;
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let mut sources: Vec<crate::model::RssSource> = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    if sources.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    for s in &mut sources {
+        if s.source_url.trim().is_empty() || s.source_name.trim().is_empty() {
+            return Json(ReturnData::err("参数错误"));
+        }
+        s.user_namespace = namespace.clone();
+    }
+    match state.storage.save_rss_sources(&namespace, &sources).await {
+        Ok(_) => Json(ReturnData::ok(json!({ "count": sources.len() }))),
+        Err(e) => {
+            tracing::error!("saveRssSources 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/saveBookmarks：批量保存书签（body = 数组）
+async fn save_bookmarks(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = params;
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let mut bookmarks: Vec<crate::model::Bookmark> = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    if bookmarks.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    for b in &mut bookmarks {
+        if b.book_url.trim().is_empty() || b.title.trim().is_empty() {
+            return Json(ReturnData::err("参数错误"));
+        }
+        b.user_namespace = namespace.clone();
+        if b.created_at == 0 {
+            b.created_at = now_millis();
+        }
+    }
+    match state.storage.save_bookmarks(&namespace, &bookmarks).await {
+        Ok(_) => Json(ReturnData::ok(json!({ "count": bookmarks.len() }))),
+        Err(e) => {
+            tracing::error!("saveBookmarks 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/addBookGroupMulti：批量设分组（body：{bookUrls, groupId}）
+async fn add_book_group_multi(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = params;
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let urls: Vec<String> = json
+        .get("bookUrls")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let group_id = json.get("groupId").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if urls.is_empty() || group_id < 0 {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.add_book_group_multi(&namespace, &urls, group_id).await {
+        Ok(count) => Json(ReturnData::ok(json!({ "count": count }))),
+        Err(e) => {
+            tracing::error!("addBookGroupMulti 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/removeBookGroupMulti：批量移出分组（body：{bookUrls}）
+async fn remove_book_group_multi(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = params;
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let urls: Vec<String> = json
+        .get("bookUrls")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if urls.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.remove_book_group_multi(&namespace, &urls).await {
+        Ok(count) => Json(ReturnData::ok(json!({ "count": count }))),
+        Err(e) => {
+            tracing::error!("removeBookGroupMulti 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/saveBookGroupOrder：分组排序（body：{order:[{id,orderNum}]}）
+async fn save_book_group_order(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = params;
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let order: Vec<(i64, i64)> = json
+        .get("order")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let id = item.get("id")?.as_i64()?;
+                    let order_num = item
+                        .get("orderNum")
+                        .or_else(|| item.get("order"))
+                        .and_then(|v| v.as_i64())?;
+                    Some((id, order_num))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if order.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.save_book_group_order(&namespace, &order).await {
+        Ok(count) => Json(ReturnData::ok(json!({ "count": count }))),
+        Err(e) => {
+            tracing::error!("saveBookGroupOrder 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/getAvailableBookSource：可用书源（key 要求可搜索；url 按 bookUrlPattern 规则过滤）
+async fn get_available_book_source(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let key = param_of(&params, body_json.as_ref(), "key");
+    let url = param_of(&params, body_json.as_ref(), "url");
+    let group = param_of(&params, body_json.as_ref(), "bookSourceGroup");
+    let sources = match state.storage.get_book_sources(&namespace).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("getAvailableBookSource [{namespace}] 失败: {e}");
+            return Json(ReturnData::err("系统错误"));
+        }
+    };
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for s in sources {
+        if !s.enabled {
+            continue;
+        }
+        if !group.is_empty()
+            && !s.book_source_group
+                .as_deref()
+                .map(|g| g.split(' ').any(|part| part == group))
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        if !key.is_empty() && s.search_url.is_none() {
+            continue;
+        }
+        if !url.is_empty() {
+            if let Some(pattern) = &s.book_url_pattern {
+                if !pattern.is_empty() {
+                    // 正则编译失败视为放行（书源可用性不受坏规则影响）
+                    let matched =
+                        regex::Regex::new(pattern).map(|re| re.is_match(&url)).unwrap_or(true);
+                    if !matched {
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(serde_json::to_value(s).unwrap_or(serde_json::Value::Null));
+    }
+    Json(ReturnData::ok(serde_json::Value::Array(out)))
+}
+
+/// GET/POST /reader3/getInvalidBookSources：并发 HEAD/首页检测失效书源（轻量超时 8s）
+async fn get_invalid_book_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = (params, body);
+    let sources = match state.storage.get_book_sources(&namespace).await {
+        Ok(s) => s.into_iter().filter(|s| s.enabled).collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::error!("getInvalidBookSources [{namespace}] 失败: {e}");
+            return Json(ReturnData::err("系统错误"));
+        }
+    };
+    let invalid = crate::service::health::find_invalid(&namespace, &sources).await;
+    let arr: Vec<serde_json::Value> = invalid
+        .into_iter()
+        .map(|(s, reason)| {
+            json!({
+                "bookSourceUrl": s.book_source_url,
+                "bookSourceName": s.book_source_name,
+                "error": reason,
+            })
+        })
+        .collect();
+    Json(ReturnData::ok(serde_json::Value::Array(arr)))
+}
+
+/// POST /reader3/setAsDefaultBookSources：默认书源标记（body：{bookSources:[url...] 或 [对象...]}）
+async fn set_as_default_book_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = params;
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let urls: Vec<String> = json
+        .get("bookSources")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .or_else(|| item.get("bookSourceUrl").and_then(|v| v.as_str()).map(str::to_string))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if urls.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.set_default_book_sources(&namespace, &urls).await {
+        Ok(_) => Json(ReturnData::ok(json!({ "count": urls.len() }))),
+        Err(e) => {
+            tracing::error!("setAsDefaultBookSources 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/searchBookSourceSSE：流式换源结果（逐书源事件 + end）
+async fn search_book_source_sse(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Response {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return sse_error(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    let book_source_param = param_of(&params, body_json.as_ref(), "bookSource");
+    if url.is_empty() {
+        return sse_error(ReturnData::err("请输入书籍链接"));
+    }
+    if book_source_param.is_empty() {
+        return sse_error(ReturnData::err("未配置书源"));
+    }
+
+    // ① 当前书名（书架优先；未入架走详情解析）
+    let name = match state.storage.find_book(&namespace, &url).await {
+        Ok(Some(b)) => b.name,
+        _ => {
+            let Some(source) = resolve_book_source(&state, &namespace, &book_source_param).await
+            else {
+                return sse_error(ReturnData::err("书源不存在"));
+            };
+            match crate::service::book::fetch_url(&namespace, &url, &source).await {
+                Ok(resp) => {
+                    let info = crate::service::book::analyze_book_info(
+                        &resp.body,
+                        &resp.url,
+                        &source,
+                        &url,
+                    );
+                    if info.name.is_empty() {
+                        return sse_error(ReturnData::err("获取书籍信息失败"));
+                    }
+                    info.name
+                }
+                Err(e) => {
+                    tracing::error!("searchBookSourceSSE 获取书名失败 [{url}]: {e}");
+                    return sse_error(ReturnData::err("获取书籍信息失败"));
+                }
+            }
+        }
+    };
+    let key = name.trim().to_string();
+    if key.is_empty() {
+        return sse_error(ReturnData::err("无法获取书名"));
+    }
+
+    // ② 全部启用可搜索书源（排除当前源）
+    let current = book_source_param.trim();
+    let sources: Vec<crate::model::BookSource> = match state.storage.get_book_sources(&namespace).await
+    {
+        Ok(s) => s
+            .into_iter()
+            .filter(|s| {
+                s.enabled
+                    && s.search_url.is_some()
+                    && s.book_source_url != current
+                    && s.book_source_name != current
+            })
+            .collect(),
+        Err(_) => return sse_error(ReturnData::err("系统错误")),
+    };
+
+    let (tx, rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::convert::Infallible>>();
+    let ns = namespace.clone();
+    tokio::spawn(async move {
+        if sources.is_empty() {
+            let payload = json!({ "lastIndex": -1, "isEnd": true });
+            let _ = tx.send(Ok(Bytes::from(format!("event: end\ndata: {payload}\n\n"))));
+            return;
+        }
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        let mut tasks = futures::stream::FuturesUnordered::new();
+        for (i, source) in sources.into_iter().enumerate() {
+            let sem = semaphore.clone();
+            let key = key.clone();
+            let ns = ns.clone();
+            tasks.push(Box::pin(async move {
+                let _permit = sem.acquire().await;
+                let books = crate::service::search::search_one_source(&ns, &source, &key, 1)
+                    .await
+                    .unwrap_or_default();
+                (i as i64, books)
+            }));
+        }
+        // 汇总：书名匹配过滤 + 按书源去重，逐源推送
+        let mut last = -1i64;
+        let mut seen = std::collections::HashSet::new();
+        let ql = key.to_lowercase();
+        while let Some((i, books)) = tasks.next().await {
+            last = i;
+            let matched: Vec<_> = books
+                .into_iter()
+                .filter(|b| {
+                    let bl = b.name.to_lowercase();
+                    bl.contains(&ql) || ql.contains(&bl)
+                })
+                .filter(|b| seen.insert(b.origin.clone()))
+                .collect();
+            let payload = json!({ "lastIndex": i, "data": matched });
+            if tx
+                .send(Ok(Bytes::from(format!("event: book\ndata: {payload}\n\n"))))
+                .is_err()
+            {
+                return; // 客户端断开
+            }
+        }
+        let end_payload = json!({ "lastIndex": last, "isEnd": true });
+        let _ = tx.send(Ok(Bytes::from(format!("event: end\ndata: {end_payload}\n\n"))));
+    });
+
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream; charset=utf-8")
+        .header("Cache-Control", "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// GET/POST /reader3/getReadingStats：阅读统计（today/week/total 秒数 + 单书 books[]）
+async fn get_reading_stats(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = (params, body);
+    match state.storage.get_reading_stats(&namespace).await {
+        Ok(stats) => Json(ReturnData::ok(
+            serde_json::to_value(stats).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("getReadingStats [{namespace}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
 /// GET /reader3/getBookshelf：按命名空间返回书架（user_namespace 取自 accessToken；非 secure 用 default）
 async fn get_bookshelf(
     State(state): State<AppState>,
@@ -2895,13 +4060,39 @@ async fn save_book_progress(
             .and_then(|b| b.get("durChapterTitle").and_then(|v| v.as_str()))
             .map(str::to_string)
     };
+    // 阅读统计：先取旧进度（增量时长/字数），再更新
+    let old = match state.storage.find_book(&namespace, &book_url).await {
+        Ok(Some(b)) => Some((b.dur_chapter_time, b.dur_chapter_pos)),
+        _ => None,
+    };
     match state
         .storage
         .update_book_progress(&namespace, &book_url, title.as_deref(), index, pos, time)
         .await
     {
         Ok(0) => Json(ReturnData::err("书籍未加入书架")),
-        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Ok(_) => {
+            // 增量累计阅读时长/字数到 reading_stats（今日行）
+            if let Some((old_time, old_pos)) = old {
+                let delta_seconds = if old_time > 0 && time > old_time {
+                    (time - old_time) / 1000
+                } else {
+                    0
+                };
+                let delta_chars = if pos > old_pos { pos - old_pos } else { 0 };
+                if delta_seconds > 0 || delta_chars > 0 {
+                    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                    if let Err(e) = state
+                        .storage
+                        .record_reading_stats(&namespace, &book_url, &date, delta_seconds, delta_chars)
+                        .await
+                    {
+                        tracing::warn!("记录阅读统计失败 [{book_url}]: {e}");
+                    }
+                }
+            }
+            Json(ReturnData::ok(serde_json::Value::Null))
+        }
         Err(e) => {
             tracing::error!("saveBookProgress 失败: {e}");
             Json(ReturnData::err("保存失败"))
@@ -6140,4 +7331,1229 @@ mod tests {
         let m = merge_login_params(&q, Some(b"\x00\x01\x02"));
         assert_eq!(m.get("bookSource").map(String::as_str), Some("https://a.com"));
     }
+    // ==================== 差距补全批：导出 / 调试 / 缓存 / 配置 / 刷新 / 批量 / 健康 / 统计 ====================
+
+    /// 微型 HTTP 服务器：支持 HEAD 与 GET（健康检测用）
+    async fn serve_head_get() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..10 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let req = String::from_utf8_lossy(&buf);
+                let body = if req.starts_with("HEAD ") { "" } else { "<html>ok</html>" };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// exportBook：本地书 txt/epub/html 三格式导出 + 参数校验
+    #[tokio::test]
+    async fn test_export_book_api() {
+        let (state, dir) = test_state("exportbook").await;
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "local://exp1".into(),
+                    name: "导出测试书".into(),
+                    author: "作者甲".into(),
+                    origin: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_chapters(
+                "local://exp1",
+                &[
+                    ("第一章".to_string(), "正文一 <甲> & 乙。".to_string()),
+                    ("第二章".to_string(), "正文二。".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        let params = |format: &str| -> HashMap<String, String> {
+            [("url".into(), "local://exp1".into()), ("format".into(), format.into())]
+                .into_iter()
+                .collect()
+        };
+
+        // txt
+        let resp = export_book(AxumState(state.clone()), Query(params("txt")), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        let cd = resp.headers().get("Content-Disposition").and_then(|v| v.to_str().ok()).expect("应含 Content-Disposition");
+        assert!(cd.starts_with("attachment; filename="), "{cd}");
+        assert!(cd.ends_with(".txt\""), "{cd}");
+        assert!(cd.contains("%E5%AF%BC"), "非 ASCII 应百分号编码: {cd}");
+        let txt = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(txt.contains("导出测试书"));
+        assert!(txt.contains("第一章"));
+        assert!(txt.contains("正文一 <甲> & 乙。"));
+        assert!(txt.contains("正文二。"));
+
+        // epub（zip 构造验证：mimetype/container/OPF/spine 章节）
+        let resp = export_book(AxumState(state.clone()), Query(params("epub")), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+            Some("application/epub+zip")
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("EPUB 应为合法 zip");
+        let mut mime = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("mimetype").unwrap(), &mut mime).unwrap();
+        assert_eq!(mime, "application/epub+zip");
+        let mut container = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("META-INF/container.xml").unwrap(), &mut container).unwrap();
+        assert!(container.contains("OEBPS/content.opf"));
+        let mut opf = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("OEBPS/content.opf").unwrap(), &mut opf).unwrap();
+        assert!(opf.contains("<dc:title>导出测试书</dc:title>"));
+        assert!(opf.contains("<dc:creator>作者甲</dc:creator>"));
+        assert_eq!(opf.matches("<itemref").count(), 2, "spine 两章");
+        let mut ch0 = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("OEBPS/chap_0000.xhtml").unwrap(), &mut ch0).unwrap();
+        assert!(ch0.contains("正文一 &lt;甲&gt; &amp; 乙。"), "XML 转义: {ch0}");
+
+        // html（单页：标题 + 章节）
+        let resp = export_book(AxumState(state.clone()), Query(params("html")), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        let html = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("<h1>导出测试书</h1>"));
+        assert!(html.contains("<h2>第一章</h2>"));
+        assert!(html.contains("<p>正文二。</p>"));
+
+        // 非法格式 / 缺 url
+        let resp = export_book(AxumState(state.clone()), Query(params("pdf")), HeaderMap::new(), None).await;
+        let json: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap());
+        assert_eq!(json["errorMsg"], "不支持的导出格式（txt|epub|html）");
+        let resp = export_book(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        let json: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap());
+
+        cleanup(state, dir).await;
+    }
+
+    /// exportBook：书源书（目录 → 逐章正文，复用规则引擎）
+    #[tokio::test]
+    async fn test_export_book_web_api() {
+        let (state, dir) = test_state("exportweb").await;
+        let base_url = serve_bodies(vec![
+            r#"<ul class="chapters"><li><a href="/ch1.html">第一章</a></li><li><a href="/ch2.html">第二章</a></li></ul>"#.to_string(),
+            r#"<html><body><div class="content">正文一。</div></body></html>"#.to_string(),
+            r#"<html><body><div class="content">正文二。</div></body></html>"#.to_string(),
+        ])
+        .await;
+        let base = base_url.trim_end_matches("/sources.json").to_string();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base.clone(),
+                    book_source_name: "导出源".into(),
+                    rule_toc: Some(serde_json::json!({
+                        "chapterList": "ul.chapters@li", "chapterName": "a@text", "chapterUrl": "a@href"
+                    })),
+                    rule_content: Some(serde_json::json!({ "content": "div.content@text" })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let book_url = format!("{base}/book/1");
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.clone(),
+                    name: "网文书".into(),
+                    origin: base.clone(),
+                    toc_url: format!("{base}/toc"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let params: HashMap<String, String> = [("url".into(), book_url.clone())].into_iter().collect();
+        let resp = export_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "书源书应可导出");
+        let txt = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(txt.contains("网文书"));
+        assert!(txt.contains("第一章"));
+        assert!(txt.contains("正文一。"));
+        assert!(txt.contains("正文二。"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// bookSourceDebugSSE：search 动作逐步骤事件（规则解析/URL 构造/请求/规则应用）→ result
+    #[tokio::test]
+    async fn test_book_source_debug_sse_search() {
+        let (state, dir) = test_state("dbgsearch").await;
+        let base_url = serve_bodies(vec![
+            r#"{"data":[{"name":"调试书","author":"甲","url":"/book/1"}]}"#.to_string(),
+        ])
+        .await;
+        let base = base_url.trim_end_matches("/sources.json").to_string();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base.clone(),
+                    book_source_name: "调试源".into(),
+                    search_url: Some(format!("{base}/search?q={{key}}")),
+                    rule_search: Some(serde_json::json!({
+                        "bookList": "$.data[*]",
+                        "name": "$.name", "author": "$.author", "bookUrl": "$.url"
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let params: HashMap<String, String> = [
+            ("bookSource".into(), base.clone()),
+            ("action".into(), "search".into()),
+            ("key".into(), "调试书".into()),
+        ]
+        .into_iter()
+        .collect();
+        let resp = book_source_debug_sse(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("\"type\":\"start\""), "{body}");
+        assert!(body.contains("\"type\":\"step\""), "应含 step 事件: {body}");
+        assert!(body.contains("规则解析（ruleSearch）"), "应含规则解析步骤: {body}");
+        assert!(body.contains("URL 构造"), "应含 URL 构造步骤: {body}");
+        assert!(body.contains("请求 URL"), "应含请求步骤: {body}");
+        assert!(body.contains("规则应用（bookList 字段）"), "应含规则应用步骤: {body}");
+        assert!(body.contains("\"type\":\"result\""), "应含 result 事件: {body}");
+        assert!(body.contains("\"name\":\"调试书\""), "result 应含搜索结果: {body}");
+        assert!(body.contains("\"ruleName\":\"规则解析（ruleSearch）\""), "step 应含 ruleName 字段: {body}");
+        assert!(body.contains("bookListKind"), "step 应含规则解析明细: {body}");
+
+        // 缺 key → error 事件
+        let params: HashMap<String, String> = [("bookSource".into(), base.clone()), ("action".into(), "search".into())]
+            .into_iter()
+            .collect();
+        let resp = book_source_debug_sse(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("请输入搜索关键字"));
+
+        // 非法动作 → error 事件
+        let params: HashMap<String, String> = [("bookSource".into(), base.clone()), ("action".into(), "bad".into())]
+            .into_iter()
+            .collect();
+        let resp = book_source_debug_sse(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("请输入调试动作"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// bookSourceDebugSSE：toc / content 动作
+    #[tokio::test]
+    async fn test_book_source_debug_sse_toc_content() {
+        let (state, dir) = test_state("dbgtoc").await;
+        let base_url = serve_bodies(vec![
+            r#"<ul class="chapters"><li><a href="/ch.html">第一章</a></li></ul>"#.to_string(),
+        ])
+        .await;
+        let base = base_url.trim_end_matches("/sources.json").to_string();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base.clone(),
+                    book_source_name: "目录源".into(),
+                    rule_toc: Some(serde_json::json!({
+                        "chapterList": "ul.chapters@li", "chapterName": "a@text", "chapterUrl": "a@href"
+                    })),
+                    rule_content: Some(serde_json::json!({ "content": "div.content@text" })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [
+            ("bookSource".into(), base.clone()),
+            ("action".into(), "toc".into()),
+            ("url".into(), format!("{base}/toc.html")),
+        ]
+        .into_iter()
+        .collect();
+        let resp = book_source_debug_sse(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("规则解析（ruleToc）"), "{body}");
+        assert!(body.contains("chapterList 提取"), "应含 chapterList 提取步骤: {body}");
+        assert!(body.contains("字段规则（chapterName/chapterUrl）"), "{body}");
+        assert!(body.contains("\"title\":\"第一章\""), "result 应含章节: {body}");
+
+        // content
+        let base_url = serve_bodies(vec![
+            r#"<html><body><div class="content">正文一。</div></body></html>"#.to_string(),
+        ])
+        .await;
+        let base2 = base_url.trim_end_matches("/sources.json").to_string();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base2.clone(),
+                    book_source_name: "正文源".into(),
+                    rule_content: Some(serde_json::json!({ "content": "div.content@text" })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [
+            ("bookSource".into(), base2.clone()),
+            ("action".into(), "content".into()),
+            ("chapterUrl".into(), format!("{base2}/ch.html")),
+        ]
+        .into_iter()
+        .collect();
+        let resp = book_source_debug_sse(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("规则解析（ruleContent）"), "{body}");
+        assert!(body.contains("content 规则应用"), "{body}");
+        assert!(body.contains("\"content\":\"正文一。\""), "result 应含正文: {body}");
+
+        // 缺 url → error 事件（toc）
+        let params: HashMap<String, String> = [("bookSource".into(), base.clone()), ("action".into(), "toc".into())]
+            .into_iter()
+            .collect();
+        let resp = book_source_debug_sse(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("请输入目录链接"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// cacheBookOnServer / cacheBookSSE / cancelCacheBook：本地书（无网络）
+    #[tokio::test]
+    async fn test_cache_book_api() {
+        let (state, dir) = test_state("cachebook").await;
+        let book_url = "local://cache1";
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.into(),
+                    name: "缓存书".into(),
+                    origin: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_chapters(
+                book_url,
+                &[("第一章".to_string(), "正文一".to_string()), ("第二章".to_string(), "正文二".to_string())],
+            )
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [("url".into(), book_url.into())].into_iter().collect();
+
+        // 启动任务
+        let ret = cache_book_on_server(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert!(ret.0.data["started"].as_bool().unwrap());
+        // 等待完成
+        assert!(
+            crate::service::cache_job::wait_finished(book_url, std::time::Duration::from_secs(5)).await,
+            "任务应在 5s 内完成"
+        );
+        let p = crate::service::cache_job::progress_of(book_url).unwrap();
+        let p = p.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(p.finished);
+        assert_eq!(p.total, 2);
+        assert_eq!(p.cached, 2);
+        assert_eq!(p.title, "缓存书");
+        drop(p);
+
+        // SSE 进度流
+        let resp = cache_book_sse(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("\"cached\":2"), "{body}");
+        assert!(body.contains("\"total\":2"), "{body}");
+        assert!(body.contains("\"finished\":true"), "{body}");
+
+        // cancel：任务已完成但仍在表内 → true；再 cancel → false
+        let ret = cancel_cache_book(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        assert!(ret.0.data["cancelled"].as_bool().unwrap());
+        let ret = cancel_cache_book(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), None).await;
+        assert!(!ret.0.data["cancelled"].as_bool().unwrap());
+
+        // 未知任务 SSE → error 事件
+        let ghost: HashMap<String, String> = [("url".into(), "local://ghost".into())].into_iter().collect();
+        let resp = cache_book_sse(AxumState(state.clone()), Query(ghost), HeaderMap::new(), None).await;
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("缓存任务不存在"));
+
+        // 书不存在 → 不启动
+        let ghost: HashMap<String, String> = [("url".into(), "local://ghost2".into())].into_iter().collect();
+        let ret = cache_book_on_server(AxumState(state.clone()), Query(ghost), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "书籍不存在（请先加入书架）");
+
+        cleanup(state, dir).await;
+    }
+
+    /// cacheBookOnServer：书源书后台缓存（目录 → 并发 3 逐章 → 缓存表）
+    #[tokio::test]
+    async fn test_cache_book_web_api() {
+        let (state, dir) = test_state("cacheweb").await;
+        let base_url = serve_bodies(vec![
+            r#"<ul class="chapters"><li><a href="/ch1.html">第一章</a></li><li><a href="/ch2.html">第二章</a></li></ul>"#.to_string(),
+            r#"<html><body><div class="content">正文一。</div></body></html>"#.to_string(),
+            r#"<html><body><div class="content">正文二。</div></body></html>"#.to_string(),
+        ])
+        .await;
+        let base = base_url.trim_end_matches("/sources.json").to_string();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base.clone(),
+                    book_source_name: "缓存源".into(),
+                    rule_toc: Some(serde_json::json!({
+                        "chapterList": "ul.chapters@li", "chapterName": "a@text", "chapterUrl": "a@href"
+                    })),
+                    rule_content: Some(serde_json::json!({ "content": "div.content@text" })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let book_url = format!("{base}/book/cache");
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.clone(),
+                    name: "缓存网文书".into(),
+                    origin: base.clone(),
+                    toc_url: format!("{base}/toc"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let params: HashMap<String, String> = [("url".into(), book_url.clone())].into_iter().collect();
+        let ret = cache_book_on_server(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert!(
+            crate::service::cache_job::wait_finished(&book_url, std::time::Duration::from_secs(10)).await,
+            "书源书缓存应在 10s 内完成"
+        );
+        let p = crate::service::cache_job::progress_of(&book_url).unwrap();
+        let p = p.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(p.finished, "任务应结束");
+        assert_eq!(p.total, 2);
+        assert_eq!(p.cached, 2, "两章都应缓存成功: {p:?}");
+        assert_eq!(p.title, "缓存网文书");
+        drop(p);
+        // 缓存表已写入（chapterUrl md5 键）
+        let idx1 = crate::util::md5::chapter_url_hash(&format!("{base}/ch1.html"));
+        let idx2 = crate::util::md5::chapter_url_hash(&format!("{base}/ch2.html"));
+        assert_eq!(
+            state.storage.get_chapter_content(&book_url, idx1).await.unwrap().as_deref(),
+            Some("正文一。")
+        );
+        assert_eq!(
+            state.storage.get_chapter_content(&book_url, idx2).await.unwrap().as_deref(),
+            Some("正文二。")
+        );
+        // 清理任务表
+        crate::service::cache_job::cancel(&book_url);
+        cleanup(state, dir).await;
+    }
+
+    /// getUserConfig / saveUserConfig：读写覆盖 + 用户隔离（secure 模式）
+    #[tokio::test]
+    async fn test_user_config_api() {
+        let (state, dir) = test_state("userconf").await;
+
+        // 保存 {ns, config}
+        let body = Bytes::from(r#"{"ns":"reader","config":{"fontSize":18,"theme":"dark"}}"#);
+        let ret = save_user_config(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        // 读取
+        let params: HashMap<String, String> = [("key".into(), "reader".into())].into_iter().collect();
+        let ret = get_user_config(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data["ns"], "reader");
+        assert_eq!(ret.0.data["config"]["fontSize"], 18);
+        assert_eq!(ret.0.data["config"]["theme"], "dark");
+        // 覆盖
+        let body = Bytes::from(r#"{"ns":"reader","config":{"fontSize":20}}"#);
+        let ret = save_user_config(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        let params: HashMap<String, String> = [("key".into(), "reader".into())].into_iter().collect();
+        let ret = get_user_config(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data["config"]["fontSize"], 20);
+        // 未设置的 key → null
+        let params: HashMap<String, String> = [("key".into(), "ghost".into())].into_iter().collect();
+        let ret = get_user_config(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.data["config"].is_null());
+        // 裸 JSON 整体保存（无 config 键；默认 ns=global）
+        let body = Bytes::from(r#"{"fontSize":16}"#);
+        let ret = save_user_config(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        let ret = get_user_config(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data["config"]["fontSize"], 16);
+        // 非 JSON → 参数错误
+        let ret = save_user_config(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(Bytes::from("nope"))).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        // secure 模式用户隔离
+        let mut state = state;
+        state.storage.config.secure = true;
+        state
+            .storage
+            .insert_user(&User { username: "alice".into(), token: "t1".into(), ..Default::default() })
+            .await
+            .unwrap();
+        state
+            .storage
+            .insert_user(&User { username: "bob".into(), token: "t2".into(), ..Default::default() })
+            .await
+            .unwrap();
+        let body = Bytes::from(r#"{"ns":"pref","config":{"a":1}}"#);
+        let params: HashMap<String, String> = [("accessToken".into(), "alice:t1".into())].into_iter().collect();
+        let ret = save_user_config(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        let mut q = params.clone();
+        q.insert("key".into(), "pref".into());
+        let ret = get_user_config(AxumState(state.clone()), Query(q), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data["config"]["a"], 1);
+        // bob 读不到 alice 的配置
+        let mut qb: HashMap<String, String> = [
+            ("accessToken".into(), "bob:t2".into()),
+            ("key".into(), "pref".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = get_user_config(AxumState(state.clone()), Query(qb.clone()), HeaderMap::new(), None).await;
+        assert!(ret.0.data["config"].is_null(), "bob 不应看到 alice 配置: {ret:?}");
+        // bob 覆盖自己的配置不影响 alice
+        let body = Bytes::from(r#"{"ns":"pref","config":{"a":2}}"#);
+        let ret = save_user_config(AxumState(state.clone()), Query(qb), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        let mut q = params;
+        q.insert("key".into(), "pref".into());
+        let ret = get_user_config(AxumState(state.clone()), Query(q), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data["config"]["a"], 1, "alice 配置不受 bob 影响");
+
+        cleanup(state, dir).await;
+    }
+
+    /// refreshLocalBook：local:// 重解析原文件 + 文件书重解析 + 非本地书拒绝
+    #[tokio::test]
+    async fn test_refresh_local_book_api() {
+        let (state, dir) = test_state("refreshlocal").await;
+        // local:// 书：原文件在 opds_files/{id}.txt
+        let id = "book-abc";
+        let opds_dir = state.storage.config.storage_dir().join("data/default/opds_files");
+        std::fs::create_dir_all(&opds_dir).unwrap();
+        std::fs::write(
+            opds_dir.join(format!("{id}.txt")),
+            "第一章 起点\n内容一。\n第二章 成长\n内容二。",
+        )
+        .unwrap();
+        let book_url = format!("local://{id}");
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.clone(),
+                    name: "刷新书".into(),
+                    origin: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [("url".into(), book_url.clone())].into_iter().collect();
+        let ret = refresh_local_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["chapterCount"], 2);
+        assert_eq!(ret.0.data["name"], "刷新书");
+        assert_eq!(state.storage.list_chapters(&book_url).await.unwrap().len(), 2, "章节已重扫入库");
+        assert_eq!(
+            state.storage.find_book("default", &book_url).await.unwrap().unwrap().total_chapter_num,
+            2,
+            "totalChapterNum 已更新"
+        );
+
+        // 文件型本地书（storage/ 路径）
+        let file_dir = state.storage.config.storage_dir().join("data/default/books");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        std::fs::write(
+            file_dir.join("示例2.txt"),
+            "第一章 起点\n内容一。\n第二章 成长\n内容二。\n第三章 终章\n内容三。",
+        )
+        .unwrap();
+        let fbook = "storage/data/default/books/示例2.txt";
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: fbook.into(),
+                    name: "文件书".into(),
+                    origin: "loc_book".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [("url".into(), fbook.into())].into_iter().collect();
+        let ret = refresh_local_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["chapterCount"], 3);
+
+        // 非本地书 → 拒绝；不存在 → 书籍不存在；缺 url → 参数错误
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book { book_url: "https://web.com/a".into(), name: "网文".into(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [("url".into(), "https://web.com/a".into())].into_iter().collect();
+        let ret = refresh_local_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "仅支持本地书刷新");
+        let params: HashMap<String, String> = [("url".into(), "local://ghost".into())].into_iter().collect();
+        let ret = refresh_local_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "书籍不存在");
+        let ret = refresh_local_book(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        cleanup(state, dir).await;
+    }
+
+    /// deleteBooks：批量删除（含章节清理）与参数校验
+    #[tokio::test]
+    async fn test_delete_books_api() {
+        let (state, dir) = test_state("delbooks").await;
+        for (url, name) in [("https://b.com/1", "书1"), ("https://b.com/2", "书2"), ("https://b.com/3", "书3")] {
+            state
+                .storage
+                .upsert_book("default", &crate::model::Book { book_url: url.into(), name: name.into(), ..Default::default() })
+                .await
+                .unwrap();
+        }
+        state.storage.save_chapters("https://b.com/1", &[("第一章".into(), "正文".into())]).await.unwrap();
+
+        let body = Bytes::from(r#"{"bookUrls":["https://b.com/1","https://b.com/2"]}"#);
+        let ret = delete_books(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["count"], 2);
+        assert!(state.storage.find_book("default", "https://b.com/1").await.unwrap().is_none());
+        assert!(state.storage.find_book("default", "https://b.com/2").await.unwrap().is_none());
+        assert!(state.storage.find_book("default", "https://b.com/3").await.unwrap().is_some());
+        assert_eq!(state.storage.count_chapters("https://b.com/1").await.unwrap(), 0, "章节连带删除");
+
+        // 参数校验
+        let ret = delete_books(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let body = Bytes::from(r#"{"bookUrls":[]}"#);
+        let ret = delete_books(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        cleanup(state, dir).await;
+    }
+
+    /// deleteBookmarks：批量删书签（{bookUrl, ids}）与参数校验
+    #[tokio::test]
+    async fn test_delete_bookmarks_api() {
+        let (state, dir) = test_state("delbms").await;
+        for (i, title) in ["m1", "m2", "m3"].iter().enumerate() {
+            state
+                .storage
+                .save_bookmark(
+                    "default",
+                    &crate::model::Bookmark {
+                        book_url: "https://b.com/1".into(),
+                        title: (*title).into(),
+                        paragraph_index: i as i64,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // 删两条
+        let body = Bytes::from(r#"{"bookUrl":"https://b.com/1","ids":["m1","m3"]}"#);
+        let ret = delete_bookmarks(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["count"], 2);
+        let rest = state.storage.list_bookmarks("default", "https://b.com/1").await.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].title, "m2");
+        // 参数校验
+        let body = Bytes::from(r#"{"bookUrl":"https://b.com/1","ids":[]}"#);
+        let ret = delete_bookmarks(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let ret = delete_bookmarks(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        cleanup(state, dir).await;
+    }
+
+    /// saveRssSources：批量保存 RSS 源（覆盖 + 校验）
+    #[tokio::test]
+    async fn test_save_rss_sources_api() {
+        let (state, dir) = test_state("save_rss").await;
+        let body = Bytes::from(
+            r#"[{"sourceUrl":"https://r1.com/feed","sourceName":"源1","sourceGroup":"科技","enabled":true},
+                {"sourceUrl":"https://r2.com/feed","sourceName":"源2","enabled":false}]"#,
+        );
+        let ret = save_rss_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["count"], 2);
+        let list = state.storage.get_rss_sources("default").await.unwrap();
+        assert_eq!(list.len(), 2);
+        let s1 = list.iter().find(|s| s.source_url == "https://r1.com/feed").unwrap();
+        assert_eq!(s1.source_name, "源1");
+        assert_eq!(s1.source_group.as_deref(), Some("科技"));
+        assert!(s1.enabled);
+        let s2 = list.iter().find(|s| s.source_url == "https://r2.com/feed").unwrap();
+        assert!(!s2.enabled);
+        // 覆盖同 url 不新增
+        let body = Bytes::from(r#"[{"sourceUrl":"https://r1.com/feed","sourceName":"源1v2"}]"#);
+        let ret = save_rss_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        assert_eq!(state.storage.get_rss_sources("default").await.unwrap().len(), 2);
+        // 校验
+        let ret = save_rss_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let body = Bytes::from(r#"[]"#);
+        let ret = save_rss_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let body = Bytes::from(r#"[{"sourceUrl":"https://r3.com/feed"}]"#);
+        let ret = save_rss_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误", "缺 sourceName 应拒绝");
+
+        cleanup(state, dir).await;
+    }
+
+    /// saveBookmarks：批量保存书签（createdAt 自动补）
+    #[tokio::test]
+    async fn test_save_bookmarks_api() {
+        let (state, dir) = test_state("savebms").await;
+        let body = Bytes::from(
+            r#"[{"bookUrl":"https://b.com/1","title":"书签甲","paragraphIndex":3,"chapterIndex":1},
+                {"bookUrl":"https://b.com/1","title":"书签乙"}]"#,
+        );
+        let ret = save_bookmarks(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["count"], 2);
+        let list = state.storage.list_bookmarks("default", "https://b.com/1").await.unwrap();
+        assert_eq!(list.len(), 2);
+        let jia = list.iter().find(|b| b.title == "书签甲").unwrap();
+        assert_eq!(jia.paragraph_index, 3);
+        assert!(jia.created_at > 0, "createdAt 应自动补");
+        // 校验
+        let body = Bytes::from(r#"[{"bookUrl":"https://b.com/1"}]"#);
+        let ret = save_bookmarks(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let ret = save_bookmarks(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        cleanup(state, dir).await;
+    }
+
+    /// addBookGroupMulti / removeBookGroupMulti：批量设分组/移出分组
+    #[tokio::test]
+    async fn test_book_group_multi_api() {
+        let (state, dir) = test_state("grpmulti").await;
+        let g = state
+            .storage
+            .save_book_group("default", &crate::model::BookGroup { name: "玄幻".into(), order: 1, ..Default::default() })
+            .await
+            .unwrap();
+        for url in ["https://b.com/1", "https://b.com/2", "https://b.com/3"] {
+            state
+                .storage
+                .upsert_book("default", &crate::model::Book { book_url: url.into(), name: url.into(), ..Default::default() })
+                .await
+                .unwrap();
+        }
+        // 批量设分组
+        let body = Bytes::from(format!(r#"{{"bookUrls":["https://b.com/1","https://b.com/2"],"groupId":{}}}"#, g.id));
+        let ret = add_book_group_multi(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["count"], 2);
+        assert_eq!(state.storage.find_book("default", "https://b.com/1").await.unwrap().unwrap().group, g.id);
+        assert_eq!(state.storage.find_book("default", "https://b.com/2").await.unwrap().unwrap().group, g.id);
+        assert_eq!(state.storage.find_book("default", "https://b.com/3").await.unwrap().unwrap().group, 0);
+        // 参数校验
+        let body = Bytes::from(r#"{"bookUrls":["https://b.com/1"],"groupId":-1}"#);
+        let ret = add_book_group_multi(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        // 批量移出
+        let body = Bytes::from(r#"{"bookUrls":["https://b.com/1","https://b.com/3"]}"#);
+        let ret = remove_book_group_multi(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data["count"], 2, "匹配行数（b1 置 0 + b3 本为 0 也计入匹配）");
+        assert_eq!(state.storage.find_book("default", "https://b.com/1").await.unwrap().unwrap().group, 0);
+        assert_eq!(state.storage.find_book("default", "https://b.com/2").await.unwrap().unwrap().group, g.id, "未涉及的保持");
+        let ret = remove_book_group_multi(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        cleanup(state, dir).await;
+    }
+
+    /// saveBookGroupOrder：分组排序批量保存
+    #[tokio::test]
+    async fn test_save_book_group_order_api() {
+        let (state, dir) = test_state("grporder").await;
+        let g1 = state
+            .storage
+            .save_book_group("default", &crate::model::BookGroup { name: "甲".into(), order: 1, ..Default::default() })
+            .await
+            .unwrap();
+        let g2 = state
+            .storage
+            .save_book_group("default", &crate::model::BookGroup { name: "乙".into(), order: 2, ..Default::default() })
+            .await
+            .unwrap();
+        let body = Bytes::from(format!(
+            r#"{{"order":[{{"id":{},"orderNum":2}},{{"id":{},"orderNum":1}}]}}"#,
+            g1.id, g2.id
+        ));
+        let ret = save_book_group_order(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["count"], 2);
+        let list = state.storage.list_book_groups("default").await.unwrap();
+        assert_eq!(list[0].id, g2.id, "乙应排第一");
+        assert_eq!(list[0].order, 1);
+        assert_eq!(list[1].id, g1.id);
+        assert_eq!(list[1].order, 2);
+        // 参数校验
+        let body = Bytes::from(r#"{"order":[]}"#);
+        let ret = save_book_group_order(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        cleanup(state, dir).await;
+    }
+
+    /// getAvailableBookSource：启用过滤 + key 可搜索过滤 + bookUrlPattern 规则过滤
+    #[tokio::test]
+    async fn test_get_available_book_source_api() {
+        let (state, dir) = test_state("availsrc").await;
+        // s1：可搜索 + bookUrlPattern 匹配 a.com
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "https://s1.com".into(),
+                    book_source_name: "源1".into(),
+                    enabled: true,
+                    search_url: Some("https://s1.com/s".into()),
+                    book_url_pattern: Some(r#"^https://a\.com/"#.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // s2：可探索不可搜索、无 pattern
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "https://s2.com".into(),
+                    book_source_name: "源2".into(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // s3：禁用
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "https://s3.com".into(),
+                    book_source_name: "源3".into(),
+                    enabled: false,
+                    search_url: Some("https://s3.com/s".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // key → 仅可搜索源
+        let params: HashMap<String, String> = [("key".into(), "测试".into())].into_iter().collect();
+        let ret = get_available_book_source(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["bookSourceUrl"], "https://s1.com");
+        // url 匹配 pattern → s1 + s2（s2 无 pattern 放行）
+        let params: HashMap<String, String> = [("url".into(), "https://a.com/book/1".into())].into_iter().collect();
+        let ret = get_available_book_source(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // url 不匹配 pattern → 仅 s2
+        let params: HashMap<String, String> = [("url".into(), "https://b.com/book/1".into())].into_iter().collect();
+        let ret = get_available_book_source(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["bookSourceUrl"], "https://s2.com");
+
+        cleanup(state, dir).await;
+    }
+
+    /// getInvalidBookSources：HEAD 200 判定可用；连接拒绝判定失效
+    #[tokio::test]
+    async fn test_get_invalid_book_sources_api() {
+        let (state, dir) = test_state("invalidsrc").await;
+        let good_url = serve_head_get().await;
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: good_url.clone(),
+                    book_source_name: "好源".into(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "http://127.0.0.1:1".into(),
+                    book_source_name: "坏源".into(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // 禁用的不参与检测
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "http://127.0.0.1:2".into(),
+                    book_source_name: "停用源".into(),
+                    enabled: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let ret = get_invalid_book_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "仅坏源应判定失效: {arr:?}");
+        assert_eq!(arr[0]["bookSourceUrl"], "http://127.0.0.1:1");
+        assert!(arr[0]["error"].as_str().unwrap().contains("连接失败"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// setAsDefaultBookSources：默认书源标记（字符串数组 / 对象数组）
+    #[tokio::test]
+    async fn test_set_as_default_book_sources_api() {
+        let (state, dir) = test_state("defaultsrc").await;
+        let body = Bytes::from(r#"{"bookSources":["https://s1.com",{"bookSourceUrl":"https://s2.com"}]}"#);
+        let ret = set_as_default_book_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["count"], 2);
+        let list = state.storage.get_default_book_sources("default").await.unwrap();
+        assert_eq!(list, vec!["https://s1.com".to_string(), "https://s2.com".to_string()]);
+        // 覆盖
+        let body = Bytes::from(r#"{"bookSources":["https://s3.com"]}"#);
+        let ret = set_as_default_book_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        assert_eq!(state.storage.get_default_book_sources("default").await.unwrap(), vec!["https://s3.com".to_string()]);
+        // 校验
+        let body = Bytes::from(r#"{"bookSources":[]}"#);
+        let ret = set_as_default_book_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        cleanup(state, dir).await;
+    }
+
+    /// searchBookSourceSSE：流式换源（逐书源 event: book → event: end）
+    #[tokio::test]
+    async fn test_search_book_source_sse_api() {
+        let (state, dir) = test_state("srcsse").await;
+        // 当前源 s1（排除）
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "https://s1.com".into(),
+                    book_source_name: "源1".into(),
+                    enabled: true,
+                    search_url: Some("https://s1.com/s?q={{key}}".into()),
+                    rule_search: Some(serde_json::json!({
+                        "bookList": "$.data[*]",
+                        "name": "$.name", "author": "$.author", "bookUrl": "$.url", "tocUrl": "$.toc"
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // s2 → 本地测试服务器（返回命中结果）
+        let base_url = serve_bodies(vec![
+            r#"{"data":[{"name":"测试书","author":"甲","url":"/book/9","toc":"/toc"}]}"#.to_string(),
+        ])
+        .await;
+        let base = base_url.trim_end_matches("/sources.json").to_string();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base.clone(),
+                    book_source_name: "源2".into(),
+                    enabled: true,
+                    search_url: Some(format!("{base}/search?q={{key}}")),
+                    rule_search: Some(serde_json::json!({
+                        "bookList": "$.data[*]",
+                        "name": "$.name", "author": "$.author", "bookUrl": "$.url", "tocUrl": "$.toc"
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://s1.com/book/1".into(),
+                    name: "测试书".into(),
+                    origin: "https://s1.com".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let params: HashMap<String, String> = [
+            ("url".into(), "https://s1.com/book/1".into()),
+            ("bookSource".into(), "https://s1.com".into()),
+        ]
+        .into_iter()
+        .collect();
+        let resp = search_book_source_sse(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("event: book"), "应含 book 事件: {body}");
+        assert!(body.contains("\"name\":\"测试书\""), "命中书应推送: {body}");
+        assert!(body.contains("event: end"), "应含 end 事件: {body}");
+        assert!(body.contains("\"isEnd\":true"), "{body}");
+
+        // 缺 url → error 事件
+        let params: HashMap<String, String> = [("bookSource".into(), "https://s1.com".into())].into_iter().collect();
+        let resp = search_book_source_sse(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let body = String::from_utf8(axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("请输入书籍链接"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// getReadingStats：saveBookProgress 增量累计时长/字数 → today/week/total/books
+    #[tokio::test]
+    async fn test_reading_stats_api() {
+        let (state, dir) = test_state("readstats").await;
+        let now = now_millis();
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://stats.com/b".into(),
+                    name: "统计书".into(),
+                    dur_chapter_time: now - 10_000,
+                    dur_chapter_pos: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // 第一次进度：+10s / +500 字
+        let body = Bytes::from(
+            json!({"bookUrl":"https://stats.com/b","durChapterIndex":1,"durChapterPos":500,"durChapterTime":now}).to_string(),
+        );
+        let ret = save_book_progress(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        // 第二次：+5s / +200 字
+        let body = Bytes::from(
+            json!({"bookUrl":"https://stats.com/b","durChapterIndex":1,"durChapterPos":700,"durChapterTime":now + 5000}).to_string(),
+        );
+        let ret = save_book_progress(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+
+        // storage 层汇总
+        let stats = state.storage.get_reading_stats("default").await.unwrap();
+        assert_eq!(stats.today, 15, "10s + 5s");
+        assert_eq!(stats.total, 15);
+        assert!(stats.week >= 15);
+        assert_eq!(stats.books.len(), 1);
+        assert_eq!(stats.books[0].book_url, "https://stats.com/b");
+        assert_eq!(stats.books[0].name, "统计书");
+        assert_eq!(stats.books[0].seconds, 15);
+        assert_eq!(stats.books[0].chars, 700, "500 + 200 字");
+
+        // handler 输出（camelCase）
+        let ret = get_reading_stats(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data["today"], 15);
+        assert_eq!(ret.0.data["total"], 15);
+        assert_eq!(ret.0.data["books"][0]["chars"], 700);
+        assert_eq!(ret.0.data["books"][0]["bookUrl"], "https://stats.com/b");
+
+        // 未入架书 → 书籍未加入书架（不记统计）
+        let body = Bytes::from(r#"{"bookUrl":"https://ghost.com/b","durChapterIndex":0,"durChapterPos":10}"#);
+        let ret = save_book_progress(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "书籍未加入书架");
+
+        cleanup(state, dir).await;
+    }
+
+    /// 命名兼容批 2（端到端）：resetPassword / httpTTS / uploadFile 别名路由
+    #[tokio::test]
+    async fn test_alias_routes_batch2() {
+        let (state, dir) = test_state("alias2").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.secure_key = "sk".into();
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let app = router(state.storage.config.clone(), state.storage.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // uploadFile（= file/upload）：multipart txt 上传（手构 multipart body）
+        let boundary = "----reader-test-boundary";
+        let multipart_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"示例.txt\"\r\nContent-Type: text/plain\r\n\r\n第一章 起点\n内容一。\r\n--{boundary}--\r\n"
+        );
+        let resp = client
+            .post(format!("{base}/reader3/uploadFile"))
+            .query(&[("accessToken", "alice:t1")])
+            .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+            .body(multipart_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: Value = resp.json().await.unwrap();
+        assert!(json["isSuccess"].as_bool().unwrap(), "uploadFile 应成功: {json}");
+        let arr = json["data"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "示例.txt");
+        assert!(
+            std::path::Path::new(&state.storage.config.storage_dir().join("data/alice/示例.txt")).exists(),
+            "文件应落盘"
+        );
+
+        // httpTTS（= tts）：未知引擎 → 业务错误（无网络请求）
+        let resp = client
+            .get(format!("{base}/reader3/httpTTS"))
+            .query(&[("accessToken", "alice:t1"), ("text", "你好"), ("engine", "nope")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: Value = resp.json().await.unwrap();
+        assert_eq!(json["errorMsg"], "不支持的TTS引擎");
+
+        // resetPassword（= resetUserPassword）：重置后旧 token 失效
+        let resp = client
+            .post(format!("{base}/reader3/resetPassword"))
+            .query(&[("accessToken", "alice:t1"), ("secureKey", "sk")])
+            .json(&json!({"username": "alice", "newPassword": "新密码123"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: Value = resp.json().await.unwrap();
+        assert!(json["isSuccess"].as_bool().unwrap(), "resetPassword 应成功: {json}");
+        let alice = state.storage.find_user("alice").await.unwrap().unwrap();
+        assert_eq!(gen_encrypted_password("新密码123", &alice.salt), alice.password, "新密码应可校验");
+        assert!(alice.token.is_empty(), "旧 token 应失效");
+
+        cleanup(state, dir).await;
+    }
+
 }

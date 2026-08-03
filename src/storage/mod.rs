@@ -42,6 +42,33 @@ pub struct BookContentHit {
     pub snippet: String,
 }
 
+/// 阅读统计单书汇总（getReadingStats.books[]）
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingStatBook {
+    pub book_url: String,
+    /// 书名（书架 books 表关联；不在书架时用 bookUrl）
+    pub name: String,
+    /// 累计阅读秒数
+    pub seconds: i64,
+    /// 累计阅读字数
+    pub chars: i64,
+}
+
+/// 阅读统计（getReadingStats：今日/本周/总计 + 单书汇总）
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingStats {
+    /// 今日阅读秒数
+    pub today: i64,
+    /// 近 7 天阅读秒数
+    pub week: i64,
+    /// 累计阅读秒数
+    pub total: i64,
+    /// 单书汇总（按秒数降序）
+    pub books: Vec<ReadingStatBook>,
+}
+
 /// 命中摘要：定位 key 首次出现位置（大小写不敏感），取所在段落 + 前后各 radius 字符，
 /// 截断处补省略号、换行压平为空格
 fn make_snippet(content: &str, key: &str, radius: usize) -> String {
@@ -425,6 +452,37 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             enable INTEGER DEFAULT 1,
             serial_number INTEGER DEFAULT 0,
             user_namespace TEXT DEFAULT ''
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // 用户配置（前端设置同步：user_config 表按用户命名空间 + 配置命名空间双主键）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS user_config (
+            user_namespace TEXT NOT NULL,
+            ns TEXT NOT NULL,
+            config TEXT,
+            updated_at INTEGER DEFAULT 0,
+            PRIMARY KEY (user_namespace, ns)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // 阅读统计（reading_stats：按用户 + 书 + 日期累计阅读时长/字数）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS reading_stats (
+            user_namespace TEXT NOT NULL,
+            book_url TEXT NOT NULL,
+            date TEXT NOT NULL,
+            seconds INTEGER DEFAULT 0,
+            chars INTEGER DEFAULT 0,
+            PRIMARY KEY (user_namespace, book_url, date)
         );
         "#,
     )
@@ -1474,6 +1532,273 @@ impl Storage {
             .await?;
         tx.commit().await?;
         Ok(r.rows_affected())
+    }
+
+    // ---------------- 批量接口（deleteBooks / 分组批量 / 书签批量 / RSS 批量） ----------------
+
+    /// 批量删除书（事务：每本连带删章节）；返回删除的书行数
+    pub async fn delete_books(&self, ns: &str, book_urls: &[String]) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let mut deleted = 0u64;
+        for url in book_urls {
+            sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
+                .bind(url)
+                .execute(&mut *tx)
+                .await?;
+            let r = sqlx::query("DELETE FROM books WHERE user_namespace = ?1 AND book_url = ?2")
+                .bind(ns)
+                .bind(url)
+                .execute(&mut *tx)
+                .await?;
+            deleted += r.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    /// 批量书设分组（books.group_name = 分组 id）；返回受影响行数
+    pub async fn add_book_group_multi(
+        &self,
+        ns: &str,
+        book_urls: &[String],
+        group_id: i64,
+    ) -> Result<u64> {
+        if book_urls.is_empty() {
+            return Ok(0);
+        }
+        let mut qb = sqlx::QueryBuilder::new("UPDATE books SET group_name = ");
+        qb.push_bind(group_id)
+            .push(" WHERE user_namespace = ")
+            .push_bind(ns)
+            .push(" AND book_url IN (");
+        let mut sep = qb.separated(", ");
+        for url in book_urls {
+            sep.push_bind(url);
+        }
+        qb.push(")");
+        let r = qb.build().execute(&self.pool).await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 批量移出分组（group_name 置 0）；返回受影响行数
+    pub async fn remove_book_group_multi(&self, ns: &str, book_urls: &[String]) -> Result<u64> {
+        if book_urls.is_empty() {
+            return Ok(0);
+        }
+        let mut qb = sqlx::QueryBuilder::new("UPDATE books SET group_name = 0 WHERE user_namespace = ");
+        qb.push_bind(ns).push(" AND book_url IN (");
+        let mut sep = qb.separated(", ");
+        for url in book_urls {
+            sep.push_bind(url);
+        }
+        qb.push(")");
+        let r = qb.build().execute(&self.pool).await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 分组排序批量保存（order = [(id, order_num)]）；返回更新行数
+    pub async fn save_book_group_order(&self, ns: &str, order: &[(i64, i64)]) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let mut updated = 0u64;
+        for (id, order_num) in order {
+            let r = sqlx::query(
+                "UPDATE book_groups SET order_num = ?3 WHERE user_namespace = ?1 AND id = ?2",
+            )
+            .bind(ns)
+            .bind(id)
+            .bind(order_num)
+            .execute(&mut *tx)
+            .await?;
+            updated += r.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    /// 批量保存书签（单事务，INSERT OR REPLACE 按 book_url+title 主键去重）
+    pub async fn save_bookmarks(&self, ns: &str, bookmarks: &[crate::model::Bookmark]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for b in bookmarks {
+            sqlx::query(
+                "INSERT OR REPLACE INTO bookmarks (book_url, title, paragraph_index, chapter_index,              created_at, user_namespace) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(&b.book_url)
+            .bind(&b.title)
+            .bind(b.paragraph_index)
+            .bind(b.chapter_index)
+            .bind(b.created_at)
+            .bind(ns)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 批量删除书签（book_url + ids=书签标题列表，IN 查询）；返回受影响行数
+    pub async fn delete_bookmarks(&self, ns: &str, book_url: &str, ids: &[String]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut qb = sqlx::QueryBuilder::new("DELETE FROM bookmarks WHERE user_namespace = ");
+        qb.push_bind(ns)
+            .push(" AND book_url = ")
+            .push_bind(book_url)
+            .push(" AND title IN (");
+        let mut sep = qb.separated(", ");
+        for id in ids {
+            sep.push_bind(id);
+        }
+        qb.push(")");
+        let r = qb.build().execute(&self.pool).await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 批量保存 RSS 源（单事务，INSERT OR REPLACE 按 rss_source_url 主键覆盖）
+    pub async fn save_rss_sources(&self, ns: &str, sources: &[crate::model::RssSource]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for s in sources {
+            sqlx::query(
+                "INSERT OR REPLACE INTO rss_sources            (rss_source_url, rss_source_name, rss_source_group, enabled, user_namespace, raw_json)            VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(&s.source_url)
+            .bind(&s.source_name)
+            .bind(&s.source_group)
+            .bind(s.enabled)
+            .bind(ns)
+            .bind(&s.raw_json)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ---------------- 用户配置（user_config 表：按用户 + 配置命名空间） ----------------
+
+    /// 读取用户配置（无则 None）
+    pub async fn get_user_config(&self, ns: &str, key: &str) -> Result<Option<String>> {
+        let r: Option<(String,)> = sqlx::query_as(
+            "SELECT config FROM user_config WHERE user_namespace = ?1 AND ns = ?2",
+        )
+        .bind(ns)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    /// 保存用户配置（INSERT OR REPLACE）
+    pub async fn save_user_config(&self, ns: &str, key: &str, config: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO user_config (user_namespace, ns, config, updated_at)              VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(ns)
+        .bind(key)
+        .bind(config)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ---------------- 阅读统计（reading_stats 表：按用户 + 书 + 日期累计） ----------------
+
+    /// 增量累计阅读统计（seconds/chars 累加到当日行；INSERT OR REPLACE 语义不丢历史）
+    pub async fn record_reading_stats(
+        &self,
+        ns: &str,
+        book_url: &str,
+        date: &str,
+        seconds: i64,
+        chars: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO reading_stats (user_namespace, book_url, date, seconds, chars)              VALUES (?1, ?2, ?3, ?4, ?5)              ON CONFLICT(user_namespace, book_url, date)              DO UPDATE SET seconds = seconds + excluded.seconds, chars = chars + excluded.chars",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .bind(date)
+        .bind(seconds)
+        .bind(chars)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 阅读统计汇总：今日/近 7 天/累计秒数 + 单书（秒数降序，关联书架书名）
+    pub async fn get_reading_stats(&self, ns: &str) -> Result<ReadingStats> {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let week_start = (chrono::Utc::now() - chrono::Duration::days(6))
+            .format("%Y-%m-%d")
+            .to_string();
+        let today_s: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(seconds), 0) FROM reading_stats WHERE user_namespace = ?1 AND date = ?2",
+        )
+        .bind(ns)
+        .bind(&today)
+        .fetch_one(&self.pool)
+        .await?;
+        let week_s: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(seconds), 0) FROM reading_stats WHERE user_namespace = ?1 AND date >= ?2",
+        )
+        .bind(ns)
+        .bind(&week_start)
+        .fetch_one(&self.pool)
+        .await?;
+        let total_s: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(seconds), 0) FROM reading_stats WHERE user_namespace = ?1",
+        )
+        .bind(ns)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT book_url, COALESCE(SUM(seconds), 0), COALESCE(SUM(chars), 0)              FROM reading_stats WHERE user_namespace = ?1              GROUP BY book_url ORDER BY 2 DESC",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut books = Vec::with_capacity(rows.len());
+        for (book_url, seconds, chars) in rows {
+            let name = sqlx::query_scalar::<_, String>(
+                "SELECT name FROM books WHERE user_namespace = ?1 AND book_url = ?2",
+            )
+            .bind(ns)
+            .bind(&book_url)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or_else(|| book_url.clone());
+            books.push(ReadingStatBook {
+                book_url,
+                name,
+                seconds,
+                chars,
+            });
+        }
+        Ok(ReadingStats {
+            today: today_s,
+            week: week_s,
+            total: total_s,
+            books,
+        })
+    }
+
+    // ---------------- 默认书源标记（system_settings：default_book_sources_{ns}） ----------------
+
+    /// 默认书源列表（JSON 数组存 system_settings；无则空）
+    pub async fn get_default_book_sources(&self, ns: &str) -> Result<Vec<String>> {
+        let key = format!("default_book_sources_{ns}");
+        match self.get_system_setting(&key).await? {
+            Some(raw) => Ok(serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 设置默认书源标记（覆盖式保存书源 URL 列表）
+    pub async fn set_default_book_sources(&self, ns: &str, urls: &[String]) -> Result<()> {
+        let key = format!("default_book_sources_{ns}");
+        let raw = serde_json::to_string(urls).unwrap_or_else(|_| "[]".to_string());
+        self.set_system_setting(&key, &raw).await
     }
 
     // ---------------- F-28 替换规则 ----------------

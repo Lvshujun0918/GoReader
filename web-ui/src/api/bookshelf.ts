@@ -16,6 +16,14 @@ export function deleteBook(bookUrl: string): Promise<ReturnData<null>> {
   return post<null>('/deleteBook', { bookUrl })
 }
 
+/**
+ * POST /reader3/deleteBooks：批量移出书架（body { bookUrls: string[] }）。
+ * 后端并行实现中（可能 404）：调用方传 { silent: true } 并降级逐本 deleteBook。
+ */
+export function deleteBooks(bookUrls: string[], opts?: { silent?: boolean }): Promise<ReturnData<{ count?: number } | null>> {
+  return post<{ count?: number } | null>('/deleteBooks', { bookUrls }, opts)
+}
+
 /** GET /reader3/getBookGroups：书架分组列表（契约：data [{id,name,orderNum,bookCount}]；后端当前输出 order） */
 export function getBookGroups(): Promise<ReturnData<BookGroup[]>> {
   return get<BookGroup[]>('/getBookGroups')

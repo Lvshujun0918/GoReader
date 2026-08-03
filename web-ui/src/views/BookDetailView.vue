@@ -5,6 +5,9 @@ import { ElMessage } from 'element-plus'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { getBookInfo, searchBookSource } from '@/api/books'
 import { searchBookContent } from '@/api/cache'
+import { exportBook, type ExportFormat } from '@/api/export'
+import { cacheBookOnServer, cacheBookSSE, cancelCacheBook } from '@/api/cacheBook'
+import { downloadBlob } from '@/utils/download'
 import type { Book, BookInfo, ContentSearchHit, SearchBook } from '@/types'
 
 const route = useRoute()
@@ -302,6 +305,174 @@ async function switchSource(r: SearchBook) {
   }
 }
 
+/* ================= 导出（GET /reader3/exportBook：txt/epub/html blob 下载） ================= */
+
+const EXPORT_FORMATS: { value: ExportFormat; label: string; tip: string }[] = [
+  { value: 'txt', label: 'TXT', tip: '纯文本' },
+  { value: 'epub', label: 'EPUB', tip: '电子书' },
+  { value: 'html', label: 'HTML', tip: '网页' },
+]
+
+const exportOpen = ref(false)
+const exportFormat = ref<ExportFormat>('txt')
+const exportBusy = ref(false)
+const exportMsg = ref('')
+const exportMsgError = ref(false)
+
+function openExport() {
+  exportFormat.value = 'txt'
+  exportMsg.value = ''
+  exportMsgError.value = false
+  exportOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeExport() {
+  if (exportBusy.value) return
+  exportOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 导出并下载（失败在弹窗内提示，不弹全局 toast——接口可能未实现） */
+async function confirmExport() {
+  if (exportBusy.value) return
+  exportBusy.value = true
+  exportMsg.value = ''
+  exportMsgError.value = false
+  try {
+    const blob = await exportBook(bookUrl.value, exportFormat.value)
+    const name = `${(display.value.name || 'book').replace(/[\\/:*?"<>|]/g, '_')}.${exportFormat.value}`
+    const ok = await downloadBlob(blob, name)
+    if (ok) {
+      exportMsg.value = `已下载 ${name}`
+      window.setTimeout(() => {
+        if (!exportBusy.value) closeExport()
+      }, 900)
+    }
+  } catch (err) {
+    exportMsg.value = isNotImplemented(err)
+      ? '导出接口后端暂未提供（GET /reader3/exportBook）'
+      : `导出失败：${err instanceof Error ? err.message : '请稍后重试'}`
+    exportMsgError.value = true
+  } finally {
+    exportBusy.value = false
+  }
+}
+
+/* ================= 缓存本书（POST /reader3/cacheBookOnServer：SSE 进度 cached/total） ================= */
+
+const cacheOpen = ref(false)
+const cacheBusy = ref(false)
+const cacheDone = ref(false)
+const cacheCached = ref(0)
+const cacheTotal = ref(0)
+const cacheTitle = ref('')
+const cacheMsg = ref('')
+const cacheMsgError = ref(false)
+let cacheHandle: { close: () => void } | null = null
+
+const cachePercent = computed(() => {
+  if (cacheTotal.value <= 0) return cacheCached.value > 0 ? 100 : 0
+  return Math.min(100, Math.round((cacheCached.value / cacheTotal.value) * 100))
+})
+
+function openCache() {
+  cacheOpen.value = true
+  cacheBusy.value = false
+  cacheDone.value = false
+  cacheCached.value = 0
+  cacheTotal.value = 0
+  cacheTitle.value = ''
+  cacheMsg.value = ''
+  cacheMsgError.value = false
+  document.body.style.overflow = 'hidden'
+  void startCache()
+}
+
+function closeCache() {
+  if (cacheBusy.value) {
+    cacheHandle?.close()
+    cacheHandle = null
+    cacheBusy.value = false
+  }
+  cacheOpen.value = false
+  document.body.style.overflow = ''
+}
+
+async function startCache() {
+  cacheBusy.value = true
+  cacheDone.value = false
+  cacheMsg.value = ''
+  cacheMsgError.value = false
+  try {
+    // ① POST 启动后台缓存任务（后端立即返回 {started,cached,total,title}）
+    const res = await cacheBookOnServer(bookUrl.value)
+    if (!res.isSuccess) throw new Error(res.errorMsg || '缓存启动失败')
+    const start = res.data
+    if (start) {
+      cacheCached.value = start.cached ?? 0
+      cacheTotal.value = start.total ?? 0
+      if (start.title) cacheTitle.value = start.title
+    }
+    // ② 订阅进度流（GET /reader3/cacheBookSSE：cached/total/title/finished/cancelled/error）
+    const handle = await cacheBookSSE(bookUrl.value, {
+      onProgress: (p) => {
+        cacheCached.value = p.cached
+        cacheTotal.value = p.total
+        if (p.title) cacheTitle.value = p.title
+        if (p.cancelled) {
+          cacheBusy.value = false
+          cacheMsg.value = '缓存已取消'
+          cacheMsgError.value = false
+        } else if (p.error) {
+          cacheBusy.value = false
+          cacheMsg.value = `缓存失败：${p.error}`
+          cacheMsgError.value = true
+        } else if (p.finished) {
+          cacheBusy.value = false
+          cacheDone.value = true
+          cacheMsg.value = '缓存完成，可随时离线/多端阅读'
+          cacheMsgError.value = false
+        }
+      },
+      onEnd: () => {
+        cacheBusy.value = false
+        if (!cacheMsg.value) {
+          cacheDone.value = true
+          cacheMsg.value = '缓存完成，可随时离线/多端阅读'
+        }
+      },
+      onStreamError: (msg) => {
+        cacheBusy.value = false
+        cacheMsg.value = `缓存进度中断：${msg}`
+        cacheMsgError.value = true
+      },
+    })
+    cacheHandle = handle
+  } catch (err) {
+    cacheBusy.value = false
+    cacheMsg.value = isNotImplemented(err)
+      ? '缓存接口后端暂未提供（POST /reader3/cacheBookOnServer）'
+      : `缓存失败：${err instanceof Error ? err.message : '请稍后重试'}`
+    cacheMsgError.value = true
+  }
+}
+
+/** 取消缓存：中断 SSE 流 + 通知后端（GET /reader3/cancelCacheBook，静默降级） */
+async function cancelCache() {
+  if (!cacheBusy.value) return
+  cacheHandle?.close()
+  cacheHandle = null
+  cacheBusy.value = false
+  try {
+    await cancelCacheBook(bookUrl.value)
+  } catch {
+    // 接口未实现：忽略（本地流已中断）
+  }
+  cacheMsg.value = '已取消缓存'
+  cacheMsgError.value = false
+}
+
 onMounted(load)
 </script>
 
@@ -376,6 +547,10 @@ onMounted(load)
             <button v-if="shelfBook" class="search-btn" type="button" @click="openSearch">全书搜索</button>
             <!-- 换源（书架书且带书源：搜索同书其他书源并切换） -->
             <button v-if="canSwitchSource()" class="search-btn" type="button" @click="openSource">换源</button>
+            <!-- 导出（GET /reader3/exportBook：txt/epub/html blob 下载） -->
+            <button class="search-btn" type="button" @click="openExport">导出</button>
+            <!-- 缓存本书（POST /reader3/cacheBookOnServer：SSE 进度条） -->
+            <button class="search-btn" type="button" @click="openCache">缓存本书</button>
           </div>
         </div>
       </div>
@@ -483,6 +658,94 @@ onMounted(load)
                 <div v-if="sourceMsgError" class="source-retry">
                   <button class="ghost-btn" type="button" @click="runSourceSearch">重试</button>
                 </div>
+              </template>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+    <!-- 导出弹层（GET /reader3/exportBook：txt/epub/html） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="exportOpen" class="dlg-overlay" @click.self="closeExport">
+          <div
+            class="dlg dlg-export"
+            role="dialog"
+            aria-modal="true"
+            aria-label="导出书籍"
+            tabindex="-1"
+            @keydown.esc="closeExport"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">导出 · {{ display.name }}</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="exportBusy" @click="closeExport">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <div class="export-formats">
+              <button
+                v-for="f in EXPORT_FORMATS"
+                :key="f.value"
+                class="fmt-btn"
+                :class="{ active: exportFormat === f.value }"
+                type="button"
+                :disabled="exportBusy"
+                @click="exportFormat = f.value"
+              >
+                <span class="fmt-label">{{ f.label }}</span>
+                <span class="fmt-tip">{{ f.tip }}</span>
+              </button>
+            </div>
+            <p class="field-tip">由服务器生成 {{ exportFormat.toUpperCase() }} 文件并下载。</p>
+            <p v-if="exportMsg" class="search-msg" :class="{ error: exportMsgError }">{{ exportMsg }}</p>
+            <div class="dlg-actions">
+              <button class="ghost-btn" type="button" :disabled="exportBusy" @click="closeExport">取消</button>
+              <button class="accent-btn" type="button" :disabled="exportBusy" @click="confirmExport">
+                {{ exportBusy ? '导出中…' : '导出' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 缓存本书弹层（POST /reader3/cacheBookOnServer：SSE 进度 cached/total） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="cacheOpen" class="dlg-overlay" @click.self="closeCache">
+          <div
+            class="dlg dlg-cache"
+            role="dialog"
+            aria-modal="true"
+            aria-label="缓存本书"
+            tabindex="-1"
+            @keydown.esc="closeCache"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">缓存本书{{ cacheTitle ? ' · ' + cacheTitle : '' }}</h2>
+              <button class="dlg-close" type="button" title="关闭" @click="closeCache">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <p class="field-tip">将本书章节缓存到服务器，之后可在其他设备快速阅读。</p>
+            <div class="cache-progress">
+              <div class="cache-bar">
+                <div class="cache-fill" :style="{ width: cachePercent + '%' }"></div>
+              </div>
+              <span class="cache-percent">
+                {{ cacheBusy ? `${cacheCached} / ${cacheTotal}` : cacheDone ? '完成' : `${cachePercent}%` }}
+              </span>
+            </div>
+            <p v-if="cacheMsg" class="search-msg" :class="{ error: cacheMsgError }">{{ cacheMsg }}</p>
+            <div class="dlg-actions">
+              <button v-if="cacheBusy" class="ghost-btn" type="button" @click="cancelCache">取消缓存</button>
+              <template v-else>
+                <button v-if="cacheMsgError" class="ghost-btn" type="button" @click="startCache">重试</button>
+                <button class="accent-btn" type="button" @click="closeCache">关闭</button>
               </template>
             </div>
           </div>
@@ -1066,6 +1329,135 @@ onMounted(load)
 .source-retry {
   display: flex;
   justify-content: flex-start;
+}
+
+/* ================= 导出弹层 ================= */
+.dlg-export {
+  width: min(420px, 100%);
+}
+.export-formats {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.fmt-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 10px 0;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.fmt-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.fmt-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.fmt-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.fmt-label {
+  font-size: 13.5px;
+  font-weight: 400;
+  letter-spacing: 2px;
+  color: var(--text-1);
+}
+.fmt-tip {
+  font-size: 10.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.dlg-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+.ghost-btn {
+  padding: 7px 18px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
+.ghost-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.ghost-btn:disabled,
+.accent-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.accent-btn {
+  padding: 7px 18px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease;
+}
+.accent-btn:hover:not(:disabled) {
+  background: var(--accent-deep);
+  border-color: var(--accent-deep);
+}
+
+/* ================= 缓存本书弹层 ================= */
+.dlg-cache {
+  width: min(420px, 100%);
+}
+.cache-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0 2px;
+}
+.cache-bar {
+  flex: 1;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--hover);
+  overflow: hidden;
+}
+.cache-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+.cache-percent {
+  flex-shrink: 0;
+  min-width: 56px;
+  text-align: right;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
 }
 
 /* 弹窗动画：fade 200ms */

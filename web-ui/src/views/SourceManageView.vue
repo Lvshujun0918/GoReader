@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { deleteBookSource, getBookSources, saveBookSource, saveBookSources } from '@/api/sources'
+import { deleteBookSource, getBookSources, getInvalidBookSources, saveBookSource, saveBookSources } from '@/api/sources'
 import { deleteSourceSub, getSourceSubs, refreshSourceSub, saveSourceSub } from '@/api/sourceSubs'
 import { exportBookSources } from '@/api/system'
+import { bookSourceDebugSSE, type DebugAction } from '@/api/sourceDebug'
 import { downloadBlob } from '@/utils/download'
 import type { BookSource, SourceSub } from '@/types'
 
@@ -59,6 +60,192 @@ const filtered = computed(() => {
 })
 
 const enabledCount = computed(() => sources.value.filter((s) => s.enabled).length)
+
+/** 判断是否接口未实现（404 / 后端未就绪） */
+function isNotImplemented(err: unknown): boolean {
+  const e = err as { response?: { status?: number }; message?: string } | null | undefined
+  const status = e?.response?.status
+  if (status === 404 || status === 501) return true
+  const msg = e?.message ?? ''
+  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
+}
+
+/* ================= 失效检测（GET /reader3/getInvalidBookSources） ================= */
+
+const invalidChecking = ref(false)
+const invalidSources = ref<Set<string>>(new Set())
+const invalidMsg = ref('')
+const invalidMsgError = ref(false)
+
+/** 归一化后端返回：string[] 或含 bookSourceUrl 的对象数组 */
+function normalizeInvalid(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  for (const item of raw) {
+    if (typeof item === 'string') out.push(item)
+    else if (item && typeof item === 'object') {
+      const u = (item as Record<string, unknown>).bookSourceUrl
+      if (typeof u === 'string') out.push(u)
+    }
+  }
+  return out
+}
+
+async function checkInvalid() {
+  if (invalidChecking.value) return
+  invalidChecking.value = true
+  invalidMsg.value = ''
+  invalidMsgError.value = false
+  try {
+    const res = await getInvalidBookSources()
+    invalidSources.value = new Set(normalizeInvalid(res.data))
+    const n = invalidSources.value.size
+    invalidMsg.value = n === 0 ? '检测完成：未发现失效书源' : `检测完成：发现 ${n} 个失效书源（已红色标记）`
+  } catch (err) {
+    invalidMsg.value = isNotImplemented(err)
+      ? '失效检测接口后端暂未提供（GET /reader3/getInvalidBookSources）'
+      : `检测失败：${err instanceof Error ? err.message : '请稍后重试'}`
+    invalidMsgError.value = true
+  } finally {
+    invalidChecking.value = false
+  }
+}
+
+/* ================= 书源调试（GET /reader3/bookSourceDebugSSE：SSE 逐步日志） ================= */
+
+const DEBUG_ACTIONS: { value: DebugAction; label: string; tip: string; needKey: boolean; needUrl: boolean }[] = [
+  { value: 'search', label: '搜索', tip: '关键词搜索', needKey: true, needUrl: false },
+  { value: 'toc', label: '目录', tip: '获取章节目录', needKey: false, needUrl: true },
+  { value: 'content', label: '正文', tip: '获取章节正文', needKey: false, needUrl: true },
+]
+
+const debugOpen = ref(false)
+const debugSource = ref<BookSource | null>(null)
+const debugAction = ref<DebugAction>('search')
+const debugInput = ref('')
+const debugRunning = ref(false)
+const debugLogs = ref<{ text: string; error: boolean }[]>([])
+const debugMsg = ref('')
+const debugMsgError = ref(false)
+let debugHandle: { close: () => void } | null = null
+
+function debugActionMeta(a: DebugAction) {
+  return DEBUG_ACTIONS.find((x) => x.value === a) ?? DEBUG_ACTIONS[0]
+}
+
+const debugPlaceholder = computed(() => {
+  if (debugAction.value === 'search') return '搜索关键词，如：斗破苍穹'
+  if (debugAction.value === 'toc') return '书籍 URL（目录页地址，可留空）'
+  return '章节 URL'
+})
+
+const debugTip = computed(() => {
+  const meta = debugActionMeta(debugAction.value)
+  return `动作：${meta.label}（${meta.tip}）· 步骤经 SSE 实时输出`
+})
+
+const debugCanRun = computed(() => {
+  const meta = debugActionMeta(debugAction.value)
+  return !meta.needKey || debugInput.value.trim().length > 0
+})
+
+function openDebug(s: BookSource) {
+  debugSource.value = s
+  debugAction.value = 'search'
+  debugInput.value = ''
+  debugLogs.value = []
+  debugMsg.value = ''
+  debugMsgError.value = false
+  debugOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeDebug() {
+  if (debugRunning.value) return
+  debugHandle?.close()
+  debugHandle = null
+  debugOpen.value = false
+  document.body.style.overflow = ''
+}
+
+function pushLog(text: string, error = false) {
+  debugLogs.value.push({ text, error })
+}
+
+/** 运行调试：建立 SSE 连接，逐步追加日志；失败红色标记 */
+async function runDebug() {
+  const s = debugSource.value
+  if (!s || debugRunning.value) return
+  const meta = debugActionMeta(debugAction.value)
+  const input = debugInput.value.trim()
+  if (meta.needKey && !input) {
+    debugMsg.value = '请输入搜索关键词'
+    debugMsgError.value = true
+    return
+  }
+  debugRunning.value = true
+  debugMsg.value = ''
+  debugMsgError.value = false
+  debugLogs.value = []
+  pushLog(`开始调试「${s.bookSourceName}」· ${meta.label}`)
+  try {
+    const handle = await bookSourceDebugSSE(
+      {
+        bookSourceUrl: s.bookSourceUrl,
+        action: debugAction.value,
+        key: meta.needKey ? input : undefined,
+        chapterUrl: meta.needUrl && input ? input : undefined,
+      },
+      {
+        onStep: (message) => pushLog(message),
+        onResult: (data) => {
+          let summary: string
+          try {
+            summary = typeof data === 'string' ? data : JSON.stringify(data, null, 2)
+          } catch {
+            summary = String(data)
+          }
+          pushLog(`结果：${summary}`)
+          debugMsg.value = '调试完成'
+          debugMsgError.value = false
+        },
+        onEnd: () => {
+          debugRunning.value = false
+          debugMsg.value = debugMsg.value || '调试完成'
+        },
+        onStreamError: (msg) => {
+          debugRunning.value = false
+          debugMsg.value = `调试失败：${msg}`
+          debugMsgError.value = true
+          pushLog(`错误：${msg}`, true)
+        },
+      },
+    )
+    debugHandle = handle
+  } catch {
+    debugRunning.value = false
+    debugMsg.value = '调试接口后端暂未提供（GET /reader3/bookSourceDebugSSE）'
+    debugMsgError.value = true
+    pushLog('连接失败：后端未就绪或网络异常', true)
+  }
+}
+
+function stopDebug() {
+  debugHandle?.close()
+  debugHandle = null
+  debugRunning.value = false
+  debugMsg.value = '已停止调试'
+  debugMsgError.value = false
+}
+
+/* 切换动作时清空输入与日志 */
+watch(debugAction, () => {
+  if (debugRunning.value) return
+  debugInput.value = ''
+  debugLogs.value = []
+  debugMsg.value = ''
+  debugMsgError.value = false
+})
 
 /* ================= 启用开关 ================= */
 const toggling = ref<Set<string>>(new Set())
@@ -502,6 +689,15 @@ onMounted(() => {
           <button
             class="ghost-btn"
             type="button"
+            :disabled="invalidChecking"
+            title="检测失效书源（GET /reader3/getInvalidBookSources）"
+            @click="checkInvalid"
+          >
+            {{ invalidChecking ? '检测中…' : '检测失效' }}
+          </button>
+          <button
+            class="ghost-btn"
+            type="button"
             :disabled="exporting"
             title="下载当前账号全部书源（bookSource.json）"
             @click="doExport"
@@ -556,6 +752,9 @@ onMounted(() => {
         </div>
       </div>
 
+      <!-- 失效检测结果提示 -->
+      <p v-if="invalidMsg" class="invalid-note" :class="{ error: invalidMsgError }">{{ invalidMsg }}</p>
+
       <!-- 加载态 -->
       <div v-if="loading" class="state-row">
         <svg class="mini-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
@@ -579,7 +778,7 @@ onMounted(() => {
 
       <!-- 书源列表 -->
       <ul v-else class="source-list">
-        <li v-for="s in filtered" :key="s.bookSourceUrl" class="source-row">
+        <li v-for="s in filtered" :key="s.bookSourceUrl" class="source-row" :class="{ invalid: invalidSources.has(s.bookSourceUrl) }">
           <div class="source-main">
             <p class="source-name" :title="s.bookSourceName">{{ s.bookSourceName }}</p>
             <p class="source-url" :title="s.bookSourceUrl">{{ s.bookSourceUrl }}</p>
@@ -587,7 +786,16 @@ onMounted(() => {
           <span v-if="s.bookSourceGroup" class="source-group" :title="s.bookSourceGroup">
             {{ s.bookSourceGroup }}
           </span>
+          <span v-if="invalidSources.has(s.bookSourceUrl)" class="source-badge invalid">失效</span>
           <span class="source-state" :class="{ on: s.enabled }">{{ s.enabled ? '启用' : '停用' }}</span>
+          <button
+            class="test-btn"
+            type="button"
+            title="调试书源（搜索 / 目录 / 正文，SSE 逐步日志）"
+            @click="openDebug(s)"
+          >
+            测试
+          </button>
           <button
             class="switch"
             :class="{ on: s.enabled }"
@@ -779,6 +987,67 @@ onMounted(() => {
               <button class="danger-btn" type="button" :disabled="deleteSubBusy" @click="confirmDeleteSub">
                 {{ deleteSubBusy ? '删除中…' : '删除' }}
               </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+    <!-- 书源调试弹窗（GET /reader3/bookSourceDebugSSE：动作选择 + 输入 + SSE 逐步日志） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="debugOpen" class="dlg-overlay" @click.self="closeDebug">
+          <div
+            class="dlg dlg-debug"
+            role="dialog"
+            aria-modal="true"
+            aria-label="书源调试"
+            tabindex="-1"
+            @keydown.esc="closeDebug"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">调试 · {{ debugSource?.bookSourceName }}</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="debugRunning" @click="closeDebug">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <div class="debug-actions">
+              <button
+                v-for="a in DEBUG_ACTIONS"
+                :key="a.value"
+                class="capsule debug-act"
+                :class="{ active: debugAction === a.value }"
+                type="button"
+                :disabled="debugRunning"
+                @click="debugAction = a.value"
+              >
+                {{ a.label }}
+              </button>
+            </div>
+            <input
+              v-model="debugInput"
+              class="debug-input"
+              type="text"
+              :placeholder="debugPlaceholder"
+              spellcheck="false"
+              :disabled="debugRunning"
+              @keydown.enter="runDebug"
+            />
+            <p class="field-tip">{{ debugTip }}</p>
+            <div class="debug-log">
+              <p v-for="(l, i) in debugLogs" :key="i" class="debug-line" :class="{ error: l.error }">
+                {{ l.text }}
+              </p>
+              <p v-if="debugRunning" class="debug-line running">… 执行中（逐步输出）</p>
+            </div>
+            <p v-if="debugMsg" class="debug-msg" :class="{ error: debugMsgError }">{{ debugMsg }}</p>
+            <div class="dlg-actions">
+              <button v-if="debugRunning" class="ghost-btn" type="button" @click="stopDebug">停止</button>
+              <template v-else>
+                <button class="ghost-btn" type="button" @click="closeDebug">关闭</button>
+                <button class="accent-btn" type="button" :disabled="!debugCanRun" @click="runDebug">开始调试</button>
+              </template>
             </div>
           </div>
         </div>
@@ -1206,6 +1475,135 @@ onMounted(() => {
 .refresh-btn svg {
   width: 13px;
   height: 13px;
+}
+
+/* ================= 失效检测 ================= */
+.invalid-note {
+  margin: 0 0 14px;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 0.5px;
+  color: var(--text-2);
+}
+.invalid-note.error {
+  color: #cf4444;
+}
+/* 失效书源：整行置灰 + 名称/徽标红色 */
+.source-row.invalid {
+  opacity: 0.62;
+}
+.source-row.invalid .source-name {
+  color: #cf4444;
+}
+.source-badge {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+}
+.source-badge.invalid {
+  color: #cf4444;
+  border: 1px solid rgba(207, 68, 68, 0.5);
+  background: rgba(207, 68, 68, 0.06);
+}
+
+/* 测试按钮（细字描边） */
+.test-btn {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.test-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ================= 书源调试弹窗 ================= */
+.dlg-debug {
+  width: min(480px, 100%);
+}
+.debug-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.debug-act {
+  padding: 4px 16px;
+}
+.debug-input {
+  width: 100%;
+  height: 36px;
+  margin-bottom: 10px;
+  padding: 0 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+.debug-input::placeholder {
+  color: var(--text-3);
+  font-weight: 300;
+}
+.debug-input:focus {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+.debug-input:disabled {
+  opacity: 0.55;
+}
+.debug-log {
+  min-height: 96px;
+  max-height: 200px;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  overflow-y: auto;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.8;
+}
+.debug-line {
+  margin: 0;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.debug-line.error {
+  color: #cf4444;
+}
+.debug-line.running {
+  color: var(--text-3);
+}
+.debug-msg {
+  margin: 10px 0 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+}
+.debug-msg.error {
+  color: #cf4444;
 }
 
 /* ================= 订阅源区块 ================= */

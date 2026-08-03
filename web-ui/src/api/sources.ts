@@ -20,3 +20,11 @@ export function saveBookSources(sources: BookSource[]): Promise<ReturnData<{ cou
 export function deleteBookSource(bookSourceUrl: string): Promise<ReturnData<null>> {
   return post<null>('/deleteBookSource', { bookSourceUrl })
 }
+
+/**
+ * GET /reader3/getInvalidBookSources：检测失效书源，返回失效书源 URL 列表（string[]）。
+ * 后端并行实现中（可能 404）：调用方传 { silent: true } 自行降级提示。
+ */
+export function getInvalidBookSources(): Promise<ReturnData<string[]>> {
+  return get<string[]>('/getInvalidBookSources', undefined, { silent: true })
+}

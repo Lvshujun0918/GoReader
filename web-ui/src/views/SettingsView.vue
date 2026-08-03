@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
@@ -8,6 +8,20 @@ import { clearCache, getCacheInfo } from '@/api/cache'
 import { backupToWebdav, downloadBackupZip } from '@/api/backup'
 import { getSystemInfo } from '@/api/system'
 import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
+import { getBookshelf } from '@/api/bookshelf'
+import { getUserConfig, saveUserConfig } from '@/api/userConfig'
+import { getReadingStats } from '@/api/stats'
+import {
+  loadReaderConfig,
+  applyReaderConfig,
+  toServerConfig,
+  fromServerConfig,
+  type ReaderConfig,
+  type HanMode,
+  type Theme,
+  type TextAlign,
+  type PageMode,
+} from '@/utils/readerConfig'
 import { useUserStore } from '@/stores/user'
 import { downloadBlob } from '@/utils/download'
 import type { CacheClearType, CacheInfo, HttpTts, SystemInfo, TxtTocRule } from '@/types'
@@ -275,7 +289,261 @@ onMounted(() => {
   loadSysInfo()
   loadTxtTocRules()
   loadCacheInfo()
+  loadServerPref()
 })
+
+/* ================= 阅读偏好（多端同步：GET/POST /reader3/getUserConfig|saveUserConfig，服务器优先） ================= */
+
+/** 判断是否接口未实现（404 / 后端未就绪） */
+function isNotImplemented(err: unknown): boolean {
+  const e = err as { response?: { status?: number }; message?: string } | null | undefined
+  const status = e?.response?.status
+  if (status === 404 || status === 501) return true
+  const msg = e?.message ?? ''
+  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
+}
+
+const pref = ref<ReaderConfig>(loadReaderConfig())
+const prefSaving = ref(false)
+const prefMsg = ref('')
+const prefMsgError = ref(false)
+
+const HAN_OPTIONS: { value: HanMode; label: string }[] = [
+  { value: 'auto', label: '自动' },
+  { value: 'simp', label: '简体' },
+  { value: 'trad', label: '繁体' },
+]
+const THEME_OPTIONS: { value: Theme; label: string }[] = [
+  { value: 'light', label: '浅色' },
+  { value: 'dark', label: '深色' },
+  { value: 'paper', label: '纸色' },
+  { value: 'system', label: '跟随系统' },
+]
+const WIDTH_OPTIONS: { value: string; label: string }[] = [
+  { value: '720px', label: '窄' },
+  { value: '900px', label: '适中' },
+  { value: '1080px', label: '宽' },
+]
+const FONT_OPTIONS: { value: string; label: string }[] = [
+  { value: 'system', label: '系统' },
+  { value: 'song', label: '宋体' },
+  { value: 'hei', label: '黑体' },
+  { value: 'kai', label: '楷体' },
+  { value: 'fangsong', label: '仿宋' },
+  { value: 'round', label: '圆体' },
+  { value: 'lishu', label: '隶书' },
+  { value: 'yahei', label: '雅黑' },
+  { value: 'pingfang', label: '苹方' },
+  { value: 'wenkai', label: '文楷' },
+  { value: 'hanserif', label: '思源宋' },
+  { value: 'serif', label: '衬线' },
+]
+const ALIGN_OPTIONS: { value: TextAlign; label: string }[] = [
+  { value: 'left', label: '左对齐' },
+  { value: 'justify', label: '两端对齐' },
+]
+const PAGE_MODE_OPTIONS: { value: PageMode; label: string }[] = [
+  { value: 'scroll', label: '滚动' },
+  { value: 'slide', label: '滑动翻页' },
+]
+
+/** 主题即时预览：设置页切换主题即应用到全局（保存时经 applyReaderConfig 落 localStorage） */
+watch(
+  () => pref.value.theme,
+  (t) => {
+    const real = t === 'system' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : t
+    document.documentElement.dataset.theme = real
+  },
+)
+
+/** 进入设置页：拉取服务器配置并与本地合并（服务器优先），应用后回写本地 */
+async function loadServerPref() {
+  prefMsg.value = ''
+  prefMsgError.value = false
+  try {
+    const res = await getUserConfig()
+    // 后端返回 { ns, config }（config 为配置 JSON 或 null）
+    const cfg = res.data && typeof res.data === 'object' ? (res.data as Record<string, unknown>).config : undefined
+    const server = fromServerConfig(cfg)
+    const merged = { ...loadReaderConfig(), ...server }
+    applyReaderConfig(merged)
+    pref.value = merged
+    prefMsg.value = '已从服务器同步阅读偏好（服务器优先）'
+  } catch (err) {
+    prefMsg.value = isNotImplemented(err)
+      ? '配置同步接口后端暂未提供（GET /reader3/getUserConfig）· 当前仅保存在本机'
+      : `同步失败：${err instanceof Error ? err.message : '请稍后重试'}`
+    prefMsgError.value = true
+  }
+}
+
+/** 保存阅读偏好：本地立即生效（阅读页读取 localStorage）+ POST /reader3/saveUserConfig */
+async function savePref() {
+  if (prefSaving.value) return
+  prefSaving.value = true
+  prefMsg.value = ''
+  prefMsgError.value = false
+  applyReaderConfig(pref.value)
+  try {
+    await saveUserConfig(toServerConfig(pref.value))
+    prefMsg.value = '已保存到服务器，多端一致'
+  } catch (err) {
+    prefMsg.value = isNotImplemented(err)
+      ? '保存接口后端暂未提供（POST /reader3/saveUserConfig）· 已保存到本机'
+      : `保存失败：${err instanceof Error ? err.message : '请稍后重试'}`
+    prefMsgError.value = true
+  } finally {
+    prefSaving.value = false
+  }
+}
+
+/* ================= 阅读统计（GET /reader3/getReadingStats；后端未就绪时本地进度降级） ================= */
+
+/** 归一化后的展示模型（兼容后端秒数形态与契约对象形态） */
+interface StatsView {
+  today: { seconds: number; count: number }
+  week: { seconds: number; count: number }
+  total: { seconds: number; count: number }
+  top: { name: string; bookUrl?: string; seconds?: number; chars?: number; count?: number }[]
+}
+
+const statsOpen = ref(false)
+const statsLoading = ref(false)
+const statsFromLocal = ref(false)
+const stats = ref<StatsView | null>(null)
+const statsMsg = ref('')
+const statsMsgError = ref(false)
+
+function numOr(v: unknown, fallback = 0): number {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : fallback
+}
+
+/** 容错解析后端统计：today/week/total 为秒数（数字）或 {count,minutes,books} 对象 */
+function normalizeStats(raw: unknown): StatsView | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const cell = (x: unknown): { seconds: number; count: number } => {
+    if (typeof x === 'number') return { seconds: Math.max(0, x), count: 0 }
+    const it = (x && typeof x === 'object' ? x : {}) as Record<string, unknown>
+    const minutes = numOr(it.minutes)
+    return {
+      seconds: typeof it.seconds === 'number' ? Math.max(0, it.seconds) : minutes > 0 ? Math.round(minutes * 60) : 0,
+      count: numOr(it.count),
+    }
+  }
+  const list = Array.isArray(o.books) ? o.books : Array.isArray(o.topBooks) ? o.topBooks : []
+  const top: StatsView['top'] = []
+  for (const t of list) {
+    if (typeof t === 'string') {
+      top.push({ name: t })
+      continue
+    }
+    if (!t || typeof t !== 'object') continue
+    const it = t as Record<string, unknown>
+    const name = typeof it.name === 'string' ? it.name : typeof it.bookName === 'string' ? it.bookName : ''
+    if (!name) continue
+    top.push({
+      name,
+      bookUrl: typeof it.bookUrl === 'string' ? it.bookUrl : undefined,
+      seconds: typeof it.seconds === 'number' ? it.seconds : undefined,
+      chars: typeof it.chars === 'number' ? it.chars : undefined,
+      count: typeof it.count === 'number' ? it.count : undefined,
+    })
+  }
+  return { today: cell(o.today), week: cell(o.week), total: cell(o.total), top }
+}
+
+/** 秒 → 阅读时长文案 */
+function fmtMinutes(seconds: number): string {
+  if (seconds <= 0) return ''
+  if (seconds < 60) return '不足 1 分钟'
+  return `${Math.round(seconds / 60)} 分钟`
+}
+
+/** TOP 行右侧数值文案 */
+function topValue(b: StatsView['top'][number]): string {
+  if (typeof b.seconds === 'number' && b.seconds > 0) return fmtMinutes(b.seconds)
+  if (typeof b.chars === 'number' && b.chars > 0) return `${(b.chars / 10000).toFixed(1)} 万字`
+  if (typeof b.count === 'number') return `${b.count} 次`
+  return '—'
+}
+
+function startOfDay(d: Date): number {
+  const x = new Date(d)
+  x.setHours(0, 0, 0, 0)
+  return x.getTime()
+}
+
+function startOfWeek(d: Date): number {
+  const day0 = startOfDay(d)
+  const offset = (d.getDay() + 6) % 7 // 周一为起点
+  return day0 - offset * 86400000
+}
+
+/** 本地降级：从 reader-progress-{bookUrl} 汇总近似统计（name 经书架映射） */
+function localStats(nameMap: Map<string, string>): StatsView {
+  const day0 = startOfDay(new Date())
+  const week0 = startOfWeek(new Date())
+  const entries: { name: string; updatedAt: number }[] = []
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (!key || !key.startsWith('reader-progress-')) continue
+      const raw = localStorage.getItem(key)
+      if (!raw) continue
+      const p = JSON.parse(raw) as { updatedAt?: unknown }
+      if (typeof p.updatedAt !== 'number') continue
+      const bookUrl = key.slice('reader-progress-'.length)
+      entries.push({ name: nameMap.get(bookUrl) || bookUrl, updatedAt: p.updatedAt })
+    }
+  } catch {
+    /* ignore */
+  }
+  const countSince = (t: number) => entries.filter((e) => e.updatedAt >= t).length
+  const top = [...entries].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 5)
+  return {
+    today: { seconds: 0, count: countSince(day0) },
+    week: { seconds: 0, count: countSince(week0) },
+    total: { seconds: 0, count: entries.length },
+    top: top.map((e) => ({ name: e.name, count: 1 })),
+  }
+}
+
+async function loadStats() {
+  statsOpen.value = true
+  document.body.style.overflow = 'hidden'
+  statsLoading.value = true
+  statsMsg.value = ''
+  statsMsgError.value = false
+  statsFromLocal.value = false
+  stats.value = null
+  try {
+    const res = await getReadingStats()
+    stats.value = normalizeStats(res.data)
+    if (!stats.value) throw new Error('empty')
+  } catch {
+    // 后端未就绪/数据为空：本地降级近似统计
+    statsFromLocal.value = true
+    try {
+      const shelfRes = await getBookshelf().catch(() => null)
+      const nameMap = new Map((shelfRes?.data ?? []).map((b) => [b.bookUrl, b.name]))
+      stats.value = localStats(nameMap)
+      statsMsg.value = '后端统计接口暂未提供（GET /reader3/getReadingStats）· 以下为本地近似统计'
+    } catch {
+      stats.value = null
+      statsMsg.value = '统计加载失败'
+      statsMsgError.value = true
+    }
+  } finally {
+    statsLoading.value = false
+  }
+}
+
+function closeStats() {
+  statsOpen.value = false
+  document.body.style.overflow = ''
+}
 
 /* ================= 缓存管理（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache） ================= */
 
@@ -451,14 +719,156 @@ async function downloadBackup() {
         </div>
       </section>
 
-      <!-- 主题偏好 -->
+      <!-- 阅读偏好（多端同步：GET/POST /reader3/getUserConfig|saveUserConfig，服务器优先） -->
       <section class="card">
-        <h2 class="card-title">主题偏好</h2>
+        <div class="card-head">
+          <h2 class="card-title">阅读偏好</h2>
+          <span class="card-sub">简繁 / 主题 / 排版 · 服务器与本地合并，服务器优先</span>
+          <button class="row-action" type="button" :disabled="prefSaving" @click="savePref">
+            {{ prefSaving ? '保存中…' : '保存到云端' }}
+          </button>
+        </div>
+        <div class="row">
+          <span class="row-label">简繁</span>
+          <div class="pref-pills">
+            <button
+              v-for="o in HAN_OPTIONS"
+              :key="o.value"
+              class="capsule"
+              :class="{ active: pref.hanMode === o.value }"
+              type="button"
+              @click="pref.hanMode = o.value"
+            >
+              {{ o.label }}
+            </button>
+          </div>
+        </div>
         <div class="row">
           <span class="row-label">主题</span>
-          <span class="row-value">浅色 / 深色 / 纸色</span>
-          <span class="row-hint">请在阅读页顶部切换</span>
+          <div class="pref-pills">
+            <button
+              v-for="o in THEME_OPTIONS"
+              :key="o.value"
+              class="capsule"
+              :class="{ active: pref.theme === o.value }"
+              type="button"
+              @click="pref.theme = o.value"
+            >
+              {{ o.label }}
+            </button>
+          </div>
         </div>
+        <div class="row">
+          <span class="row-label">字号</span>
+          <div class="pref-slider">
+            <input v-model.number="pref.fontSize" class="pref-range" type="range" min="14" max="22" step="1" />
+            <span class="pref-val">{{ pref.fontSize }}px</span>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-label">行距</span>
+          <div class="pref-slider">
+            <input v-model.number="pref.lineHeight" class="pref-range" type="range" min="1.5" max="2.5" step="0.1" />
+            <span class="pref-val">{{ pref.lineHeight.toFixed(1) }}</span>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-label">段距</span>
+          <div class="pref-slider">
+            <input v-model.number="pref.paraSpacing" class="pref-range" type="range" min="0.5" max="2" step="0.1" />
+            <span class="pref-val">{{ pref.paraSpacing.toFixed(1) }}</span>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-label">字重</span>
+          <div class="pref-slider">
+            <input v-model.number="pref.fontWeight" class="pref-range" type="range" min="300" max="500" step="50" />
+            <span class="pref-val">{{ pref.fontWeight }}</span>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-label">宽度</span>
+          <div class="pref-pills">
+            <button
+              v-for="o in WIDTH_OPTIONS"
+              :key="o.value"
+              class="capsule"
+              :class="{ active: pref.contentWidth === o.value }"
+              type="button"
+              @click="pref.contentWidth = o.value"
+            >
+              {{ o.label }}
+            </button>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-label">字体</span>
+          <select v-model="pref.fontFamily" class="pref-select">
+            <option v-for="o in FONT_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+          </select>
+        </div>
+        <div class="row">
+          <span class="row-label">字距</span>
+          <div class="pref-slider">
+            <input v-model.number="pref.letterSpacing" class="pref-range" type="range" min="0" max="2" step="0.5" />
+            <span class="pref-val">{{ pref.letterSpacing.toFixed(1) }}</span>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-label">首行缩进</span>
+          <button
+            class="switch"
+            :class="{ on: pref.textIndent }"
+            type="button"
+            role="switch"
+            :aria-checked="pref.textIndent"
+            @click="pref.textIndent = !pref.textIndent"
+          >
+            <span class="switch-knob"></span>
+          </button>
+        </div>
+        <div class="row">
+          <span class="row-label">对齐</span>
+          <div class="pref-pills">
+            <button
+              v-for="o in ALIGN_OPTIONS"
+              :key="o.value"
+              class="capsule"
+              :class="{ active: pref.textAlign === o.value }"
+              type="button"
+              @click="pref.textAlign = o.value"
+            >
+              {{ o.label }}
+            </button>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-label">翻页</span>
+          <div class="pref-pills">
+            <button
+              v-for="o in PAGE_MODE_OPTIONS"
+              :key="o.value"
+              class="capsule"
+              :class="{ active: pref.pageMode === o.value }"
+              type="button"
+              @click="pref.pageMode = o.value"
+            >
+              {{ o.label }}
+            </button>
+          </div>
+        </div>
+        <p v-if="prefMsg" class="card-note" :class="{ error: prefMsgError }">{{ prefMsg }}</p>
+        <p class="card-note">阅读页内的调整同样写入本机；「保存到云端」后多端一致（服务器优先）。</p>
+      </section>
+
+      <!-- 阅读统计（GET /reader3/getReadingStats；后端未就绪时本地降级） -->
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">阅读统计</h2>
+          <span class="card-sub">今日 / 本周 / 总计 · 书籍 TOP</span>
+          <button class="row-action" type="button" @click="loadStats">查看</button>
+        </div>
+        <p class="card-note">后端 GET /reader3/getReadingStats 未就绪时自动降级为本地近似统计。</p>
       </section>
 
       <!-- 听书设置 -->
@@ -769,6 +1179,66 @@ async function downloadBackup() {
               <button class="danger-btn" type="button" :disabled="deleteTocBusy" @click="confirmDeleteToc">
                 {{ deleteTocBusy ? '删除中…' : '删除' }}
               </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+    <!-- 阅读统计弹窗 -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="statsOpen" class="dlg-overlay" @click.self="closeStats">
+          <div
+            class="dlg dlg-stats"
+            role="dialog"
+            aria-modal="true"
+            aria-label="阅读统计"
+            tabindex="-1"
+            @keydown.esc="closeStats"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">阅读统计</h2>
+              <button class="dlg-close" type="button" title="关闭" @click="closeStats">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <p v-if="statsLoading" class="stats-loading">加载中…</p>
+            <template v-else-if="stats">
+              <p v-if="statsFromLocal" class="field-tip">{{ statsMsg }}</p>
+              <div class="stats-grid">
+                <div class="stats-cell">
+                  <span class="stats-num">{{ stats.today.count > 0 ? stats.today.count : fmtMinutes(stats.today.seconds) || '0' }}</span>
+                  <span class="stats-label">今日</span>
+                  <span class="stats-sub">{{ stats.today.count > 0 ? fmtMinutes(stats.today.seconds) || '阅读' : '阅读' }}</span>
+                </div>
+                <div class="stats-cell">
+                  <span class="stats-num">{{ stats.week.count > 0 ? stats.week.count : fmtMinutes(stats.week.seconds) || '0' }}</span>
+                  <span class="stats-label">本周</span>
+                  <span class="stats-sub">{{ stats.week.count > 0 ? fmtMinutes(stats.week.seconds) || '阅读' : '阅读' }}</span>
+                </div>
+                <div class="stats-cell">
+                  <span class="stats-num">{{ stats.total.count > 0 ? stats.total.count : fmtMinutes(stats.total.seconds) || '0' }}</span>
+                  <span class="stats-label">总计</span>
+                  <span class="stats-sub">{{ stats.total.count > 0 ? fmtMinutes(stats.total.seconds) || '阅读' : '阅读' }}</span>
+                </div>
+              </div>
+              <template v-if="stats.top.length">
+                <p class="stats-top-title">书籍 TOP{{ stats.top.length }}</p>
+                <ul class="stats-top-list">
+                  <li v-for="(b, i) in stats.top" :key="i" class="stats-top-row">
+                    <span class="stats-rank">{{ i + 1 }}</span>
+                    <span class="stats-book" :title="b.name">{{ b.name }}</span>
+                    <span class="stats-val">{{ topValue(b) }}</span>
+                  </li>
+                </ul>
+              </template>
+              <p v-else class="field-tip">暂无书籍数据</p>
+            </template>
+            <p v-else class="stats-msg" :class="{ error: statsMsgError }">{{ statsMsg || '统计加载失败' }}</p>
+            <div class="dlg-actions">
+              <button class="ghost-btn" type="button" @click="closeStats">关闭</button>
             </div>
           </div>
         </div>
@@ -1386,6 +1856,166 @@ async function downloadBackup() {
   color: #ffffff;
   background: #cf4444;
   border-color: #cf4444;
+}
+
+/* ================= 阅读偏好控件 ================= */
+.pref-pills {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.pref-slider {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pref-range {
+  flex: 1;
+  min-width: 0;
+  height: 18px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.pref-val {
+  flex-shrink: 0;
+  min-width: 46px;
+  text-align: right;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.pref-select {
+  height: 30px;
+  padding: 0 8px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+.pref-select:focus {
+  border-color: var(--accent);
+}
+.card-note.error {
+  color: #cf4444;
+}
+
+/* ================= 阅读统计弹窗 ================= */
+.dlg-stats {
+  width: min(400px, 100%);
+}
+.stats-loading {
+  margin: 0;
+  padding: 32px 0;
+  text-align: center;
+  font-size: 12.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.stats-grid {
+  display: flex;
+  gap: 10px;
+  margin: 12px 0 4px;
+}
+.stats-cell {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 16px 8px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.stats-num {
+  font-size: 24px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+.stats-label {
+  font-size: 11.5px;
+  font-weight: 400;
+  letter-spacing: 2px;
+  color: var(--text-2);
+}
+.stats-sub {
+  font-size: 10.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.stats-top-title {
+  margin: 16px 0 8px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.stats-top-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.stats-top-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.stats-rank {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.stats-book {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stats-val {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.stats-msg {
+  margin: 0;
+  padding: 24px 0;
+  text-align: center;
+  font-size: 12.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.stats-msg.error {
+  color: #cf4444;
 }
 
 /* ================= 响应式 ================= */

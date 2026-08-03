@@ -173,7 +173,7 @@ fn js_vars(
 /// 1) `@js:`/`js:` 前缀 → JS 返回值作为搜索 URL（注入 key/page/baseUrl/headerMap）；
 /// 2) `,{...}` 后缀解析：js 键对 URL 执行 JS（注入 key/page/result 为空字符串/baseUrl/headerMap）；
 /// 3) 模板替换（{{key}}/{key}/{{page}}/{page}）与相对路径拼接
-fn build_request_url(
+pub(crate) fn build_request_url(
     search_url: &str,
     key: &str,
     page: i64,

@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import {
   deleteBook,
+  deleteBooks,
   deleteBookGroup,
   getBookGroups,
   getBookshelf,
@@ -12,7 +13,9 @@ import {
   updateBookGroupId,
 } from '@/api/bookshelf'
 import { uploadLocalBook } from '@/api/upload'
+import { exportBook, type ExportFormat } from '@/api/export'
 import { probeSecureMode } from '@/api/users'
+import { downloadBlob } from '@/utils/download'
 import { useUserStore } from '@/stores/user'
 import type { Book, BookGroup } from '@/types'
 
@@ -377,13 +380,13 @@ function onCardMenu(book: Book, e: MouseEvent) {
   openCardMenu(book, e)
 }
 
-/** 批量移出书架：逐本调 POST /reader3/deleteBook */
+/** 批量删除：优先 POST /reader3/deleteBooks（批量契约 {bookUrls}），后端未实现时降级逐本 deleteBook */
 async function bulkRemove() {
   const urls = Array.from(selected.value)
   if (!urls.length || manageBusy.value) return
   try {
-    await ElMessageBox.confirm(`确定将选中的 ${urls.length} 本书移出书架吗？`, '移出书架', {
-      confirmButtonText: '移出',
+    await ElMessageBox.confirm(`确定将选中的 ${urls.length} 本书从书架删除吗？`, '删除书籍', {
+      confirmButtonText: '删除',
       cancelButtonText: '取消',
       type: 'warning',
     })
@@ -393,20 +396,86 @@ async function bulkRemove() {
   manageBusy.value = true
   let ok = 0
   const removed = new Set<string>()
-  for (const url of urls) {
-    try {
-      await deleteBook(url)
-      ok++
-      removed.add(url)
-    } catch {
-      // 单本失败不中断，继续逐本处理
+  try {
+    const res = await deleteBooks(urls, { silent: true })
+    ok = typeof res.data?.count === 'number' ? res.data.count : urls.length
+    urls.forEach((u) => removed.add(u))
+  } catch {
+    // 批量接口未就绪（404）/失败：降级逐本 deleteBook（单本失败不中断）
+    for (const url of urls) {
+      try {
+        await deleteBook(url)
+        ok++
+        removed.add(url)
+      } catch {
+        // 单本失败继续
+      }
     }
   }
   if (removed.size) books.value = books.value.filter((b) => !removed.has(b.bookUrl))
   selected.value = new Set()
   manageBusy.value = false
   const failed = urls.length - ok
-  ElMessage.success(failed > 0 ? `已移出 ${ok} 本，${failed} 本失败` : `已移出 ${ok} 本书`)
+  ElMessage.success(failed > 0 ? `已删除 ${ok} 本，${failed} 本失败` : `已删除 ${ok} 本书`)
+}
+
+/* ================= 导出（GET /reader3/exportBook：txt/epub/html blob 下载） ================= */
+
+const EXPORT_FORMATS: { value: ExportFormat; label: string; tip: string }[] = [
+  { value: 'txt', label: 'TXT', tip: '纯文本' },
+  { value: 'epub', label: 'EPUB', tip: '电子书' },
+  { value: 'html', label: 'HTML', tip: '网页' },
+]
+
+const exportOpen = ref(false)
+const exportBookUrl = ref('')
+const exportName = ref('')
+const exportFormat = ref<ExportFormat>('txt')
+const exportBusy = ref(false)
+const exportMsg = ref('')
+const exportMsgError = ref(false)
+
+function openExportFor(book: Book) {
+  exportBookUrl.value = book.bookUrl
+  exportName.value = book.name || 'book'
+  exportFormat.value = 'txt'
+  exportMsg.value = ''
+  exportMsgError.value = false
+  closeMenu()
+  exportOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeExport() {
+  if (exportBusy.value) return
+  exportOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 导出并下载（失败在弹窗内提示，不弹全局 toast——接口可能未实现） */
+async function confirmExport() {
+  if (exportBusy.value) return
+  exportBusy.value = true
+  exportMsg.value = ''
+  exportMsgError.value = false
+  try {
+    const blob = await exportBook(exportBookUrl.value, exportFormat.value)
+    const name = `${exportName.value.replace(/[\\/:*?"<>|]/g, '_')}.${exportFormat.value}`
+    const ok = await downloadBlob(blob, name)
+    if (ok) {
+      exportMsg.value = `已下载 ${name}`
+      window.setTimeout(() => {
+        if (!exportBusy.value) closeExport()
+      }, 900)
+    }
+  } catch (err) {
+    exportMsg.value = isNotImplemented(err)
+      ? '导出接口后端暂未提供（GET /reader3/exportBook）'
+      : `导出失败：${err instanceof Error ? err.message : '请稍后重试'}`
+    exportMsgError.value = true
+  } finally {
+    exportBusy.value = false
+  }
 }
 
 function openMovePanel() {
@@ -1209,6 +1278,14 @@ onMounted(() => {
                 </svg>
                 移动到分组
               </button>
+              <button class="ctx-item" type="button" @click="openExportFor(menuBook)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 15V4" />
+                  <path d="M7 9.5L12 4.5l5 5" />
+                  <path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15" />
+                </svg>
+                导出
+              </button>
               <button class="ctx-item danger" type="button" :disabled="menuBusy" @click="removeFromShelf">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M4 7h16" />
@@ -1359,7 +1436,7 @@ onMounted(() => {
             :disabled="selected.size === 0 || manageBusy"
             @click="bulkRemove"
           >
-            移出书架
+            删除
           </button>
           <button
             class="manage-act accent"
@@ -1412,6 +1489,53 @@ onMounted(() => {
               <div class="dlg-actions">
                 <button class="ghost-btn" type="button" :disabled="manageBusy" @click="closeMovePanel">取消</button>
               </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 导出弹层（GET /reader3/exportBook：txt/epub/html blob 下载） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="exportOpen" class="dlg-overlay" @click.self="closeExport">
+          <div
+            class="dlg"
+            role="dialog"
+            aria-modal="true"
+            aria-label="导出书籍"
+            tabindex="-1"
+            @keydown.esc="closeExport"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">导出 · {{ exportName }}</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="exportBusy" @click="closeExport">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <div class="export-formats">
+              <button
+                v-for="f in EXPORT_FORMATS"
+                :key="f.value"
+                class="fmt-btn"
+                :class="{ active: exportFormat === f.value }"
+                type="button"
+                :disabled="exportBusy"
+                @click="exportFormat = f.value"
+              >
+                <span class="fmt-label">{{ f.label }}</span>
+                <span class="fmt-tip">{{ f.tip }}</span>
+              </button>
+            </div>
+            <p class="field-tip">由服务器生成 {{ exportFormat.toUpperCase() }} 文件并下载。</p>
+            <p v-if="exportMsg" class="export-msg" :class="{ error: exportMsgError }">{{ exportMsg }}</p>
+            <div class="dlg-actions">
+              <button class="ghost-btn" type="button" :disabled="exportBusy" @click="closeExport">取消</button>
+              <button class="accent-btn" type="button" :disabled="exportBusy" @click="confirmExport">
+                {{ exportBusy ? '导出中…' : '导出' }}
+              </button>
             </div>
           </div>
         </div>
@@ -2492,6 +2616,65 @@ onMounted(() => {
   padding: 28px 0;
   text-align: center;
   font-size: 12.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+
+/* ================= 导出弹层 ================= */
+.export-formats {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.fmt-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 10px 0;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.fmt-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.fmt-btn.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.fmt-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.fmt-label {
+  font-size: 13.5px;
+  font-weight: 400;
+  letter-spacing: 2px;
+  color: var(--text-1);
+}
+.fmt-tip {
+  font-size: 10.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.export-msg {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+}
+.export-msg.error {
+  color: #cf4444;
+}
+.field-tip {
+  margin: 0 0 10px;
+  font-size: 11.5px;
   font-weight: 300;
   color: var(--text-3);
 }
