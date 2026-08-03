@@ -122,7 +122,7 @@ watch(fontWeight, (v) => persist('reader_font_weight', v))
 
 /* ---------------- 2.1 字体（系统/衬线/圆体/黑体） ---------------- */
 
-type FontKind = 'system' | 'song' | 'hei' | 'kai' | 'fangsong' | 'round' | 'lishu' | 'yahei' | 'pingfang' | 'serif'
+type FontKind = 'system' | 'song' | 'hei' | 'kai' | 'fangsong' | 'round' | 'lishu' | 'yahei' | 'pingfang' | 'wenkai' | 'hanserif' | 'serif'
 const FONT_OPTIONS: { label: string; value: FontKind }[] = [
   { label: '系统', value: 'system' },
   { label: '宋体', value: 'song' },
@@ -133,6 +133,8 @@ const FONT_OPTIONS: { label: string; value: FontKind }[] = [
   { label: '隶书', value: 'lishu' },
   { label: '雅黑', value: 'yahei' },
   { label: '苹方', value: 'pingfang' },
+  { label: '文楷', value: 'wenkai' },
+  { label: '思源宋', value: 'hanserif' },
   { label: '衬线', value: 'serif' },
 ]
 const FONT_STACK: Record<FontKind, string> = {
@@ -145,6 +147,8 @@ const FONT_STACK: Record<FontKind, string> = {
   lishu: "'LiSu', 'STLiti', '隶书', serif",
   yahei: "'Microsoft YaHei', '微软雅黑', 'PingFang SC', sans-serif",
   pingfang: "'PingFang SC', 'SF Pro SC', 'HarmonyOS Sans SC', sans-serif",
+  wenkai: "'LXGW WenKai', 'Kaiti SC', '楷体', serif",
+  hanserif: "'Source Han Serif CN', 'Songti SC', 'SimSun', '宋体', serif",
   serif: "Georgia, 'Songti SC', 'SimSun', 'Noto Serif CJK SC', serif",
 }
 const fontKind = ref<FontKind>('system')
