@@ -8,14 +8,92 @@ use crate::model::BookSource;
 use crate::service::crawler;
 use crate::service::search::SearchBook;
 
-/// 解析 exploreUrl 集合（legacy：多行 URL，{{page}} 分页）
-pub fn parse_explore_urls(explore_url: &str) -> Vec<String> {
-    explore_url
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.to_string())
-        .collect()
+/// 探索条目（title + url）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExploreEntry {
+    pub title: String,
+    pub url: String,
+}
+
+/// 解析 exploreUrl（legado 语义）：
+/// - `@js:代码`：执行 JS（返回 JSON.stringify([{title,url},...])）→ 解析条目
+/// - 普通多行 URL：每行一个条目（title 从 URL 尾部提取）
+pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
+    let mut entries = Vec::new();
+    for line in explore_url.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(code) = line.strip_prefix("@js:") {
+            if let Ok(result) = crate::parser::js::eval_js(code, &Default::default()) {
+                if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&result) {
+                    for item in list {
+                        let title = item
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if !url.is_empty() {
+                            entries.push(ExploreEntry { title, url });
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+        // 普通 URL 行：title 从尾部提取
+        let title = url_title(&line);
+        entries.push(ExploreEntry {
+            title,
+            url: line.to_string(),
+        });
+    }
+    entries
+}
+
+/// 从 URL 提取分类名（尾部路径段/查询参数，解码）
+fn url_title(url: &str) -> String {
+    let cleaned = url.split(['?', '&', '#']).next().unwrap_or(url);
+    let seg = cleaned
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(cleaned);
+    let decoded = percent_decode(seg);
+    if !decoded.is_empty() && decoded != "/" {
+        return decoded;
+    }
+    // 查询参数 name/type/id
+    for param in ["name", "type", "id"] {
+        for pair in url.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == param && !v.is_empty() {
+                    return percent_decode(v);
+                }
+            }
+        }
+    }
+    url.to_string()
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 单页发现：抓取 + 解析（复用搜索的 SearchRule 语义）

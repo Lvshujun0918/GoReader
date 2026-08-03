@@ -103,8 +103,8 @@ export interface SearchBook {
 
 /** 探索分类（/reader3/getExploreUrls → string[]；视图层派生：url + 从 URL 尾部路径/参数提取的名称） */
 export interface ExploreCategory {
+  title: string
   url: string
-  name: string
 }
 
 /** 书架分组（/reader3/getBookGroups → BookGroup，camelCase；books.group 存分组 id，0=未分组） */
@@ -175,6 +175,30 @@ export interface TxtTocRule {
   [key: string]: unknown
 }
 
+/** 用户管理（GET /reader3/getUsers → ReaderUser；secure 模式需 secure+secureKey query，缺/错返回 NEED_SECURE_KEY） */
+export interface ReaderUser {
+  username: string
+  enableWebdav: boolean
+  enableLocalStore: boolean
+  enableBookSource: boolean
+  enableRssSource: boolean
+  bookSourceLimit: number
+  bookLimit: number
+  lastLoginAt: number
+  [key: string]: unknown
+}
+
+/** 用户更新（POST /reader3/updateUser body：username + 各 enable/limit 字段，缺省字段不修改） */
+export interface UserUpdatePayload {
+  username: string
+  enableWebdav?: boolean
+  enableLocalStore?: boolean
+  enableBookSource?: boolean
+  enableRssSource?: boolean
+  bookSourceLimit?: number
+  bookLimit?: number
+}
+
 /** 系统信息（/reader3/getSystemInfo：版本/端口/用户数/书数/书源数） */
 export interface SystemInfo {
   version: string
@@ -185,6 +209,21 @@ export interface SystemInfo {
   freeMemory?: string
   totalMemory?: string
   maxMemory?: string
+  [key: string]: unknown
+}
+
+/** 全书内容搜索命中（GET /reader3/searchBookContent 契约——当前后端待实现；chapterIndex=章节索引 / title=章节标题 / snippet=匹配片段） */
+export interface ContentSearchHit {
+  chapterIndex: number
+  title: string
+  snippet: string
+  [key: string]: unknown
+}
+
+/** 缓存统计（GET /reader3/getCacheInfo 契约——当前后端待实现；chapterCacheCount=章节缓存数 / chapterCacheSize=章节缓存大小(字节)） */
+export interface CacheInfo {
+  chapterCacheCount: number
+  chapterCacheSize: number
   [key: string]: unknown
 }
 
