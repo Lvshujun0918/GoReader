@@ -22,8 +22,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{anyhow, Result};
 use boa_engine::object::ObjectInitializer;
-use boa_engine::property::Attribute;
+use boa_engine::property::{Attribute, PropertyKey};
 use boa_engine::{Context, JsArgs, JsObject, JsResult, JsString, JsValue, NativeFunction, Source};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 /// source.put/get 书源级变量存储：全局共享（跨搜索/详情调用），
 /// 外层 key 为书源 key（URL），内层为该书源的变量表（书源间隔离）
@@ -118,7 +119,39 @@ pub fn eval_js_with_bridge(
     let result = context
         .eval(Source::from_bytes(code.as_bytes()))
         .map_err(|e| anyhow!("JS 执行失败: {e}"))?;
-    Ok(js_value_to_string(&result, &mut context))
+    Ok(js_result_to_string(&result, &mut context))
+}
+
+/// 执行 JS 并返回结构化结果（serde_json::Value）
+///
+/// 数组/对象经递归转换（`js_value_to_json`）直接得到 JSON——避免 boa ToString 对
+/// 数组元素对象输出 "[object Object]" 导致后续 JSON.parse 为空；若结果为字符串且
+/// 可解析为 JSON（如 JS 内 `JSON.stringify(...)` 出口），自动解析为对应结构。
+pub fn eval_js_json(code: &str, vars: &HashMap<String, String>) -> Result<JsonValue> {
+    eval_js_json_with_bridge(code, vars, &JsBridge::default())
+}
+
+/// 带书源桥接的 JSON 版本（同 eval_js_json，注入 java.*/source.*）
+pub fn eval_js_json_with_bridge(
+    code: &str,
+    vars: &HashMap<String, String>,
+    bridge: &JsBridge,
+) -> Result<JsonValue> {
+    let mut context = Context::default();
+    inject_vars(&mut context, vars)?;
+    install_bridge(&mut context, bridge)?;
+    let result = context
+        .eval(Source::from_bytes(code.as_bytes()))
+        .map_err(|e| anyhow!("JS 执行失败: {e}"))?;
+    let json = js_value_to_json(&result, &mut context)
+        .map_err(|e| anyhow!("JS 结果 JSON 转换失败: {e}"))?;
+    // 字符串结果：若为 JSON 文本则解析为结构（兼容 JSON.stringify 出口）
+    if let JsonValue::String(s) = &json {
+        if let Ok(parsed) = serde_json::from_str::<JsonValue>(s) {
+            return Ok(parsed);
+        }
+    }
+    Ok(json)
 }
 
 /// 执行 JS 表达式并返回 JsValue（供内部使用）
@@ -353,6 +386,60 @@ fn js_value_to_string(v: &JsValue, context: &mut Context) -> String {
     }
 }
 
+/// eval 结果出口：数组/对象 → JSON 文本（避免 ToString 的 "[object Object]"
+/// 使下游 JSON 解析为空）；其余按 String() 语义（数字/布尔字面量、null/undefined 空串）
+fn js_result_to_string(v: &JsValue, context: &mut Context) -> String {
+    match v {
+        JsValue::Null | JsValue::Undefined => String::new(),
+        JsValue::Object(_) => js_value_to_json(v, context)
+            .map(|j| j.to_string())
+            .unwrap_or_default(),
+        _ => js_value_to_string(v, context),
+    }
+}
+
+/// JsValue → serde_json::Value 递归转换（数组/对象/基本类型全支持）
+///
+/// 背景：boa ToString 对数组输出元素 Join（对象元素为 "[object Object]"），
+/// 经 JSON.parse 必然解析为空。此处对齐 JSON.stringify 语义（Undefined/BigInt/
+/// Symbol → null，不 panic——区别于 boa `JsValue::to_json` 对 Undefined 的 todo!）。
+pub fn js_value_to_json(v: &JsValue, context: &mut Context) -> JsResult<JsonValue> {
+    match v {
+        JsValue::Null | JsValue::Undefined => Ok(JsonValue::Null),
+        JsValue::Boolean(b) => Ok(JsonValue::Bool(*b)),
+        JsValue::String(s) => Ok(JsonValue::String(s.to_std_string_escaped())),
+        JsValue::Rational(r) => Ok(serde_json::json!(*r)),
+        JsValue::Integer(i) => Ok(serde_json::json!(*i)),
+        // BigInt/Symbol：JSON.stringify 语义（BigInt 抛错、Symbol 忽略）——此处收敛为 null
+        JsValue::BigInt(_) | JsValue::Symbol(_) => Ok(JsonValue::Null),
+        JsValue::Object(obj) => {
+            if obj.is_array() {
+                // 数组：按 length 逐元素（对齐 JSON.stringify 语义）
+                let len = obj.get(JsString::from("length"), context)?.to_u32(context)?;
+                let mut arr = Vec::with_capacity(len as usize);
+                for k in 0..len {
+                    let val = obj.get(k, context)?;
+                    arr.push(js_value_to_json(&val, context)?);
+                }
+                Ok(JsonValue::Array(arr))
+            } else {
+                // 对象：own_property_keys 遍历（Symbol 键跳过）
+                let mut map = JsonMap::new();
+                for key in obj.own_property_keys(context)? {
+                    let k = match &key {
+                        PropertyKey::String(s) => s.to_std_string_escaped(),
+                        PropertyKey::Index(i) => i.get().to_string(),
+                        PropertyKey::Symbol(_) => continue,
+                    };
+                    let val = obj.get(key, context)?;
+                    map.insert(k, js_value_to_json(&val, context)?);
+                }
+                Ok(JsonValue::Object(map))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +635,65 @@ mod tests {
         assert_eq!(eval_js_with_bridge("key + 'x'", &v, &bridge).unwrap(), "ax");
         assert_eq!(eval_js_with_bridge("1 + 2", &v, &bridge).unwrap(), "3");
         assert!(eval_js_with_bridge("throw new Error('x')", &v, &bridge).is_err());
+    }
+
+    // ---- 数组/对象序列化（bookList 修复） ----
+
+    #[test]
+    fn eval_js_array_to_json_string() {
+        // 数组结果：eval 字符串出口应输出 JSON 文本而非 "[object Object]"
+        let v = vars(&[]);
+        assert_eq!(eval_js("[{a:1},{b:2}]", &v).unwrap(), r#"[{"a":1},{"b":2}]"#);
+        // 对象结果同样 JSON 化
+        assert_eq!(eval_js("({name:'A',url:'u'})", &v).unwrap(), r#"{"name":"A","url":"u"}"#);
+        // 字符串/数字/布尔/null 语义不变
+        assert_eq!(eval_js("JSON.stringify([1,2])", &v).unwrap(), "[1,2]");
+        assert_eq!(eval_js("1+2", &v).unwrap(), "3");
+        assert_eq!(eval_js("null", &v).unwrap(), "");
+    }
+
+    #[test]
+    fn eval_js_json_array_from_parse() {
+        // JSON.parse(result).data 数组 → 直接结构化返回（bookList 核心修复场景）
+        let v = vars(&[("result", r#"{"data":[{"name":"书A","url":"/a"},{"name":"书B","url":"/b"}]}"#)]);
+        let json = eval_js_json("JSON.parse(result).data", &v).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["name"], "书A");
+        assert_eq!(arr[1]["url"], "/b");
+    }
+
+    #[test]
+    fn eval_js_json_object_and_scalars() {
+        let v = vars(&[]);
+        // 对象
+        let json = eval_js_json("({x:1,y:'s'})", &v).unwrap();
+        assert_eq!(json["x"], 1);
+        assert_eq!(json["y"], "s");
+        // 字符串内 JSON 自动解析（JSON.stringify 出口）
+        let json = eval_js_json("JSON.stringify([{n:1}])", &v).unwrap();
+        assert_eq!(json.as_array().unwrap()[0]["n"], 1);
+        // 标量
+        assert_eq!(eval_js_json("42", &v).unwrap(), serde_json::json!(42));
+        assert_eq!(eval_js_json("3.14", &v).unwrap(), serde_json::json!(3.14));
+        assert_eq!(eval_js_json("true", &v).unwrap(), serde_json::json!(true));
+        assert_eq!(eval_js_json("'str'", &v).unwrap(), serde_json::json!("str"));
+        // undefined/bigint → null（不 panic，区别于 boa to_json 的 todo!）
+        assert_eq!(eval_js_json("undefined", &v).unwrap(), serde_json::json!(null));
+        assert_eq!(eval_js_json("1n", &v).unwrap(), serde_json::json!(null));
+    }
+
+    #[test]
+    fn eval_js_json_with_bridge_roundtrip() {
+        let bridge = JsBridge::new("https://src.test", "源");
+        let v = vars(&[]);
+        let json = eval_js_json_with_bridge(
+            "java.put('k','v'); JSON.parse('{\"list\":[{\"n\":1}]}').list",
+            &v,
+            &bridge,
+        )
+        .unwrap();
+        assert_eq!(json.as_array().unwrap()[0]["n"], 1);
     }
 }
 

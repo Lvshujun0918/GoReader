@@ -370,7 +370,7 @@ onMounted(() => {
   align-items: center;
   gap: 16px;
   padding: 14px 32px;
-  background: rgba(250, 250, 250, 0.86);
+  background: var(--bg-float);
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);

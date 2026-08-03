@@ -409,30 +409,29 @@ fn js_book_list(rule: &str, body: &str, base_url: &str) -> Vec<String> {
     } else {
         return vec![];
     };
-    // 执行（注入 result=响应体、key/page）
+    // 执行（注入 result=响应体、key/page）并直接取结构化结果：
+    // 数组/对象经递归 JSON 转换（js_value_to_json）——避免 boa ToString 对数组
+    // 元素对象输出 "[object Object]" 导致 JSON.parse 解析为空（bookList 修复核心）
     let mut vars = std::collections::HashMap::new();
     vars.insert("result".to_string(), body.to_string());
     vars.insert("key".to_string(), String::new());
     vars.insert("page".to_string(), "1".to_string());
     vars.insert("baseUrl".to_string(), base_url.to_string());
-    let Ok(result) = crate::parser::js::eval_js(&code, &vars) else {
+    let Ok(result) = crate::parser::js::eval_js_json(&code, &vars) else {
         return vec![];
     };
-    // 解析 JSON 数组（每项书对象 → 上下文 JSON 字符串）
-    let trimmed = result.trim();
-    let arr: serde_json::Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(_) => {
-            // 可能不是纯 JSON——尝试找数组片段
-            return vec![];
-        }
-    };
-    match arr {
+    // 数组：每项书对象/字符串 → 上下文（JSON 文本）；单对象兼容
+    match result {
         serde_json::Value::Array(list) => list
             .iter()
-            .filter(|item| item.is_object())
-            .map(|item| item.to_string())
+            .map(|item| match item {
+                serde_json::Value::Object(_) => item.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .filter(|s| !s.is_empty())
             .collect(),
+        serde_json::Value::Object(_) => vec![result.to_string()],
         _ => vec![],
     }
 }
@@ -539,6 +538,20 @@ pub(crate) fn field(context: &str, rule: Option<&str>, default: &str) -> String 
             let v = apply(&rule, context);
             v.into_iter().next().unwrap_or_else(|| default.to_string())
         }
+        RuleKind::Js => {
+            // 纯 JS 字段规则（@js:/js: 前缀——parse_rule 已剥前缀，body 即代码）：
+            // 注入 result=上下文执行；数组/对象结果自动 JSON 化（js_result_to_string）
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("result".to_string(), context.to_string());
+            vars.insert("key".to_string(), String::new());
+            vars.insert("page".to_string(), "1".to_string());
+            let s = crate::parser::js::eval_js(&r.body, &vars).unwrap_or_default();
+            if s.is_empty() {
+                default.to_string()
+            } else {
+                s
+            }
+        }
         _ => default.to_string(),
     }
 }
@@ -628,6 +641,87 @@ mod tests {
         assert_eq!(books[0].name, "书名A");
         assert_eq!(books[0].author, "作者甲");
         assert_eq!(books[0].book_url, "https://a.com/book/1");
+    }
+
+    /// bookList 修复：JS 返回 JSON.parse(result).data 数组 → 逐本书解析（此前 ToString
+    /// 输出 "[object Object]" 导致解析为空）
+    #[test]
+    fn test_js_book_list_json_parse_array() {
+        let body = r#"{"code":0,"data":[
+            {"novelName":"书A","authorName":"作者甲","novelId":"id1"},
+            {"novelName":"书B","authorName":"作者乙","novelId":"id2"}
+        ]}"#;
+        let rule = SearchRule {
+            book_list: Some("@js:JSON.parse(result).data".into()),
+            name: Some("$.novelName".into()),
+            author: Some("$.authorName".into()),
+            book_url: Some("/novel/{{$.novelId}}".into()),
+            ..Default::default()
+        };
+        let src = BookSource { book_source_url: "https://api.test".into(), ..Default::default() };
+        let books = analyze_book_list(&body, "https://api.test", &src, &rule, "@js:JSON.parse(result).data", "key");
+        assert_eq!(books.len(), 2, "JS bookList 应解析出 2 本书");
+        assert_eq!(books[0].name, "书A");
+        assert_eq!(books[0].author, "作者甲");
+        assert_eq!(books[0].book_url, "https://api.test/novel/id1");
+        assert_eq!(books[1].name, "书B");
+    }
+
+    /// bookList 修复：JS 直接返回数组字面量（非字符串出口）
+    #[test]
+    fn test_js_book_list_array_literal() {
+        let rule = SearchRule {
+            book_list: Some("@js:[{name:'直A',url:'/a'},{name:'直B',url:'/b'}]".into()),
+            name: Some("$.name".into()),
+            book_url: Some("$.url".into()),
+            ..Default::default()
+        };
+        let src = BookSource { book_source_url: "https://api.test".into(), ..Default::default() };
+        let books = analyze_book_list("{}", "https://api.test", &src, &rule, "@js:[{name:'直A',url:'/a'},{name:'直B',url:'/b'}]", "");
+        assert_eq!(books.len(), 2);
+        assert_eq!(books[0].name, "直A");
+        assert_eq!(books[0].book_url, "https://api.test/a");
+    }
+
+    /// bookList 兼容：JS 内 JSON.stringify 返回字符串数组——自动解析
+    #[test]
+    fn test_js_book_list_stringify_backward_compat() {
+        let rule = SearchRule {
+            book_list: Some("@js:JSON.stringify([{name:'串A',url:'/s/a'}])".into()),
+            name: Some("$.name".into()),
+            book_url: Some("$.url".into()),
+            ..Default::default()
+        };
+        let src = BookSource { book_source_url: "https://api.test".into(), ..Default::default() };
+        let books = analyze_book_list("{}", "https://api.test", &src, &rule, "@js:JSON.stringify([{name:'串A',url:'/s/a'}])", "");
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].name, "串A");
+    }
+
+    /// bookList：<js> 包裹形式
+    #[test]
+    fn test_js_book_list_html_wrapped() {
+        let rule = SearchRule {
+            book_list: Some("<js>JSON.parse(result).data</js>".into()),
+            name: Some("$.name".into()),
+            book_url: Some("$.url".into()),
+            ..Default::default()
+        };
+        let body = r#"{"data":[{"name":"包A","url":"/w/1"}]}"#;
+        let src = BookSource { book_source_url: "https://api.test".into(), ..Default::default() };
+        let books = analyze_book_list(body, "https://api.test", &src, &rule, "<js>JSON.parse(result).data</js>", "");
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].name, "包A");
+    }
+
+    /// 字段规则：@js: 前缀（analyze 系列字段出口——result 注入上下文执行）
+    #[test]
+    fn test_field_js_rule() {
+        let ctx = r#"{"data":{"name":"字段书","author":"字段作者"}}"#;
+        assert_eq!(field(ctx, Some("@js:JSON.parse(result).data.name"), ""), "字段书");
+        assert_eq!(field(ctx, Some("@js:JSON.parse(result).data.author"), ""), "字段作者");
+        // 失败回退默认值
+        assert_eq!(field(ctx, Some("@js:JSON.parse(result).data.missing.x"), "默认"), "默认");
     }
 
     #[test]

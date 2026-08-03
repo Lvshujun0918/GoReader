@@ -250,7 +250,7 @@ async function submit() {
   border: none;
   border-radius: var(--radius);
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-family: inherit;
   font-size: 14.5px;
   font-weight: 400;
@@ -272,8 +272,8 @@ async function submit() {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.35);
-  border-top-color: #fff;
+  border: 2px solid color-mix(in srgb, var(--on-accent) 35%, transparent);
+  border-top-color: var(--on-accent);
   animation: spin 0.7s linear infinite;
 }
 @keyframes spin {

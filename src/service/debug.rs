@@ -330,6 +330,10 @@ async fn debug_toc(
             crate::parser::rule::RuleKind::JsonPath | crate::parser::rule::RuleKind::Regex => {
                 crate::parser::rule::apply(&list_rule, &resp.body)
             }
+            // JS chapterList（JSON 数组递归转换——与 analyze_toc 同源；含 <js> 包裹兜底）
+            _ if list_rule.contains("<js>") || list_rule.trim_start().starts_with("@js:") => {
+                crate::service::book::toc_items(&list_rule, &resp.body)
+            }
             _ => vec![],
         };
         step.elapsed_ms = started.elapsed().as_millis() as i64;

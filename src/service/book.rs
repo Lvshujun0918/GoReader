@@ -115,33 +115,9 @@ pub async fn analyze_toc(
             break;
         };
 
-        let parsed = parse_rule(&list_rule);
-        let items: Vec<String> = match parsed.kind {
-            RuleKind::Css => css_chain(&list_rule, &resp.body),
-            RuleKind::JsonPath | RuleKind::Regex => apply(&list_rule, &resp.body),
-            _ => vec![],
-        };
-
+        let items = toc_items(&list_rule, &resp.body);
         let start_index = all.len() as i64;
-        for (i, item) in items.iter().enumerate() {
-            let title = field(item, rule.chapter_name.as_deref(), "");
-            let url = rule
-                .chapter_url
-                .as_deref()
-                .map(|r| field(item, Some(r), ""))
-                .unwrap_or_default();
-            if title.is_empty() && url.is_empty() {
-                continue;
-            }
-            let url = to_abs(&url, &base);
-            let is_volume = title.starts_with("卷") || title.contains("【卷");
-            all.push(BookChapter {
-                title,
-                url,
-                is_volume,
-                index: start_index + i as i64,
-            });
-        }
+        all.extend(chapters_from_items(&items, &rule, &base, start_index));
 
         // 多页目录
         let next = rule
@@ -156,6 +132,110 @@ pub async fn analyze_toc(
     }
 
     Ok(all)
+}
+
+/// 单页目录解析（ruleToc 应用一次——getChapterListByRule 调试接口复用）
+pub async fn parse_toc_page(
+    ns: &str,
+    url: &str,
+    source: &BookSource,
+) -> Result<Vec<BookChapter>> {
+    let resp = fetch_url(ns, url, source).await?;
+    let base = resp.url.clone();
+    let rule: TocRule = source
+        .rule_toc
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let Some(list_rule) = rule.chapter_list.clone() else {
+        return Ok(vec![]);
+    };
+    let items = toc_items(&list_rule, &resp.body);
+    Ok(chapters_from_items(&items, &rule, &base, 0))
+}
+
+/// chapterList 规则 → 章节上下文列表（CSS/JSONPath/Regex/JS 全类型）
+pub(crate) fn toc_items(list_rule: &str, body: &str) -> Vec<String> {
+    let parsed = parse_rule(list_rule);
+    let mut items: Vec<String> = match parsed.kind {
+        RuleKind::Css => css_chain(list_rule, body),
+        RuleKind::JsonPath | RuleKind::Regex => apply(list_rule, body),
+        RuleKind::Js => js_chapter_items(list_rule, body),
+        _ => vec![],
+    };
+    // <js> 包裹形式（parse_rule 不识别为 Js）——兜底
+    if items.is_empty()
+        && (list_rule.contains("<js>") || list_rule.trim_start().starts_with("@js:"))
+    {
+        items = js_chapter_items(list_rule, body);
+    }
+    items
+}
+
+/// JS chapterList（<js> 或 @js:——eval 返回章节对象数组）→ 每项 JSON 文本
+/// （数组经递归 JSON 转换——避免 ToString 的 "[object Object]" 使解析为空）
+fn js_chapter_items(rule: &str, body: &str) -> Vec<String> {
+    let code = if rule.trim_start().starts_with("@js:") {
+        rule.trim_start()[4..].to_string()
+    } else if let Some(start) = rule.find("<js>") {
+        let rest = &rule[start + 4..];
+        let end = rest.find("</js>").unwrap_or(rest.len());
+        rest[..end].to_string()
+    } else {
+        return vec![];
+    };
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("result".to_string(), body.to_string());
+    vars.insert("key".to_string(), String::new());
+    vars.insert("page".to_string(), "1".to_string());
+    let Ok(result) = crate::parser::js::eval_js_json(&code, &vars) else {
+        return vec![];
+    };
+    match result {
+        serde_json::Value::Array(list) => list
+            .iter()
+            .map(|item| match item {
+                serde_json::Value::Object(_) => item.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect(),
+        serde_json::Value::Object(_) => vec![result.to_string()],
+        _ => vec![],
+    }
+}
+
+/// 章节上下文列表 → 章节（字段规则应用 + 相对 URL 转绝对）
+fn chapters_from_items(
+    items: &[String],
+    rule: &TocRule,
+    base: &str,
+    start_index: i64,
+) -> Vec<BookChapter> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            let title = field(item, rule.chapter_name.as_deref(), "");
+            let url = rule
+                .chapter_url
+                .as_deref()
+                .map(|r| field(item, Some(r), ""))
+                .unwrap_or_default();
+            if title.is_empty() && url.is_empty() {
+                return None;
+            }
+            let url = to_abs(&url, base);
+            let is_volume = title.starts_with("卷") || title.contains("【卷");
+            Some(BookChapter {
+                title,
+                url,
+                is_volume,
+                index: start_index + i as i64,
+            })
+        })
+        .collect()
 }
 
 /// 正文解析（ruleContent：content 字段 + sourceRegex 清洗 + 多页）
@@ -283,5 +363,43 @@ mod tests {
         let html = r#"<div class="content">多   个  空格</div>"#;
         let content = analyze_content_from(html, &src);
         assert_eq!(content, "多个空格");
+    }
+
+    /// chapterList JS 规则（JSON.parse(result).data 数组）→ 章节上下文列表
+    #[test]
+    fn test_toc_items_js_array() {
+        let body = r#"{"data":[{"title":"第一章","href":"/c/1"},{"title":"第二章","href":"/c/2"}]}"#;
+        let items = toc_items("@js:JSON.parse(result).data", body);
+        assert_eq!(items.len(), 2, "JS chapterList 应解析出 2 项");
+        assert!(items[0].contains("第一章"));
+        assert!(items[0].contains("/c/1"));
+    }
+
+    /// chapterList JS 数组字面量 + 字段规则 → 章节（title/url 绝对化/index）
+    #[test]
+    fn test_toc_js_full_pipeline() {
+        let rule = TocRule {
+            chapter_list: Some("@js:[{t:'章A',u:'/x/1'},{t:'章B',u:'/x/2'}]".into()),
+            chapter_name: Some("$.t".into()),
+            chapter_url: Some("$.u".into()),
+            ..Default::default()
+        };
+        let items = toc_items(rule.chapter_list.as_deref().unwrap(), "{}");
+        assert_eq!(items.len(), 2);
+        let chapters = chapters_from_items(&items, &rule, "https://src.test", 5);
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "章A");
+        assert_eq!(chapters[0].url, "https://src.test/x/1");
+        assert_eq!(chapters[0].index, 5);
+        assert_eq!(chapters[1].index, 6);
+    }
+
+    /// <js> 包裹 chapterList 兜底
+    #[test]
+    fn test_toc_items_js_html_wrapped() {
+        let body = r#"{"data":[{"title":"包章","url":"/b/1"}]}"#;
+        let items = toc_items("<js>JSON.parse(result).data</js>", body);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].contains("包章"));
     }
 }

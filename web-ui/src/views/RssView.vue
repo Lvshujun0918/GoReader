@@ -511,7 +511,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   padding: 14px 32px;
-  background: rgba(250, 250, 250, 0.86);
+  background: var(--bg-float);
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
@@ -664,7 +664,7 @@ onBeforeUnmount(() => {
   border-color: var(--accent);
 }
 .pill.active {
-  color: #ffffff;
+  color: var(--on-accent);
   border-color: var(--accent);
   background: var(--accent);
   font-weight: 400;
@@ -1123,7 +1123,7 @@ onBeforeUnmount(() => {
   border-radius: var(--radius);
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -1206,6 +1206,9 @@ onBeforeUnmount(() => {
   }
   .article-read {
     padding: 8px 4px 32px;
+  }
+  .source-item {
+    min-height: 40px;
   }
   .dlg-overlay {
     padding: 16px;

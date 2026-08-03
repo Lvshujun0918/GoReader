@@ -1561,7 +1561,7 @@ onMounted(() => {
   align-items: center;
   gap: 24px;
   padding: 14px 32px;
-  background: rgba(250, 250, 250, 0.86);
+  background: var(--bg-float);
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
@@ -2291,7 +2291,7 @@ onMounted(() => {
   border-radius: var(--radius);
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -2704,7 +2704,7 @@ onMounted(() => {
   border-color: var(--accent);
 }
 .manage-btn.active {
-  color: #ffffff;
+  color: var(--on-accent);
   background: var(--accent);
   border-color: var(--accent);
 }
@@ -2758,7 +2758,7 @@ onMounted(() => {
 .book-card.selected .select-dot {
   background: var(--accent);
   border-color: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
 }
 .select-dot svg {
   width: 11px;
@@ -2930,6 +2930,20 @@ onMounted(() => {
     flex-basis: 100%;
     margin: 0;
   }
+  .user-area {
+    overflow-x: auto;
+    max-width: 100%;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .user-area::-webkit-scrollbar {
+    display: none;
+  }
+  .user-area .nav-link,
+  .user-area .user-chip,
+  .user-area .logout-btn {
+    flex-shrink: 0;
+  }
   .content {
     padding: 32px 16px 56px;
   }
@@ -2948,6 +2962,25 @@ onMounted(() => {
   .manage-act {
     padding: 5px 12px;
     font-size: 12px;
+  }
+}
+
+/* 小屏手机：书架列数继续加密 + 底部操作栏避开手势区 */
+@media (max-width: 480px) {
+  .book-grid {
+    grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+    gap: 20px 12px;
+  }
+  .brand-name {
+    font-size: 15px;
+    letter-spacing: 2px;
+  }
+  .search-mode-label,
+  .search-note {
+    display: none;
+  }
+  .manage-bar {
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
   }
 }
 </style>

@@ -65,12 +65,16 @@ const theme = ref<Theme>('light')
   const raw = localStorage.getItem(THEME_KEY)
   if (raw === 'light' || raw === 'dark' || raw === 'paper' || raw === 'system') theme.value = raw
 }
+/** 阅读页根元素（主题只作用于阅读页内，与界面主题 html[data-theme] 分离） */
+const pageRef = ref<HTMLElement | null>(null)
 /** 系统深色偏好（theme=system 时生效；matchMedia 监听切换） */
 const systemDark = ref(false)
 let mediaQuery: MediaQueryList | null = null
 const systemTheme = (): Theme => (systemDark.value ? 'dark' : 'light')
 function applyTheme(t: Theme) {
-  document.documentElement.dataset.theme = t === 'system' ? systemTheme() : t
+  // 阅读内容主题仅作用于 .reader-page（变量覆盖见 styles/main.css），不影响书架/设置等界面
+  const real = t === 'system' ? systemTheme() : t
+  if (pageRef.value) pageRef.value.dataset.readerTheme = real
 }
 function onSystemThemeChange(e: MediaQueryListEvent) {
   systemDark.value = e.matches
@@ -1308,7 +1312,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="reader-page">
+  <div ref="pageRef" class="reader-page">
     <!-- 顶部极简栏 -->
     <header class="topbar">
       <button class="icon-btn" type="button" title="返回" @click="goBack">
@@ -1984,6 +1988,8 @@ onBeforeUnmount(() => {
 <style scoped>
 .reader-page {
   min-height: 100vh;
+  /* 阅读主题变量在 .reader-page[data-reader-theme] 上覆盖（与界面主题分离），此处显式取背景 */
+  background: var(--bg);
   animation: fade-in 0.2s ease both;
 }
 
@@ -2446,7 +2452,7 @@ onBeforeUnmount(() => {
   border: none;
   border-radius: var(--radius);
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -2982,28 +2988,53 @@ onBeforeUnmount(() => {
 /* ================= 响应式 ================= */
 @media (max-width: 720px) {
   .topbar {
-    padding: 10px 12px;
-    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 10px;
+    gap: 8px;
   }
+  .icon-btn {
+    width: 32px;
+    height: 32px;
+  }
+  .book-name {
+    order: 2;
+    flex: 1;
+    font-size: 13px;
+  }
+  /* 顶部操作栏：第二行整宽，横向滚动（触屏滑动），按钮不压缩 */
   .top-actions {
+    order: 3;
+    width: 100%;
     gap: 6px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding-bottom: 2px;
+  }
+  .top-actions::-webkit-scrollbar {
+    display: none;
+  }
+  .top-actions .font-btn,
+  .top-actions .toc-btn {
+    flex-shrink: 0;
+    min-width: 32px;
   }
   .font-btn {
-    min-width: 30px;
-    padding: 0 6px;
+    padding: 0 8px;
   }
   .toc-btn {
     padding: 0 10px;
     margin-left: 0;
   }
   .reader-main {
-    padding: 36px 20px 130px;
+    padding: 32px 16px 130px;
   }
   .chapter-nav {
     gap: 12px;
   }
   .progress-bar {
-    padding: 0 16px 8px;
+    padding: 0 12px 10px;
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
   }
 }
 </style>

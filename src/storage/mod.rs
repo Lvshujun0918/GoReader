@@ -995,6 +995,31 @@ impl Storage {
         Ok(count)
     }
 
+    /// 删除单书缓存（book_chapters 该 book_url 行——本地书章节 + 书源书正文缓存）；
+    /// 不影响书架 books 行。返回删除行数
+    pub async fn delete_book_cache(&self, book_url: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
+            .bind(book_url)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 单书缓存信息：(章节数, 正文近似大小 sum length(content))
+    pub async fn book_cache_info(&self, book_url: &str) -> Result<(i64, i64)> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1")
+            .bind(book_url)
+            .fetch_one(&self.pool)
+            .await?;
+        let size: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(length(content)), 0) FROM book_chapters WHERE book_url = ?1",
+        )
+        .bind(book_url)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((count, size))
+    }
+
     /// 全书搜索：book_chapters 正文 LIKE 匹配（key 中 %/_ 转义为字面量），按章节序返回
     /// 命中章节（chapterIndex/title/snippet——命中段落前后截取），最多 limit 条
     pub async fn search_book_content(
@@ -3796,6 +3821,73 @@ mod tests {
         assert_eq!(chap_del, 0);
 
         cleanup(storage, "cache").await;
+    }
+
+    /// 单书缓存：book_cache_info（章节数+大小）/ delete_book_cache（仅删该书，不动书架）
+    #[tokio::test]
+    async fn test_book_cache_info_and_delete() {
+        let storage = test_storage("bookcache").await;
+        // 书 A：本地书章节 + 书源书正文缓存（md5 键）混合
+        storage
+            .save_chapters(
+                "https://book.com/a",
+                &[
+                    ("第一章".to_string(), "正文一二三四五".to_string()),
+                    ("第二章".to_string(), "正文六七八九十".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        storage
+            .cache_chapter_content(
+                "https://book.com/a",
+                crate::util::md5::chapter_url_hash("https://book.com/c/3"),
+                "第三章",
+                "正文三",
+            )
+            .await
+            .unwrap();
+        storage
+            .save_chapters("https://book.com/b", &[("第一章".to_string(), "另一本".to_string())])
+            .await
+            .unwrap();
+        storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://book.com/a".into(),
+                    name: "测试书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // 信息统计：A 共 3 章（本地 2 + 缓存 1），size = 7+7+3 字符
+        let (count, size) = storage.book_cache_info("https://book.com/a").await.unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(size, 17);
+        // 无缓存书 → 0
+        let (count, size) = storage.book_cache_info("https://ghost.com").await.unwrap();
+        assert_eq!((count, size), (0, 0));
+
+        // 删单书缓存：只删 A 的章节，B 不受影响、书架行保留
+        let deleted = storage.delete_book_cache("https://book.com/a").await.unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(storage.count_chapters("https://book.com/a").await.unwrap(), 0);
+        assert_eq!(storage.count_chapters("https://book.com/b").await.unwrap(), 1);
+        assert!(
+            storage
+                .find_book("default", "https://book.com/a")
+                .await
+                .unwrap()
+                .is_some(),
+            "删除缓存不应影响书架"
+        );
+        // 再删空书 → 0 行
+        assert_eq!(storage.delete_book_cache("https://ghost.com").await.unwrap(), 0);
+
+        cleanup(storage, "bookcache").await;
     }
 
     /// 全书搜索：LIKE 匹配 + 命中摘要（前后截取）+ %/_ 转义 + 章节序 + limit

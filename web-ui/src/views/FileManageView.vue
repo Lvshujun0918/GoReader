@@ -577,7 +577,7 @@ onMounted(() => {
   align-items: center;
   gap: 24px;
   padding: 14px 32px;
-  background: rgba(250, 250, 250, 0.86);
+  background: var(--bg-float);
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
@@ -1074,7 +1074,7 @@ onMounted(() => {
 .btn-primary {
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
 }
 .btn-primary:hover:not(:disabled) {
   background: var(--accent-deep);
@@ -1088,8 +1088,6 @@ onMounted(() => {
 /* ================= 响应式 ================= */
 @media (max-width: 720px) {
   .topbar {
-    flex-wrap: wrap;
-    gap: 12px;
     padding: 12px 16px;
   }
   .content {
@@ -1105,6 +1103,7 @@ onMounted(() => {
   }
   .pill {
     flex-shrink: 0;
+    min-height: 40px;
   }
   .file-bar {
     flex-direction: column;
@@ -1117,6 +1116,7 @@ onMounted(() => {
     /* 移动端简化：仅选择点 + 名称 */
     grid-template-columns: 30px 1fr;
     padding: 11px 12px;
+    min-height: 40px;
   }
   .row-size,
   .row-time {

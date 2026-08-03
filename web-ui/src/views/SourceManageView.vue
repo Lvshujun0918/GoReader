@@ -310,19 +310,23 @@ function closeAdd() {
   document.body.style.overflow = ''
 }
 
-/** 后端要求完整 BookSource：补默认值 */
-function buildSource(form: { bookSourceUrl: string; bookSourceName: string; bookSourceGroup: string }): BookSource {
+/** 后端要求完整 BookSource：补默认值；base 传入时保留其全部字段（编辑场景——登录/header/规则等原样保留） */
+function buildSource(
+  form: { bookSourceUrl: string; bookSourceName: string; bookSourceGroup: string },
+  base?: BookSource,
+): BookSource {
   return {
+    ...(base ?? {}),
     bookSourceUrl: form.bookSourceUrl.trim(),
     bookSourceName: form.bookSourceName.trim() || form.bookSourceUrl.trim(),
     bookSourceGroup: form.bookSourceGroup.trim() || null,
-    bookSourceType: 0,
-    customOrder: 0,
-    enabled: true,
-    enabledExplore: false,
-    lastUpdateTime: 0,
-    respondTime: 0,
-    weight: 0,
+    bookSourceType: base?.bookSourceType ?? 0,
+    customOrder: base?.customOrder ?? 0,
+    enabled: base?.enabled ?? true,
+    enabledExplore: base?.enabledExplore ?? false,
+    lastUpdateTime: base?.lastUpdateTime ?? 0,
+    respondTime: base?.respondTime ?? 0,
+    weight: base?.weight ?? 0,
   }
 }
 
@@ -339,6 +343,123 @@ async function confirmAdd() {
     // 错误提示已由拦截器处理
   } finally {
     addBusy.value = false
+  }
+}
+
+/* ================= 编辑（基本信息 + 规则字段 textarea JSON；saveBookSource 整源覆盖，其余字段保留） ================= */
+
+interface RuleField {
+  key: string
+  label: string
+  tip: string
+  kind: 'json' | 'text'
+}
+
+/** 规则字段清单：对齐后端 BookSource 模型（legacy + legado 两套命名；json = 嵌套对象按 JSON 文本编辑，每字段一个 textarea 单条规则） */
+const RULE_FIELDS: RuleField[] = [
+  { key: 'searchUrl', label: 'searchUrl', tip: '搜索 URL 模板（{{key}} 为关键词占位符）', kind: 'text' },
+  { key: 'ruleSearch', label: 'ruleSearch', tip: '搜索规则 JSON：bookList / name / author / kind / coverUrl / intro / bookUrl / wordCount / latestChapterTitle', kind: 'json' },
+  { key: 'searchRule', label: 'searchRule', tip: '搜索规则 JSON（legado 命名别名，与 ruleSearch 二选一）', kind: 'json' },
+  { key: 'ruleBookInfo', label: 'ruleBookInfo', tip: '详情规则 JSON：init / name / author / kind / coverUrl / intro / tocUrl', kind: 'json' },
+  { key: 'bookInfoRule', label: 'bookInfoRule', tip: '详情规则 JSON（legado 命名别名，与 ruleBookInfo 二选一）', kind: 'json' },
+  { key: 'ruleToc', label: 'ruleToc', tip: '目录规则 JSON：chapterList / chapterName / chapterUrl / nextTocUrl / isVolume', kind: 'json' },
+  { key: 'tocRule', label: 'tocRule', tip: '目录规则 JSON（legado 命名别名，与 ruleToc 二选一）', kind: 'json' },
+  { key: 'ruleContent', label: 'ruleContent', tip: '正文规则 JSON：content / nextContentUrl / sourceRegex（contentType 等字段可一并写入）', kind: 'json' },
+  { key: 'contentRule', label: 'contentRule', tip: '正文规则 JSON（legado 命名别名，与 ruleContent 二选一）', kind: 'json' },
+  { key: 'ruleExplore', label: 'ruleExplore', tip: '探索规则 JSON：bookList / name / author / kind / coverUrl / intro / bookUrl / wordCount / latestChapterTitle', kind: 'json' },
+  { key: 'exploreRule', label: 'exploreRule', tip: '探索规则 JSON（legado 命名别名，与 ruleExplore 二选一）', kind: 'json' },
+  { key: 'exploreUrl', label: 'exploreUrl', tip: '探索 URL 模板（每行一个分类地址）', kind: 'text' },
+]
+
+const editOpen = ref(false)
+const editBusy = ref(false)
+const editSource = ref<BookSource | null>(null)
+const editForm = ref({ bookSourceUrl: '', bookSourceName: '', bookSourceGroup: '' })
+const editRules = ref<Record<string, string>>({})
+const editMsg = ref('')
+const editMsgError = ref(false)
+
+/** 书源字段 → textarea 文本（json 字段 pretty-print，text 字段原样） */
+function ruleToText(s: BookSource | null, f: RuleField): string {
+  if (!s) return ''
+  const v = s[f.key]
+  if (v === undefined || v === null) return ''
+  if (f.kind === 'json') {
+    try {
+      return JSON.stringify(v, null, 2)
+    } catch {
+      return String(v)
+    }
+  }
+  return String(v)
+}
+
+function openEdit(s: BookSource) {
+  editSource.value = s
+  editForm.value = {
+    bookSourceUrl: s.bookSourceUrl,
+    bookSourceName: s.bookSourceName,
+    bookSourceGroup: s.bookSourceGroup ?? '',
+  }
+  editRules.value = {}
+  for (const f of RULE_FIELDS) editRules.value[f.key] = ruleToText(s, f)
+  editMsg.value = ''
+  editMsgError.value = false
+  editOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeEdit() {
+  if (editBusy.value) return
+  editOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 校验 + 保存：JSON 字段逐个 parse（失败定位到具体字段），合并进原书源后 saveBookSource 整源覆盖，刷新列表 */
+async function confirmEdit() {
+  if (editBusy.value) return
+  const base = editSource.value
+  if (!base) return
+  const url = editForm.value.bookSourceUrl.trim()
+  if (!url) {
+    editMsg.value = 'URL 不能为空'
+    editMsgError.value = true
+    return
+  }
+  for (const f of RULE_FIELDS) {
+    const v = editRules.value[f.key]?.trim() ?? ''
+    if (f.kind !== 'json' || !v) continue
+    try {
+      JSON.parse(v)
+    } catch (err) {
+      editMsg.value = `「${f.label}」不是有效 JSON：${err instanceof Error ? err.message : '语法错误'}`
+      editMsgError.value = true
+      return
+    }
+  }
+  editBusy.value = true
+  editMsg.value = ''
+  try {
+    const merged = buildSource(editForm.value, base)
+    for (const f of RULE_FIELDS) {
+      const v = editRules.value[f.key]?.trim() ?? ''
+      if (v === '') {
+        delete merged[f.key] // 留空 = 清除该规则
+      } else if (f.kind === 'json') {
+        merged[f.key] = JSON.parse(v) as unknown
+      } else {
+        merged[f.key] = v
+      }
+    }
+    await saveBookSource(merged)
+    editBusy.value = false // 先复位再关闭（closeEdit 忙碌中不允许关闭）
+    closeEdit()
+    ElMessage.success(`已保存「${merged.bookSourceName}」`)
+    await load()
+  } catch {
+    // 错误提示已由拦截器处理
+  } finally {
+    editBusy.value = false
   }
 }
 
@@ -464,6 +585,7 @@ async function confirmImport() {
     const res = await saveBookSources(list)
     const count = res.data?.count ?? list.length
     importTip.value = `成功导入 ${count} 个书源`
+    importBusy.value = false // 先复位再关闭（closeImport 忙碌中不允许关闭）
     closeImport()
     await load()
   } catch (err) {
@@ -796,6 +918,9 @@ onMounted(() => {
           >
             测试
           </button>
+          <button class="test-btn" type="button" title="编辑书源（基本信息 + 规则字段）" @click="openEdit(s)">
+            编辑
+          </button>
           <button
             class="switch"
             :class="{ on: s.enabled }"
@@ -1053,6 +1178,81 @@ onMounted(() => {
         </div>
       </Transition>
     </Teleport>
+    <!-- 编辑书源弹窗（基本信息 + 规则字段 textarea JSON；留空 = 清除该规则，其余字段原样保留） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="editOpen" class="dlg-overlay" @click.self="closeEdit">
+          <div
+            class="dlg dlg-edit"
+            role="dialog"
+            aria-modal="true"
+            aria-label="编辑书源"
+            tabindex="-1"
+            @keydown.esc="closeEdit"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">编辑书源 · {{ editSource?.bookSourceName }}</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="editBusy" @click="closeEdit">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="confirmEdit">
+              <label class="field">
+                <span class="field-label">URL<em>*</em></span>
+                <input
+                  v-model="editForm.bookSourceUrl"
+                  class="field-input"
+                  type="text"
+                  spellcheck="false"
+                  :disabled="editBusy"
+                />
+                <span class="field-tip">修改 URL 将新增书源，原书源保留</span>
+              </label>
+              <label class="field">
+                <span class="field-label">名称</span>
+                <input v-model="editForm.bookSourceName" class="field-input" type="text" spellcheck="false" :disabled="editBusy" />
+              </label>
+              <label class="field">
+                <span class="field-label">分组</span>
+                <input
+                  v-model="editForm.bookSourceGroup"
+                  class="field-input"
+                  type="text"
+                  placeholder="多个分组用空格分隔"
+                  spellcheck="false"
+                  :disabled="editBusy"
+                />
+              </label>
+              <div class="rules-head">
+                <h3 class="rules-title">规则字段</h3>
+                <span class="rules-sub">JSON 字段按对象编辑（单条规则）· 留空 = 清除该规则 · 登录/header 等其余字段原样保留</span>
+              </div>
+              <label v-for="f in RULE_FIELDS" :key="f.key" class="field rule-field">
+                <span class="field-label">{{ f.label }}</span>
+                <textarea
+                  v-model="editRules[f.key]"
+                  class="rule-textarea"
+                  :class="{ json: f.kind === 'json' }"
+                  :placeholder="f.kind === 'json' ? '{ }' : 'https://…'"
+                  spellcheck="false"
+                  :disabled="editBusy"
+                ></textarea>
+                <span class="field-tip">{{ f.tip }}</span>
+              </label>
+              <p v-if="editMsg" class="field-tip" :class="{ error: editMsgError }">{{ editMsg }}</p>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="editBusy" @click="closeEdit">取消</button>
+                <button class="accent-btn" type="submit" :disabled="editBusy || !editForm.bookSourceUrl.trim()">
+                  {{ editBusy ? '保存中…' : '保存' }}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -1073,7 +1273,7 @@ onMounted(() => {
   align-items: center;
   gap: 16px;
   padding: 14px 32px;
-  background: rgba(250, 250, 250, 0.86);
+  background: var(--bg-float);
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
@@ -1824,7 +2024,7 @@ onMounted(() => {
   border-radius: var(--radius);
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -1855,6 +2055,70 @@ onMounted(() => {
 }
 .danger-btn:hover:not(:disabled) {
   background: rgba(207, 68, 68, 0.08);
+}
+
+/* ================= 编辑书源弹窗（规则字段 textarea） ================= */
+.dlg-edit {
+  width: min(680px, 100%);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+}
+.dlg-edit .dlg-form {
+  overflow-y: auto;
+  padding-right: 6px;
+}
+.rules-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 2px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+.rules-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-1);
+}
+.rules-sub {
+  font-size: 11px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.rule-field {
+  gap: 4px;
+}
+.rule-textarea {
+  width: 100%;
+  min-height: 32px;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  outline: none;
+  resize: vertical;
+  transition: border-color 0.2s ease;
+}
+.rule-textarea.json {
+  min-height: 120px;
+}
+.rule-textarea::placeholder {
+  color: var(--text-3);
+  font-weight: 300;
+}
+.rule-textarea:focus {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+.rule-textarea:disabled {
+  opacity: 0.55;
 }
 
 /* 弹窗动画：fade 200ms */
@@ -1899,6 +2163,10 @@ onMounted(() => {
   }
   .source-state {
     display: none;
+  }
+  .source-row {
+    min-height: 44px;
+    padding: 12px 6px;
   }
   .dlg-overlay {
     padding: 16px;

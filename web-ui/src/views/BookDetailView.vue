@@ -772,7 +772,7 @@ onMounted(load)
   align-items: center;
   justify-content: space-between;
   padding: 14px 32px;
-  background: rgba(250, 250, 250, 0.86);
+  background: var(--bg-float);
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
@@ -926,7 +926,7 @@ onMounted(load)
   border: none;
   border-radius: var(--radius);
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-family: inherit;
   font-size: 14.5px;
   font-weight: 400;
@@ -1155,7 +1155,7 @@ onMounted(load)
   border-radius: var(--radius);
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -1412,7 +1412,7 @@ onMounted(load)
   border-radius: var(--radius);
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;

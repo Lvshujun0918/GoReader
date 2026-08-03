@@ -22,6 +22,7 @@ import {
   type TextAlign,
   type PageMode,
 } from '@/utils/readerConfig'
+import { applyUiTheme, loadUiTheme, uiThemeFromServer, uiThemeToServer, type UiTheme } from '@/utils/uiTheme'
 import { useUserStore } from '@/stores/user'
 import { downloadBlob } from '@/utils/download'
 import type { CacheClearType, CacheInfo, HttpTts, SystemInfo, TxtTocRule } from '@/types'
@@ -347,14 +348,18 @@ const PAGE_MODE_OPTIONS: { value: PageMode; label: string }[] = [
   { value: 'slide', label: '滑动翻页' },
 ]
 
-/** 主题即时预览：设置页切换主题即应用到全局（保存时经 applyReaderConfig 落 localStorage） */
-watch(
-  () => pref.value.theme,
-  (t) => {
-    const real = t === 'system' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : t
-    document.documentElement.dataset.theme = real
-  },
-)
+/** 界面主题（外观卡片）：浅色 / 深色 / 跟随系统——与阅读内容主题分离，切换即时生效并落 localStorage */
+const UI_THEME_OPTIONS: { value: UiTheme; label: string }[] = [
+  { value: 'light', label: '浅色' },
+  { value: 'dark', label: '深色' },
+  { value: 'system', label: '跟随系统' },
+]
+const uiTheme = ref<UiTheme>(loadUiTheme())
+
+/** 界面主题即时预览：切换即应用到全局（html[data-theme]），保存时随 userConfig 上传 */
+watch(uiTheme, (t) => {
+  applyUiTheme(t)
+})
 
 /** 进入设置页：拉取服务器配置并与本地合并（服务器优先），应用后回写本地 */
 async function loadServerPref() {
@@ -368,6 +373,12 @@ async function loadServerPref() {
     const merged = { ...loadReaderConfig(), ...server }
     applyReaderConfig(merged)
     pref.value = merged
+    // 界面主题（ui_theme 键）同样服务器优先
+    const ui = uiThemeFromServer(cfg ? (cfg as Record<string, unknown>).ui_theme : undefined)
+    if (ui) {
+      uiTheme.value = ui
+      applyUiTheme(ui)
+    }
     prefMsg.value = '已从服务器同步阅读偏好（服务器优先）'
   } catch (err) {
     prefMsg.value = isNotImplemented(err)
@@ -385,7 +396,7 @@ async function savePref() {
   prefMsgError.value = false
   applyReaderConfig(pref.value)
   try {
-    await saveUserConfig(toServerConfig(pref.value))
+    await saveUserConfig({ ...toServerConfig(pref.value), ...uiThemeToServer(uiTheme.value) })
     prefMsg.value = '已保存到服务器，多端一致'
   } catch (err) {
     prefMsg.value = isNotImplemented(err)
@@ -719,11 +730,41 @@ async function downloadBackup() {
         </div>
       </section>
 
+      <!-- 外观（界面主题：浅色/深色/跟随系统——与阅读内容主题分离） -->
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">外观</h2>
+          <span class="card-sub">界面主题 · 切换即时生效（本机），保存到云端后多端一致</span>
+          <button class="row-action" type="button" :disabled="prefSaving" @click="savePref">
+            {{ prefSaving ? '保存中…' : '保存到云端' }}
+          </button>
+        </div>
+        <div class="row">
+          <span class="row-label">界面主题</span>
+          <div class="pref-pills">
+            <button
+              v-for="o in UI_THEME_OPTIONS"
+              :key="o.value"
+              class="capsule"
+              :class="{ active: uiTheme === o.value }"
+              type="button"
+              @click="uiTheme = o.value"
+            >
+              {{ o.label }}
+            </button>
+          </div>
+        </div>
+        <div class="row">
+          <span class="row-label">阅读内容主题</span>
+          <span class="row-value hint">阅读页内独立设置（浅色/深色/纸色），与界面主题互不影响</span>
+        </div>
+      </section>
+
       <!-- 阅读偏好（多端同步：GET/POST /reader3/getUserConfig|saveUserConfig，服务器优先） -->
       <section class="card">
         <div class="card-head">
           <h2 class="card-title">阅读偏好</h2>
-          <span class="card-sub">简繁 / 主题 / 排版 · 服务器与本地合并，服务器优先</span>
+          <span class="card-sub">简繁 / 阅读主题 / 排版 · 服务器与本地合并，服务器优先</span>
           <button class="row-action" type="button" :disabled="prefSaving" @click="savePref">
             {{ prefSaving ? '保存中…' : '保存到云端' }}
           </button>
@@ -744,7 +785,7 @@ async function downloadBackup() {
           </div>
         </div>
         <div class="row">
-          <span class="row-label">主题</span>
+          <span class="row-label">阅读主题</span>
           <div class="pref-pills">
             <button
               v-for="o in THEME_OPTIONS"
@@ -1264,7 +1305,7 @@ async function downloadBackup() {
   align-items: center;
   gap: 24px;
   padding: 14px 32px;
-  background: rgba(250, 250, 250, 0.86);
+  background: var(--bg-float);
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
@@ -1641,7 +1682,7 @@ async function downloadBackup() {
   border-radius: var(--radius);
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -1741,6 +1782,11 @@ async function downloadBackup() {
 }
 .mono {
   font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+}
+.row-value.hint {
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
 }
 .row-hint {
   flex-shrink: 0;
@@ -2024,6 +2070,20 @@ async function downloadBackup() {
     flex-wrap: wrap;
     gap: 12px;
     padding: 12px 16px;
+  }
+  .user-area {
+    margin-left: 0;
+    overflow-x: auto;
+    max-width: 100%;
+    scrollbar-width: none;
+  }
+  .user-area::-webkit-scrollbar {
+    display: none;
+  }
+  .user-area .nav-link,
+  .user-area .user-chip,
+  .user-area .logout-btn {
+    flex-shrink: 0;
   }
   .content {
     padding: 32px 16px 56px;

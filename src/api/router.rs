@@ -208,6 +208,26 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/setAsDefaultBookSources", post(set_as_default_book_sources))
         .route("/reader3/searchBookSourceSSE", get(search_book_source_sse).post(search_book_source_sse))
         .route("/reader3/getReadingStats", get(get_reading_stats).post(get_reading_stats))
+        // 小项补全批：单书缓存删除 / 书架缓存信息 / 导入预览 / 书源文件读取 / 正文缓存写回 /
+        // 用户书源删除 / 分组别名 / 目录规则单页调试
+        .route("/reader3/deleteBookCache", get(delete_book_cache))
+        .route(
+            "/reader3/getShelfBookWithCacheInfo",
+            get(get_shelf_book_with_cache_info).post(get_shelf_book_with_cache_info),
+        )
+        .route(
+            "/reader3/importBookPreview",
+            post(import_book_preview)
+                .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
+        .route("/reader3/readSourceFile", post(read_source_file))
+        .route("/reader3/saveBookContent", post(save_book_content))
+        .route("/reader3/deleteUserBookSource", post(delete_user_book_source))
+        .route("/reader3/saveBookGroupId", post(save_book_group_id))
+        .route(
+            "/reader3/getChapterListByRule",
+            get(get_chapter_list_by_rule).post(get_chapter_list_by_rule),
+        )
         // 命名兼容批 2（legacy 别名路由——外部客户端兼容）
         .route("/reader3/resetPassword", post(reset_user_password))
         .route("/reader3/httpTTS", get(tts_synthesize).post(tts_synthesize))
@@ -4557,6 +4577,337 @@ async fn update_book_group_id(
     }
 }
 
+// ---------------- 小项补全批 ----------------
+
+/// GET /reader3/deleteBookCache：删除单书缓存（book_chapters 该 book_url 行——
+/// 本地书章节 + 书源书正文缓存）；不影响书架 books 行
+async fn delete_book_cache(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<ReturnData> {
+    let url = params.get("url").cloned().unwrap_or_default();
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_book_cache(&url).await {
+        Ok(deleted) => Json(ReturnData::ok(json!({ "deleted": deleted }))),
+        Err(e) => {
+            tracing::error!("deleteBookCache 失败 [{url}]: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/getShelfBookWithCacheInfo：书架书 + 缓存信息（缓存章数/正文大小）
+async fn get_shelf_book_with_cache_info(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("书源链接不能为空"));
+    }
+    let book = match state.storage.find_book(&namespace, &url).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return Json(ReturnData::err("书籍不存在")),
+        Err(e) => {
+            tracing::error!("getShelfBookWithCacheInfo 失败 [{url}]: {e}");
+            return Json(ReturnData::err("系统错误"));
+        }
+    };
+    let (cache_chapter_count, cache_size) = state
+        .storage
+        .book_cache_info(&url)
+        .await
+        .unwrap_or((0, 0));
+    let mut data = serde_json::to_value(book).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("cacheChapterCount".to_string(), json!(cache_chapter_count));
+        obj.insert("cacheSize".to_string(), json!(cache_size));
+    }
+    Json(ReturnData::ok(data))
+}
+
+/// POST /reader3/importBookPreview：导入预览（multipart file——解析但不入库）
+/// 返回 {name, author, format, chapterCount, preview: [前 10 章标题]}
+async fn import_book_preview(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    // 取 file 字段（首块）
+    let mut file_name = String::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("file") {
+            file_name = field.file_name().unwrap_or("file").to_string();
+            if let Ok(b) = field.bytes().await {
+                bytes = b.to_vec();
+            }
+            break;
+        }
+    }
+    if bytes.is_empty() {
+        return Json(ReturnData::err("请上传文件"));
+    }
+    let safe_name = std::path::Path::new(&file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = crate::service::local_book::file_ext(&safe_name);
+    if ext.is_empty()
+        || !crate::service::local_book::SUPPORTED_EXTENSIONS
+            .iter()
+            .any(|e| *e == ext)
+    {
+        return Json(ReturnData::err("不支持的格式"));
+    }
+    // 解析（parse_loc_book_path 按扩展名分派；核心逻辑在可测的纯函数中）
+    let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
+    match import_preview_from_bytes(&bytes, &ext, &user_rules) {
+        Ok(json) => Json(ReturnData::ok(json)),
+        Err(e) => Json(ReturnData::err(format!("解析失败：{e}"))),
+    }
+}
+
+/// 导入预览核心（纯函数，可测）：字节 → 临时文件 → parse_loc_book_path 解析
+/// （复用本地书解析链路）→ {name, author, format, chapterCount, preview: [前 10 章标题]}；不入库
+fn import_preview_from_bytes(
+    bytes: &[u8],
+    ext: &str,
+    user_rules: &[String],
+) -> anyhow::Result<serde_json::Value> {
+    let tmp_path =
+        std::env::temp_dir().join(format!("reader-preview-{}.{ext}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp_path, bytes)?;
+    let result = (|| -> anyhow::Result<serde_json::Value> {
+        let imported = crate::service::local_book::parse_loc_book_path(&tmp_path, user_rules)?;
+        let preview: Vec<String> = imported
+            .chapters
+            .iter()
+            .take(10)
+            .map(|c| c.title.clone())
+            .collect();
+        Ok(json!({
+            "name": imported.meta.title,
+            "author": imported.meta.author,
+            "format": imported.format,
+            "chapterCount": imported.chapters.len(),
+            "preview": preview,
+        }))
+    })();
+    let _ = std::fs::remove_file(&tmp_path);
+    result
+}
+
+/// POST /reader3/readSourceFile：读取书源文件文本（body {path}）
+/// secure 模式限 storage 目录内（resolve_storage_path 防穿越）；非 secure 限工作目录内
+async fn read_source_file(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let path = param_of(&params, body_json.as_ref(), "path");
+    if path.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    let file = if state.storage.config.secure {
+        resolve_storage_path(&state.storage.config.storage_dir(), &path)
+    } else {
+        let base = std::path::PathBuf::from(&state.storage.config.work_dir);
+        crate::api::files::resolve_secure_path(&base, &path)
+    };
+    let Some(file) = file else {
+        return Json(ReturnData::err("路径不存在"));
+    };
+    if !file.is_file() {
+        return Json(ReturnData::err("路径不存在"));
+    }
+    match tokio::fs::read_to_string(&file).await {
+        Ok(content) => Json(ReturnData::ok(serde_json::Value::String(content))),
+        Err(e) => {
+            tracing::error!("readSourceFile 读取失败 [{}]: {e}", file.display());
+            Json(ReturnData::err("读取失败"))
+        }
+    }
+}
+
+/// POST /reader3/saveBookContent：写章节正文缓存（body {bookUrl, chapterUrl, title, content}）
+/// chapter_index = chapterUrl md5 哈希（与 getBookContent 正文缓存同键）
+async fn save_book_content(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    let chapter_url = param_of(&params, body_json.as_ref(), "chapterUrl");
+    let title = param_of(&params, body_json.as_ref(), "title");
+    let content = param_of(&params, body_json.as_ref(), "content");
+    if book_url.is_empty() || chapter_url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    if content.is_empty() {
+        return Json(ReturnData::err("正文不能为空"));
+    }
+    let idx = crate::util::md5::chapter_url_hash(&chapter_url);
+    match state
+        .storage
+        .cache_chapter_content(&book_url, idx, &title, &content)
+        .await
+    {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveBookContent 失败 [{book_url}]: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/deleteUserBookSource：删除当前用户书源（body {bookSource}；
+/// 兼容 bookSourceUrl/url 参数名）
+async fn delete_user_book_source(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let mut url = param_of(&params, body_json.as_ref(), "bookSource");
+    if url.is_empty() {
+        url = param_of(&params, body_json.as_ref(), "bookSourceUrl");
+    }
+    if url.is_empty() {
+        url = param_of(&params, body_json.as_ref(), "url");
+    }
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_book_source(&namespace, &url).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("deleteUserBookSource 失败 [{url}]: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+/// POST /reader3/saveBookGroupId：设置书分组（body {bookUrl, groupId}）——
+/// updateBookGroupId 别名（参数名兼容 group/groupId）
+async fn save_book_group_id(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    let group = params
+        .get("groupId")
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| {
+            body_json
+                .as_ref()
+                .and_then(|b| b.get("groupId").and_then(|v| v.as_i64()))
+        })
+        .or_else(|| {
+            params
+                .get("group")
+                .and_then(|v| v.parse::<i64>().ok())
+                .or_else(|| {
+                    body_json
+                        .as_ref()
+                        .and_then(|b| b.get("group").and_then(|v| v.as_i64()))
+                })
+        })
+        .unwrap_or(-1);
+    if book_url.is_empty() || group < 0 {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state
+        .storage
+        .update_book_group_id(&namespace, &book_url, group)
+        .await
+    {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveBookGroupId 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/getChapterListByRule：书源 ruleToc 单页解析调试
+/// 参数：url（目录页，缺省用 chapterUrl）+ bookSource（书源 URL 或完整 JSON）
+/// 返回章节数组（同 getBookToc 结构：title/url/isVolume/index）
+async fn get_chapter_list_by_rule(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let mut url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        url = param_of(&params, body_json.as_ref(), "chapterUrl");
+    }
+    if url.is_empty() {
+        return Json(ReturnData::err("请输入目录链接"));
+    }
+    let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
+    if bs_param.is_empty() {
+        // find_book_source 对空串走 LIKE '%' 会命中首源——显式拦截
+        return Json(ReturnData::err("书源不存在"));
+    }
+    let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
+        return Json(ReturnData::err("书源不存在"));
+    };
+    match crate::service::book::parse_toc_page(&namespace, &url, &source).await {
+        Ok(chapters) => Json(ReturnData::ok(
+            serde_json::to_value(chapters).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("getChapterListByRule 失败 [{url}]: {e}");
+            Json(ReturnData::err("获取目录失败"))
+        }
+    }
+}
+
 // ---------------- F-28 替换规则 ----------------
 
 /// GET/POST /reader3/getReplaceRules：替换规则列表（用户命名空间，无则回退 default）
@@ -5508,6 +5859,267 @@ mod tests {
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "书籍不存在");
 
+        cleanup(state, dir).await;
+    }
+
+    /// deleteBookCache：删单书缓存（book_chapters 行）——只删目标书、书架不受影响
+    #[tokio::test]
+    async fn test_delete_book_cache_api() {
+        let (state, dir) = test_state("delbcache").await;
+        state.storage.save_chapters("https://book.com/a", &[("第一章".to_string(), "正文A".to_string())]).await.unwrap();
+        state.storage.save_chapters("https://book.com/b", &[("第一章".to_string(), "正文B".to_string())]).await.unwrap();
+        state.storage.upsert_book("default", &crate::model::Book { book_url: "https://book.com/a".into(), name: "书A".into(), ..Default::default() }).await.unwrap();
+
+        let params: HashMap<String, String> = [("url".into(), "https://book.com/a".into())].into_iter().collect();
+        let ret = delete_book_cache(AxumState(state.clone()), Query(params)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["deleted"], 1);
+        assert_eq!(state.storage.count_chapters("https://book.com/a").await.unwrap(), 0);
+        assert_eq!(state.storage.count_chapters("https://book.com/b").await.unwrap(), 1, "其他书缓存不受影响");
+        assert!(state.storage.find_book("default", "https://book.com/a").await.unwrap().is_some(), "删除缓存不应动书架");
+
+        // 缺 url → 参数错误
+        let ret = delete_book_cache(AxumState(state.clone()), Query(HashMap::new())).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        cleanup(state, dir).await;
+    }
+
+    /// getShelfBookWithCacheInfo：书架书 + cacheChapterCount/cacheSize
+    #[tokio::test]
+    async fn test_get_shelf_book_with_cache_info_api() {
+        let (state, dir) = test_state("shelfcache").await;
+        state.storage.upsert_book("default", &crate::model::Book { book_url: "https://book.com/a".into(), name: "缓存书".into(), ..Default::default() }).await.unwrap();
+        state.storage.save_chapters("https://book.com/a", &[
+            ("第一章".to_string(), "正文一二三".to_string()),
+            ("第二章".to_string(), "正文四五六".to_string()),
+        ]).await.unwrap();
+
+        let params: HashMap<String, String> = [("url".into(), "https://book.com/a".into())].into_iter().collect();
+        let ret = get_shelf_book_with_cache_info(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["bookUrl"], "https://book.com/a");
+        assert_eq!(ret.0.data["name"], "缓存书");
+        assert_eq!(ret.0.data["cacheChapterCount"], 2);
+        assert_eq!(ret.0.data["cacheSize"], 10, "5+5 字符×2 章");
+
+        // 不存在 → 书籍不存在；缺 url → 书源链接不能为空
+        let params: HashMap<String, String> = [("url".into(), "https://book.com/none".into())].into_iter().collect();
+        let ret = get_shelf_book_with_cache_info(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "书籍不存在");
+        let ret = get_shelf_book_with_cache_info(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "书源链接不能为空");
+        cleanup(state, dir).await;
+    }
+
+    /// saveBookContent：写正文缓存（chapterUrl md5 键）→ 可读回
+    #[tokio::test]
+    async fn test_save_book_content_api() {
+        let (state, dir) = test_state("savecontent").await;
+        let chapter_url = "https://book.com/c/1";
+        let body = Bytes::from(format!(
+            r#"{{"bookUrl":"https://book.com/a","chapterUrl":"{chapter_url}","title":"第一章","content":"手动写入的正文"}}"#
+        ));
+        let ret = save_book_content(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let idx = crate::util::md5::chapter_url_hash(chapter_url);
+        let cached = state.storage.get_chapter_content("https://book.com/a", idx).await.unwrap();
+        assert_eq!(cached.as_deref(), Some("手动写入的正文"));
+        assert_eq!(state.storage.list_chapters("https://book.com/a").await.unwrap()[0].1, "第一章", "标题一并入库");
+
+        // 缺 bookUrl/chapterUrl → 参数错误；空正文 → 正文不能为空
+        let ret = save_book_content(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(Bytes::from(r#"{"bookUrl":"x"}"#))).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let ret = save_book_content(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(Bytes::from(r#"{"bookUrl":"x","chapterUrl":"y","content":""}"#))).await;
+        assert_eq!(ret.0.error_msg, "正文不能为空");
+        cleanup(state, dir).await;
+    }
+
+    /// deleteUserBookSource：删当前用户书源（body {bookSource}）
+    #[tokio::test]
+    async fn test_delete_user_book_source_api() {
+        let (state, dir) = test_state("delusersrc").await;
+        state.storage.save_book_source("default", &crate::model::BookSource { book_source_url: "https://s1.com".into(), book_source_name: "源1".into(), ..Default::default() }).await.unwrap();
+        state.storage.save_book_source("default", &crate::model::BookSource { book_source_url: "https://s2.com".into(), book_source_name: "源2".into(), ..Default::default() }).await.unwrap();
+
+        let body = Bytes::from(r#"{"bookSource":"https://s1.com"}"#);
+        let ret = delete_user_book_source(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert!(state.storage.find_book_source("default", "https://s1.com").await.unwrap().is_none());
+        assert!(state.storage.find_book_source("default", "https://s2.com").await.unwrap().is_some(), "其他书源保留");
+
+        // 缺参 → 参数错误；query bookSource 形式生效
+        let ret = delete_user_book_source(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let params: HashMap<String, String> = [("bookSource".into(), "https://s2.com".into())].into_iter().collect();
+        let ret = delete_user_book_source(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        assert!(state.storage.find_book_source("default", "https://s2.com").await.unwrap().is_none());
+        cleanup(state, dir).await;
+    }
+
+    /// saveBookGroupId：updateBookGroupId 别名（groupId/group 参数名兼容）
+    #[tokio::test]
+    async fn test_save_book_group_id_api() {
+        let (state, dir) = test_state("savegrpid").await;
+        let gid = state.storage.save_book_group("default", &crate::model::BookGroup { name: "玄幻".into(), order: 1, ..Default::default() }).await.unwrap().id;
+        state.storage.upsert_book("default", &crate::model::Book { book_url: "https://b.com/1".into(), name: "书1".into(), ..Default::default() }).await.unwrap();
+
+        // body groupId
+        let body = Bytes::from(format!(r#"{{"bookUrl":"https://b.com/1","groupId":{gid}}}"#));
+        let ret = save_book_group_id(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(state.storage.find_book("default", "https://b.com/1").await.unwrap().unwrap().group, gid);
+
+        // query group 参数名（兼容旧 updateBookGroupId 命名）
+        let params: HashMap<String, String> = [("bookUrl".into(), "https://b.com/1".into()), ("group".into(), "0".into())].into_iter().collect();
+        let ret = save_book_group_id(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success);
+        assert_eq!(state.storage.find_book("default", "https://b.com/1").await.unwrap().unwrap().group, 0);
+
+        // 缺 bookUrl / 非法 groupId → 参数错误
+        let ret = save_book_group_id(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(Bytes::from(r#"{"groupId":1}"#))).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let body = Bytes::from(r#"{"bookUrl":"https://b.com/1","groupId":-5}"#);
+        let ret = save_book_group_id(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        cleanup(state, dir).await;
+    }
+
+    /// readSourceFile：读书源文件文本；secure 限 storage 内，非 secure 限工作目录内（防穿越）
+    #[tokio::test]
+    async fn test_read_source_file_api() {
+        let (mut state, dir) = test_state("readsrc").await;
+        // 非 secure：工作目录内可读
+        std::fs::write(dir.join("bookSource.json"), r#"{"bookSourceUrl":"https://x.com"}"#).unwrap();
+        let body = Bytes::from(r#"{"path":"bookSource.json"}"#);
+        let ret = read_source_file(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data, json!(r#"{"bookSourceUrl":"https://x.com"}"#));
+
+        // 穿越/绝对路径拒绝（解析不出 → 路径不存在）
+        let body = Bytes::from(r#"{"path":"../escape.json"}"#);
+        let ret = read_source_file(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "路径不存在");
+        // 不存在 → 路径不存在；缺 path → 参数错误
+        let body = Bytes::from(r#"{"path":"ghost.json"}"#);
+        let ret = read_source_file(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "路径不存在");
+        let ret = read_source_file(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(Bytes::from(r#"{}"#))).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        // secure：storage 内可读、storage 外拒绝（需登录）
+        state.storage.config.secure = true;
+        state.storage.insert_user(&User {
+            username: "alice".into(),
+            token: "tok9".into(),
+            ..Default::default()
+        }).await.unwrap();
+        let auth_params: HashMap<String, String> =
+            [("accessToken".into(), "alice:tok9".into())].into_iter().collect();
+        let storage_dir = state.storage.config.storage_dir();
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::write(storage_dir.join("bookSource.json"), "[secure]").unwrap();
+        let body = Bytes::from(r#"{"path":"storage/bookSource.json"}"#);
+        let ret = read_source_file(AxumState(state.clone()), Query(auth_params.clone()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "secure storage 内应可读: {}", ret.0.error_msg);
+        assert_eq!(ret.0.data, json!("[secure]"));
+        let body = Bytes::from(r#"{"path":"work-only.txt"}"#);
+        std::fs::write(dir.join("work-only.txt"), "outside").unwrap();
+        let ret = read_source_file(AxumState(state.clone()), Query(auth_params), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success, "工作目录文件在 secure 下不可达");
+        assert_eq!(ret.0.error_msg, "路径不存在");
+        cleanup(state, dir).await;
+    }
+
+    /// getChapterListByRule：书源 ruleToc 单页解析（url 抓取 → 章节数组）
+    #[tokio::test]
+    async fn test_get_chapter_list_by_rule_api() {
+        let (state, dir) = test_state("chplist").await;
+        let base_url = serve_bodies(vec![r#"{"chapters":[
+            {"t":"第一章 开始","h":"/c/1.html"},
+            {"t":"第二章 继续","h":"/c/2.html"}
+        ]}"#.to_string()]).await;
+        let base = base_url.trim_end_matches("/sources.json").to_string();
+        state.storage.save_book_source("default", &crate::model::BookSource {
+            book_source_url: base.clone(),
+            book_source_name: "目录源".into(),
+            rule_toc: Some(serde_json::json!({
+                "chapterList": "$.chapters[*]",
+                "chapterName": "$.t",
+                "chapterUrl": "$.h",
+            })),
+            ..Default::default()
+        }).await.unwrap();
+
+        // url + bookSource（书源 URL）
+        let toc_url = format!("{base}/toc");
+        let params: HashMap<String, String> = [
+            ("url".into(), toc_url.clone()),
+            ("bookSource".into(), base.clone()),
+        ].into_iter().collect();
+        let ret = get_chapter_list_by_rule(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["title"], "第一章 开始");
+        assert_eq!(arr[0]["url"], format!("{base}/c/1.html"), "相对 URL 应转绝对");
+        assert_eq!(arr[0]["index"], 0);
+        assert_eq!(arr[1]["title"], "第二章 继续");
+
+        // chapterUrl 参数兜底
+        let params: HashMap<String, String> = [
+            ("chapterUrl".into(), toc_url.clone()),
+            ("bookSource".into(), base.clone()),
+        ].into_iter().collect();
+        let ret = get_chapter_list_by_rule(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "chapterUrl 兜底应生效: {}", ret.0.error_msg);
+
+        // 缺 url/书源不存在 → 参数校验
+        let ret = get_chapter_list_by_rule(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "请输入目录链接");
+        let params: HashMap<String, String> = [("url".into(), toc_url)].into_iter().collect();
+        let ret = get_chapter_list_by_rule(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "书源不存在");
+        cleanup(state, dir).await;
+    }
+
+    /// importBookPreview：multipart file → 解析预览（不入库）——handler 全链路 + 纯函数
+    #[tokio::test]
+    async fn test_import_book_preview_api() {
+        // 纯函数核心：TXT 三章 → {name/format/chapterCount/preview 前 10 章}
+        let txt = "第一章 起点\n内容一。\n第二章 成长\n内容二。\n第三章 终局\n内容三。";
+        let json = import_preview_from_bytes(txt.as_bytes(), "txt", &[]).unwrap();
+        assert_eq!(json["format"], "txt");
+        assert_eq!(json["chapterCount"], 3);
+        let preview = json["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 3);
+        assert_eq!(preview[0], "第一章 起点");
+        assert_eq!(preview[2], "第三章 终局");
+        // 不支持的格式
+        assert!(import_preview_from_bytes(b"x", "exe", &[]).is_err());
+
+        // handler 全链路：构造 multipart 请求体 → Multipart 提取器 → 响应
+        let (state, dir) = test_state("importprev").await;
+        let boundary = "reader-test-boundary";
+        let multipart_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\nContent-Type: text/plain\r\n\r\n{txt}\r\n--{boundary}--\r\n"
+        );
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(axum::body::Body::from(multipart_body))
+            .unwrap();
+        use axum::extract::FromRequest;
+        let multipart = axum::extract::Multipart::from_request(req, &()).await.unwrap();
+        let ret = import_book_preview(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), multipart).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["format"], "txt");
+        assert_eq!(ret.0.data["chapterCount"], 3);
+        assert_eq!(ret.0.data["preview"][0], "第一章 起点");
+        // 不入库：书架/章节表无痕
+        assert!(state.storage.list_books("default").await.unwrap().is_empty());
         cleanup(state, dir).await;
     }
 

@@ -119,7 +119,9 @@ export function loadReaderConfig(): ReaderConfig {
   }
 }
 
-/** 将偏好写入 localStorage（逐键覆盖；theme 同时应用到 documentElement） */
+/** 将偏好写入 localStorage（逐键覆盖）。
+ *  阅读主题只作用于阅读页（ReaderView 将其挂到 .reader-page[data-reader-theme]），
+ *  不再写入 html[data-theme]——界面主题（浅色/深色/跟随系统）见 utils/uiTheme.ts。 */
 export function applyReaderConfig(cfg: ReaderConfig) {
   const set = (k: string, v: string) => {
     try {
@@ -140,8 +142,6 @@ export function applyReaderConfig(cfg: ReaderConfig) {
   set(KEY_MAP.textIndent, cfg.textIndent ? '1' : '0')
   set(KEY_MAP.textAlign, cfg.textAlign)
   set(KEY_MAP.pageMode, cfg.pageMode)
-  const t = cfg.theme === 'system' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : cfg.theme
-  document.documentElement.dataset.theme = t
 }
 
 /**

@@ -289,7 +289,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 12px;
   padding: 12px 20px;
-  background: rgba(250, 250, 250, 0.86);
+  background: var(--bg-float);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border, #ececec);
 }
@@ -551,5 +551,31 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 300;
   color: var(--text-3, #999);
+}
+
+/* ================= 响应式 ================= */
+@media (max-width: 720px) {
+  .topbar {
+    padding: 10px 12px;
+    gap: 8px;
+  }
+  .main {
+    padding: 20px 14px 64px;
+  }
+  .cats {
+    margin-bottom: 14px;
+  }
+  .book-grid {
+    gap: 16px 12px;
+  }
+}
+@media (max-width: 480px) {
+  .book-grid {
+    grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+    gap: 14px 10px;
+  }
+  .book-cover {
+    font-size: 26px;
+  }
 }
 </style>

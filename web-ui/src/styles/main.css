@@ -23,6 +23,7 @@
   --bg-float: rgba(250, 250, 250, 0.86);
   --hover: #f4f4f5;
   --surface: #ffffff;
+  --card: #ffffff;
   --border: #e5e5e5;
   --border-strong: #d4d4d8;
   --text-1: #18181b;
@@ -31,6 +32,8 @@
   --accent: #4f46e5;
   --accent-deep: #4338ca;
   --accent-soft: rgba(79, 70, 229, 0.08);
+  /* 强调色上的文字（浅色主题白字 / 深色主题深字） */
+  --on-accent: #ffffff;
   --radius: 8px;
   --font-sans:
     -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter',
@@ -39,14 +42,75 @@
 }
 
 /* ---------- 主题变量体系 ----------
-   浅色（默认 :root）/ 深色 / 纸色 三档，由阅读页顶部主题按钮切换，
-   以 html[data-theme] 挂载（html.dark hack 已废弃，见 main.ts）。 */
+   界面主题：浅色（默认 :root）/ 深色 两档，由 html[data-theme] 挂载
+   （设置页「外观」+ utils/uiTheme.ts，跟随系统时解析为 light/dark）。
+   阅读内容主题（浅色/深色/纸色）见下方 .reader-page[data-reader-theme] 块。 */
 html[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #1a1a1a;
+  --bg-float: rgba(26, 26, 26, 0.86);
+  --hover: #26262b;
+  --surface: #212126;
+  --card: #212126;
+  --border: #2f2f36;
+  --border-strong: #3f3f47;
+  --text-1: #ececf0;
+  --text-2: #a3a3ad;
+  --text-3: #63636d;
+  /* 柔化强调色：浅紫 + 深色文字保证对比度 */
+  --accent: #8b87ff;
+  --accent-deep: #a5a2ff;
+  --accent-soft: rgba(139, 135, 255, 0.14);
+  --on-accent: #16161c;
+  /* Element Plus 深色映射 */
+  --el-bg-color: #212126;
+  --el-bg-color-overlay: #26262c;
+  --el-border-color: #2f2f36;
+  --el-border-color-light: #2f2f36;
+  --el-border-color-lighter: #2f2f36;
+  --el-fill-color-blank: #212126;
+  --el-fill-color-light: #26262b;
+  --el-text-color-primary: #ececf0;
+  --el-text-color-regular: #a3a3ad;
+  --el-text-color-placeholder: #63636d;
+  --el-message-bg-color: #26262c;
+  --el-message-text-color: #ececf0;
+  --el-message-border-color: #2f2f36;
+  --el-mask-color: rgba(0, 0, 0, 0.6);
+  --el-overlay-color-lighter: rgba(0, 0, 0, 0.45);
+  --el-overlay-color-light: rgba(0, 0, 0, 0.6);
+  --el-overlay-color: rgba(0, 0, 0, 0.7);
+}
+
+/* ---------- 阅读内容主题（与界面主题分离） ----------
+   阅读页配色由 .reader-page[data-reader-theme=...] 决定（阅读页顶栏/正文/底部栏），
+   与 html[data-theme]（界面主题：浅色/深色，作用于书架/设置等 UI）互不影响。
+   阅读页根元素必须显式 background: var(--bg)（见 ReaderView）。 */
+.reader-page[data-reader-theme='light'] {
+  color-scheme: light;
+  --bg: #fafafa;
+  --bg-float: rgba(250, 250, 250, 0.86);
+  --hover: #f4f4f5;
+  --surface: #ffffff;
+  --card: #ffffff;
+  --border: #e5e5e5;
+  --border-strong: #d4d4d8;
+  --text-1: #18181b;
+  --text-2: #52525b;
+  --text-3: #a1a1aa;
+  --accent: #4f46e5;
+  --accent-deep: #4338ca;
+  --accent-soft: rgba(79, 70, 229, 0.08);
+  --on-accent: #ffffff;
+}
+
+.reader-page[data-reader-theme='dark'] {
   color-scheme: dark;
   --bg: #17171a;
   --bg-float: rgba(23, 23, 26, 0.86);
   --hover: #26262c;
   --surface: #1e1e23;
+  --card: #1e1e23;
   --border: #2e2e36;
   --border-strong: #3f3f49;
   --text-1: #ececf1;
@@ -55,28 +119,16 @@ html[data-theme='dark'] {
   --accent: #8b87ff;
   --accent-deep: #a5a2ff;
   --accent-soft: rgba(139, 135, 255, 0.14);
-  /* Element Plus 深色映射 */
-  --el-bg-color: #1e1e23;
-  --el-bg-color-overlay: #24242b;
-  --el-border-color: #2e2e36;
-  --el-border-color-light: #2e2e36;
-  --el-border-color-lighter: #2e2e36;
-  --el-fill-color-blank: #1e1e23;
-  --el-fill-color-light: #26262c;
-  --el-text-color-primary: #ececf1;
-  --el-text-color-regular: #a1a1ad;
-  --el-text-color-placeholder: #63636e;
-  --el-message-bg-color: #24242b;
-  --el-message-text-color: #ececf1;
-  --el-message-border-color: #2e2e36;
+  --on-accent: #16161c;
 }
 
-html[data-theme='paper'] {
+.reader-page[data-reader-theme='paper'] {
   color-scheme: light;
   --bg: #f6f1e6;
   --bg-float: rgba(246, 241, 230, 0.88);
   --hover: #eee7d6;
   --surface: #fbf7ed;
+  --card: #fbf7ed;
   --border: #e3dac4;
   --border-strong: #d2c6a8;
   --text-1: #3d382c;
@@ -85,20 +137,7 @@ html[data-theme='paper'] {
   --accent: #4f46e5;
   --accent-deep: #4338ca;
   --accent-soft: rgba(79, 70, 229, 0.08);
-  /* Element Plus 纸色映射 */
-  --el-bg-color: #fbf7ed;
-  --el-bg-color-overlay: #fbf7ed;
-  --el-border-color: #e3dac4;
-  --el-border-color-light: #e3dac4;
-  --el-border-color-lighter: #e3dac4;
-  --el-fill-color-blank: #fbf7ed;
-  --el-fill-color-light: #eee7d6;
-  --el-text-color-primary: #3d382c;
-  --el-text-color-regular: #6d6450;
-  --el-text-color-placeholder: #a99f84;
-  --el-message-bg-color: #fbf7ed;
-  --el-message-text-color: #3d382c;
-  --el-message-border-color: #e3dac4;
+  --on-accent: #ffffff;
 }
 
 * {
@@ -200,4 +239,38 @@ body {
 .logo-mark {
   display: block;
   color: var(--accent);
+}
+
+/* ============================================================
+   移动端全局适配（各视图内的 @media 微调见对应 .vue）
+   ============================================================ */
+
+/* 弹窗宽度上限：任何弹层不超过 92vw（触屏安全边距） */
+.el-dialog,
+.el-message-box,
+.dlg {
+  max-width: 92vw;
+}
+.el-message {
+  max-width: 88vw;
+}
+
+/* 窄屏：弹窗/抽屉贴近边缘 + 触控目标下限 40px（列表行 / 胶囊按钮） */
+@media (max-width: 720px) {
+  .el-dialog {
+    --el-dialog-width: 92vw;
+  }
+  .el-message-box {
+    --el-messagebox-width: 88vw;
+  }
+  .el-message-box__btns .el-button {
+    min-height: 40px;
+  }
+  .capsule,
+  .row-action,
+  .nav-link,
+  .font-btn,
+  .toc-btn {
+    min-height: 40px;
+  }
 }

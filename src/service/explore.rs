@@ -57,9 +57,15 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
                 i += 1;
                 line[4..].to_string()
             };
-            if let Ok(result) = crate::parser::js::eval_js_with_bridge(&code, &Default::default(), &crate::parser::js::JsBridge::default()) {
-                if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&result) {
-                    for item in list {
+            // eval 直接取结构化结果（数组/对象递归 JSON 转换——避免 ToString 的
+            // "[object Object]" 导致条目解析为空；JSON.stringify 字符串出口自动解析）
+            if let Ok(list) = crate::parser::js::eval_js_json_with_bridge(
+                &code,
+                &Default::default(),
+                &crate::parser::js::JsBridge::default(),
+            ) {
+                if let serde_json::Value::Array(items) = list {
+                    for item in items {
                         let title = item
                             .get("title")
                             .and_then(|v| v.as_str())
@@ -233,5 +239,25 @@ mod tests {
         let parsed = parse_explore_entries(js);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].title, "分类A");
+    }
+
+    /// exploreUrl JS 返回数组字面量（非 JSON.stringify 字符串）——此前 ToString
+    /// 输出 "[object Object]" 导致条目解析为空
+    #[test]
+    fn test_parse_js_entries_array_literal() {
+        let js = "@js:[{title:'分类X',url:'https://a.com/x'},{title:'分类Y',url:'https://a.com/y'}]";
+        let parsed = parse_explore_entries(js);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].title, "分类X");
+        assert_eq!(parsed[0].url, "https://a.com/x");
+        assert_eq!(parsed[1].title, "分类Y");
+        // JSON.parse 数组出口
+        let js = "@js:JSON.parse('[{\"title\":\"类P\",\"url\":\"https://a.com/p\"}]')";
+        let parsed = parse_explore_entries(js);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].title, "类P");
+        // 无 url 条目丢弃
+        let js = "@js:[{title:'空',url:''}]";
+        assert!(parse_explore_entries(js).is_empty());
     }
 }
