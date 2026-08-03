@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use regex::Regex;
@@ -64,8 +66,8 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     axum::Router::new()
         .nest_service("/assets", assets_service)
         .route("/health", get(health))
-        // SPA fallback：未匹配路由（非 /reader3）→ 前端
-        .fallback_service(web_service)
+        // SPA fallback：未匹配路由 → webdav 分流 / API 404 / 前端
+        .fallback(fallback_handler)
         .route("/reader3/getBookshelf", get(get_bookshelf))
         .route("/reader3/getBookSources", get(get_book_sources).post(get_book_sources))
         .route("/reader3/getBookSource", get(get_book_source).post(get_book_source))
@@ -769,4 +771,44 @@ pub fn internal_error(err: anyhow::Error) -> axum::response::Response {
         Json(json!({ "isSuccess": false, "errorMsg": err.to_string(), "data": null })),
     )
         .into_response()
+}
+
+/// fallback：webdav 分流 / API 404 JSON / 前端 SPA（index.html）
+async fn fallback_handler(
+    State(state): State<AppState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let path = uri.path();
+    // WebDAV
+    if path.starts_with("/reader3/webdav") {
+        return crate::api::webdav::handle(&state.storage, method, path, &headers, body).await;
+    }
+    // 其他 /reader3 未匹配 → JSON 404
+    if path.starts_with("/reader3") {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"isSuccess": false, "errorMsg": "接口不存在", "data": null})),
+        )
+            .into_response();
+    }
+    // 前端 SPA：index.html
+    let index = std::path::PathBuf::from(&state.storage.config.web_root).join("index.html");
+    match tokio::fs::read(&index).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(_) => webdav_status_404(),
+    }
+}
+
+fn webdav_status_404() -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::empty())
+        .unwrap()
 }
