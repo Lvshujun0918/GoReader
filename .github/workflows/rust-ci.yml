@@ -56,13 +56,14 @@ jobs:
           PFX_PWD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
         run: |
           $bytes = [Convert]::FromBase64String($env:PFX_B64)
-          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\codesign.pfx", $bytes)
-          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-            "$env:RUNNER_TEMP\codesign.pfx", $env:PFX_PWD)
-          $sig = Set-AuthenticodeSignature -FilePath "targeteleaseeader-dev.exe" -Certificate $cert
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, $bytes)
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfxPath, $env:PFX_PWD)
+          $exe = Join-Path (Get-Location) "target\release\reader-dev.exe"
+          $sig = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert
           Write-Host "签名状态: $($sig.Status)"
           if ($sig.Status -ne "Valid") { exit 1 }
-          Remove-Item "$env:RUNNER_TEMP\codesign.pfx"
+          Remove-Item $pfxPath
 
       - uses: actions/upload-artifact@v4
         with:
