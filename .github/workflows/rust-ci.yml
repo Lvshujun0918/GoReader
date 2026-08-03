@@ -34,3 +34,37 @@ jobs:
 
       - name: cargo build (release)
         run: cargo build --release
+
+  build-windows-signed:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build (release)
+        run: cargo build --release
+
+      - name: 代码签名（自签证书来自 secrets）
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.WINDOWS_CODESIGN_PFX }}
+          PFX_PWD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+        run: |
+          $bytes = [Convert]::FromBase64String($env:PFX_B64)
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\codesign.pfx", $bytes)
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            "$env:RUNNER_TEMP\codesign.pfx", $env:PFX_PWD)
+          $sig = Set-AuthenticodeSignature -FilePath "targeteleaseeader-dev.exe" -Certificate $cert
+          Write-Host "签名状态: $($sig.Status)"
+          if ($sig.Status -ne "Valid") { exit 1 }
+          Remove-Item "$env:RUNNER_TEMP\codesign.pfx"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reader-dev-windows-signed
+          path: target/release/reader-dev.exe
