@@ -1105,7 +1105,7 @@ onBeforeUnmount(() => {
     </header>
 
     <!-- 正文 -->
-    <main class="reader-main">
+    <main class="reader-main" :style="{ maxWidth: contentWidth }">
       <!-- 不在书架 -->
       <div v-if="notFound" class="state">
         <p class="state-text">未找到这本书（可能不在书架中）</p>
@@ -1145,7 +1145,6 @@ onBeforeUnmount(() => {
             fontSize: `${fontSize}px`,
             lineHeight: `${lineHeight}`,
             fontWeight: `${fontWeight}`,
-            maxWidth: contentWidth,
             fontFamily: fontFamilyStyle || undefined,
             letterSpacing: letterSpacing > 0 ? `${letterSpacing}px` : undefined,
             textAlign,
@@ -1638,7 +1637,7 @@ onBeforeUnmount(() => {
 
 /* ================= 正文 ================= */
 .reader-main {
-  width: min(680px, 100%);
+  width: 100%;
   margin: 0 auto;
   padding: 48px 24px 150px;
 }
