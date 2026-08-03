@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
@@ -11,17 +11,47 @@ import {
   updateBookGroupId,
 } from '@/api/bookshelf'
 import { uploadLocalBook } from '@/api/upload'
+import { probeSecureMode } from '@/api/users'
 import { useUserStore } from '@/stores/user'
 import type { Book, BookGroup } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
 
+/** 后端 secure 模式（用户管理入口仅 secure 模式显示，探测见 api/users.ts） */
+const secureMode = ref(false)
+
 const books = ref<Book[]>([])
 const loading = ref(true)
 const refreshing = ref(false)
 const keyword = ref('')
 const failedCovers = ref<Set<string>>(new Set())
+
+/* ================= 多选模式 ================= */
+const manageMode = ref(false)
+const selected = ref<Set<string>>(new Set())
+const manageBusy = ref(false)
+const moveOpen = ref(false)
+
+/* ================= 虚拟滚动（简易：视口可见行 + 上下缓冲 2 行） ================= */
+const gridWrapRef = ref<HTMLElement | null>(null)
+const narrowMq = window.matchMedia('(max-width: 720px)')
+const cols = ref(1)
+const rowH = ref(0)
+const rowGap = ref(32)
+const startRow = ref(0)
+const endRow = ref(1)
+let lastWrapW = 0
+let viewportRaf: number | undefined
+let wrapObserver: ResizeObserver | undefined
+
+/* ================= 搜索范围：书名 / 全书 ================= */
+/** 'name'=书名/作者（本地）；'full'=全书内容搜索（后端契约 GET /reader3/searchBookContent 待实现，
+ *  简化实现：本地匹配书名/作者/简介，并标注「全书搜索后端待实现」） */
+const searchMode = ref<'name' | 'full'>('name')
+const searchPlaceholder = computed(() =>
+  searchMode.value === 'full' ? '搜索书名 / 作者 / 简介' : '搜索书名 / 作者',
+)
 
 /* ================= 书架分组 ================= */
 const groups = ref<BookGroup[]>([])
@@ -178,6 +208,10 @@ async function startUpload() {
 
 onBeforeUnmount(() => {
   if (longPressTimer) clearTimeout(longPressTimer)
+  wrapObserver?.disconnect()
+  window.removeEventListener('scroll', onWindowScroll)
+  window.removeEventListener('resize', onWindowResize)
+  if (viewportRaf !== undefined) cancelAnimationFrame(viewportRaf)
   document.body.style.overflow = ''
 })
 
@@ -227,6 +261,14 @@ const filtered = computed(() => {
   return books.value.filter((b) => {
     if (gid !== null && b.group !== gid) return false
     if (!kw) return true
+    if (searchMode.value === 'full') {
+      // 全书模式（简化实现）：书名/作者/简介本地匹配；全书内容搜索后端待实现（GET /reader3/searchBookContent）
+      return (
+        b.name.toLowerCase().includes(kw) ||
+        b.author.toLowerCase().includes(kw) ||
+        (b.intro ?? '').toLowerCase().includes(kw)
+      )
+    }
     return b.name.toLowerCase().includes(kw) || b.author.toLowerCase().includes(kw)
   })
 })
@@ -235,6 +277,191 @@ const emptyText = computed(() => {
   if (keyword.value) return '没有找到匹配的书籍'
   if (activeGroup.value !== null) return '该分组下暂无书籍'
   return '书架空空如也，去搜索添加第一本书吧'
+})
+
+/* ================= 多选模式 ================= */
+function toggleManage() {
+  manageMode.value = !manageMode.value
+  selected.value = new Set()
+  moveOpen.value = false
+}
+
+function toggleSelect(book: Book) {
+  const s = new Set(selected.value)
+  if (s.has(book.bookUrl)) s.delete(book.bookUrl)
+  else s.add(book.bookUrl)
+  selected.value = s
+}
+
+/** 多选模式下右键也视为点选，不弹书卡菜单 */
+function onCardMenu(book: Book, e: MouseEvent) {
+  if (manageMode.value) {
+    e.preventDefault()
+    toggleSelect(book)
+    return
+  }
+  openCardMenu(book, e)
+}
+
+/** 批量移出书架：逐本调 POST /reader3/deleteBook */
+async function bulkRemove() {
+  const urls = Array.from(selected.value)
+  if (!urls.length || manageBusy.value) return
+  try {
+    await ElMessageBox.confirm(`确定将选中的 ${urls.length} 本书移出书架吗？`, '移出书架', {
+      confirmButtonText: '移出',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return // 用户取消
+  }
+  manageBusy.value = true
+  let ok = 0
+  const removed = new Set<string>()
+  for (const url of urls) {
+    try {
+      await deleteBook(url)
+      ok++
+      removed.add(url)
+    } catch {
+      // 单本失败不中断，继续逐本处理
+    }
+  }
+  if (removed.size) books.value = books.value.filter((b) => !removed.has(b.bookUrl))
+  selected.value = new Set()
+  manageBusy.value = false
+  const failed = urls.length - ok
+  ElMessage.success(failed > 0 ? `已移出 ${ok} 本，${failed} 本失败` : `已移出 ${ok} 本书`)
+}
+
+function openMovePanel() {
+  if (!selected.value.size || manageBusy.value) return
+  moveOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeMovePanel() {
+  if (manageBusy.value) return
+  moveOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 批量移动到分组：逐本调 POST /reader3/updateBookGroupId（已在目标分组则跳过） */
+async function performMove(gid: number) {
+  const urls = Array.from(selected.value)
+  if (!urls.length || manageBusy.value) return
+  manageBusy.value = true
+  let moved = 0
+  let already = 0
+  for (const url of urls) {
+    const b = books.value.find((x) => x.bookUrl === url)
+    if (b && b.group === gid) {
+      already++
+      continue
+    }
+    try {
+      await updateBookGroupId(url, gid)
+      if (b) b.group = gid
+      moved++
+    } catch {
+      // 单本失败继续
+    }
+  }
+  selected.value = new Set()
+  manageBusy.value = false
+  moveOpen.value = false
+  document.body.style.overflow = ''
+  ElMessage.success(
+    already > 0 ? `已移动 ${moved} 本（${already} 本已在目标分组）` : `已移动 ${moved} 本`,
+  )
+}
+
+/* ================= 虚拟滚动 ================= */
+const totalRows = computed(() =>
+  Math.max(0, Math.ceil(filtered.value.length / Math.max(1, cols.value))),
+)
+
+const visibleBooks = computed(() => {
+  const total = filtered.value.length
+  if (total === 0) return []
+  const s = Math.min(total, startRow.value * cols.value)
+  const e = Math.min(total, endRow.value * cols.value)
+  return filtered.value.slice(s, Math.max(s, e))
+})
+
+const padTop = computed(() => startRow.value * (rowH.value + rowGap.value))
+const padBottom = computed(() => (totalRows.value - endRow.value) * (rowH.value + rowGap.value))
+
+/** 按视口高度计算可见行（上下各缓冲 2 行），滚动时更新 */
+function updateViewport() {
+  const wrap = gridWrapRef.value
+  if (!wrap) return
+  const total = totalRows.value
+  if (total <= 0) return
+  const stride = rowH.value + rowGap.value
+  if (stride <= 0) {
+    // 尚未测得行高：先渲染首行作为测量锚点
+    startRow.value = 0
+    endRow.value = Math.min(total, 1)
+    return
+  }
+  const gridTop = wrap.getBoundingClientRect().top + window.scrollY
+  const st = Math.max(0, window.scrollY - gridTop)
+  const vh = window.innerHeight
+  const r0 = Math.max(0, Math.floor(st / stride) - 2)
+  const r1 = Math.min(total, Math.ceil((st + vh) / stride) + 2)
+  startRow.value = r0
+  endRow.value = Math.max(r0 + 1, r1)
+}
+
+/** 计算列数并测量行高（卡片宽高比固定，任取一张测量） */
+function measureGrid() {
+  const wrap = gridWrapRef.value
+  if (!wrap) return
+  const w = wrap.clientWidth
+  if (w <= 0) return
+  const minW = narrowMq.matches ? 120 : 160
+  const colGap = narrowMq.matches ? 16 : 28
+  rowGap.value = narrowMq.matches ? 24 : 32
+  cols.value = Math.max(1, Math.floor((w + colGap) / (minW + colGap)))
+  const card = wrap.querySelector('.book-card')
+  if (card) {
+    rowH.value = Math.round(card.getBoundingClientRect().height)
+  } else {
+    const cw = (w - (cols.value - 1) * colGap) / cols.value
+    rowH.value = Math.round((cw * 4) / 3 + 78)
+  }
+  updateViewport()
+}
+
+function onWindowScroll() {
+  if (viewportRaf !== undefined) return
+  viewportRaf = requestAnimationFrame(() => {
+    viewportRaf = undefined
+    updateViewport()
+  })
+}
+
+function onWindowResize() {
+  measureGrid()
+}
+
+watch(
+  filtered,
+  () => {
+    const wrap = gridWrapRef.value
+    if (wrap && wrapObserver) wrapObserver.observe(wrap)
+    measureGrid()
+  },
+  { flush: 'post' },
+)
+
+// 切换关键词 / 分组后回到网格顶部
+watch([keyword, activeGroup], () => {
+  const wrap = gridWrapRef.value
+  if (!wrap) return
+  window.scrollTo({ top: Math.max(0, wrap.getBoundingClientRect().top + window.scrollY - 96) })
 })
 
 async function load(silent = false) {
@@ -247,6 +474,11 @@ async function load(silent = false) {
     ])
     books.value = res.data ?? []
     groups.value = gRes.data ?? []
+    // 数据刷新后清理已失效的选中项
+    if (selected.value.size) {
+      const valid = new Set(books.value.map((b) => b.bookUrl))
+      selected.value = new Set(Array.from(selected.value).filter((u) => valid.has(u)))
+    }
     // 分组被删/失效时回退到「全部」
     if (activeGroup.value !== null && !groups.value.some((g) => g.id === activeGroup.value)) {
       activeGroup.value = null
@@ -339,6 +571,7 @@ function openMenuAtEl(book: Book, e: MouseEvent) {
 
 /** 触屏长按 500ms 唤出菜单（与点击进详情互斥） */
 function onCardTouchStart(book: Book, e: TouchEvent) {
+  if (manageMode.value) return // 多选模式：点击即选中，不触发长按菜单
   longPressFired = false
   suppressClick = false
   const t = e.touches[0]
@@ -357,6 +590,10 @@ function onCardTouchEnd() {
 }
 
 function onCardClick(book: Book) {
+  if (manageMode.value) {
+    toggleSelect(book)
+    return
+  }
   if (longPressFired) {
     longPressFired = false
     return // 长按已触发菜单，忽略本次点击
@@ -420,7 +657,21 @@ async function removeFromShelf() {
   }
 }
 
-onMounted(() => load())
+onMounted(() => {
+  wrapObserver = new ResizeObserver(() => {
+    const w = gridWrapRef.value?.clientWidth ?? 0
+    if (w === lastWrapW) return
+    lastWrapW = w
+    measureGrid()
+  })
+  window.addEventListener('scroll', onWindowScroll, { passive: true })
+  window.addEventListener('resize', onWindowResize)
+  load()
+  // 探测 secure 模式：仅 secure 模式显示「用户」管理入口（后端未就绪/非 secure → 隐藏）
+  void probeSecureMode().then((v) => {
+    secureMode.value = v
+  })
+})
 </script>
 
 <template>
@@ -433,35 +684,61 @@ onMounted(() => load())
       </div>
 
       <div class="search-box">
-        <svg
-          class="search-icon"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.6"
-          stroke-linecap="round"
-        >
-          <circle cx="11" cy="11" r="6.5" />
-          <path d="M20 20l-3.8-3.8" />
-        </svg>
-        <input
-          v-model="keyword"
-          class="search-input"
-          type="text"
-          placeholder="搜索书名 / 作者"
-          spellcheck="false"
-        />
-        <button
-          v-if="keyword"
-          class="search-clear"
-          type="button"
-          title="清空"
-          @click="keyword = ''"
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-            <path d="M6 6l12 12M18 6L6 18" />
+        <div class="search-main">
+          <svg
+            class="search-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+          >
+            <circle cx="11" cy="11" r="6.5" />
+            <path d="M20 20l-3.8-3.8" />
           </svg>
-        </button>
+          <input
+            v-model="keyword"
+            class="search-input"
+            type="text"
+            :placeholder="searchPlaceholder"
+            spellcheck="false"
+          />
+          <button
+            v-if="keyword"
+            class="search-clear"
+            type="button"
+            title="清空"
+            @click="keyword = ''"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+        </div>
+        <div class="search-sub">
+          <span class="search-mode-label">范围</span>
+          <button
+            class="search-mode-btn"
+            :class="{ active: searchMode === 'name' }"
+            type="button"
+            title="按书名 / 作者筛选书架"
+            @click="searchMode = 'name'"
+          >
+            书名/作者
+          </button>
+          <button
+            class="search-mode-btn"
+            :class="{ active: searchMode === 'full' }"
+            type="button"
+            title="全书内容搜索（后端待实现，当前匹配书名/作者/简介）"
+            @click="searchMode = 'full'"
+          >
+            全书
+          </button>
+          <span v-if="searchMode === 'full'" class="search-note">
+            全书内容搜索后端待实现（GET /reader3/searchBookContent）· 当前仅匹配书名/作者/简介
+          </span>
+        </div>
       </div>
 
       <div class="user-area">
@@ -471,16 +748,30 @@ onMounted(() => load())
         <button class="nav-link" type="button" @click="router.push('/rules')">替换规则</button>
         <button class="nav-link" type="button" @click="router.push('/rss')">RSS</button>
         <button class="nav-link" type="button" @click="router.push('/files')">文件</button>
+        <button v-if="secureMode" class="nav-link" type="button" @click="router.push('/users')">用户</button>
         <span class="user-chip">{{ store.username || '未登录' }}</span>
         <button class="logout-btn" type="button" @click="logout">退出</button>
       </div>
     </header>
 
-    <main class="content">
+    <main class="content" :class="{ 'with-manage-bar': manageMode }">
       <!-- 标题区 -->
       <div class="section-head">
         <h1 class="section-title">我的书架</h1>
         <span class="count">{{ books.length }} 本</span>
+        <button
+          class="manage-btn"
+          type="button"
+          :class="{ active: manageMode }"
+          :title="manageMode ? '退出多选' : '进入多选模式'"
+          @click="toggleManage"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 11.5l2 2 4-4.5" />
+            <rect x="4" y="4" width="16" height="16" rx="3" />
+          </svg>
+          <span>{{ manageMode ? '完成' : '管理' }}</span>
+        </button>
         <button class="import-btn" type="button" title="导入本地书" @click="openImport">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 16V4" />
@@ -552,51 +843,62 @@ onMounted(() => load())
         <p class="empty-text">{{ emptyText }}</p>
       </div>
 
-      <!-- 书封网格（大间距） -->
-      <div v-else class="book-grid">
-        <div
-          v-for="book in filtered"
-          :key="book.bookUrl"
-          class="book-card"
-          @click="onCardClick(book)"
-          @contextmenu="openCardMenu(book, $event)"
-          @touchstart.passive="onCardTouchStart(book, $event)"
-          @touchend="onCardTouchEnd"
-          @touchcancel="onCardTouchEnd"
-        >
-          <button
-            class="card-menu-btn"
-            type="button"
-            title="更多操作"
-            @click="openMenuAtEl(book, $event)"
+      <!-- 书封网格（虚拟滚动：仅渲染可见行 + 上下缓冲 2 行，卡片样式不变） -->
+      <div v-else ref="gridWrapRef" class="virtual-grid">
+        <div class="virtual-pad" :style="{ height: padTop + 'px' }"></div>
+        <div class="book-grid">
+          <div
+            v-for="book in visibleBooks"
+            :key="book.bookUrl"
+            class="book-card"
+            :class="{ managing: manageMode, selected: selected.has(book.bookUrl) }"
+            @click="onCardClick(book)"
+            @contextmenu="onCardMenu(book, $event)"
+            @touchstart.passive="onCardTouchStart(book, $event)"
+            @touchend="onCardTouchEnd"
+            @touchcancel="onCardTouchEnd"
           >
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <circle cx="5" cy="12" r="1.6" />
-              <circle cx="12" cy="12" r="1.6" />
-              <circle cx="19" cy="12" r="1.6" />
-            </svg>
-          </button>
-          <div class="cover-wrap">
-            <img
-              v-if="hasCover(book)"
-              v-lazy="coverSrc(book) as string"
-              class="cover-img"
-              :alt="book.name"
-              loading="lazy"
-              @error="onCoverError(book)"
-            />
-            <div v-else class="cover-ph" :style="{ background: coverColor(book.name) }">
-              <span class="cover-ph-char">{{ coverInitial(book.name) }}</span>
+            <span class="select-dot" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5 12.5l4.5 4.5L19 7.5" />
+              </svg>
+            </span>
+            <button
+              class="card-menu-btn"
+              type="button"
+              title="更多操作"
+              :tabindex="manageMode ? -1 : 0"
+              @click="openMenuAtEl(book, $event)"
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <circle cx="5" cy="12" r="1.6" />
+                <circle cx="12" cy="12" r="1.6" />
+                <circle cx="19" cy="12" r="1.6" />
+              </svg>
+            </button>
+            <div class="cover-wrap">
+              <img
+                v-if="hasCover(book)"
+                v-lazy="coverSrc(book) as string"
+                class="cover-img"
+                :alt="book.name"
+                loading="lazy"
+                @error="onCoverError(book)"
+              />
+              <div v-else class="cover-ph" :style="{ background: coverColor(book.name) }">
+                <span class="cover-ph-char">{{ coverInitial(book.name) }}</span>
+              </div>
+            </div>
+            <div class="book-meta">
+              <p class="book-name" :title="book.name">{{ book.name }}</p>
+              <p class="book-author">{{ book.author || '佚名' }}</p>
+              <p v-if="book.latestChapterTitle" class="book-chapter" :title="book.latestChapterTitle">
+                {{ book.latestChapterTitle }}
+              </p>
             </div>
           </div>
-          <div class="book-meta">
-            <p class="book-name" :title="book.name">{{ book.name }}</p>
-            <p class="book-author">{{ book.author || '佚名' }}</p>
-            <p v-if="book.latestChapterTitle" class="book-chapter" :title="book.latestChapterTitle">
-              {{ book.latestChapterTitle }}
-            </p>
-          </div>
         </div>
+        <div class="virtual-pad" :style="{ height: padBottom + 'px' }"></div>
       </div>
     </main>
 
@@ -826,6 +1128,76 @@ onMounted(() => load())
         </div>
       </Transition>
     </Teleport>
+
+    <!-- 多选底部操作条（细字：已选 N 本 + 移出书架 + 移动到分组） -->
+    <Transition name="bar">
+      <div v-if="manageMode" class="manage-bar">
+        <span class="manage-count">已选 {{ selected.size }} 本</span>
+        <div class="manage-actions">
+          <button
+            class="manage-act danger"
+            type="button"
+            :disabled="selected.size === 0 || manageBusy"
+            @click="bulkRemove"
+          >
+            移出书架
+          </button>
+          <button
+            class="manage-act accent"
+            type="button"
+            :disabled="selected.size === 0 || manageBusy"
+            @click="openMovePanel"
+          >
+            移动到分组
+          </button>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- 移动到分组弹层（多选，选组即执行） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="moveOpen" class="dlg-overlay" @click.self="closeMovePanel">
+          <div
+            class="dlg"
+            role="dialog"
+            aria-modal="true"
+            aria-label="移动到分组"
+            tabindex="-1"
+            @keydown.esc="closeMovePanel"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">移动到分组</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="manageBusy" @click="closeMovePanel">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <ul class="move-group-list">
+              <li>
+                <button class="move-group-row" type="button" :disabled="manageBusy" @click="performMove(0)">
+                  <span class="move-group-name">未分组</span>
+                  <span class="move-group-count">{{ groupCount(0) }} 本</span>
+                </button>
+              </li>
+              <li v-for="g in groups" :key="g.id">
+                <button class="move-group-row" type="button" :disabled="manageBusy" @click="performMove(g.id)">
+                  <span class="move-group-name" :title="g.name">{{ g.name }}</span>
+                  <span class="move-group-count">{{ groupCount(g.id) }} 本</span>
+                </button>
+              </li>
+            </ul>
+            <div class="dlg-foot">
+              <span class="overall">{{ manageBusy ? '正在移动…' : `已选 ${selected.size} 本` }}</span>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="manageBusy" @click="closeMovePanel">取消</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -873,12 +1245,14 @@ onMounted(() => load())
   font-weight: 400;
 }
 
-/* 搜索框（细边框圆角 8px） */
+/* 搜索框（细边框圆角 8px）：输入行 + 范围切换行 */
 .search-box {
-  position: relative;
   flex: 1;
-  max-width: 320px;
+  max-width: 420px;
   margin: 0 auto;
+}
+.search-main {
+  position: relative;
 }
 .search-icon {
   position: absolute;
@@ -938,6 +1312,56 @@ onMounted(() => load())
 .search-clear svg {
   width: 11px;
   height: 11px;
+}
+
+/* 范围切换（书名/作者 · 全书） + 待实现标注 */
+.search-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  min-height: 20px;
+}
+.search-mode-label {
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.search-mode-btn {
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.search-mode-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.search-mode-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.search-note {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 300;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 用户区 */
@@ -1775,6 +2199,231 @@ onMounted(() => load())
   color: var(--text-3);
 }
 
+/* ================= 多选模式 ================= */
+.manage-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.manage-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.manage-btn.active {
+  color: #ffffff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.manage-btn.active:hover {
+  background: var(--accent-deep);
+  border-color: var(--accent-deep);
+}
+.manage-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* 虚拟滚动容器：上下占位撑高，中间网格只渲染可见行 */
+.virtual-grid {
+  position: relative;
+}
+.virtual-pad {
+  width: 100%;
+}
+
+/* 多选选择点（左上圆形，选中 accent 填充 + 对勾） */
+.select-dot {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1.5px solid var(--border-strong);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+  color: transparent;
+  opacity: 0;
+  transform: scale(0.82);
+  pointer-events: none;
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease,
+    background-color 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease;
+}
+.book-card.managing .select-dot {
+  opacity: 1;
+  transform: scale(1);
+}
+.book-card.selected .select-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+.select-dot svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* 多选时隐藏书卡右上角 ⋯（避免与点选冲突） */
+.book-card.managing .card-menu-btn {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* 多选底部操作条（细字胶囊，fade 200ms） */
+.manage-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 10px 16px 10px 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+}
+.manage-count {
+  font-size: 12.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-2);
+}
+.manage-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.manage-act {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: none;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.manage-act.danger {
+  color: #cf4444;
+  border-color: rgba(207, 68, 68, 0.35);
+}
+.manage-act.danger:hover:not(:disabled) {
+  background: rgba(207, 68, 68, 0.08);
+  border-color: #cf4444;
+}
+.manage-act.accent {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.manage-act.accent:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent-deep);
+  color: var(--accent-deep);
+}
+.manage-act:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+/* 底部操作条动画：fade + 轻微上移 200ms */
+.bar-enter-active,
+.bar-leave-active {
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+.bar-enter-from,
+.bar-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 8px);
+}
+
+/* 多选时给内容区底部留出操作条空间 */
+.content.with-manage-bar {
+  padding-bottom: 150px;
+}
+
+/* 多选移动到分组弹层列表 */
+.move-group-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.move-group-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.move-group-row:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.move-group-row:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.move-group-name {
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.move-group-count {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+
 /* ================= 响应式 ================= */
 @media (max-width: 720px) {
   .dlg-overlay {
@@ -1810,6 +2459,15 @@ onMounted(() => load())
   }
   .section-head {
     margin-bottom: 28px;
+  }
+  .manage-bar {
+    bottom: 16px;
+    padding: 8px 12px 8px 16px;
+    gap: 12px;
+  }
+  .manage-act {
+    padding: 5px 12px;
+    font-size: 12px;
   }
 }
 </style>

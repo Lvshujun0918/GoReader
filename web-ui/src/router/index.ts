@@ -70,6 +70,12 @@ const router = createRouter({
       component: () => import('@/views/FileManageView.vue'),
       meta: { title: '文件' },
     },
+    {
+      path: '/users',
+      name: 'users',
+      component: () => import('@/views/UserManageView.vue'),
+      meta: { title: '用户管理' },
+    },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })

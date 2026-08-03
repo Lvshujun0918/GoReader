@@ -4,6 +4,19 @@ import router from '@/router'
 import { useUserStore } from '@/stores/user'
 import type { ReturnData } from '@/types'
 
+/** 自定义请求配置：silent=true 时失败不弹全局错误提示（探测待实现后端契约接口等场景，调用方自行降级处理） */
+declare module 'axios' {
+  export interface AxiosRequestConfig {
+    silent?: boolean
+  }
+}
+
+/** 请求选项 */
+export interface RequestOptions {
+  /** 静默模式：业务失败 / HTTP 错误均不弹 ElMessage（探测未实现契约接口用） */
+  silent?: boolean
+}
+
 /** axios 实例：baseURL=/reader3，accessToken 自动携带（query），401/NEED_LOGIN 跳登录 */
 const request = axios.create({
   baseURL: '/reader3',
@@ -30,30 +43,49 @@ request.interceptors.response.use(
           void router.replace({ path: '/login', query: { redirect: router.currentRoute.value.fullPath } })
           return Promise.reject(new Error(res.errorMsg || '请登录后使用'))
         }
-        ElMessage.error(res.errorMsg || '请求失败')
-        return Promise.reject(new Error(res.errorMsg || '请求失败'))
+        const err = new Error(res.errorMsg || '请求失败') as Error & { data?: unknown }
+        err.data = res.data
+        // NEED_SECURE_KEY：不弹全局提示，由调用方（用户管理）引导输入 secureKey
+        if (res.data !== 'NEED_SECURE_KEY') {
+          const silent = !!(response.config as { silent?: boolean }).silent
+          if (!silent) ElMessage.error(res.errorMsg || '请求失败')
+        }
+        return Promise.reject(err)
       }
       return response
     }
     return response
   },
   (error) => {
+    const silent = !!(error.config as { silent?: boolean } | undefined)?.silent
     if (error.response?.status === 401) {
       const store = useUserStore()
       store.clear()
       void router.replace({ path: '/login', query: { redirect: router.currentRoute.value.fullPath } })
     }
-    ElMessage.error(error.response?.data?.errorMsg || error.message || '网络错误')
+    if (!silent) ElMessage.error(error.response?.data?.errorMsg || error.message || '网络错误')
     return Promise.reject(error)
   },
 )
 
-export function get<T>(url: string, params?: Record<string, unknown>): Promise<ReturnData<T>> {
-  return request.get(url, { params }).then((r) => r.data as ReturnData<T>)
+export function get<T>(
+  url: string,
+  params?: Record<string, unknown>,
+  opts?: RequestOptions,
+): Promise<ReturnData<T>> {
+  return request.get(url, { params, silent: opts?.silent }).then((r) => r.data as ReturnData<T>)
 }
 
-export function post<T>(url: string, data?: unknown): Promise<ReturnData<T>> {
-  return request.post(url, data).then((r) => r.data as ReturnData<T>)
+/** 第三参数兼容两种用法：历史调用传 query params；新调用传 RequestOptions（如 { silent: true }） */
+export function post<T>(
+  url: string,
+  data?: unknown,
+  paramsOrOpts?: Record<string, unknown> | RequestOptions,
+): Promise<ReturnData<T>> {
+  const isOpts = !!paramsOrOpts && 'silent' in paramsOrOpts
+  const params = isOpts ? undefined : (paramsOrOpts as Record<string, unknown> | undefined)
+  const silent = isOpts ? (paramsOrOpts as RequestOptions).silent : undefined
+  return request.post(url, data, { params, silent }).then((r) => r.data as ReturnData<T>)
 }
 
 export default request

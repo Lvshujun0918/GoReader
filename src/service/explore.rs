@@ -20,13 +20,27 @@ pub struct ExploreEntry {
 /// - 普通多行 URL：每行一个条目（title 从 URL 尾部提取）
 pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
     let mut entries = Vec::new();
-    for line in explore_url.lines() {
-        let line = line.trim();
+    let lines: Vec<&str> = explore_url.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
         if line.is_empty() || line.starts_with('#') {
+            i += 1;
             continue;
         }
-        if let Some(code) = line.strip_prefix("@js:") {
-            if let Ok(result) = crate::parser::js::eval_js(code, &Default::default()) {
+        // @js: 格式：同行（@js:代码）或独立行（@js: 后所有行为代码——legado 常见）
+        if line == "@js:" || line.starts_with("@js:") {
+            let code = if line == "@js:" {
+                // 独立行：后续所有行拼接为代码
+                let rest = &lines[i + 1..];
+                i = lines.len();
+                rest.join("
+")
+            } else {
+                i += 1;
+                line[4..].to_string()
+            };
+            if let Ok(result) = crate::parser::js::eval_js_with_bridge(&code, &Default::default(), &crate::parser::js::JsBridge::default()) {
                 if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&result) {
                     for item in list {
                         let title = item
@@ -34,14 +48,20 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let url = item
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         if !url.is_empty() {
                             entries.push(ExploreEntry { title, url });
                         }
                     }
+                    i = lines.len();
                     continue;
                 }
             }
+            continue;
         }
         // 普通 URL 行：title 从尾部提取
         let title = url_title(&line);
@@ -49,6 +69,7 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
             title,
             url: line.to_string(),
         });
+        i += 1;
     }
     entries
 }
@@ -130,8 +151,13 @@ mod tests {
     #[test]
     fn test_parse_urls() {
         let urls = "https://a.com/list\n#注释\nhttps://b.com/{{page}}\n";
-        let parsed = parse_explore_urls(urls);
+        let parsed = parse_explore_entries(urls);
         assert_eq!(parsed.len(), 2);
-        assert!(parsed[1].contains("{{page}}"));
+        assert!(parsed[1].url.contains("{{page}}"));
+        // @js: 代码行生成条目
+        let js = "@js:JSON.stringify([{title:'分类A',url:'https://a.com/x'}])";
+        let parsed = parse_explore_entries(js);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].title, "分类A");
     }
 }

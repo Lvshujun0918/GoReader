@@ -397,6 +397,85 @@ function scrollToParagraph(idx: number) {
   window.scrollTo(0, top)
 }
 
+/* ---------------- 4.2 章节内搜索（前端本地：当前章段落包含匹配 + 高亮 + 点击跳段） ---------------- */
+
+const searchOpen = ref(false)
+const searchKeyword = ref('')
+const searchSearched = ref(false)
+/** 搜索结果：段落序号 + 高亮 HTML 片段 */
+const searchResults = ref<{ idx: number; html: string }[]>([])
+/** 跳转后短暂高亮的目标段落 */
+const flashParaIdx = ref(-1)
+const searchInputRef = ref<HTMLInputElement | null>(null)
+let flashTimer: number | undefined
+const SEARCH_MAX_HITS = 100
+
+function openChapterSearch() {
+  searchKeyword.value = ''
+  searchSearched.value = false
+  searchResults.value = []
+  searchOpen.value = true
+  void nextTick(() => searchInputRef.value?.focus())
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+/** 生成高亮 HTML：对转义后的段落按关键词（大小写不敏感）包 <mark> */
+function highlightSnippet(text: string, kw: string): string {
+  const esc = escapeHtml(text)
+  const escKw = escapeHtml(kw)
+  if (!escKw) return esc
+  const lower = esc.toLowerCase()
+  const kwLower = escKw.toLowerCase()
+  const parts: string[] = []
+  let from = 0
+  let found = 0
+  let i = lower.indexOf(kwLower, from)
+  while (i !== -1 && found < 60) {
+    parts.push(esc.slice(from, i), `<mark>${esc.slice(i, i + escKw.length)}</mark>`)
+    from = i + escKw.length
+    i = lower.indexOf(kwLower, from)
+    found++
+  }
+  parts.push(esc.slice(from))
+  return parts.join('')
+}
+
+/** 在当前章段落中查找包含关键词的段落（大小写不敏感） */
+function runChapterSearch() {
+  const kw = searchKeyword.value.trim()
+  searchSearched.value = true
+  searchResults.value = []
+  if (!kw) return
+  const lower = kw.toLowerCase()
+  const hits: { idx: number; html: string }[] = []
+  paragraphs.value.forEach((p, i) => {
+    if (hits.length >= SEARCH_MAX_HITS) return
+    if (p.toLowerCase().includes(lower)) hits.push({ idx: i, html: highlightSnippet(p, kw) })
+  })
+  searchResults.value = hits
+}
+
+/** 点击结果：跳转该段并短暂高亮 */
+function jumpToSearchResult(idx: number) {
+  searchOpen.value = false
+  searchKeyword.value = ''
+  searchSearched.value = false
+  searchResults.value = []
+  scrollToParagraph(idx)
+  flashParaIdx.value = idx
+  window.clearTimeout(flashTimer)
+  flashTimer = window.setTimeout(() => {
+    flashParaIdx.value = -1
+  }, 1600)
+}
+
 /* ---------------- 5. 简繁转换（legacy chinese.js 移植） ---------------- */
 
 const HAN_KEY = 'reader_han_trad'
@@ -1047,6 +1126,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('mousedown', onDocMouseDown)
   window.clearTimeout(saveTimer)
   window.clearTimeout(removeTimer)
+  window.clearTimeout(flashTimer)
   stopTts()
   stopAuto()
   saveProgress()
@@ -1111,6 +1191,9 @@ onBeforeUnmount(() => {
         </button>
         <button class="font-btn" type="button" title="书签列表" @click="openBookmarks">
           书签
+        </button>
+        <button class="font-btn" type="button" title="搜索本章内容" @click="openChapterSearch">
+          搜索
         </button>
         <button
           class="font-btn auto-btn"
@@ -1180,6 +1263,7 @@ onBeforeUnmount(() => {
             v-for="(para, i) in paragraphs"
             :key="i"
             class="reader-para"
+            :class="{ flash: flashParaIdx === i }"
             :style="{ marginBottom: `${paraSpacing}em`, textIndent: textIndent ? '2em' : '0' }"
           >
             {{ para }}
@@ -1228,6 +1312,40 @@ onBeforeUnmount(() => {
             />
             <button class="pop-btn" type="button" @click="confirmJump">跳转</button>
           </div>
+        </div>
+      </div>
+    </transition>
+
+    <!-- 章节内搜索弹层（本地搜索当前章，段落高亮 + 点击跳段） -->
+    <transition name="pop">
+      <div v-if="searchOpen" class="pop-mask" @click="searchOpen = false">
+        <div class="pop-card search-card" @click.stop>
+          <p class="pop-title">搜索本章</p>
+          <div class="pop-row">
+            <input
+              ref="searchInputRef"
+              v-model="searchKeyword"
+              class="pop-input"
+              type="text"
+              placeholder="输入关键词，搜索当前章正文"
+              spellcheck="false"
+              @keyup.enter="runChapterSearch"
+            />
+            <button class="pop-btn" type="button" @click="runChapterSearch">搜索</button>
+          </div>
+          <p v-if="searchSearched && !searchKeyword.trim()" class="pop-hint">请输入关键词</p>
+          <p v-else-if="searchSearched && searchResults.length === 0" class="pop-hint">
+            本章未找到「{{ searchKeyword.trim() }}」
+          </p>
+          <ul v-else-if="searchResults.length" class="search-list">
+            <li v-for="r in searchResults" :key="r.idx" class="search-item">
+              <button type="button" class="search-jump" :title="`跳转到第 ${r.idx + 1} 段`" @click="jumpToSearchResult(r.idx)">
+                <span class="search-idx">{{ r.idx + 1 }}</span>
+                <span class="search-text" v-html="r.html"></span>
+              </button>
+            </li>
+          </ul>
+          <p v-else class="pop-hint">搜索范围：当前章（前端本地匹配，高亮显示，点击跳转）</p>
         </div>
       </div>
     </transition>
@@ -1700,6 +1818,19 @@ onBeforeUnmount(() => {
   text-indent: 2em;
   word-break: break-word;
 }
+/* 搜索跳转后的短暂高亮 */
+.reader-para.flash {
+  animation: search-flash 1.6s ease;
+}
+@keyframes search-flash {
+  0%,
+  55% {
+    background: rgba(255, 193, 7, 0.35);
+  }
+  100% {
+    background: transparent;
+  }
+}
 
 /* ================= 加载 / 错误 / 空 ================= */
 .state {
@@ -2026,6 +2157,78 @@ onBeforeUnmount(() => {
 }
 .pop-btn:hover {
   background: var(--accent-deep);
+}
+
+/* ================= 章节内搜索弹层 ================= */
+.search-card {
+  width: min(460px, 92vw);
+}
+.search-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.search-item {
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  overflow: hidden;
+}
+.search-jump {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 12px;
+  border: none;
+  background: none;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.search-jump:hover {
+  background: var(--accent-soft);
+}
+.search-idx {
+  flex-shrink: 0;
+  margin-top: 2px;
+  min-width: 20px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.search-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 300;
+  line-height: 1.7;
+  color: var(--text-1);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+/* v-html 注入的 <mark> 需要 :deep 才能命中 scoped 样式 */
+.search-text :deep(mark) {
+  background: rgba(255, 193, 7, 0.4);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
 }
 
 /* ================= 排版设置 ================= */

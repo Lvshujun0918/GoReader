@@ -88,6 +88,14 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/logout", post(logout))
         // F-34 不活跃用户清理（secure + secureKey）
         .route("/reader3/clearInactiveUsers", post(clear_inactive_users))
+        // F-32 用户管理（secure + secureKey）
+        .route("/reader3/getUsers", get(get_users).post(get_users))
+        .route("/reader3/updateUser", post(update_user))
+        .route("/reader3/deleteUser", post(delete_user))
+        .route("/reader3/resetUserPassword", post(reset_user_password))
+        // F-25 TTS：Edge 语音 + HttpTTS + 语音列表
+        .route("/reader3/getTTSVoices", get(get_tts_voices).post(get_tts_voices))
+        .route("/reader3/tts", get(tts_synthesize).post(tts_synthesize))
         // F-39 手动备份到 WebDAV（书架数据 zip）
         .route("/reader3/backupToWebdav", post(backup_to_webdav))
         // F-38 文件管理（home 语义对齐 legacy FileController）
@@ -1278,6 +1286,293 @@ async fn clear_inactive_users(
     }
 }
 
+/// F-32 用户管理：GET/POST /reader3/getUsers：用户列表（含启用状态；secure + secureKey 管理校验）
+async fn get_users(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    // 需登录（legacy checkAuth）
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    if let Err(ret) = check_manager_auth(&state, &params, body_json.as_ref()) {
+        return Json(ret);
+    }
+    match state.storage.list_users().await {
+        Ok(users) => {
+            let arr: Vec<Value> = users.iter().map(user_admin_json).collect();
+            Json(ReturnData::ok(Value::Array(arr)))
+        }
+        Err(e) => {
+            tracing::error!("getUsers 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// 用户管理输出 JSON（不含密码/salt/token；camelCase 兼容 legacy）
+fn user_admin_json(user: &User) -> Value {
+    json!({
+        "username": user.username,
+        "enableWebdav": user.enable_webdav,
+        "enableLocalStore": user.enable_local_store,
+        "enableBookSource": user.enable_book_source,
+        "enableRssSource": user.enable_rss_source,
+        "bookSourceLimit": user.book_source_limit,
+        "bookLimit": user.book_limit,
+        "lastLoginAt": user.last_login_at,
+        "createdAt": user.created_at,
+    })
+}
+
+/// POST /reader3/updateUser：更新用户权限/限额（body/query：username + 可选字段；secureKey）
+async fn update_user(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    if let Err(ret) = check_manager_auth(&state, &params, body_json.as_ref()) {
+        return Json(ret);
+    }
+    let username = param_of(&params, body_json.as_ref(), "username");
+    if username.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    // 布尔参数：body 布尔值或 query "true"/"1"
+    let bool_param = |key: &str| -> Option<bool> {
+        if let Some(b) = body_json.as_ref().and_then(|b| b.get(key)) {
+            return b.as_bool();
+        }
+        params.get(key).map(|v| v == "true" || v == "1")
+    };
+    let int_param = |key: &str| -> Option<i64> {
+        if let Some(b) = body_json.as_ref().and_then(|b| b.get(key)) {
+            return b.as_i64();
+        }
+        params.get(key).and_then(|v| v.parse::<i64>().ok())
+    };
+    match state
+        .storage
+        .update_user_permissions(
+            &username,
+            bool_param("enableWebdav"),
+            bool_param("enableLocalStore"),
+            bool_param("enableBookSource"),
+            bool_param("enableRssSource"),
+            int_param("bookSourceLimit"),
+            int_param("bookLimit"),
+        )
+        .await
+    {
+        Ok(0) => Json(ReturnData::err("用户不存在")),
+        Ok(_) => Json(ReturnData::ok(Value::Null)),
+        Err(e) => {
+            tracing::error!("updateUser [{username}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/deleteUser：删除用户（secureKey；不能删除自己）
+async fn delete_user(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    if let Err(ret) = check_manager_auth(&state, &params, body_json.as_ref()) {
+        return Json(ret);
+    }
+    let username = param_of(&params, body_json.as_ref(), "username");
+    if username.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    if username == namespace {
+        return Json(ReturnData::err("不能删除自己"));
+    }
+    match state.storage.delete_user(&username).await {
+        Ok(0) => Json(ReturnData::err("用户不存在")),
+        Ok(_) => {
+            tracing::info!("deleteUser：删除用户 {username}");
+            Json(ReturnData::ok(Value::Null))
+        }
+        Err(e) => {
+            tracing::error!("deleteUser [{username}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/resetUserPassword：重置用户密码（body/query：username + password/newPassword；secureKey）
+async fn reset_user_password(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    if let Err(ret) = check_manager_auth(&state, &params, body_json.as_ref()) {
+        return Json(ret);
+    }
+    let username = param_of(&params, body_json.as_ref(), "username");
+    let mut password = param_of(&params, body_json.as_ref(), "password");
+    if password.is_empty() {
+        password = param_of(&params, body_json.as_ref(), "newPassword");
+    }
+    if username.is_empty() || password.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    // 新 salt（与注册一致：8 位随机字母数字）
+    use rand::Rng;
+    let salt: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(8)
+        .map(char::from)
+        .collect();
+    let encrypted = gen_encrypted_password(&password, &salt);
+    match state
+        .storage
+        .reset_user_password(&username, &salt, &encrypted)
+        .await
+    {
+        Ok(0) => Json(ReturnData::err("用户不存在")),
+        Ok(_) => {
+            tracing::info!("resetUserPassword：重置用户 {username} 密码");
+            Json(ReturnData::ok(Value::Null))
+        }
+        Err(e) => {
+            tracing::error!("resetUserPassword [{username}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// 管理校验（legacy checkManagerAuth）：secure 模式 + secureKey 匹配
+/// 失败返回 NEED_SECURE_KEY（errorMsg=请输入管理密码）
+fn check_manager_auth(
+    state: &AppState,
+    params: &HashMap<String, String>,
+    body: Option<&serde_json::Value>,
+) -> Result<(), ReturnData> {
+    let config = &state.storage.config;
+    if !config.secure || config.secure_key.is_empty() {
+        return Err(ReturnData::err("不支持的操作"));
+    }
+    let secure_key = param_of(params, body, "secureKey");
+    if secure_key != config.secure_key {
+        return Err(ReturnData {
+            is_success: false,
+            error_msg: "请输入管理密码".to_string(),
+            data: json!("NEED_SECURE_KEY"),
+        });
+    }
+    Ok(())
+}
+
+// ---------------- F-25 TTS ----------------
+
+/// GET/POST /reader3/getTTSVoices：Edge TTS 可用语音列表（预置 zh-CN/en-US）
+async fn get_tts_voices(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let _ = (&state, &params, &headers, &body);
+    let arr: Vec<Value> = crate::service::tts::edge_voices()
+        .iter()
+        .map(|v| {
+            json!({
+                "name": v.name,
+                "value": v.value,
+                "locale": v.locale,
+                "gender": v.gender,
+            })
+        })
+        .collect();
+    Json(ReturnData::ok(Value::Array(arr)))
+}
+
+/// GET/POST /reader3/tts：语音合成
+/// 参数：text（必填）、voice（默认 zh-CN-XiaoxiaoNeural）、rate（默认 +0%）、pitch（默认 +0Hz）、
+/// engine（edge=Edge 语音 / http=HttpTTS，默认 edge）、url（engine=http 时的 HttpTTS 地址）
+/// 成功：audio/mpeg 字节流；失败：ReturnData JSON
+async fn tts_synthesize(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Response {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret).into_response(),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let text = param_of(&params, body_json.as_ref(), "text");
+    if text.trim().is_empty() {
+        return Json(ReturnData::err("参数错误")).into_response();
+    }
+    let engine = param_of(&params, body_json.as_ref(), "engine");
+    let engine = if engine.is_empty() { "edge" } else { engine.as_str() };
+    let voice = param_of(&params, body_json.as_ref(), "voice");
+    let voice = if voice.is_empty() {
+        crate::service::tts::DEFAULT_VOICE.to_string()
+    } else {
+        voice
+    };
+    let rate = param_of(&params, body_json.as_ref(), "rate");
+    let rate = if rate.is_empty() { "+0%".to_string() } else { rate };
+    let pitch = param_of(&params, body_json.as_ref(), "pitch");
+    let pitch = if pitch.is_empty() { "+0Hz".to_string() } else { pitch };
+
+    let result = match engine {
+        "edge" => crate::service::tts::edge_synthesize(&text, &voice, &rate, &pitch).await,
+        "http" | "httptts" | "api" => {
+            let url = param_of(&params, body_json.as_ref(), "url");
+            if url.trim().is_empty() {
+                return Json(ReturnData::err("参数错误")).into_response();
+            }
+            crate::service::tts::http_tts_synthesize(&url, &text, Some(&voice), Some(&rate), Some(&pitch))
+                .await
+        }
+        _ => {
+            return Json(ReturnData::err("不支持的TTS引擎")).into_response();
+        }
+    };
+
+    match result {
+        Ok(audio) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "audio/mpeg")
+            .header("Cache-Control", "no-store")
+            .body(Body::from(audio))
+            .unwrap(),
+        Err(e) => {
+            tracing::warn!("tts 合成失败 [{engine}]: {e}");
+            Json(ReturnData::err("合成失败")).into_response()
+        }
+    }
+}
+
 /// F-39：POST /reader3/backupToWebdav：书架数据 zip 打包写入
 /// storage/data/{ns}/webdav/legado/backup-{ts}.zip（secure 模式需开启 webdav 权限）
 async fn backup_to_webdav(
@@ -1642,8 +1937,10 @@ async fn get_explore_urls(
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
     };
-    let urls = crate::service::explore::parse_explore_urls(source.explore_url.as_deref().unwrap_or(""));
-    Json(ReturnData::ok(serde_json::to_value(urls).unwrap_or(serde_json::Value::Null)))
+    // legado 语义：exploreUrl 可能是 @js: 代码（执行后返回 [{title,url}]）或普通 URL 集合
+    let raw = source.explore_url.as_deref().unwrap_or("");
+    let entries = crate::service::explore::parse_explore_entries(raw);
+    Json(ReturnData::ok(serde_json::to_value(entries).unwrap_or(serde_json::Value::Null)))
 }
 
 /// GET/POST /reader3/exploreBook：探索/书海（url=ruleFindUrl + bookSource + page）
@@ -3303,6 +3600,361 @@ mod tests {
             .map(|v| v["title"].as_str().unwrap())
             .collect();
         assert_eq!(titles, vec!["第一章 起点", "第二章 成长"], "禁用规则后回退默认");
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-25：getTTSVoices——预置语音列表（zh-CN 晓晓 + en-US Aria）
+    #[tokio::test]
+    async fn test_get_tts_voices_api() {
+        let (state, dir) = test_state("ttsvoices").await;
+        let ret = get_tts_voices(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(ret.0.is_success);
+        let arr = ret.0.data.as_array().unwrap();
+        assert!(!arr.is_empty());
+        assert!(arr.iter().any(|v| v["value"] == "zh-CN-XiaoxiaoNeural" && v["name"] == "晓晓"));
+        assert!(arr.iter().any(|v| v["value"] == "en-US-AriaNeural"));
+        for v in arr {
+            assert!(v["locale"].is_string() && v["gender"].is_string());
+        }
+        cleanup(state, dir).await;
+    }
+
+    /// F-25：tts 合成——参数校验（无 text / 未知引擎 / http 缺 url），不发起网络请求
+    #[tokio::test]
+    async fn test_tts_synthesize_param_validation() {
+        let (state, dir) = test_state("ttsval").await;
+
+        // 缺 text → 参数错误
+        let ret = tts_synthesize(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        let body = axum::body::to_bytes(ret.into_body(), 1024 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap());
+        assert_eq!(json["errorMsg"], "参数错误");
+
+        // 未知引擎 → 不支持的TTS引擎
+        let params: HashMap<String, String> = [
+            ("text".into(), "你好".into()),
+            ("engine".into(), "nope".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = tts_synthesize(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let body = axum::body::to_bytes(ret.into_body(), 1024 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errorMsg"], "不支持的TTS引擎");
+
+        // http 引擎缺 url → 参数错误（不发起网络请求）
+        let params: HashMap<String, String> = [
+            ("text".into(), "你好".into()),
+            ("engine".into(), "http".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = tts_synthesize(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let body = axum::body::to_bytes(ret.into_body(), 1024 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap());
+        assert_eq!(json["errorMsg"], "参数错误");
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-32：getUsers——secureKey 校验（未登录/缺 key/错 key）+ 用户列表含启用状态
+    #[tokio::test]
+    async fn test_get_users_api() {
+        let (state, dir) = test_state("getusers").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.secure_key = "sk".into();
+        state
+            .storage
+            .insert_user(&User {
+                username: "admin".into(),
+                token: "t1".into(),
+                enable_webdav: true,
+                enable_book_source: false,
+                book_source_limit: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t2".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // 未登录 → 请登录后使用
+        let ret = get_users(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.data, json!("NEED_LOGIN"));
+
+        // 已登录但缺 secureKey → NEED_SECURE_KEY
+        let params: HashMap<String, String> = [("accessToken".into(), "admin:t1".into())]
+            .into_iter()
+            .collect();
+        let ret = get_users(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.data, json!("NEED_SECURE_KEY"));
+
+        // 错 secureKey → NEED_SECURE_KEY
+        let params: HashMap<String, String> = [
+            ("accessToken".into(), "admin:t1".into()),
+            ("secureKey".into(), "wrong".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = get_users(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data, json!("NEED_SECURE_KEY"));
+
+        // 正确 secureKey → 列表（含启用状态；不含密码字段）
+        let params: HashMap<String, String> = [
+            ("accessToken".into(), "admin:t1".into()),
+            ("secureKey".into(), "sk".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = get_users(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "getUsers 应成功: {}", ret.0.error_msg);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let admin = arr.iter().find(|v| v["username"] == "admin").unwrap();
+        assert_eq!(admin["enableWebdav"], true);
+        assert_eq!(admin["enableBookSource"], false);
+        assert_eq!(admin["bookSourceLimit"], 5);
+        assert!(admin.get("password").is_none(), "列表不应泄露密码");
+        assert!(admin.get("salt").is_none());
+        assert!(admin.get("token").is_none());
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-32：updateUser——权限/限额更新（body 布尔 + query int），不存在用户报错
+    #[tokio::test]
+    async fn test_update_user_api() {
+        let (state, dir) = test_state("upduser").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.secure_key = "sk".into();
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t1".into(),
+                enable_webdav: false,
+                enable_local_store: false,
+                enable_book_source: true,
+                enable_rss_source: true,
+                book_source_limit: 10,
+                book_limit: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let auth = |extra: Vec<(&str, &str)>| -> HashMap<String, String> {
+            let mut m: HashMap<String, String> = [
+                ("accessToken".into(), "alice:t1".into()),
+                ("secureKey".into(), "sk".into()),
+            ]
+            .into_iter()
+            .collect();
+            for (k, v) in extra {
+                m.insert(k.into(), v.into());
+            }
+            m
+        };
+
+        // body：部分字段更新（camelCase）
+        let body = Bytes::from(
+            r#"{"username":"alice","enableWebdav":true,"enableBookSource":false,"bookLimit":99}"#,
+        );
+        let ret = update_user(AxumState(state.clone()), Query(auth(vec![])), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "updateUser 应成功: {}", ret.0.error_msg);
+        let alice = state.storage.find_user("alice").await.unwrap().unwrap();
+        assert!(alice.enable_webdav);
+        assert!(!alice.enable_book_source);
+        assert_eq!(alice.book_limit, 99);
+        assert_eq!(alice.book_source_limit, 10, "未提供的字段保持原值");
+        assert!(alice.enable_rss_source, "未提供的字段保持原值");
+
+        // query 参数：int + bool
+        let ret = update_user(
+            AxumState(state.clone()),
+            Query(auth(vec![
+                ("username", "alice"),
+                ("enableRssSource", "false"),
+                ("bookSourceLimit", "7"),
+            ])),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(ret.0.is_success);
+        let alice = state.storage.find_user("alice").await.unwrap().unwrap();
+        assert!(!alice.enable_rss_source);
+        assert_eq!(alice.book_source_limit, 7);
+
+        // 不存在的用户 → 用户不存在
+        let body = Bytes::from(r#"{"username":"ghost","enableWebdav":true}"#);
+        let ret = update_user(AxumState(state.clone()), Query(auth(vec![])), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "用户不存在");
+
+        // 缺 username → 参数错误；缺 secureKey → NEED_SECURE_KEY
+        let body = Bytes::from(r#"{"enableWebdav":true}"#);
+        let ret = update_user(AxumState(state.clone()), Query(auth(vec![])), HeaderMap::new(), Some(body.clone())).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let no_key: HashMap<String, String> = [("accessToken".into(), "alice:t1".into())]
+            .into_iter()
+            .collect();
+        let ret = update_user(AxumState(state.clone()), Query(no_key), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.data, json!("NEED_SECURE_KEY"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-32：deleteUser——不能删自己；删他人成功；secureKey 校验
+    #[tokio::test]
+    async fn test_delete_user_api() {
+        let (state, dir) = test_state("deluser").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.secure_key = "sk".into();
+        state
+            .storage
+            .insert_user(&User {
+                username: "admin".into(),
+                token: "t1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .storage
+            .insert_user(&User {
+                username: "bob".into(),
+                token: "t2".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [
+            ("accessToken".into(), "admin:t1".into()),
+            ("secureKey".into(), "sk".into()),
+        ]
+        .into_iter()
+        .collect();
+
+        // 删自己 → 拒绝
+        let body = Bytes::from(r#"{"username":"admin"}"#);
+        let ret = delete_user(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "不能删除自己");
+        assert!(state.storage.find_user("admin").await.unwrap().is_some());
+
+        // 删他人 → 成功
+        let body = Bytes::from(r#"{"username":"bob"}"#);
+        let ret = delete_user(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "deleteUser 应成功: {}", ret.0.error_msg);
+        assert!(state.storage.find_user("bob").await.unwrap().is_none());
+
+        // 不存在 → 用户不存在；缺 secureKey → NEED_SECURE_KEY
+        let body = Bytes::from(r#"{"username":"ghost"}"#);
+        let ret = delete_user(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), Some(body.clone())).await;
+        assert_eq!(ret.0.error_msg, "用户不存在");
+        let no_key: HashMap<String, String> = [("accessToken".into(), "admin:t1".into())]
+            .into_iter()
+            .collect();
+        let ret = delete_user(AxumState(state.clone()), Query(no_key), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.data, json!("NEED_SECURE_KEY"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-32：resetUserPassword——新密码生效（genEncryptedPassword 可校验）+ token 失效；secureKey 校验
+    #[tokio::test]
+    async fn test_reset_user_password_api() {
+        let (state, dir) = test_state("resetpw").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.secure_key = "sk".into();
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                password: "old".into(),
+                salt: "oldsalt".into(),
+                token: "t1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [
+            ("accessToken".into(), "alice:t1".into()),
+            ("secureKey".into(), "sk".into()),
+        ]
+        .into_iter()
+        .collect();
+
+        // body：username + newPassword
+        let body = Bytes::from(r#"{"username":"alice","newPassword":"新密码abc"}"#);
+        let ret = reset_user_password(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "resetUserPassword 应成功: {}", ret.0.error_msg);
+        let alice = state.storage.find_user("alice").await.unwrap().unwrap();
+        assert_ne!(alice.password, "old");
+        assert_ne!(alice.salt, "oldsalt", "salt 应重新生成");
+        assert!(alice.token.is_empty(), "旧 token 应失效");
+        assert_eq!(
+            crate::util::md5::gen_encrypted_password("新密码abc", &alice.salt),
+            alice.password,
+            "新密码应可通过登录校验"
+        );
+
+        // 重置后旧 token 已失效——重新登录（新 token）以便继续测试管理接口
+        state
+            .storage
+            .update_user_session("alice", "t2", now_millis())
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [
+            ("accessToken".into(), "alice:t2".into()),
+            ("secureKey".into(), "sk".into()),
+        ]
+        .into_iter()
+        .collect();
+
+        // query：password 参数；不存在 → 用户不存在；缺 secureKey → NEED_SECURE_KEY
+        let mut q = params.clone();
+        q.insert("username".into(), "ghost".into());
+        q.insert("password".into(), "whatever1".into());
+        let ret = reset_user_password(AxumState(state.clone()), Query(q), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "用户不存在");
+        let no_key: HashMap<String, String> = [("accessToken".into(), "alice:t2".into())]
+            .into_iter()
+            .collect();
+        let ret = reset_user_password(AxumState(state.clone()), Query(no_key), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data, json!("NEED_SECURE_KEY"));
+        // 缺密码 → 参数错误
+        let body = Bytes::from(r#"{"username":"alice"}"#);
+        let ret = reset_user_password(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
 
         cleanup(state, dir).await;
     }

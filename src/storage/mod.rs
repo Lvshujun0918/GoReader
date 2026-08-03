@@ -1324,6 +1324,77 @@ impl Storage {
         Ok(deleted)
     }
 
+    // ---------------- F-32 用户管理 ----------------
+
+    /// 全部用户列表（含权限/启用状态；按创建时间排序）
+    pub async fn list_users(&self) -> Result<Vec<User>> {
+        let users = sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at, username")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(users)
+    }
+
+    /// 更新用户权限/限额（None 字段不更新；用户不存在返回 0 行）
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_user_permissions(
+        &self,
+        username: &str,
+        enable_webdav: Option<bool>,
+        enable_local_store: Option<bool>,
+        enable_book_source: Option<bool>,
+        enable_rss_source: Option<bool>,
+        book_source_limit: Option<i64>,
+        book_limit: Option<i64>,
+    ) -> Result<u64> {
+        let r = sqlx::query(
+            r#"
+            UPDATE users SET
+                enable_webdav     = COALESCE(?1, enable_webdav),
+                enable_local_store = COALESCE(?2, enable_local_store),
+                enable_book_source = COALESCE(?3, enable_book_source),
+                enable_rss_source  = COALESCE(?4, enable_rss_source),
+                book_source_limit  = COALESCE(?5, book_source_limit),
+                book_limit         = COALESCE(?6, book_limit)
+            WHERE username = ?7
+            "#,
+        )
+        .bind(enable_webdav)
+        .bind(enable_local_store)
+        .bind(enable_book_source)
+        .bind(enable_rss_source)
+        .bind(book_source_limit)
+        .bind(book_limit)
+        .bind(username)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 删除用户（仅 users 行；用户数据保留——与 clearInactiveUsers 一致）
+    pub async fn delete_user(&self, username: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM users WHERE username = ?1")
+            .bind(username)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 重置用户密码（新 salt + 加密密码；清空 token 使旧会话立即失效）
+    pub async fn reset_user_password(
+        &self,
+        username: &str,
+        salt: &str,
+        encrypted_password: &str,
+    ) -> Result<u64> {
+        let r = sqlx::query("UPDATE users SET password = ?1, salt = ?2, token = '' WHERE username = ?3")
+            .bind(encrypted_password)
+            .bind(salt)
+            .bind(username)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     // ---------------- F-35 定时书架更新 ----------------
 
     /// F-35 可更新书架书（can_update=1，全命名空间）
@@ -2399,6 +2470,91 @@ mod tests {
         assert!(deleted.is_empty());
         assert!(storage.find_user("new").await.unwrap().is_some());
         cleanup(storage, "inactive").await;
+    }
+
+    /// F-32：用户管理——列表/权限更新/删除/重置密码
+    #[tokio::test]
+    async fn test_user_management() {
+        let storage = test_storage("usermgmt").await;
+        storage
+            .insert_user(&User {
+                username: "alice".into(),
+                password: "p1".into(),
+                salt: "s1".into(),
+                token: "tok".into(),
+                enable_webdav: false,
+                enable_book_source: true,
+                book_source_limit: 10,
+                book_limit: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .insert_user(&User {
+                username: "bob".into(),
+                password: "p2".into(),
+                salt: "s2".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // 列表：含全部用户与启用状态
+        let users = storage.list_users().await.unwrap();
+        assert_eq!(users.len(), 2);
+        let alice = users.iter().find(|u| u.username == "alice").unwrap();
+        assert!(!alice.enable_webdav && alice.enable_book_source);
+        assert_eq!(alice.book_source_limit, 10);
+
+        // 部分字段更新（None 不覆盖）
+        let n = storage
+            .update_user_permissions(
+                "alice",
+                Some(true),
+                None,
+                Some(false),
+                None,
+                Some(99),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let alice = storage.find_user("alice").await.unwrap().unwrap();
+        assert!(alice.enable_webdav, "enable_webdav 应更新为 true");
+        assert!(!alice.enable_book_source, "enable_book_source 应更新为 false");
+        assert_eq!(alice.book_source_limit, 99);
+        assert_eq!(alice.book_limit, 20, "未提供的字段应保持原值");
+        assert_eq!(alice.enable_local_store, false);
+        // 不存在的用户 → 0 行
+        assert_eq!(
+            storage
+                .update_user_permissions("ghost", Some(true), None, None, None, None, None)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // 删除
+        assert_eq!(storage.delete_user("bob").await.unwrap(), 1);
+        assert!(storage.find_user("bob").await.unwrap().is_none());
+        assert_eq!(storage.delete_user("ghost").await.unwrap(), 0);
+
+        // 重置密码：新密码可校验、token 清空
+        let salt = "newsalt";
+        let encrypted = crate::util::md5::gen_encrypted_password("新密码123", salt);
+        assert_eq!(storage.reset_user_password("alice", salt, &encrypted).await.unwrap(), 1);
+        let alice = storage.find_user("alice").await.unwrap().unwrap();
+        assert_eq!(alice.password, encrypted);
+        assert_eq!(alice.salt, salt);
+        assert!(alice.token.is_empty(), "重置密码后旧 token 应失效");
+        assert_eq!(
+            storage.reset_user_password("ghost", salt, &encrypted).await.unwrap(),
+            0
+        );
+
+        cleanup(storage, "usermgmt").await;
     }
 
     /// F-35：可更新书扫描（仅 can_update=1）+ 更新信息回写（含 None 标题不覆盖 latest_chapter_time）

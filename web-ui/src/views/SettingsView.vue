@@ -4,11 +4,12 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import { deleteHttpTts, getHttpTtsList, saveHttpTts } from '@/api/httpTts'
+import { clearCache, getCacheInfo } from '@/api/cache'
 import { backupToWebdav } from '@/api/backup'
 import { getSystemInfo } from '@/api/system'
 import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
 import { useUserStore } from '@/stores/user'
-import type { HttpTts, SystemInfo, TxtTocRule } from '@/types'
+import type { CacheInfo, HttpTts, SystemInfo, TxtTocRule } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
@@ -272,7 +273,51 @@ onMounted(() => {
   loadTtsList()
   loadSysInfo()
   loadTxtTocRules()
+  loadCacheInfo()
 })
+
+/* ================= 缓存管理（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache——后端待实现） ================= */
+
+const cacheInfo = ref<CacheInfo | null>(null)
+/** 后端契约是否可用（getCacheInfo 静默探测；未实现时置 false，界面显示「后端待实现」） */
+const cacheReady = ref(false)
+const cacheBusy = ref(false)
+
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+async function loadCacheInfo() {
+  try {
+    const res = await getCacheInfo()
+    cacheInfo.value = res.data ?? null
+    cacheReady.value = true
+  } catch {
+    // 接口未实现（404）/网络失败：静默降级显示「后端待实现」
+    cacheInfo.value = null
+    cacheReady.value = false
+  }
+}
+
+async function runClearCache() {
+  if (!cacheReady.value) {
+    ElMessage.info('清理缓存接口后端待实现（POST /reader3/clearCache）')
+    return
+  }
+  if (cacheBusy.value) return
+  cacheBusy.value = true
+  try {
+    await clearCache()
+    ElMessage.success('已清理缓存')
+    await loadCacheInfo()
+  } catch {
+    // 已提示
+  } finally {
+    cacheBusy.value = false
+  }
+}
 
 /* ================= OPDS 访问 ================= */
 /** OPDS 地址 = 当前 host + /opds */
@@ -434,6 +479,31 @@ async function runBackup() {
           </button>
         </div>
         <p v-if="backupPath" class="card-note mono backup-path">已备份至：{{ backupPath }}</p>
+      </section>
+
+      <!-- 缓存（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache——后端待实现） -->
+      <section class="card">
+        <h2 class="card-title">缓存</h2>
+        <div class="row">
+          <span class="row-label">章节缓存</span>
+          <span v-if="cacheReady" class="row-value">
+            {{ cacheInfo?.chapterCacheCount ?? 0 }} 章 · {{ fmtSize(cacheInfo?.chapterCacheSize ?? 0) }}
+          </span>
+          <span v-else class="row-value">后端待实现</span>
+          <button
+            class="row-action"
+            type="button"
+            :disabled="cacheBusy"
+            :title="cacheReady ? '清理章节缓存' : '清理接口后端待实现'"
+            @click="runClearCache"
+          >
+            {{ cacheBusy ? '清理中…' : '清理缓存' }}
+          </button>
+        </div>
+        <p v-if="!cacheReady" class="card-note">
+          缓存统计接口 GET /reader3/getCacheInfo 与清理接口 POST /reader3/clearCache 后端待实现。
+        </p>
+        <p v-else class="card-note">章节正文缓存占用磁盘空间，清理后再次打开章节会重新拉取。</p>
       </section>
 
       <!-- txtTocRule（自定义 TXT 目录规则） -->

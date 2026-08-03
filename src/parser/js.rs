@@ -171,6 +171,9 @@ fn build_bridge_objects(bridge: &JsBridge, context: &mut Context) -> (JsObject, 
     java.function(bind(bridge, java_put), JsString::from("put"), 2)
         .function(bind(bridge, java_get), JsString::from("get"), 1)
         .function(bind(bridge, java_log), JsString::from("log"), 1)
+        .function(bind(bridge, java_toast), JsString::from("toast"), 1)
+        .function(bind(bridge, java_toast), JsString::from("longToast"), 1)
+        .function(bind(bridge, java_toast), JsString::from("shortToast"), 1)
         .function(unsafe { NativeFunction::from_closure(java_aes_decrypt) }, JsString::from("aesBase64DecodeToString"), 4)
         .property(JsString::from("headerMap"), header_map, Attribute::all());
     let java = java.build();
@@ -232,6 +235,13 @@ fn java_get(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> J
 }
 
 /// java.log(msg)：tracing 日志（调试书源规则）
+/// java.toast/longToast/shortToast：无 UI 环境提示（记日志）
+fn java_toast(_inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let msg = args.get(0).map(|v| js_value_to_string(v, context)).unwrap_or_default();
+    tracing::debug!("java.toast: {}", msg);
+    Ok(JsValue::undefined())
+}
+
 fn java_log(_inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let msg = js_value_to_string(args.get_or_undefined(0), context);
     tracing::info!(target: "reader.js", "[java.log] {}", msg);

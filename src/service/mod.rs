@@ -7,3 +7,4 @@ pub mod explore;
 pub mod local_book;
 pub mod rss;
 pub mod search;
+pub mod tts;
