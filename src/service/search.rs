@@ -346,12 +346,12 @@ fn analyze_book_list_impl(
         RuleKind::Css => css_items(book_list_rule, body),
         RuleKind::JsonPath => apply(book_list_rule, body),
         RuleKind::Regex => apply(book_list_rule, body),
-        RuleKind::Js => js_book_list(book_list_rule, body),
+        RuleKind::Js => js_book_list(book_list_rule, body, base_url),
         _ => vec![],
     };
     // JS 规则（<js> 或 @js: 开头——eval 返回 JSON 书单数组）
     if items.is_empty() && (book_list_rule.contains("<js>") || book_list_rule.trim_start().starts_with("@js:")) {
-        items = js_book_list(book_list_rule, body);
+        items = js_book_list(book_list_rule, body, base_url);
     }
 
     items
@@ -399,7 +399,7 @@ fn analyze_book_list_impl(
 
 /// CSS 书单：链式 CSS（legado）→ 元素 html 列表
 /// JS 书单规则（legado `<js>代码</js>` 或 `@js:代码`——eval 返回 JSON 数组，每项为书对象）
-fn js_book_list(rule: &str, body: &str) -> Vec<String> {
+fn js_book_list(rule: &str, body: &str, base_url: &str) -> Vec<String> {
     // 提取 JS 代码
     let code = if rule.trim_start().starts_with("@js:") {
         rule.trim_start()[4..].to_string()
@@ -415,6 +415,7 @@ fn js_book_list(rule: &str, body: &str) -> Vec<String> {
     vars.insert("result".to_string(), body.to_string());
     vars.insert("key".to_string(), String::new());
     vars.insert("page".to_string(), "1".to_string());
+    vars.insert("baseUrl".to_string(), base_url.to_string());
     let Ok(result) = crate::parser::js::eval_js(&code, &vars) else {
         return vec![];
     };
