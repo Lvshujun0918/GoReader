@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import {
   deleteBook,
+  deleteBookGroup,
   getBookGroups,
   getBookshelf,
   saveBookGroup,
@@ -60,6 +61,34 @@ const groupOpen = ref(false)
 const groupDialogRef = ref<HTMLElement | null>(null)
 const newGroupName = ref('')
 const groupSaving = ref(false)
+
+/* ================= 分组管理：重命名 / 删除 ================= */
+const renamingId = ref<number | null>(null)
+const renameName = ref('')
+const renameBusy = ref(false)
+
+/** 判断是否接口未实现（404 / 后端未就绪） */
+function isNotImplemented(err: unknown): boolean {
+  const e = err as { response?: { status?: number }; message?: string } | null | undefined
+  const status = e?.response?.status
+  if (status === 404 || status === 501) return true
+  const msg = e?.message ?? ''
+  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
+}
+
+/** 分组内书数：优先用后端契约 bookCount，未返回时本地统计兜底 */
+function groupCount(id: number): number {
+  const g = groups.value.find((x) => x.id === id)
+  if (g && typeof g.bookCount === 'number' && g.bookCount >= 0) return g.bookCount
+  return books.value.filter((b) => b.group === id).length
+}
+
+/** 本地书分组变动后失效 API bookCount，回落本地统计（避免过期计数） */
+function invalidateGroupCounts() {
+  groups.value.forEach((g) => {
+    g.bookCount = undefined
+  })
+}
 
 /* ================= 书卡菜单（右键 / 长按 / hover ⋯） ================= */
 const menuBook = ref<Book | null>(null)
@@ -368,6 +397,7 @@ async function performMove(gid: number) {
       // 单本失败继续
     }
   }
+  invalidateGroupCounts()
   selected.value = new Set()
   manageBusy.value = false
   moveOpen.value = false
@@ -496,17 +526,11 @@ function logout() {
   void router.replace('/login')
 }
 
-function openBook(book: Book) {
-  void router.push(`/book/${encodeURIComponent(book.bookUrl)}`)
-}
+
 
 /* ================= 分组管理 ================= */
 function groupName(id: number): string {
   return groups.value.find((g) => g.id === id)?.name ?? (id === 0 ? '未分组' : `分组 ${id}`)
-}
-
-function groupCount(id: number): number {
-  return books.value.filter((b) => b.group === id).length
 }
 
 function openGroups() {
@@ -527,7 +551,7 @@ async function createGroup() {
   if (!name) return
   groupSaving.value = true
   try {
-    const res = await saveBookGroup(name)
+    const res = await saveBookGroup({ name })
     groups.value.push(res.data)
     newGroupName.value = ''
     ElMessage.success('已新建分组')
@@ -538,11 +562,72 @@ async function createGroup() {
   }
 }
 
-/** 删除分组：后端暂无删除 API（TODO）。有书先提示移动，无书提示待实现 */
-function deleteGroupHint(g: BookGroup) {
+/** 重命名分组：saveBookGroup 带 id 覆盖（id>0） */
+function startRename(g: BookGroup) {
+  renamingId.value = g.id
+  renameName.value = g.name
+  renameBusy.value = false
+}
+
+function cancelRename() {
+  if (renameBusy.value) return
+  renamingId.value = null
+}
+
+async function saveRename() {
+  if (renamingId.value === null || renameBusy.value) return
+  const name = renameName.value.trim()
+  if (!name) return
+  const g = groups.value.find((x) => x.id === renamingId.value)
+  if (!g) return
+  renameBusy.value = true
+  try {
+    const res = await saveBookGroup({ id: g.id, name })
+    if (res.isSuccess && res.data) Object.assign(g, res.data)
+    renamingId.value = null
+    ElMessage.success('已重命名')
+  } catch {
+    // 错误提示已由拦截器统一处理
+  } finally {
+    renameBusy.value = false
+  }
+}
+
+/**
+ * 删除分组：POST /reader3/deleteBookGroup（后端并行实现中）——
+ * 成功后端将组内书置未分组，本地同步；接口未实现（404）时友好提示。
+ */
+async function deleteGroup(g: BookGroup) {
   const n = groupCount(g.id)
-  if (n > 0) ElMessage.warning(`分组「${g.name}」内有 ${n} 本书，请先移动或移出后再删除`)
-  else ElMessage.info('删除分组接口后端暂未提供（TODO）')
+  try {
+    await ElMessageBox.confirm(
+      `确定删除分组「${g.name}」吗？组内 ${n} 本书将移至未分组。`,
+      '删除分组',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  if (groupSaving.value) return
+  groupSaving.value = true
+  try {
+    await deleteBookGroup(g.id, { silent: true })
+    groups.value = groups.value.filter((x) => x.id !== g.id)
+    books.value.forEach((b) => {
+      if (b.group === g.id) b.group = 0
+    })
+    invalidateGroupCounts()
+    if (activeGroup.value === g.id) activeGroup.value = null
+    ElMessage.success(`已删除分组「${g.name}」`)
+  } catch (err) {
+    if (isNotImplemented(err)) {
+      ElMessage.info('删除分组接口后端暂未提供（POST /reader3/deleteBookGroup）')
+    } else {
+      ElMessage.error(err instanceof Error ? err.message : '删除失败')
+    }
+  } finally {
+    groupSaving.value = false
+  }
 }
 
 /* ================= 书卡菜单 ================= */
@@ -598,7 +683,13 @@ function onCardClick(book: Book) {
     longPressFired = false
     return // 长按已触发菜单，忽略本次点击
   }
-  openBook(book)
+  // 点击封面/书名直接进入阅读
+  void router.push(`/reader/${encodeURIComponent(book.bookUrl)}`)
+}
+
+/** 详情（封面左上角按钮） */
+function openDetail(book: Book) {
+  void router.push(`/book/${encodeURIComponent(book.bookUrl)}`)
 }
 
 function closeMenu() {
@@ -623,6 +714,7 @@ async function moveToGroup(groupId: number) {
   try {
     await updateBookGroupId(book.bookUrl, groupId)
     book.group = groupId
+    invalidateGroupCounts()
     ElMessage.success(groupId === 0 ? '已移出分组' : `已移动到「${groupName(groupId)}」`)
     closeMenu()
   } catch {
@@ -877,6 +969,20 @@ onMounted(() => {
               </svg>
             </button>
             <div class="cover-wrap">
+              <button
+                v-if="!manageMode"
+                class="detail-btn"
+                type="button"
+                title="查看详情"
+                :tabindex="-1"
+                @click.stop="openDetail(book)"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 11v5" />
+                  <path d="M12 8h.01" />
+                </svg>
+              </button>
               <img
                 v-if="hasCover(book)"
                 v-lazy="coverSrc(book) as string"
@@ -1102,24 +1208,59 @@ onMounted(() => {
               </button>
             </div>
 
-            <!-- 分组列表：名称 + 本书数 + 删除 -->
+            <!-- 分组列表：名称 + 本书数 + 重命名 / 删除 -->
             <ul v-if="groups.length" class="group-list">
               <li v-for="g in groups" :key="g.id" class="group-row">
-                <span class="group-row-name" :title="g.name">{{ g.name }}</span>
-                <span class="group-row-count">{{ groupCount(g.id) }} 本</span>
-                <button class="group-del" type="button" title="删除分组" @click="deleteGroupHint(g)">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M4 7h16" />
-                    <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-                    <path d="M6.5 7l.8 12a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12" />
-                  </svg>
-                </button>
+                <!-- 重命名：行内输入 -->
+                <template v-if="renamingId === g.id">
+                  <input
+                    v-model="renameName"
+                    class="group-input group-rename-input"
+                    type="text"
+                    maxlength="20"
+                    spellcheck="false"
+                    @keydown.enter="saveRename"
+                    @keydown.esc="cancelRename"
+                  />
+                  <button
+                    class="group-del"
+                    type="button"
+                    title="保存重命名"
+                    :disabled="renameBusy || !renameName.trim()"
+                    @click="saveRename"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4.5 12.5l5 5L19.5 7" />
+                    </svg>
+                  </button>
+                  <button class="group-del" type="button" title="取消" :disabled="renameBusy" @click="cancelRename">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                      <path d="M6 6l12 12M18 6L6 18" />
+                    </svg>
+                  </button>
+                </template>
+                <template v-else>
+                  <span class="group-row-name" :title="g.name">{{ g.name }}</span>
+                  <span class="group-row-count">{{ groupCount(g.id) }} 本</span>
+                  <button class="group-del" type="button" title="重命名" @click="startRename(g)">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+                    </svg>
+                  </button>
+                  <button class="group-del" type="button" title="删除分组" @click="deleteGroup(g)">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4 7h16" />
+                      <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                      <path d="M6.5 7l.8 12a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12" />
+                    </svg>
+                  </button>
+                </template>
               </li>
             </ul>
             <p v-else class="group-empty">还没有分组，输入名称新建一个吧</p>
 
             <div class="dlg-foot">
-              <span class="overall">删除分组接口后端暂未提供（TODO）</span>
+              <span class="overall">重命名：改名称保存 · 删除：组内书移至未分组</span>
               <div class="dlg-actions">
                 <button class="ghost-btn" type="button" :disabled="groupSaving" @click="closeGroups">关闭</button>
               </div>
@@ -1510,6 +1651,36 @@ onMounted(() => {
   transform: translateY(-4px);
 }
 
+.detail-btn {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 3;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.85);
+  border: none;
+  border-radius: 999px;
+  color: var(--text-2, #666);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s ease, color 0.2s ease;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+}
+.detail-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.book-card:hover .detail-btn {
+  opacity: 1;
+}
+.detail-btn:hover {
+  color: var(--accent, #4f46e5);
+}
 .cover-wrap {
   position: relative;
   aspect-ratio: 3 / 4;
@@ -2131,6 +2302,14 @@ onMounted(() => {
 .group-input:focus {
   border-color: var(--accent);
 }
+/* 重命名行内输入（紧凑） */
+.group-rename-input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12.5px;
+}
 .group-list {
   list-style: none;
   margin: 0;
@@ -2185,6 +2364,16 @@ onMounted(() => {
 .group-del:hover {
   color: #cf4444;
   background: rgba(207, 68, 68, 0.08);
+}
+.group-del:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+/* 重命名保存/取消按钮：hover 用强调色而非危险色 */
+.group-row .group-del[title='保存重命名']:hover,
+.group-row .group-del[title='取消']:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 .group-del svg {
   width: 12px;
