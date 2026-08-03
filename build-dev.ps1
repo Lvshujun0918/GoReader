@@ -4,6 +4,8 @@ param([string]$Args)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 工具链 PATH（cargo + MSYS2 gcc）
+$env:PATH = "C:\Users\chong\.cargo\bin;C:\msys64\ucrt64\bin;" + $env:PATH
 
 # 1. 编译
 Push-Location $root
@@ -35,11 +37,10 @@ foreach ($target in $targets) {
     if (Test-Path $target) {
         try {
             $sig = Set-AuthenticodeSignature -FilePath $target -Certificate $cert -ErrorAction Stop
-            Write-Host "✅ 已签名: $target (状态: $($sig.Status))"
+            Write-Host "OK signed: $target ($($sig.Status))"
         } catch {
-            # 文件可能被占用（如服务运行中）——尝试后报错但不中断
             Write-Warning "签名失败（可能被占用）: $target — $_"
         }
     }
 }
-Write-Host "✔ 构建+签名完成"
+Write-Host "build+sign done"
