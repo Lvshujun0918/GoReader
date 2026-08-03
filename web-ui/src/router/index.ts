@@ -35,6 +35,12 @@ const router = createRouter({
       meta: { title: '搜索' },
     },
     {
+      path: '/explore',
+      name: 'explore',
+      component: () => import('@/views/ExploreView.vue'),
+      meta: { title: '探索' },
+    },
+    {
       path: '/sources',
       name: 'sources',
       component: () => import('@/views/SourceManageView.vue'),

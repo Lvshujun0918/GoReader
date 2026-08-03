@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { searchBookMulti } from '@/api/search'
-import type { SearchBook } from '@/types'
+import { searchBookMulti, searchBookMultiSSE } from '@/api/search'
+import { useUserStore } from '@/stores/user'
+import type { ReturnData, SearchBook } from '@/types'
 
 const router = useRouter()
 const route = useRoute()
@@ -12,26 +13,167 @@ const key = ref('')
 const searching = ref(false)
 const searched = ref(false)
 const errorMsg = ref('')
-const results = ref<SearchBook[]>([])
+const stopped = ref(false)
+/** 当前搜索是否走 SSE（决定实时源计数是否显示） */
+const usingSSE = ref(false)
+
+/** 合并后的结果（bookUrl 去重，同书多源合并来源标签） */
+interface MergedResult {
+  book: SearchBook
+  /** 来源标签（按 origin 去重，显示 originName || origin） */
+  origins: { key: string; label: string }[]
+}
+
+const results = ref<MergedResult[]>([])
+/** 已返回结果的书源数（SSE 每源一个 book 事件，lastIndex 去重计数） */
+const searchedSources = ref(0)
+
+const bookMap = new Map<string, MergedResult>()
+const completedSources = new Set<number>()
+let sseAbort: (() => void) | null = null
+/** 搜索代数：取消/停止后使在途 SSE/批量响应失效 */
+let searchSeq = 0
+
+function labelOf(b: SearchBook): string {
+  return b.originName || b.origin
+}
+
+/** bookUrl 去重合并：新书入表；同书追加来源标签并补全缺失展示字段 */
+function mergeBooks(books: SearchBook[]) {
+  for (const b of books) {
+    let entry = bookMap.get(b.bookUrl)
+    if (!entry) {
+      entry = { book: b, origins: [] }
+      bookMap.set(b.bookUrl, entry)
+    }
+    const okey = b.origin || labelOf(b)
+    if (!entry.origins.some((o) => o.key === okey)) {
+      entry.origins.push({ key: okey, label: labelOf(b) })
+    }
+    const cur = entry.book
+    if (!cur.intro && b.intro) cur.intro = b.intro
+    if (!cur.latestChapterTitle && b.latestChapterTitle) cur.latestChapterTitle = b.latestChapterTitle
+    if (!cur.wordCount && b.wordCount) cur.wordCount = b.wordCount
+    if (!cur.author && b.author) cur.author = b.author
+  }
+  results.value = Array.from(bookMap.values())
+}
+
+/** 服务端业务错误（event: error）：NEED_LOGIN 跳登录，其余展示错误 */
+function handleErrorEvent(ret: ReturnData) {
+  if (ret.data === 'NEED_LOGIN' || (ret.errorMsg || '').includes('请登录')) {
+    const store = useUserStore()
+    store.clear()
+    void router.replace({ path: '/login', query: { redirect: router.currentRoute.value.fullPath } })
+    return
+  }
+  errorMsg.value = ret.errorMsg || '搜索失败，请稍后重试'
+  searching.value = false
+  searched.value = true
+}
 
 async function doSearch(kw?: string) {
   const word = (kw ?? key.value).trim()
   if (!word || searching.value) return
   key.value = word
+  const seq = ++searchSeq
+  sseAbort = null
   searching.value = true
   searched.value = false
   errorMsg.value = ''
+  stopped.value = false
+  usingSSE.value = true
   results.value = []
+  bookMap.clear()
+  completedSources.clear()
+  searchedSources.value = 0
+
+  // 1) 优先 SSE 流式搜索（增量显示）
+  try {
+    const handle = await searchBookMultiSSE(
+      {
+        key: word,
+        bookSourceGroup: '',
+        lastIndex: -1,
+        searchSize: 50,
+        concurrentCount: 12,
+      },
+      {
+        onBooks: (lastIndex, books) => {
+          if (seq !== searchSeq) return
+          if (lastIndex >= 0) completedSources.add(lastIndex)
+          searchedSources.value = completedSources.size
+          mergeBooks(books)
+        },
+        onEnd: () => {
+          if (seq !== searchSeq) return
+          searching.value = false
+          searched.value = true
+          pushHistory(word)
+        },
+        onErrorEvent: (ret) => {
+          if (seq !== searchSeq) return
+          handleErrorEvent(ret)
+        },
+        onStreamError: (msg) => {
+          if (seq !== searchSeq) return
+          errorMsg.value = msg
+          searching.value = false
+          searched.value = true
+        },
+      },
+    )
+    if (seq !== searchSeq) {
+      // 等待连接期间已被停止
+      handle.abort()
+      return
+    }
+    sseAbort = handle.abort
+  } catch {
+    // 2) SSE 传输失败/不支持 → 降级批量模式
+    if (seq !== searchSeq) return
+    usingSSE.value = false
+    await runBatch(word, seq)
+  }
+}
+
+/** 批量降级：现有 searchBookMulti（maxSources=50），一次性出结果 */
+async function runBatch(word: string, seq: number) {
   try {
     const res = await searchBookMulti(word, 50)
-    results.value = res.data ?? []
+    if (seq !== searchSeq) return
+    if (!res.isSuccess) {
+      if ((res.data as unknown) === 'NEED_LOGIN' || (res.errorMsg || '').includes('请登录')) {
+        const store = useUserStore()
+        store.clear()
+        void router.replace({ path: '/login', query: { redirect: router.currentRoute.value.fullPath } })
+        return
+      }
+      throw new Error(res.errorMsg || '搜索失败，请稍后重试')
+    }
+    mergeBooks(res.data ?? [])
     searched.value = true
     pushHistory(word)
   } catch (err) {
+    if (seq !== searchSeq) return
     errorMsg.value = err instanceof Error ? err.message : '搜索失败，请稍后重试'
   } finally {
-    searching.value = false
+    if (seq === searchSeq) searching.value = false
   }
+}
+
+/** 停止搜索：中断 SSE，保留已到达的部分结果 */
+function stopSearch() {
+  if (!searching.value) return
+  searchSeq++
+  if (sseAbort) {
+    sseAbort()
+    sseAbort = null
+  }
+  stopped.value = true
+  searched.value = true
+  searching.value = false
+  pushHistory(key.value.trim())
 }
 
 function onEnter() {
@@ -144,49 +286,64 @@ onMounted(() => {
         </div>
       </div>
 
-      <!-- 加载态：细字 + 微 spinner -->
+      <!-- 加载态：实时源计数（SSE）+ 停止按钮 -->
       <div v-if="searching" class="state-row" aria-live="polite">
         <svg class="mini-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
           <path d="M21 12a9 9 0 1 1-6.2-8.56" />
         </svg>
-        <span class="state-text">正在搜索多个书源…</span>
+        <span class="state-text">
+          {{ usingSSE ? `正在搜索 · 已搜索 ${searchedSources} 个书源` : '正在搜索多个书源…' }}
+        </span>
+        <button class="stop-btn" type="button" @click="stopSearch">停止</button>
       </div>
 
-      <!-- 错误态 -->
-      <div v-else-if="errorMsg" class="state-row">
+      <!-- 错误态（无结果时整行展示） -->
+      <div v-else-if="errorMsg && !results.length" class="state-row">
         <span class="state-text error">{{ errorMsg }}</span>
         <button class="retry-btn" type="button" @click="doSearch()">重试</button>
       </div>
 
-      <!-- 空结果 -->
-      <div v-else-if="searched && results.length === 0" class="state-row">
-        <span class="state-text">没有找到与「{{ key.trim() }}」相关的书籍</span>
+      <!-- 空结果 / 已停止 -->
+      <div v-else-if="searched && !results.length" class="state-row">
+        <span class="state-text">{{ stopped ? '已停止搜索' : `没有找到与「${key.trim()}」相关的书籍` }}</span>
       </div>
 
-      <!-- 结果列表 -->
-      <ul v-else-if="results.length" class="result-list">
-        <li
-          v-for="book in results"
-          :key="`${book.origin}-${book.bookUrl}`"
-          class="result-item"
-          @click="openBook(book)"
-        >
-          <div class="result-main">
-            <p class="result-name" :title="book.name">{{ book.name }}</p>
-            <p class="result-sub">
-              <span class="result-author">{{ book.author || '佚名' }}</span>
-              <span class="source-badge" :title="book.originName || book.origin">{{ book.originName || book.origin }}</span>
-              <span v-if="book.latestChapterTitle" class="result-chapter" :title="book.latestChapterTitle">
-                {{ book.latestChapterTitle }}
-              </span>
-            </p>
-            <p v-if="book.intro" class="result-intro">{{ book.intro }}</p>
-          </div>
-          <svg class="result-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M9 6l6 6-6 6" />
-          </svg>
-        </li>
-      </ul>
+      <!-- 结果列表（SSE 增量累积） -->
+      <div v-if="results.length" class="results-wrap">
+        <p v-if="errorMsg" class="result-note error">{{ errorMsg }}</p>
+        <p v-else-if="stopped" class="result-note">已停止 · 以下为部分结果</p>
+        <p class="result-meta">
+          共 {{ results.length }} 本书<span v-if="searchedSources"> · 来自 {{ searchedSources }} 个书源</span>
+        </p>
+        <ul class="result-list">
+          <li
+            v-for="entry in results"
+            :key="entry.book.bookUrl"
+            class="result-item"
+            @click="openBook(entry.book)"
+          >
+            <div class="result-main">
+              <p class="result-name" :title="entry.book.name">{{ entry.book.name }}</p>
+              <p class="result-sub">
+                <span class="result-author">{{ entry.book.author || '佚名' }}</span>
+                <span
+                  v-for="o in entry.origins"
+                  :key="o.key"
+                  class="source-badge"
+                  :title="o.label"
+                >{{ o.label }}</span>
+                <span v-if="entry.book.latestChapterTitle" class="result-chapter" :title="entry.book.latestChapterTitle">
+                  {{ entry.book.latestChapterTitle }}
+                </span>
+              </p>
+              <p v-if="entry.book.intro" class="result-intro">{{ entry.book.intro }}</p>
+            </div>
+            <svg class="result-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 6l6 6-6 6" />
+            </svg>
+          </li>
+        </ul>
+      </div>
     </main>
   </div>
 </template>
@@ -407,6 +564,27 @@ onMounted(() => {
     transform: rotate(360deg);
   }
 }
+.stop-btn {
+  padding: 5px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+  background: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.stop-btn:hover {
+  color: var(--accent-deep);
+  border-color: var(--accent-deep);
+  background: var(--accent-soft);
+}
 .retry-btn {
   padding: 5px 14px;
   border-radius: var(--radius);
@@ -427,9 +605,29 @@ onMounted(() => {
 }
 
 /* ================= 结果列表 ================= */
+.results-wrap {
+  margin-top: 22px;
+}
+.result-meta {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.result-note {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.result-note.error {
+  color: #cf4444;
+}
 .result-list {
   list-style: none;
-  margin: 22px 0 0;
+  margin: 10px 0 0;
   padding: 0;
   display: flex;
   flex-direction: column;
@@ -465,7 +663,8 @@ onMounted(() => {
 .result-sub {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px 10px;
   margin: 5px 0 0;
   min-width: 0;
 }
@@ -475,7 +674,7 @@ onMounted(() => {
   color: var(--text-3);
   flex-shrink: 0;
 }
-/* 来源徽标：细字描边 */
+/* 来源徽标：细字描边（同书多源时展示多枚） */
 .source-badge {
   flex-shrink: 0;
   max-width: 140px;

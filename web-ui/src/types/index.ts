@@ -101,6 +101,12 @@ export interface SearchBook {
   [key: string]: unknown
 }
 
+/** 探索分类（/reader3/getExploreUrls → string[]；视图层派生：url + 从 URL 尾部路径/参数提取的名称） */
+export interface ExploreCategory {
+  url: string
+  name: string
+}
+
 /** 书架分组（/reader3/getBookGroups → BookGroup，camelCase；books.group 存分组 id，0=未分组） */
 export interface BookGroup {
   id: number
@@ -156,6 +162,14 @@ export interface HttpTts {
   name: string
   url: string
   type: number
+  [key: string]: unknown
+}
+
+/** 书源订阅（当前 localStorage: reader_source_subs；占位实现，见 api/sourceSubs.ts；enabled=启用订阅，启用时重新拉取并批量导入书源） */
+export interface SourceSub {
+  url: string
+  name: string
+  enabled: boolean
   [key: string]: unknown
 }
 

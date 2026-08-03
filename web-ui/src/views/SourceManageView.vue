@@ -2,7 +2,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { deleteBookSource, getBookSources, saveBookSource, saveBookSources } from '@/api/sources'
-import type { BookSource } from '@/types'
+import { loadSourceSubs, persistSourceSubs } from '@/api/sourceSubs'
+import type { BookSource, SourceSub } from '@/types'
 
 const router = useRouter()
 
@@ -235,7 +236,133 @@ async function confirmImport() {
   }
 }
 
-onMounted(load)
+/* ================= 订阅源（远程书源订阅，localStorage 占位，见 api/sourceSubs.ts） ================= */
+const subs = ref<SourceSub[]>([])
+const subUrl = ref('')
+const subBusy = ref(false)
+const subBusyUrls = ref<Set<string>>(new Set())
+const subMsg = ref('')
+const subMsgError = ref(false)
+
+function setSubMsg(msg: string, isError = false) {
+  subMsg.value = msg
+  subMsgError.value = isError
+}
+
+/** 订阅显示名：优先响应里的 name / bookSourceGroup，否则取域名 */
+function subNameFromRaw(raw: unknown, url: string): string {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const obj = raw as Record<string, unknown>
+    if (typeof obj.name === 'string' && obj.name.trim()) return obj.name.trim()
+    if (typeof obj.bookSourceGroup === 'string' && obj.bookSourceGroup.trim()) return obj.bookSourceGroup.trim()
+  }
+  try {
+    return new URL(url).hostname
+  } catch {
+    return url
+  }
+}
+
+/** 拉取远程书源 JSON 并批量导入，返回导入数量 */
+async function fetchAndImport(url: string): Promise<number> {
+  const resp = await fetch(url, { mode: 'cors' })
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  const raw: unknown = await resp.json()
+  const list = normalizeSources(raw)
+  if (list.length === 0) throw new Error('未识别到书源（需为书源数组或含 bookSourceList 的对象）')
+  const res = await saveBookSources(list)
+  return res.data?.count ?? list.length
+}
+
+/** 新增订阅：拉取书源数组 → 批量导入 → 记录订阅（localStorage） */
+async function confirmAddSub() {
+  if (subBusy.value) return
+  const url = subUrl.value.trim()
+  if (!url) return
+  subBusy.value = true
+  subMsg.value = ''
+  try {
+    const resp = await fetch(url, { mode: 'cors' })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const raw: unknown = await resp.json()
+    const list = normalizeSources(raw)
+    if (list.length === 0) throw new Error('未识别到书源（需为书源数组或含 bookSourceList 的对象）')
+    const res = await saveBookSources(list)
+    const count = res.data?.count ?? list.length
+    const name = subNameFromRaw(raw, url)
+    const existing = subs.value.find((x) => x.url === url)
+    if (existing) {
+      existing.name = name
+      existing.enabled = true
+    } else {
+      subs.value.push({ url, name, enabled: true })
+    }
+    persistSourceSubs(subs.value)
+    subUrl.value = ''
+    setSubMsg(`订阅成功：已导入 ${count} 个书源`)
+    await load() // 刷新书源列表
+  } catch (err) {
+    setSubMsg(
+      `订阅失败：${err instanceof Error && err.message ? err.message : '未知错误'}（若为浏览器跨域限制，可下载后手动新增）`,
+      true,
+    )
+  } finally {
+    subBusy.value = false
+  }
+}
+
+/** 启用/停用订阅：启用时重新拉取并批量导入；停用仅改本地记录（已导入书源保留） */
+async function toggleSub(sub: SourceSub) {
+  if (subBusyUrls.value.has(sub.url)) return
+  const prev = sub.enabled
+  subBusyUrls.value.add(sub.url)
+  try {
+    if (!prev) {
+      const count = await fetchAndImport(sub.url)
+      sub.enabled = true
+      setSubMsg(`已启用「${sub.name}」，重新导入 ${count} 个书源`)
+      await load()
+    } else {
+      sub.enabled = false
+      setSubMsg('已停用订阅（仅本地记录，已导入的书源保留）')
+    }
+    persistSourceSubs(subs.value)
+  } catch (err) {
+    setSubMsg(
+      `导入失败：${err instanceof Error && err.message ? err.message : '未知错误'}（订阅未启用）`,
+      true,
+    )
+  } finally {
+    subBusyUrls.value.delete(sub.url)
+  }
+}
+
+/* 删除订阅（仅本地记录） */
+const deletingSub = ref<SourceSub | null>(null)
+
+function askDeleteSub(sub: SourceSub) {
+  deletingSub.value = sub
+  document.body.style.overflow = 'hidden'
+}
+
+function confirmDeleteSub() {
+  const s = deletingSub.value
+  if (!s) return
+  subs.value = subs.value.filter((x) => x.url !== s.url)
+  persistSourceSubs(subs.value)
+  setSubMsg('已删除订阅记录（已导入的书源保留）')
+  closeDeleteSub()
+}
+
+function closeDeleteSub() {
+  deletingSub.value = null
+  document.body.style.overflow = ''
+}
+
+onMounted(() => {
+  load()
+  subs.value = loadSourceSubs()
+})
 </script>
 
 <template>
@@ -351,6 +478,55 @@ onMounted(load)
           </button>
         </li>
       </ul>
+
+      <!-- 订阅源：远程书源订阅（localStorage 占位，见 api/sourceSubs.ts） -->
+      <section class="subs-section">
+        <div class="subs-head">
+          <h2 class="subs-title">订阅源</h2>
+          <span class="subs-sub">远程书源订阅 · 本地占位存储（reader_source_subs），后端就绪后同步</span>
+        </div>
+        <form class="subs-add" @submit.prevent="confirmAddSub">
+          <input
+            v-model="subUrl"
+            class="filter-input subs-input"
+            type="text"
+            placeholder="订阅书源 JSON 地址，如 https://…/bookSource.json"
+            spellcheck="false"
+          />
+          <button class="accent-outline-btn" type="submit" :disabled="subBusy || !subUrl.trim()">
+            {{ subBusy ? '订阅中…' : '订阅' }}
+          </button>
+        </form>
+        <p v-if="subMsg" class="subs-msg" :class="{ error: subMsgError }">{{ subMsg }}</p>
+        <p v-if="subs.length === 0" class="subs-empty">暂无订阅。订阅后书源将批量导入，启用开关可随时重新导入。</p>
+        <ul v-else class="subs-list">
+          <li v-for="sub in subs" :key="sub.url" class="subs-row">
+            <div class="subs-main">
+              <p class="subs-name" :title="sub.name">{{ sub.name }}</p>
+              <p class="subs-url" :title="sub.url">{{ sub.url }}</p>
+            </div>
+            <span class="source-state" :class="{ on: sub.enabled }">{{ sub.enabled ? '启用' : '停用' }}</span>
+            <button
+              class="switch"
+              :class="{ on: sub.enabled }"
+              type="button"
+              role="switch"
+              :aria-checked="sub.enabled"
+              :title="sub.enabled ? '停用订阅（仅本地记录）' : '启用并重新导入书源'"
+              @click="toggleSub(sub)"
+            >
+              <span class="switch-knob"></span>
+            </button>
+            <button class="delete-btn" type="button" title="删除订阅（仅本地记录）" @click="askDeleteSub(sub)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 7h16" />
+                <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                <path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13" />
+              </svg>
+            </button>
+          </li>
+        </ul>
+      </section>
     </main>
 
     <!-- 新增书源弹窗 -->
@@ -439,6 +615,26 @@ onMounted(load)
               <button class="danger-btn" type="button" :disabled="deleteBusy" @click="confirmDelete">
                 {{ deleteBusy ? '删除中…' : '删除' }}
               </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 删除订阅确认弹窗（极简） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="deletingSub" class="dlg-overlay" @click.self="closeDeleteSub">
+          <div class="dlg dlg-confirm" role="alertdialog" aria-modal="true" aria-label="删除订阅" tabindex="-1" @keydown.esc="closeDeleteSub">
+            <div class="dlg-head">
+              <h2 class="dlg-title">删除订阅</h2>
+            </div>
+            <p class="confirm-text">
+              确定删除订阅「{{ deletingSub.name }}」吗？仅删除本地订阅记录，已导入的书源不受影响。
+            </p>
+            <div class="dlg-actions">
+              <button class="ghost-btn" type="button" @click="closeDeleteSub">取消</button>
+              <button class="danger-btn" type="button" @click="confirmDeleteSub">删除</button>
             </div>
           </div>
         </div>
@@ -833,6 +1029,92 @@ onMounted(load)
 .delete-btn svg {
   width: 13px;
   height: 13px;
+}
+
+/* ================= 订阅源区块 ================= */
+.subs-section {
+  margin-top: 40px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+}
+.subs-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.subs-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: 2px;
+  color: var(--text-1);
+}
+.subs-sub {
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.subs-add {
+  display: flex;
+  gap: 8px;
+}
+.subs-input {
+  flex: 1;
+  min-width: 0;
+  padding: 0 12px;
+}
+.subs-msg {
+  margin: 10px 0 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+}
+.subs-msg.error {
+  color: #cf4444;
+}
+.subs-empty {
+  margin: 16px 0 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.subs-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+}
+.subs-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.subs-row:first-child {
+  border-top: 1px solid var(--border);
+}
+.subs-main {
+  flex: 1;
+  min-width: 0;
+}
+.subs-name {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.subs-url {
+  margin: 3px 0 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ================= 弹窗（极简，自写轻量） ================= */

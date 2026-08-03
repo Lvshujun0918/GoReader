@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import { deleteHttpTts, getHttpTtsList, saveHttpTts } from '@/api/httpTts'
+import { backupToWebdav } from '@/api/backup'
 import { useUserStore } from '@/stores/user'
 import type { HttpTts } from '@/types'
 
@@ -128,6 +129,53 @@ function closeDeleteTts() {
 }
 
 onMounted(loadTtsList)
+
+/* ================= OPDS 访问 ================= */
+/** OPDS 地址 = 当前 host + /opds */
+const opdsUrl = `${window.location.origin}/opds`
+const opdsCopied = ref(false)
+
+async function copyOpdsUrl() {
+  const text = opdsUrl
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // 剪贴板 API 不可用（非 https 等）：textarea 降级
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+  }
+  opdsCopied.value = true
+  window.setTimeout(() => (opdsCopied.value = false), 1600)
+}
+
+/* ================= 数据备份（WebDAV） ================= */
+const backupBusy = ref(false)
+const backupPath = ref('')
+
+async function runBackup() {
+  if (backupBusy.value) return
+  backupBusy.value = true
+  backupPath.value = ''
+  try {
+    const res = await backupToWebdav()
+    backupPath.value = res.data?.path ?? ''
+    if (!backupPath.value) {
+      ElMessage.warning('备份完成，但未返回文件路径')
+    } else {
+      ElMessage.success('备份完成')
+    }
+  } catch {
+    // 错误提示已由拦截器处理
+  } finally {
+    backupBusy.value = false
+  }
+}
 </script>
 
 <template>
@@ -216,6 +264,43 @@ onMounted(loadTtsList)
           <span class="row-value">浏览器语音（SpeechSynthesis）</span>
           <span class="row-hint">阅读页顶栏「听书」按钮</span>
         </div>
+      </section>
+
+      <!-- OPDS 访问 -->
+      <section class="card">
+        <h2 class="card-title">OPDS 访问</h2>
+        <div class="row">
+          <span class="row-label">OPDS 地址</span>
+          <span class="row-value mono">{{ opdsUrl }}</span>
+          <button class="row-action" type="button" @click="copyOpdsUrl">
+            {{ opdsCopied ? '已复制' : '复制' }}
+          </button>
+        </div>
+        <p class="card-note">外部阅读器（如 legado、静读天下等）可通过此地址连接书架，账号密码与本应用登录一致。</p>
+      </section>
+
+      <!-- 数据备份 -->
+      <section class="card">
+        <h2 class="card-title">数据备份</h2>
+        <div class="row">
+          <span class="row-label">WebDAV 备份</span>
+          <span class="row-value">{{ backupBusy ? '备份中…' : '备份到 WebDAV legado 目录' }}</span>
+          <button class="row-action" type="button" :disabled="backupBusy" @click="runBackup">
+            {{ backupBusy ? '备份中…' : '立即备份' }}
+          </button>
+        </div>
+        <p v-if="backupPath" class="card-note mono backup-path">已备份至：{{ backupPath }}</p>
+      </section>
+
+      <!-- txtTocRule -->
+      <section class="card">
+        <h2 class="card-title">txtTocRule</h2>
+        <div class="row">
+          <span class="row-label">txtTocRule</span>
+          <span class="row-value">后端实现中 · 替换规则页在 /rules</span>
+          <button class="row-action" type="button" @click="router.push('/rules')">前往</button>
+        </div>
+        <p class="card-note">TXT 文本目录解析规则（txtTocRule）后端实现中；现有「替换规则」在 /rules 页维护，txtTocRule 就绪后将在此一并管理。</p>
       </section>
 
       <!-- 关于 -->
@@ -773,6 +858,23 @@ onMounted(loadTtsList)
   display: flex;
   justify-content: flex-end;
   padding-top: 16px;
+}
+.card-note {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  line-height: 1.7;
+  color: var(--text-3);
+}
+.card-note.mono {
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+}
+.backup-path {
+  color: var(--accent);
+}
+.row-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 .danger-btn {
   padding: 8px 20px;
