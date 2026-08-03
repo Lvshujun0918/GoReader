@@ -16,6 +16,18 @@ const router = createRouter({
       component: () => import('@/views/BookshelfView.vue'),
       meta: { title: '书架' },
     },
+    {
+      path: '/book/:url',
+      name: 'book-detail',
+      component: () => import('@/views/BookDetailView.vue'),
+      meta: { title: '书籍详情' },
+    },
+    {
+      path: '/reader/:bookUrl',
+      name: 'reader',
+      component: () => import('@/views/ReaderView.vue'),
+      meta: { title: '阅读' },
+    },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })

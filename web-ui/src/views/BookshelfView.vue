@@ -82,6 +82,10 @@ function logout() {
   void router.replace('/login')
 }
 
+function openBook(book: Book) {
+  void router.push(`/book/${encodeURIComponent(book.bookUrl)}`)
+}
+
 onMounted(() => load())
 </script>
 
@@ -169,7 +173,7 @@ onMounted(() => load())
 
       <!-- 书封网格（大间距） -->
       <div v-else class="book-grid">
-        <div v-for="book in filtered" :key="book.bookUrl" class="book-card">
+        <div v-for="book in filtered" :key="book.bookUrl" class="book-card" @click="openBook(book)">
           <div class="cover-wrap">
             <img
               v-if="hasCover(book)"

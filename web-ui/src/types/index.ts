@@ -35,3 +35,33 @@ export interface Book {
   lastCheckTime?: number
   [key: string]: unknown
 }
+
+/** 书籍详情（/reader3/getBookInfo → ruleBookInfo，全字段 camelCase） */
+export interface BookInfo {
+  name: string
+  author: string
+  kind?: string | null
+  intro?: string | null
+  coverUrl?: string | null
+  tocUrl: string
+  wordCount?: string | null
+  latestChapterTitle?: string | null
+  bookUrl: string
+  origin: string
+  originName: string
+  [key: string]: unknown
+}
+
+/** 章节（/reader3/getBookToc → ruleToc，camelCase；isVolume=卷标题分隔行） */
+export interface BookChapter {
+  title: string
+  url: string
+  isVolume: boolean
+  index: number
+  [key: string]: unknown
+}
+
+/** 章节正文（/reader3/getBookContent → data.content 纯文本） */
+export interface BookContent {
+  content: string
+}
