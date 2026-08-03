@@ -882,8 +882,21 @@ async fn fallback_handler(
         )
             .into_response();
     }
+    // 前端静态资源（/static/** 等构建产物——按扩展名 MIME）
+    let web_root = std::path::PathBuf::from(&state.storage.config.web_root);
+    let rel = path.trim_start_matches('/');
+    let file = web_root.join(rel);
+    if file.is_file() {
+        if let Ok(bytes) = tokio::fs::read(&file).await {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", mime_for(&file))
+                .body(Body::from(bytes))
+                .unwrap();
+        }
+    }
     // 前端 SPA：index.html
-    let index = std::path::PathBuf::from(&state.storage.config.web_root).join("index.html");
+    let index = web_root.join("index.html");
     match tokio::fs::read(&index).await {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
@@ -891,6 +904,28 @@ async fn fallback_handler(
             .body(Body::from(bytes))
             .unwrap(),
         Err(_) => webdav_status_404(),
+    }
+}
+
+/// 按扩展名推断 MIME（前端静态资源）
+fn mime_for(file: &std::path::Path) -> &'static str {
+    match file.extension().and_then(|e| e.to_str()) {
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("mjs") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        Some("map") => "application/json",
+        _ => "application/octet-stream",
     }
 }
 
