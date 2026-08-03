@@ -51,7 +51,7 @@
             @click="openCategory(c)"
           >
             <template v-if="c.type === 'link'">↗</template>
-            {{ c.title ? applyHan(c.title, hanMode.value) : '默认' }}
+            {{ c.title ? applyHan(c.title, hanMode) : '默认' }}
           </button>
         </div>
 
@@ -69,10 +69,10 @@
                 class="cover-img"
                 @error="failedCovers.add(b.bookUrl)"
               />
-              <template v-else>{{ applyHan(b.name, hanMode.value).charAt(0) }}</template>
+              <template v-else>{{ applyHan(b.name, hanMode).charAt(0) }}</template>
             </span>
-            <span class="book-name">{{ applyHan(b.name, hanMode.value) }}</span>
-            <span class="book-author">{{ applyHan(b.author || '未知作者', hanMode.value) }}</span>
+            <span class="book-name">{{ applyHan(b.name, hanMode) }}</span>
+            <span class="book-author">{{ applyHan(b.author || '未知作者', hanMode) }}</span>
           </button>
         </div>
         <div v-if="books.length > 0" class="more-row">
