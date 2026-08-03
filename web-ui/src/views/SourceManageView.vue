@@ -289,7 +289,21 @@ async function refreshAndImport(url: string, preFetched?: BookSource[]): Promise
   return fetchAndImport(url)
 }
 
-/** 新增订阅：拉取书源数组取名称 → 注册订阅（后端 saveSourceSub，降级 localStorage）→ 刷新导入 */
+/**
+ * 注册订阅并导入书源：后端 POST /reader3/saveSourceSub 优先（服务端抓取校验 + 订阅入库 + 批量导入，返回导入数）；
+ * 降级（后端不可达，data=null）：写入 localStorage 后由前端导入（preFetched 可复用已拉取的列表）。
+ */
+async function registerAndImport(url: string, name: string, preFetched?: BookSource[]): Promise<number> {
+  const res = await saveSourceSub(url, name)
+  if (res.data && typeof res.data.count === 'number') return res.data.count
+  if (preFetched) {
+    const saveRes = await saveBookSources(preFetched)
+    return saveRes.data?.count ?? preFetched.length
+  }
+  return fetchAndImport(url)
+}
+
+/** 新增订阅：拉取书源数组取名称 → 注册订阅（后端 saveSourceSub 抓取+导入，降级 localStorage+前端导入） */
 async function confirmAddSub() {
   if (subBusy.value) return
   const url = subUrl.value.trim()
@@ -304,10 +318,8 @@ async function confirmAddSub() {
     const list = normalizeSources(raw)
     if (list.length === 0) throw new Error('未识别到书源（需为书源数组或含 bookSourceList 的对象）')
     const name = subNameFromRaw(raw, url)
-    // ② 注册订阅（后端优先；失败降级 localStorage）
-    await saveSourceSub(url, name)
-    // ③ 刷新导入书源（后端 refreshSourceSub；降级直接用已拉取的列表导入）
-    const count = await refreshAndImport(url, list)
+    // ② 注册订阅 + 导入书源（后端优先；降级用已拉取的列表导入）
+    const count = await registerAndImport(url, name, list)
     const existing = subs.value.find((x) => x.url === url)
     if (existing) {
       existing.name = name
@@ -328,15 +340,14 @@ async function confirmAddSub() {
   }
 }
 
-/** 启用/停用订阅：启用时注册订阅并重新导入（后端 refreshSourceSub / 降级前端导入）；停用仅改本地记录（已导入书源保留） */
+/** 启用/停用订阅：启用时注册订阅并重新导入（后端 saveSourceSub / 降级前端导入）；停用仅改本地记录（已导入书源保留） */
 async function toggleSub(sub: SourceSub) {
   if (subBusyUrls.value.has(sub.url)) return
   const prev = sub.enabled
   subBusyUrls.value.add(sub.url)
   try {
     if (!prev) {
-      await saveSourceSub(sub.url, sub.name) // 注册订阅（幂等；后端优先，失败降级 localStorage）
-      const count = await refreshAndImport(sub.url)
+      const count = await registerAndImport(sub.url, sub.name) // 注册订阅（幂等；后端优先，失败降级 localStorage）
       sub.enabled = true
       setSubMsg(`已启用「${sub.name}」，重新导入 ${count} 个书源`)
       await load()

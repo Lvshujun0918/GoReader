@@ -3136,9 +3136,9 @@ mod tests {
 
         let info = storage.get_cache_info().await.unwrap();
         assert_eq!(info.toc_cache_count, 2);
-        assert_eq!(info.toc_cache_size, 46, "两条 chapters_json 各 23 字节");
+        assert_eq!(info.toc_cache_size, 34, "SQLite length() 按字符计，两条各 17 字符");
         assert_eq!(info.chapter_count, 3);
-        assert_eq!(info.chapter_size, 69, "7+9+7 个汉字 × 3 字节");
+        assert_eq!(info.chapter_size, 23, "7+9+7 字符");
         assert_eq!(info.total_size, info.toc_cache_size + info.chapter_size);
 
         // 只清 toc
@@ -3237,24 +3237,23 @@ mod tests {
             .save_chapters(
                 "local://book4",
                 &[
-                    ("C1".to_string(), "进度50%完成。".to_string()),
+                    ("C1".to_string(), "进度5_0%完成。".to_string()),
                     ("C2".to_string(), "完全没有任何特殊符号的一章。".to_string()),
                 ],
             )
             .await
             .unwrap();
-        let hits = storage.search_book_content("local://book4", "50%", 10).await.unwrap();
+        let hits = storage.search_book_content("local://book4", "5_0%", 10).await.unwrap();
         assert_eq!(hits.len(), 1, "% 应转义为字面量");
         assert_eq!(hits[0].title, "C1");
         let hits = storage.search_book_content("local://book4", "5_", 10).await.unwrap();
         assert_eq!(hits.len(), 1, "_ 应转义为字面量");
-        let hits = storage.search_book_content("local://book4", "5%", 10).await.unwrap();
-        assert_eq!(hits.len(), 1);
         let hits = storage.search_book_content("local://book4", "%", 10).await.unwrap();
-        assert_eq!(hits.len(), 1, "% 转义后只匹配含字面 % 的行");
+        assert_eq!(hits.len(), 1, "% 转义后只匹配含字面 % 的行（未转义会匹配全部）");
         assert_eq!(hits[0].title, "C1");
         let hits = storage.search_book_content("local://book4", "_", 10).await.unwrap();
-        assert!(hits.is_empty(), "_ 转义后不应匹配所有行");
+        assert_eq!(hits.len(), 1, "_ 转义后只匹配含字面 _ 的行（未转义会匹配全部）");
+        assert_eq!(hits[0].title, "C1");
         assert_eq!(storage.count_chapters("local://book4").await.unwrap(), 2);
         assert_eq!(storage.count_chapters("local://ghost").await.unwrap(), 0);
 

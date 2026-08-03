@@ -2291,7 +2291,7 @@ async fn explore_book(
         )),
         Err(e) => {
             tracing::error!("exploreBook 失败 [{target}]: {e}");
-            Json(ReturnData::err("探索失败"))
+            Json(ReturnData::err(format!("探索失败：{e}")))
         }
     }
 }
@@ -4318,10 +4318,10 @@ mod tests {
         let ret = get_cache_info(AxumState(state.clone())).await;
         assert!(ret.0.is_success);
         assert_eq!(ret.0.data["tocCacheCount"], 1);
-        assert_eq!(ret.0.data["tocCacheSize"], 2);
+        assert_eq!(ret.0.data["tocCacheSize"], 2, "SQLite length() 按字符计");
         assert_eq!(ret.0.data["chapterCount"], 2);
-        assert_eq!(ret.0.data["chapterSize"], 30, "10 个汉字 × 3 字节");
-        assert_eq!(ret.0.data["totalSize"], 32);
+        assert_eq!(ret.0.data["chapterSize"], 11, "5+6 字符");
+        assert_eq!(ret.0.data["totalSize"], 13);
 
         // clearCache：type=toc（body）
         let body = Bytes::from(r#"{"type":"toc"}"#);

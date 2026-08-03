@@ -227,14 +227,23 @@ export interface ContentSearchHit {
   [key: string]: unknown
 }
 
-/** 清理缓存类型（POST /reader3/clearCache body.type：toc=目录缓存 / chapter=章节缓存 / all=全部） */
-export type CacheClearType = 'toc' | 'chapter' | 'all'
+/** 清理缓存类型（POST /reader3/clearCache body.type：toc=目录缓存 / chapters=章节缓存 / all=全部） */
+export type CacheClearType = 'toc' | 'chapters' | 'all'
 
-/** 缓存统计（GET /reader3/getCacheInfo → data；tocCount=目录缓存数 / chapterCount=章节缓存数 / totalBytes=总大小(字节)） */
+/** 清理缓存结果（POST /reader3/clearCache → data；deletedToc=删除目录缓存数 / deletedChapters=删除章节缓存数） */
+export interface CacheClearResult {
+  deletedToc: number
+  deletedChapters: number
+  [key: string]: unknown
+}
+
+/** 缓存统计（GET /reader3/getCacheInfo → data；tocCacheCount=目录缓存数 / tocCacheSize=目录缓存大小 / chapterCount=章节缓存数 / chapterSize=章节缓存大小 / totalSize=总大小(字节)） */
 export interface CacheInfo {
-  tocCount: number
+  tocCacheCount: number
+  tocCacheSize: number
   chapterCount: number
-  totalBytes: number
+  chapterSize: number
+  totalSize: number
   [key: string]: unknown
 }
 

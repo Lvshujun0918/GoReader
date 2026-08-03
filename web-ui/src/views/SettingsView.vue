@@ -286,10 +286,10 @@ const cacheBusy = ref(false)
 /** 清理类型（极简胶囊单选）：目录 / 章节 / 全部 */
 const CLEAR_TYPES: { value: CacheClearType; label: string }[] = [
   { value: 'toc', label: '目录' },
-  { value: 'chapter', label: '章节' },
+  { value: 'chapters', label: '章节' },
   { value: 'all', label: '全部' },
 ]
-const cacheType = ref<CacheClearType>('chapter')
+const cacheType = ref<CacheClearType>('chapters')
 
 function fmtSize(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return '0 B'
@@ -500,7 +500,7 @@ async function runBackup() {
         <div class="row">
           <span class="row-label">缓存统计</span>
           <span v-if="cacheReady" class="row-value">
-            章节 {{ cacheInfo?.chapterCount ?? 0 }} · 目录 {{ cacheInfo?.tocCount ?? 0 }} · {{ fmtSize(cacheInfo?.totalBytes ?? 0) }}
+            章节 {{ cacheInfo?.chapterCount ?? 0 }} · 目录 {{ cacheInfo?.tocCacheCount ?? 0 }} · {{ fmtSize(cacheInfo?.totalSize ?? 0) }}
           </span>
           <span v-else class="row-value">后端待实现</span>
         </div>

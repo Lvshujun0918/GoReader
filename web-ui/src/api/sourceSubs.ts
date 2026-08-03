@@ -8,14 +8,16 @@ import type { ReturnData, SourceSub } from '@/types'
  *
  * ============================ 后端契约 ============================
  * GET  /reader3/getSourceSubs      → ReturnData<SourceSub[]>
- * POST /reader3/saveSourceSub      body: { url, name }           → ReturnData<null>
- * POST /reader3/deleteSourceSub    body: { url }                 → ReturnData<null>
- * POST /reader3/refreshSourceSub   body: { url }                 → ReturnData<{ count: number }>
- *                                   （重新拉取远程书源 JSON 并批量导入书源表）
+ * POST /reader3/saveSourceSub      body: { url, name } → ReturnData<{ count }>
+ *                                   （服务端抓取校验远程书源 JSON → 订阅入库 + 批量导入书源表）
+ * POST /reader3/refreshSourceSub   body: { url }       → ReturnData<{ count }>
+ *                                   （重新拉取并覆盖导入书源；订阅需已存在）
+ * POST /reader3/deleteSourceSub    body: { url }       → ReturnData<null>
+ *                                   （仅删订阅行，不影响已导入书源）
  * ================================================================
  * localStorage key: reader_source_subs（值为 SourceSub[] 的 JSON）
- * 订阅只记录远程书源地址与名称；书源数据由 refresh 流程（后端 refreshSourceSub，
- * 或降级时前端 fetch + saveBookSources）批量导入到书源表。
+ * 订阅只记录远程书源地址与名称；书源数据由后端 saveSourceSub/refreshSourceSub 导入，
+ * 降级模式下由调用方前端 fetch + saveBookSources 导入。
  */
 
 const STORAGE_KEY = 'reader_source_subs'
@@ -60,11 +62,17 @@ export async function getSourceSubs(): Promise<ReturnData<SourceSub[]>> {
   }
 }
 
-/** POST /reader3/saveSourceSub（后端优先；失败降级 localStorage，url 相同则覆盖并保留 enabled） */
-export async function saveSourceSub(url: string, name: string): Promise<ReturnData<null>> {
+/**
+ * POST /reader3/saveSourceSub（后端优先：抓取校验 + 订阅入库 + 批量导入书源，返回导入数）。
+ * 降级（后端不可达）：仅写入 localStorage，data=null —— 调用方需自行导入书源（fetch + saveBookSources）。
+ */
+export async function saveSourceSub(
+  url: string,
+  name: string,
+): Promise<ReturnData<{ count: number } | null>> {
   if (!backendDown) {
     try {
-      const res = await post<null>('/saveSourceSub', { url, name }, { silent: true })
+      const res = await post<{ count: number }>('/saveSourceSub', { url, name }, { silent: true })
       const list = loadSourceSubs()
       const existing = list.find((s) => s.url === url)
       if (existing) {
@@ -105,8 +113,8 @@ export async function deleteSourceSub(url: string): Promise<ReturnData<null>> {
 }
 
 /**
- * POST /reader3/refreshSourceSub（后端优先：重新拉取远程书源 JSON 并批量导入书源表）。
- * 失败返回 isSuccess=false（不抛异常），由调用方降级为前端 fetch + saveBookSources 导入。
+ * POST /reader3/refreshSourceSub（后端优先：重新拉取远程书源 JSON 并覆盖导入书源表，返回导入数；
+ * 订阅不存在返回业务失败）。失败返回 isSuccess=false（不抛异常），由调用方降级为前端 fetch + saveBookSources 导入。
  */
 export async function refreshSourceSub(url: string): Promise<ReturnData<{ count: number }>> {
   if (backendDown) {

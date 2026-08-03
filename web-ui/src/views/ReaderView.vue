@@ -4,10 +4,12 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getBookshelf, deleteBook } from '@/api/bookshelf'
 import { getBookInfo, getBookToc, getBookContent } from '@/api/books'
+import { getHttpTtsList } from '@/api/httpTts'
 import { get, post } from '@/api/request'
 import { loadReplaceRules } from '@/api/replaceRules'
+import { getTtsVoices, synthesizeTts, type TtsVoice } from '@/api/tts'
 import { simplized, traditionalized } from '@/utils/chinese'
-import type { Book, BookChapter, Bookmark, ReplaceRule } from '@/types'
+import type { Book, BookChapter, Bookmark, HttpTts, ReplaceRule } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -553,69 +555,249 @@ watch(replaceEnabled, (v) => {
   if (v) refreshReplaceRules()
 })
 
-/* ---------------- 7. 听书（浏览器 SpeechSynthesis 极简实现；HttpTTS 源见设置页，后端就绪后接入） ---------------- */
+/* ---------------- 7. 听书（后端语音合成：POST /reader3/tts → blob → audio 元素播放；Edge/HttpTTS 引擎；本章播完自动下一章） ---------------- */
 
-const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window
-const ttsPlaying = ref(false)
-let ttsVoice: SpeechSynthesisVoice | null = null
+const TTS_DEFAULT_VOICE = 'zh-CN-XiaoxiaoNeural'
+/** 后端单次合成文本上限（service/tts.rs MAX_TEXT_CHARS） */
+const TTS_MAX_CHARS = 20000
+const TTS_VOICE_KEY = 'reader_tts_voice'
+const TTS_RATE_KEY = 'reader_tts_rate'
+const TTS_PITCH_KEY = 'reader_tts_pitch'
+const TTS_ENGINE_KEY = 'reader_tts_engine'
+const TTS_HTTP_URL_KEY = 'reader_tts_http_url'
 
-function pickZhVoice(): SpeechSynthesisVoice | null {
-  const voices = window.speechSynthesis.getVoices()
-  const zh = voices.filter((v) => v.lang.toLowerCase().startsWith('zh'))
-  if (zh.length === 0) return null
-  return zh.find((v) => v.lang.toLowerCase() === 'zh-cn') ?? zh[0]
+type TtsState = 'idle' | 'loading' | 'playing' | 'paused'
+const ttsState = ref<TtsState>('idle')
+const ttsPanelOpen = ref(false)
+const ttsVoices = ref<TtsVoice[]>([])
+const ttsVoicesLoaded = ref(false)
+const ttsHttpList = ref<HttpTts[]>([])
+const ttsHttpLoaded = ref(false)
+const ttsVoice = ref(TTS_DEFAULT_VOICE)
+const ttsRate = ref(1)
+const ttsPitch = ref(0)
+const ttsEngine = ref<'edge' | 'http'>('edge')
+const ttsHttpUrl = ref('')
+const ttsAudioRef = ref<HTMLAudioElement | null>(null)
+/** 当前播放 blob 的 objectURL（换源/停止时 revoke） */
+let ttsObjectUrl = ''
+/** 合成请求序号：切章/停止时自增，丢弃过期结果 */
+let ttsLoadSeq = 0
+/** 本章播完、待连播下一章标记（loadContent 成功后消费） */
+let ttsAutoNext = false
+
+{
+  const v = localStorage.getItem(TTS_VOICE_KEY)
+  if (v) ttsVoice.value = v
+  ttsRate.value = round1(loadSetting(TTS_RATE_KEY, 0.5, 2, 1, 0.1))
+  ttsPitch.value = loadSetting(TTS_PITCH_KEY, -10, 10, 0)
+  const e = localStorage.getItem(TTS_ENGINE_KEY)
+  if (e === 'edge' || e === 'http') ttsEngine.value = e
+  ttsHttpUrl.value = localStorage.getItem(TTS_HTTP_URL_KEY) ?? ''
 }
+watch(ttsVoice, (v) => persist(TTS_VOICE_KEY, v))
+watch(ttsRate, (v) => persist(TTS_RATE_KEY, v))
+watch(ttsPitch, (v) => persist(TTS_PITCH_KEY, v))
+watch(ttsEngine, (v) => persist(TTS_ENGINE_KEY, v))
+watch(ttsHttpUrl, (v) => persist(TTS_HTTP_URL_KEY, v))
 
-if (ttsSupported) {
-  // voices 异步加载：首次 getVoices 可能为空，监听 onvoiceschanged 补充
-  ttsVoice = pickZhVoice()
-  window.speechSynthesis.onvoiceschanged = () => {
-    ttsVoice = pickZhVoice()
+/** 播放中（顶栏按钮高亮） */
+const ttsPlaying = computed(() => ttsState.value === 'playing')
+/** 顶栏按钮文案 */
+const ttsTopLabel = computed(() =>
+  ttsState.value === 'playing' || ttsState.value === 'loading'
+    ? '停止'
+    : ttsState.value === 'paused'
+      ? '继续'
+      : '听书',
+)
+
+/** 语速 0.5-2.0 → Edge 百分比（+0% / +10% / -50%） */
+const ttsRateParam = computed(() => {
+  const pct = Math.round((ttsRate.value - 1) * 100)
+  return `${pct >= 0 ? '+' : ''}${pct}%`
+})
+/** 音调 → Edge Hz（+0Hz / -2Hz） */
+const ttsPitchParam = computed(() => `${ttsPitch.value >= 0 ? '+' : ''}${ttsPitch.value}Hz`)
+
+/** 音色下拉按 locale 分组 */
+const ttsLocaleGroups = computed(() => {
+  const map = new Map<string, TtsVoice[]>()
+  for (const v of ttsVoices.value) {
+    const arr = map.get(v.locale) ?? []
+    arr.push(v)
+    map.set(v.locale, arr)
+  }
+  return Array.from(map.entries()).map(([label, voices]) => ({ label, voices }))
+})
+
+/** 首次打开面板时加载语音列表 + HttpTTS 列表（记忆值失效时回退默认） */
+async function loadTtsOptions() {
+  if (!ttsVoicesLoaded.value) {
+    ttsVoicesLoaded.value = true
+    try {
+      const res = await getTtsVoices()
+      ttsVoices.value = res.data ?? []
+    } catch {
+      ttsVoices.value = []
+    }
+    if (ttsVoices.value.length > 0 && !ttsVoices.value.some((v) => v.value === ttsVoice.value)) {
+      ttsVoice.value = TTS_DEFAULT_VOICE
+    }
+  }
+  if (!ttsHttpLoaded.value) {
+    ttsHttpLoaded.value = true
+    try {
+      const res = await getHttpTtsList()
+      ttsHttpList.value = res.data ?? []
+    } catch {
+      ttsHttpList.value = []
+    }
+    if (ttsHttpList.value.length > 0) {
+      if (!ttsHttpList.value.some((t) => t.url === ttsHttpUrl.value)) {
+        ttsHttpUrl.value = ttsHttpList.value[0].url
+      }
+    } else if (ttsEngine.value === 'http') {
+      ttsEngine.value = 'edge'
+    }
   }
 }
+watch(ttsPanelOpen, (open) => {
+  if (open) void loadTtsOptions()
+})
 
-function stopTts() {
-  if (!ttsSupported) return
-  window.speechSynthesis.cancel()
-  ttsPlaying.value = false
+/** 朗读文本：正文段落（含替换规则/简繁转换），截断到后端上限 */
+function ttsText(): string {
+  return paragraphs.value.join('。').slice(0, TTS_MAX_CHARS)
 }
 
-function startTts() {
-  if (!ttsSupported) {
-    ElMessage.info('当前浏览器不支持语音朗读')
-    return
-  }
-  const text = paragraphs.value.join('。')
+/** 播放当前章：合成 → blob → audio 播放 */
+async function startTts() {
+  const text = ttsText()
   if (!text) {
     ElMessage.info('本章暂无内容可朗读')
     return
   }
-  // Chrome 兼容：cancel 后立即 speak 可能被吞，稍作延迟再播
-  window.speechSynthesis.cancel()
-  window.setTimeout(() => {
-    if (!ttsVoice) ttsVoice = pickZhVoice()
-    const u = new SpeechSynthesisUtterance(text)
-    u.lang = ttsVoice?.lang ?? 'zh-CN'
-    if (ttsVoice) u.voice = ttsVoice
-    u.rate = 1
-    u.onend = () => {
-      ttsPlaying.value = false
+  await loadTtsOptions()
+  const audio = ttsAudioRef.value
+  if (!audio) return
+  if (ttsEngine.value === 'http' && !ttsHttpUrl.value) {
+    ElMessage.info('请先在设置页添加 HttpTTS 源')
+    return
+  }
+  const seq = ++ttsLoadSeq
+  ttsState.value = 'loading'
+  let blob: Blob
+  try {
+    blob = await synthesizeTts({
+      text,
+      voice: ttsVoice.value,
+      rate: ttsRateParam.value,
+      pitch: ttsPitchParam.value,
+      engine: ttsEngine.value,
+      httpUrl: ttsEngine.value === 'http' ? ttsHttpUrl.value : undefined,
+    })
+  } catch (e) {
+    if (seq === ttsLoadSeq) {
+      ttsState.value = 'idle'
+      ElMessage.error(e instanceof Error ? e.message : '语音合成失败')
     }
-    u.onerror = () => {
-      ttsPlaying.value = false
-    }
-    window.speechSynthesis.speak(u)
-    ttsPlaying.value = true
-  }, 60)
+    return
+  }
+  const url = URL.createObjectURL(blob)
+  if (seq !== ttsLoadSeq) {
+    // 期间已停止/切章：丢弃过期结果
+    URL.revokeObjectURL(url)
+    return
+  }
+  if (ttsObjectUrl) URL.revokeObjectURL(ttsObjectUrl)
+  ttsObjectUrl = url
+  audio.pause()
+  audio.src = url
+  ttsState.value = 'playing'
+  try {
+    await audio.play()
+  } catch {
+    // 自动播放被拦截（异步 fetch 后手势已失效）：保持待播，面板点「播放」即可恢复
+    if (ttsState.value === 'playing') ttsState.value = 'paused'
+  }
 }
 
+function stopTts() {
+  ttsLoadSeq++
+  ttsAutoNext = false
+  ttsState.value = 'idle'
+  const audio = ttsAudioRef.value
+  if (audio) {
+    audio.pause()
+    audio.removeAttribute('src')
+    audio.load()
+  }
+  if (ttsObjectUrl) {
+    URL.revokeObjectURL(ttsObjectUrl)
+    ttsObjectUrl = ''
+  }
+}
+
+function pauseTts() {
+  const audio = ttsAudioRef.value
+  if (!audio || ttsState.value !== 'playing') return
+  audio.pause()
+  ttsState.value = 'paused'
+}
+
+function resumeTts() {
+  const audio = ttsAudioRef.value
+  if (!audio || ttsState.value !== 'paused') return
+  void audio.play().catch(() => {
+    /* 保持暂停 */
+  })
+}
+
+/** 面板播放/暂停/继续 */
+function ttsPlayPause() {
+  if (ttsState.value === 'playing') pauseTts()
+  else if (ttsState.value === 'paused') resumeTts()
+  else if (ttsState.value === 'idle') void startTts()
+}
+
+/** 顶栏听书按钮：展开面板 + 播放/继续/停止 */
 function toggleTts() {
-  if (ttsPlaying.value) stopTts()
-  else startTts()
+  ttsPanelOpen.value = true
+  if (ttsState.value === 'playing' || ttsState.value === 'loading') stopTts()
+  else if (ttsState.value === 'paused') resumeTts()
+  else void startTts()
 }
 
-/** 切换章节 / 离开页面时停止朗读 */
-watch(chapterIndex, () => stopTts())
+/** 本章播完：自动连播下一章；最后一章则停止 */
+function onTtsEnded() {
+  if (ttsState.value === 'idle') return
+  if (ttsObjectUrl) {
+    URL.revokeObjectURL(ttsObjectUrl)
+    ttsObjectUrl = ''
+  }
+  const audio = ttsAudioRef.value
+  if (audio) {
+    audio.removeAttribute('src')
+    audio.load()
+  }
+  if (hasNext.value) {
+    ttsAutoNext = true
+    ttsState.value = 'idle'
+    nextChapter()
+  } else {
+    ttsState.value = 'idle'
+    ElMessage.info('本书已播放完毕')
+  }
+}
+
+function onTtsError() {
+  if (ttsState.value === 'idle') return
+  const audio = ttsAudioRef.value
+  if (audio && !audio.getAttribute('src')) return
+  stopTts()
+  ElMessage.error('语音播放失败')
+}
 
 /* ---------------- 8. 自动阅读（定时滚动，到底自动切章） ---------------- */
 
@@ -912,7 +1094,13 @@ async function loadContent(chapterUrl: string) {
   try {
     const res = await getBookContent(chapterUrl, shelfBook.value.origin)
     content.value = res.data?.content ?? ''
+    // 听书：播放中切章 / 本章播完自动连播 → 新章正文就绪后自动续播
+    if (ttsState.value !== 'idle' || ttsAutoNext) {
+      ttsAutoNext = false
+      void startTts()
+    }
   } catch {
+    ttsAutoNext = false
     loadError.value = true
     return
   } finally {
@@ -1188,11 +1376,16 @@ onBeforeUnmount(() => {
           class="font-btn tts-btn"
           type="button"
           :class="{ active: ttsPlaying }"
-          :title="ttsPlaying ? '停止朗读' : '听书（浏览器语音朗读本章）'"
-          :disabled="!ttsSupported"
+          :title="
+            ttsState === 'playing' || ttsState === 'loading'
+              ? '停止朗读'
+              : ttsState === 'paused'
+                ? '继续朗读'
+                : '听书（后端语音合成，本章播完自动下一章）'
+          "
           @click="toggleTts"
         >
-          {{ ttsPlaying ? '停止' : '听书' }}
+          {{ ttsTopLabel }}
         </button>
         <button class="font-btn" type="button" title="在当前位置添加书签" @click="addBookmark">
           ＋书签
@@ -1619,6 +1812,126 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </transition>
+
+    <!-- 听书面板（后端语音合成） -->
+    <transition name="pop">
+      <div v-if="ttsPanelOpen" class="pop-mask" @click="ttsPanelOpen = false">
+        <div class="pop-card tts-card" @click.stop>
+          <p class="pop-title">听书</p>
+          <p class="pop-hint">后端语音合成 · 本章播完自动连播下一章</p>
+
+          <div class="set-row">
+            <span class="set-label">引擎</span>
+            <div class="seg">
+              <button
+                class="seg-btn"
+                type="button"
+                :class="{ active: ttsEngine === 'edge' }"
+                @click="ttsEngine = 'edge'"
+              >
+                Edge
+              </button>
+              <button
+                class="seg-btn"
+                type="button"
+                :class="{ active: ttsEngine === 'http' }"
+                :disabled="ttsHttpList.length === 0"
+                :title="ttsHttpList.length === 0 ? '未配置 HttpTTS 源（设置页添加）' : ''"
+                @click="ttsEngine = 'http'"
+              >
+                HttpTTS
+              </button>
+            </div>
+          </div>
+
+          <div v-if="ttsEngine === 'http'" class="set-row">
+            <span class="set-label">音源</span>
+            <select v-model="ttsHttpUrl" class="tts-select">
+              <option v-for="t in ttsHttpList" :key="t.url" :value="t.url">{{ t.name }}</option>
+            </select>
+          </div>
+
+          <div class="set-row">
+            <span class="set-label">音色</span>
+            <select v-model="ttsVoice" class="tts-select" :title="ttsVoice">
+              <optgroup v-for="g in ttsLocaleGroups" :key="g.label" :label="g.label">
+                <option v-for="v in g.voices" :key="v.value" :value="v.value">
+                  {{ v.name }} · {{ v.gender === 'Female' ? '女声' : '男声' }}
+                </option>
+              </optgroup>
+              <option v-if="ttsVoices.length === 0" :value="ttsVoice">{{ ttsVoice }}</option>
+            </select>
+          </div>
+
+          <div class="set-row">
+            <span class="set-label">语速</span>
+            <div class="set-controls">
+              <button
+                class="set-btn"
+                type="button"
+                :disabled="ttsRate <= 0.5"
+                title="减慢"
+                @click="ttsRate = round1(Math.max(0.5, ttsRate - 0.1))"
+              >
+                −
+              </button>
+              <span class="set-value">{{ ttsRate.toFixed(1) }}</span>
+              <button
+                class="set-btn"
+                type="button"
+                :disabled="ttsRate >= 2"
+                title="加快"
+                @click="ttsRate = round1(Math.min(2, ttsRate + 0.1))"
+              >
+                ＋
+              </button>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <span class="set-label">音调</span>
+            <div class="set-controls">
+              <button
+                class="set-btn"
+                type="button"
+                :disabled="ttsPitch <= -10"
+                title="降低音调"
+                @click="ttsPitch = Math.max(-10, ttsPitch - 1)"
+              >
+                −
+              </button>
+              <span class="set-value">{{ ttsPitchParam }}</span>
+              <button
+                class="set-btn"
+                type="button"
+                :disabled="ttsPitch >= 10"
+                title="升高音调"
+                @click="ttsPitch = Math.min(10, ttsPitch + 1)"
+              >
+                ＋
+              </button>
+            </div>
+          </div>
+
+          <div class="tts-controls">
+            <button
+              class="pop-btn tts-play"
+              type="button"
+              :disabled="ttsState === 'loading'"
+              @click="ttsPlayPause"
+            >
+              {{ ttsState === 'playing' ? '暂停' : ttsState === 'paused' ? '继续' : ttsState === 'loading' ? '加载中…' : '播放' }}
+            </button>
+            <button class="tts-stop" type="button" :disabled="ttsState === 'idle'" @click="stopTts">
+              停止
+            </button>
+          </div>
+        </div>
+      </div>
+    </transition>
+
+    <!-- 隐藏音频元素：后端 TTS 音频流播放（ended → 自动连播） -->
+    <audio ref="ttsAudioRef" preload="auto" @ended="onTtsEnded" @error="onTtsError"></audio>
 
     <!-- 书签列表弹层 -->
     <transition name="pop">
@@ -2373,6 +2686,10 @@ onBeforeUnmount(() => {
   color: var(--accent);
   background: var(--accent-soft);
 }
+.seg-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
 .set-foot {
   display: flex;
   align-items: center;
@@ -2514,6 +2831,62 @@ onBeforeUnmount(() => {
   border-left-color: var(--accent);
   background: var(--accent-soft);
   font-weight: 400;
+}
+
+/* ================= 听书面板 ================= */
+.tts-card {
+  width: min(320px, 86vw);
+}
+.tts-select {
+  width: 150px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 300;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+.tts-select:focus {
+  border-color: var(--accent);
+}
+.tts-controls {
+  display: flex;
+  gap: 10px;
+  margin-top: 22px;
+}
+.tts-play {
+  flex: 1;
+}
+.tts-stop {
+  flex-shrink: 0;
+  height: 36px;
+  padding: 0 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 2px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
+.tts-stop:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.tts-stop:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 /* ================= 书签弹层 ================= */
