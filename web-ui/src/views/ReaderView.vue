@@ -122,18 +122,30 @@ watch(fontWeight, (v) => persist('reader_font_weight', v))
 
 /* ---------------- 2.1 字体（系统/衬线/圆体/黑体） ---------------- */
 
-type FontKind = 'system' | 'serif' | 'round' | 'hei'
+type FontKind = 'system' | 'song' | 'hei' | 'kai' | 'fangsong' | 'round' | 'lishu' | 'yahei' | 'pingfang' | 'serif'
 const FONT_OPTIONS: { label: string; value: FontKind }[] = [
   { label: '系统', value: 'system' },
-  { label: '衬线', value: 'serif' },
-  { label: '圆体', value: 'round' },
+  { label: '宋体', value: 'song' },
   { label: '黑体', value: 'hei' },
+  { label: '楷体', value: 'kai' },
+  { label: '仿宋', value: 'fangsong' },
+  { label: '圆体', value: 'round' },
+  { label: '隶书', value: 'lishu' },
+  { label: '雅黑', value: 'yahei' },
+  { label: '苹方', value: 'pingfang' },
+  { label: '衬线', value: 'serif' },
 ]
 const FONT_STACK: Record<FontKind, string> = {
   system: '',
-  serif: "Georgia, 'Songti SC', 'SimSun', 'Noto Serif CJK SC', serif",
-  round: "'Yuanti SC', 'YouYuan', '幼圆', 'PingFang SC', sans-serif",
+  song: "'Songti SC', 'SimSun', 'NSimSun', '宋体', 'Noto Serif CJK SC', serif",
   hei: "'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif",
+  kai: "'Kaiti SC', 'STKaiti', 'KaiTi', '楷体', '楷体_GB2312', serif",
+  fangsong: "'FangSong', 'STFangsong', 'FangSong_GB2312', '仿宋', serif",
+  round: "'Yuanti SC', 'YouYuan', '幼圆', 'PingFang SC', sans-serif",
+  lishu: "'LiSu', 'STLiti', '隶书', serif",
+  yahei: "'Microsoft YaHei', '微软雅黑', 'PingFang SC', sans-serif",
+  pingfang: "'PingFang SC', 'SF Pro SC', 'HarmonyOS Sans SC', sans-serif",
+  serif: "Georgia, 'Songti SC', 'SimSun', 'Noto Serif CJK SC', serif",
 }
 const fontKind = ref<FontKind>('system')
 {
@@ -1283,7 +1295,7 @@ onBeforeUnmount(() => {
 
           <div class="set-row">
             <span class="set-label">字体</span>
-            <div class="seg-row">
+            <div class="seg-row font-row">
               <button
                 v-for="opt in FONT_OPTIONS"
                 :key="opt.value"
@@ -1786,6 +1798,16 @@ onBeforeUnmount(() => {
 .seg-row {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
+}
+.font-row {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: none;
+}
+.font-row::-webkit-scrollbar {
+  display: none;
 }
 .seg-btn {
   padding: 4px 14px;
