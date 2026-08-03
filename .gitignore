@@ -1,5 +1,5 @@
 /target
-storage/
+/storage/
 *.db
 *.db-shm
 *.db-wal

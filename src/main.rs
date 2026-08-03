@@ -28,6 +28,17 @@ pub struct AppConfig {
     pub user_limit: i64,
     /// 用户书籍上限
     pub user_book_limit: i64,
+    /// 注册邀请码（空 = 不要求）
+    pub invite_code: String,
+    /// 密码最短位数
+    pub min_user_password_length: i64,
+    /// 新用户默认权限
+    pub default_user_enable_webdav: bool,
+    pub default_user_enable_local_store: bool,
+    pub default_user_enable_book_source: bool,
+    pub default_user_enable_rss_source: bool,
+    pub default_user_book_source_limit: i64,
+    pub default_user_book_limit: i64,
 }
 
 impl AppConfig {
@@ -44,6 +55,16 @@ impl AppConfig {
             secure_key: std::env::var("READER_APP_SECUREKEY").unwrap_or_default(),
             user_limit: env_i64("READER_APP_USERLIMIT", 500_000),
             user_book_limit: env_i64("READER_APP_USERBOOKLIMIT", 500_000),
+            invite_code: std::env::var("READER_APP_INVITECODE").unwrap_or_default(),
+            min_user_password_length: env_i64("READER_APP_MINUSERPASSWORDLENGTH", 8),
+            default_user_enable_webdav: env_flag("READER_APP_DEFAULTUSERENABLEWEBDAV"),
+            default_user_enable_local_store: env_flag("READER_APP_DEFAULTUSERENABLELOCALSTORE"),
+            default_user_enable_book_source: env_flag_opt("READER_APP_DEFAULTUSERENABLEBOOKSOURCE")
+                .unwrap_or(true),
+            default_user_enable_rss_source: env_flag_opt("READER_APP_DEFAULTUSERENABLERSSSOURCE")
+                .unwrap_or(true),
+            default_user_book_source_limit: env_i64("READER_APP_DEFAULTUSERBOOKSOURCELIMIT", 200),
+            default_user_book_limit: env_i64("READER_APP_DEFAULTUSERBOOKLIMIT", 200),
         }
     }
 
@@ -59,9 +80,17 @@ impl AppConfig {
 }
 
 fn env_flag(key: &str) -> bool {
-    std::env::var(key)
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
-        .unwrap_or(false)
+    env_flag_opt(key).unwrap_or(false)
+}
+
+/// 读取布尔 env：未设置返回 None（可区分“缺省”与“显式 false”
+fn env_flag_opt(key: &str) -> Option<bool> {
+    std::env::var(key).ok().map(|v| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        )
+    })
 }
 
 fn env_i64(key: &str, default: i64) -> i64 {
@@ -84,6 +113,9 @@ async fn main() -> Result<()> {
 
     let config = AppConfig::from_env();
     let storage = storage::init(&config).await?;
+
+    // JSON → SQLite 自动迁移（检测到 legacy storage/data 且 users 表为空时执行）
+    storage::migrate::migrate_if_needed(&storage).await?;
 
     // 初始化路由
     let app = api::router(config.clone(), storage);
