@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { deleteBookSource, getBookSources, saveBookSource, saveBookSources } from '@/api/sources'
-import { loadSourceSubs, persistSourceSubs } from '@/api/sourceSubs'
+import { deleteSourceSub, getSourceSubs, refreshSourceSub, saveSourceSub } from '@/api/sourceSubs'
 import { exportBookSources } from '@/api/system'
 import type { BookSource, SourceSub } from '@/types'
 
@@ -237,7 +237,7 @@ async function confirmImport() {
   }
 }
 
-/* ================= 订阅源（远程书源订阅，localStorage 占位，见 api/sourceSubs.ts） ================= */
+/* ================= 订阅源（远程书源订阅，后端 /reader3/getSourceSubs 等为主，localStorage 降级，见 api/sourceSubs.ts） ================= */
 const subs = ref<SourceSub[]>([])
 const subUrl = ref('')
 const subBusy = ref(false)
@@ -275,22 +275,39 @@ async function fetchAndImport(url: string): Promise<number> {
   return res.data?.count ?? list.length
 }
 
-/** 新增订阅：拉取书源数组 → 批量导入 → 记录订阅（localStorage） */
+/**
+ * 刷新订阅并导入书源：后端 POST /reader3/refreshSourceSub 优先（服务端拉取远程 JSON 并导入书源表）；
+ * 后端不可用时降级为前端 fetch + saveBookSources（preFetched 可复用已拉取的列表，避免二次请求）。
+ */
+async function refreshAndImport(url: string, preFetched?: BookSource[]): Promise<number> {
+  const res = await refreshSourceSub(url)
+  if (res.isSuccess) return res.data?.count ?? preFetched?.length ?? 0
+  if (preFetched) {
+    const saveRes = await saveBookSources(preFetched)
+    return saveRes.data?.count ?? preFetched.length
+  }
+  return fetchAndImport(url)
+}
+
+/** 新增订阅：拉取书源数组取名称 → 注册订阅（后端 saveSourceSub，降级 localStorage）→ 刷新导入 */
 async function confirmAddSub() {
   if (subBusy.value) return
   const url = subUrl.value.trim()
   if (!url) return
   subBusy.value = true
-  subMsg.value = ''
+  setSubMsg('')
   try {
+    // ① 前端拉取一次：校验格式 + 提取订阅名（后端契约 saveSourceSub 需 name）
     const resp = await fetch(url, { mode: 'cors' })
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
     const raw: unknown = await resp.json()
     const list = normalizeSources(raw)
     if (list.length === 0) throw new Error('未识别到书源（需为书源数组或含 bookSourceList 的对象）')
-    const res = await saveBookSources(list)
-    const count = res.data?.count ?? list.length
     const name = subNameFromRaw(raw, url)
+    // ② 注册订阅（后端优先；失败降级 localStorage）
+    await saveSourceSub(url, name)
+    // ③ 刷新导入书源（后端 refreshSourceSub；降级直接用已拉取的列表导入）
+    const count = await refreshAndImport(url, list)
     const existing = subs.value.find((x) => x.url === url)
     if (existing) {
       existing.name = name
@@ -298,7 +315,6 @@ async function confirmAddSub() {
     } else {
       subs.value.push({ url, name, enabled: true })
     }
-    persistSourceSubs(subs.value)
     subUrl.value = ''
     setSubMsg(`订阅成功：已导入 ${count} 个书源`)
     await load() // 刷新书源列表
@@ -312,22 +328,22 @@ async function confirmAddSub() {
   }
 }
 
-/** 启用/停用订阅：启用时重新拉取并批量导入；停用仅改本地记录（已导入书源保留） */
+/** 启用/停用订阅：启用时注册订阅并重新导入（后端 refreshSourceSub / 降级前端导入）；停用仅改本地记录（已导入书源保留） */
 async function toggleSub(sub: SourceSub) {
   if (subBusyUrls.value.has(sub.url)) return
   const prev = sub.enabled
   subBusyUrls.value.add(sub.url)
   try {
     if (!prev) {
-      const count = await fetchAndImport(sub.url)
+      await saveSourceSub(sub.url, sub.name) // 注册订阅（幂等；后端优先，失败降级 localStorage）
+      const count = await refreshAndImport(sub.url)
       sub.enabled = true
       setSubMsg(`已启用「${sub.name}」，重新导入 ${count} 个书源`)
       await load()
     } else {
       sub.enabled = false
-      setSubMsg('已停用订阅（仅本地记录，已导入的书源保留）')
+      setSubMsg('已停用订阅（已导入的书源保留）')
     }
-    persistSourceSubs(subs.value)
   } catch (err) {
     setSubMsg(
       `导入失败：${err instanceof Error && err.message ? err.message : '未知错误'}（订阅未启用）`,
@@ -338,21 +354,47 @@ async function toggleSub(sub: SourceSub) {
   }
 }
 
-/* 删除订阅（仅本地记录） */
+/** 刷新订阅：重新拉取远程书源并批量导入（后端 refreshSourceSub / 降级前端导入） */
+async function refreshSub(sub: SourceSub) {
+  if (subBusyUrls.value.has(sub.url)) return
+  subBusyUrls.value.add(sub.url)
+  try {
+    const count = await refreshAndImport(sub.url)
+    setSubMsg(`已刷新「${sub.name}」，导入 ${count} 个书源`)
+    await load()
+  } catch (err) {
+    setSubMsg(
+      `刷新失败：${err instanceof Error && err.message ? err.message : '未知错误'}（若为浏览器跨域限制，可下载后手动新增）`,
+      true,
+    )
+  } finally {
+    subBusyUrls.value.delete(sub.url)
+  }
+}
+
+/* 删除订阅（后端优先；降级删除本地记录） */
 const deletingSub = ref<SourceSub | null>(null)
+const deleteSubBusy = ref(false)
 
 function askDeleteSub(sub: SourceSub) {
   deletingSub.value = sub
   document.body.style.overflow = 'hidden'
 }
 
-function confirmDeleteSub() {
+async function confirmDeleteSub() {
   const s = deletingSub.value
-  if (!s) return
-  subs.value = subs.value.filter((x) => x.url !== s.url)
-  persistSourceSubs(subs.value)
-  setSubMsg('已删除订阅记录（已导入的书源保留）')
-  closeDeleteSub()
+  if (!s || deleteSubBusy.value) return
+  deleteSubBusy.value = true
+  try {
+    await deleteSourceSub(s.url)
+    subs.value = subs.value.filter((x) => x.url !== s.url)
+    setSubMsg('已删除订阅记录（已导入的书源保留）')
+    closeDeleteSub()
+  } catch {
+    // 已提示
+  } finally {
+    deleteSubBusy.value = false
+  }
 }
 
 function closeDeleteSub() {
@@ -360,9 +402,14 @@ function closeDeleteSub() {
   document.body.style.overflow = ''
 }
 
+async function loadSubs() {
+  const res = await getSourceSubs() // 后端优先；失败降级 localStorage（api 层已处理）
+  subs.value = res.data ?? []
+}
+
 onMounted(() => {
   load()
-  subs.value = loadSourceSubs()
+  void loadSubs()
 })
 </script>
 
@@ -481,11 +528,11 @@ onMounted(() => {
         </li>
       </ul>
 
-      <!-- 订阅源：远程书源订阅（localStorage 占位，见 api/sourceSubs.ts） -->
+      <!-- 订阅源：远程书源订阅（后端 /reader3/getSourceSubs 等为主，localStorage 降级，见 api/sourceSubs.ts） -->
       <section class="subs-section">
         <div class="subs-head">
           <h2 class="subs-title">订阅源</h2>
-          <span class="subs-sub">远程书源订阅 · 本地占位存储（reader_source_subs），后端就绪后同步</span>
+          <span class="subs-sub">远程书源订阅 · 已接入服务端（账号内多设备一致；服务不可用时降级本地存储）</span>
         </div>
         <form class="subs-add" @submit.prevent="confirmAddSub">
           <input
@@ -514,10 +561,22 @@ onMounted(() => {
               type="button"
               role="switch"
               :aria-checked="sub.enabled"
-              :title="sub.enabled ? '停用订阅（仅本地记录）' : '启用并重新导入书源'"
+              :title="sub.enabled ? '停用订阅（已导入的书源保留）' : '启用并重新导入书源'"
               @click="toggleSub(sub)"
             >
               <span class="switch-knob"></span>
+            </button>
+            <button
+              class="refresh-btn"
+              type="button"
+              title="刷新订阅（重新拉取并导入书源）"
+              :disabled="subBusyUrls.has(sub.url)"
+              @click="refreshSub(sub)"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 11a8 8 0 1 0-2.3 6.3" />
+                <path d="M20 5v6h-6" />
+              </svg>
             </button>
             <button class="delete-btn" type="button" title="删除订阅（仅本地记录）" @click="askDeleteSub(sub)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -632,11 +691,13 @@ onMounted(() => {
               <h2 class="dlg-title">删除订阅</h2>
             </div>
             <p class="confirm-text">
-              确定删除订阅「{{ deletingSub.name }}」吗？仅删除本地订阅记录，已导入的书源不受影响。
+              确定删除订阅「{{ deletingSub.name }}」吗？仅删除订阅记录，已导入的书源不受影响。
             </p>
             <div class="dlg-actions">
-              <button class="ghost-btn" type="button" @click="closeDeleteSub">取消</button>
-              <button class="danger-btn" type="button" @click="confirmDeleteSub">删除</button>
+              <button class="ghost-btn" type="button" :disabled="deleteSubBusy" @click="closeDeleteSub">取消</button>
+              <button class="danger-btn" type="button" :disabled="deleteSubBusy" @click="confirmDeleteSub">
+                {{ deleteSubBusy ? '删除中…' : '删除' }}
+              </button>
             </div>
           </div>
         </div>
@@ -1029,6 +1090,36 @@ onMounted(() => {
   background: rgba(207, 68, 68, 0.06);
 }
 .delete-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* 刷新订阅按钮（细字图标） */
+.refresh-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.refresh-btn:hover:not(:disabled) {
+  color: var(--accent);
+  background: rgba(64, 158, 120, 0.06);
+}
+.refresh-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+.refresh-btn svg {
   width: 13px;
   height: 13px;
 }

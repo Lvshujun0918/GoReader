@@ -13,6 +13,23 @@ use crate::service::search::SearchBook;
 pub struct ExploreEntry {
     pub title: String,
     pub url: String,
+    /// book=书单分类（探索加载）/ link=外部链接（点击打开）
+    #[serde(default)]
+    pub r#type: String,
+}
+
+/// 判断分类类型：外部链接（群/导入/渠道/发布等）vs 书单
+fn entry_type(title: &str, url: &str) -> String {
+    let t = title.to_lowercase();
+    let keywords = ["导入", "群", "发布", "渠道", "交流", "更新", "关注", "频道", "公众号"];
+    if keywords.iter().any(|k| t.contains(k)) {
+        return "link".to_string();
+    }
+    let domains = ["qm.qq.com", "bilibili.com", "mp.weixin.qq.com", "shuyuan-api", "yckceo.com", "t.me"];
+    if domains.iter().any(|d| url.contains(d)) {
+        return "link".to_string();
+    }
+    "book".to_string()
 }
 
 /// 解析 exploreUrl（legado 语义）：
@@ -54,7 +71,7 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
                             .unwrap_or("")
                             .to_string();
                         if !url.is_empty() {
-                            entries.push(ExploreEntry { title, url });
+                            entries.push(ExploreEntry { title: title.clone(), url: url.clone(), r#type: entry_type(&title, &url) });
                         }
                     }
                     i = lines.len();
@@ -79,7 +96,7 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
                     let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     if !url.is_empty() {
-                        entries.push(ExploreEntry { title, url });
+                        entries.push(ExploreEntry { title: title.clone(), url: url.clone(), r#type: entry_type(&title, &url) });
                     }
                 }
                 continue;
@@ -91,7 +108,7 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
             let title = title.trim().to_string();
             let url = url.trim().to_string();
             if !url.is_empty() {
-                entries.push(ExploreEntry { title, url });
+                entries.push(ExploreEntry { title: title.clone(), url: url.clone(), r#type: entry_type(&title, &url) });
                 i += 1;
                 continue;
             }
@@ -99,8 +116,9 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
         // 普通 URL 行：title 从尾部提取
         let title = url_title(&line);
         entries.push(ExploreEntry {
-            title,
+            title: title.clone(),
             url: line.to_string(),
+            r#type: entry_type(&title, line),
         });
         i += 1;
     }

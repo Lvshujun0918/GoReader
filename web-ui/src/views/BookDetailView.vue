@@ -3,7 +3,8 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { getBookInfo } from '@/api/books'
-import type { Book, BookInfo } from '@/types'
+import { searchBookContent } from '@/api/cache'
+import type { Book, BookInfo, ContentSearchHit } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -133,6 +134,70 @@ function startReading() {
   void router.push(`/reader/${encodeURIComponent(shelfBook.value.bookUrl)}`)
 }
 
+/* ================= 全书搜索（GET /reader3/searchBookContent，本地书正文逐章匹配） ================= */
+
+const searchOpen = ref(false)
+const searchKey = ref('')
+const searchBusy = ref(false)
+const searchHits = ref<ContentSearchHit[]>([])
+const searchMsg = ref('')
+const searchMsgError = ref(false)
+
+function openSearch() {
+  searchKey.value = ''
+  searchHits.value = []
+  searchMsg.value = ''
+  searchMsgError.value = false
+  searchOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeSearch() {
+  if (searchBusy.value) return
+  searchOpen.value = false
+  document.body.style.overflow = ''
+}
+
+async function runSearch() {
+  if (searchBusy.value) return
+  const key = searchKey.value.trim()
+  if (!key) {
+    searchMsg.value = '请输入搜索关键词'
+    searchMsgError.value = true
+    return
+  }
+  searchBusy.value = true
+  searchMsg.value = ''
+  searchMsgError.value = false
+  searchHits.value = []
+  try {
+    const res = await searchBookContent(key, bookUrl.value)
+    const hits = res.data ?? []
+    searchHits.value = hits
+    if (hits.length === 0) {
+      searchMsg.value = '未找到匹配内容'
+      searchMsgError.value = false
+    } else {
+      searchMsg.value = `共 ${hits.length} 个章节命中`
+    }
+  } catch (err) {
+    // 接口未实现（404）/失败：在弹层内提示，不弹全局 toast
+    searchMsg.value =
+      err instanceof Error && err.message
+        ? `搜索失败：${err.message}`
+        : '搜索失败，请稍后重试'
+    searchMsgError.value = true
+  } finally {
+    searchBusy.value = false
+  }
+}
+
+/** 点击命中 → 跳阅读页并定位到该章（/reader/:bookUrl?chapter=index） */
+function goToHit(hit: ContentSearchHit) {
+  closeSearch()
+  void router.push(`/reader/${encodeURIComponent(bookUrl.value)}?chapter=${hit.chapterIndex}`)
+}
+
 onMounted(load)
 </script>
 
@@ -203,10 +268,61 @@ onMounted(load)
             <button v-else class="add-btn" type="button" :disabled="saving" @click="addToShelf">
               加入书架
             </button>
+            <!-- 全书搜索（书架书本地正文搜索；命中后跳阅读页该章） -->
+            <button v-if="shelfBook" class="search-btn" type="button" @click="openSearch">全书搜索</button>
           </div>
         </div>
       </div>
     </main>
+
+    <!-- 全书搜索弹层（GET /reader3/searchBookContent） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="searchOpen" class="dlg-overlay" @click.self="closeSearch">
+          <div
+            class="dlg dlg-search"
+            role="dialog"
+            aria-modal="true"
+            aria-label="全书搜索"
+            tabindex="-1"
+            @keydown.esc="closeSearch"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">全书搜索</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="searchBusy" @click="closeSearch">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="runSearch">
+              <div class="search-row">
+                <input
+                  v-model="searchKey"
+                  class="search-input"
+                  type="text"
+                  placeholder="搜索《{{ display.name }}》正文"
+                  spellcheck="false"
+                />
+                <button class="accent-btn" type="submit" :disabled="searchBusy || !searchKey.trim()">
+                  {{ searchBusy ? '搜索中…' : '搜索' }}
+                </button>
+              </div>
+              <p class="field-tip">搜索本书全部章节正文（本地书），命中后点击跳转阅读页对应章节。</p>
+              <p v-if="searchMsg" class="search-msg" :class="{ error: searchMsgError }">{{ searchMsg }}</p>
+              <ul v-if="searchHits.length" class="search-hits">
+                <li v-for="(hit, i) in searchHits" :key="`${hit.chapterIndex}-${i}`">
+                  <button class="hit-btn" type="button" @click="goToHit(hit)">
+                    <span class="hit-title">{{ hit.title || `第 ${hit.chapterIndex + 1} 章` }}</span>
+                    <span class="hit-snippet">{{ hit.snippet }}</span>
+                  </button>
+                </li>
+              </ul>
+            </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -374,6 +490,7 @@ onMounted(load)
   display: flex;
   align-items: center;
   gap: 16px;
+  flex-wrap: wrap;
 }
 .read-btn {
   padding: 13px 44px;
@@ -418,6 +535,29 @@ onMounted(load)
 .add-btn:disabled {
   opacity: 0.55;
   cursor: default;
+}
+
+/* 全书搜索：细字描边按钮（次于主按钮） */
+.search-btn {
+  padding: 13px 32px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 300;
+  letter-spacing: 3px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.search-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 
 /* ================= 骨架 / 空态 ================= */
@@ -482,6 +622,209 @@ onMounted(load)
 .ghost-btn:hover {
   color: var(--accent);
   border-color: var(--accent);
+}
+
+/* ================= 全书搜索弹层 ================= */
+.dlg-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(24, 24, 27, 0.35);
+}
+.dlg {
+  width: min(520px, 100%);
+  max-height: min(560px, 86vh);
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+  outline: none;
+}
+.dlg-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.dlg-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-1);
+}
+.dlg-close {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.dlg-close:hover:not(:disabled) {
+  color: var(--text-1);
+  background: #f4f4f5;
+}
+.dlg-close:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+.dlg-close svg {
+  width: 13px;
+  height: 13px;
+}
+.dlg-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+.search-row {
+  display: flex;
+  gap: 8px;
+}
+.search-input {
+  flex: 1;
+  min-width: 0;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+.search-input::placeholder {
+  color: var(--text-3);
+  font-weight: 300;
+}
+.search-input:focus {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+.accent-btn {
+  flex-shrink: 0;
+  padding: 0 20px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease;
+}
+.accent-btn:hover:not(:disabled) {
+  background: var(--accent-deep);
+  border-color: var(--accent-deep);
+}
+.accent-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.field-tip {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.search-msg {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+}
+.search-msg.error {
+  color: #cf4444;
+}
+.search-hits {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hit-btn {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.hit-btn:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.hit-title {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hit-snippet {
+  font-size: 12px;
+  font-weight: 300;
+  line-height: 1.6;
+  color: var(--text-3);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 弹窗动画：fade 200ms */
+.dlg-enter-active,
+.dlg-leave-active {
+  transition: opacity 0.2s ease;
+}
+.dlg-enter-from,
+.dlg-leave-to {
+  opacity: 0;
+}
+.dlg-enter-active .dlg,
+.dlg-leave-active .dlg {
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+.dlg-enter-from .dlg,
+.dlg-leave-to .dlg {
+  opacity: 0;
+  transform: translateY(6px);
 }
 
 /* ================= 响应式 ================= */

@@ -9,7 +9,7 @@ import { backupToWebdav } from '@/api/backup'
 import { getSystemInfo } from '@/api/system'
 import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
 import { useUserStore } from '@/stores/user'
-import type { CacheInfo, HttpTts, SystemInfo, TxtTocRule } from '@/types'
+import type { CacheClearType, CacheInfo, HttpTts, SystemInfo, TxtTocRule } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
@@ -276,14 +276,23 @@ onMounted(() => {
   loadCacheInfo()
 })
 
-/* ================= 缓存管理（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache——后端待实现） ================= */
+/* ================= 缓存管理（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache） ================= */
 
 const cacheInfo = ref<CacheInfo | null>(null)
 /** 后端契约是否可用（getCacheInfo 静默探测；未实现时置 false，界面显示「后端待实现」） */
 const cacheReady = ref(false)
 const cacheBusy = ref(false)
 
+/** 清理类型（极简胶囊单选）：目录 / 章节 / 全部 */
+const CLEAR_TYPES: { value: CacheClearType; label: string }[] = [
+  { value: 'toc', label: '目录' },
+  { value: 'chapter', label: '章节' },
+  { value: 'all', label: '全部' },
+]
+const cacheType = ref<CacheClearType>('chapter')
+
 function fmtSize(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0 B'
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${(n / 1024 / 1024).toFixed(1)} MB`
@@ -301,6 +310,10 @@ async function loadCacheInfo() {
   }
 }
 
+function clearTypeLabel(t: CacheClearType): string {
+  return CLEAR_TYPES.find((x) => x.value === t)?.label ?? t
+}
+
 async function runClearCache() {
   if (!cacheReady.value) {
     ElMessage.info('清理缓存接口后端待实现（POST /reader3/clearCache）')
@@ -309,8 +322,8 @@ async function runClearCache() {
   if (cacheBusy.value) return
   cacheBusy.value = true
   try {
-    await clearCache()
-    ElMessage.success('已清理缓存')
+    await clearCache(cacheType.value)
+    ElMessage.success(`已清理${clearTypeLabel(cacheType.value)}缓存`)
     await loadCacheInfo()
   } catch {
     // 已提示
@@ -481,29 +494,45 @@ async function runBackup() {
         <p v-if="backupPath" class="card-note mono backup-path">已备份至：{{ backupPath }}</p>
       </section>
 
-      <!-- 缓存（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache——后端待实现） -->
+      <!-- 缓存（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache） -->
       <section class="card">
         <h2 class="card-title">缓存</h2>
         <div class="row">
-          <span class="row-label">章节缓存</span>
+          <span class="row-label">缓存统计</span>
           <span v-if="cacheReady" class="row-value">
-            {{ cacheInfo?.chapterCacheCount ?? 0 }} 章 · {{ fmtSize(cacheInfo?.chapterCacheSize ?? 0) }}
+            章节 {{ cacheInfo?.chapterCount ?? 0 }} · 目录 {{ cacheInfo?.tocCount ?? 0 }} · {{ fmtSize(cacheInfo?.totalBytes ?? 0) }}
           </span>
           <span v-else class="row-value">后端待实现</span>
+        </div>
+        <div class="row">
+          <span class="row-label">清理缓存</span>
+          <div class="cache-types">
+            <button
+              v-for="t in CLEAR_TYPES"
+              :key="t.value"
+              class="capsule"
+              :class="{ active: cacheType === t.value }"
+              type="button"
+              :disabled="!cacheReady || cacheBusy"
+              @click="cacheType = t.value"
+            >
+              {{ t.label }}
+            </button>
+          </div>
           <button
-            class="row-action"
+            class="row-action cache-clear"
             type="button"
-            :disabled="cacheBusy"
-            :title="cacheReady ? '清理章节缓存' : '清理接口后端待实现'"
+            :disabled="!cacheReady || cacheBusy"
+            :title="cacheReady ? '清理所选类型缓存' : '清理接口后端待实现'"
             @click="runClearCache"
           >
-            {{ cacheBusy ? '清理中…' : '清理缓存' }}
+            {{ cacheBusy ? '清理中…' : '清理' }}
           </button>
         </div>
         <p v-if="!cacheReady" class="card-note">
           缓存统计接口 GET /reader3/getCacheInfo 与清理接口 POST /reader3/clearCache 后端待实现。
         </p>
-        <p v-else class="card-note">章节正文缓存占用磁盘空间，清理后再次打开章节会重新拉取。</p>
+        <p v-else class="card-note">正文/目录缓存占用磁盘空间，清理后再次打开会重新拉取。</p>
       </section>
 
       <!-- txtTocRule（自定义 TXT 目录规则） -->
@@ -1252,6 +1281,53 @@ async function runBackup() {
 }
 .backup-path {
   color: var(--accent);
+}
+
+/* 清理类型胶囊（极简：细字圆角条） */
+.cache-types {
+  display: flex;
+  gap: 6px;
+}
+.capsule {
+  padding: 3px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 300;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.capsule:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.capsule.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 400;
+}
+.capsule:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.cache-clear {
+  color: #cf4444;
+  border-color: rgba(207, 68, 68, 0.45);
+}
+.cache-clear:hover:not(:disabled) {
+  color: #cf4444;
+  border-color: #cf4444;
+}
+.cache-clear:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 .row-action:disabled {
   cursor: not-allowed;

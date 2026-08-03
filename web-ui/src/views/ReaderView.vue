@@ -1028,9 +1028,15 @@ async function init() {
       bookName.value = infoRes.value.data.name || bookName.value
     }
 
-    // 起始章节：服务端进度优先（getBookshelf 已带 durChapter*；durChapterTime>0 才算存过），
-    // 无服务端进度则回退 localStorage
+    // 起始章节：① 全书搜索跳转 ?chapter=index 显式指定（优先级最高）；
+    // ② 服务端进度（getBookshelf 已带 durChapter*；durChapterTime>0 才算存过）；
+    // ③ 无服务端进度则回退 localStorage
     let startIndex = realChapters.value.length ? chapters.value.indexOf(realChapters.value[0]) : 0
+    const qc = Number(route.query.chapter)
+    const queryChapter =
+      Number.isInteger(qc) && qc >= 0 && qc < chapters.value.length && !chapters.value[qc].isVolume
+        ? qc
+        : -1
     const srvIdx = found.durChapterIndex ?? -1
     const serverSaved =
       typeof srvIdx === 'number' &&
@@ -1038,7 +1044,9 @@ async function init() {
       srvIdx < chapters.value.length &&
       !chapters.value[srvIdx].isVolume &&
       (found.durChapterTime ?? 0) > 0
-    if (serverSaved) {
+    if (queryChapter >= 0) {
+      startIndex = queryChapter
+    } else if (serverSaved) {
       startIndex = srvIdx
       const srvPos = found.durChapterPos ?? 0
       restoreScrollY = srvPos > 0 ? srvPos : 0

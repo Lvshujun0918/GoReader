@@ -149,6 +149,14 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/deleteBookSource", post(delete_book_source))
         .route("/reader3/deleteBookSources", post(delete_book_sources))
         .route("/reader3/deleteAllBookSources", post(delete_all_book_sources))
+        // 缓存管理 + 全书搜索 + 书源订阅
+        .route("/reader3/getCacheInfo", get(get_cache_info).post(get_cache_info))
+        .route("/reader3/clearCache", post(clear_cache))
+        .route("/reader3/searchBookContent", get(search_book_content).post(search_book_content))
+        .route("/reader3/getSourceSubs", get(get_source_subs).post(get_source_subs))
+        .route("/reader3/saveSourceSub", post(save_source_sub))
+        .route("/reader3/deleteSourceSub", post(delete_source_sub))
+        .route("/reader3/refreshSourceSub", post(refresh_source_sub))
         // RSS 模块（兼容 legacy rss 路由）
         .route("/reader3/getRssSources", get(get_rss_sources).post(get_rss_sources))
         .route("/reader3/saveRssSource", post(save_rss_source))
@@ -616,6 +624,275 @@ async fn delete_all_book_sources(
         Ok(n) => Json(ReturnData::ok(serde_json::json!({ "deleted": n }))),
         Err(e) => {
             tracing::error!("deleteAllBookSources 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+// ---------------- 缓存管理 ----------------
+
+/// GET/POST /reader3/getCacheInfo：缓存统计（toc_cache 行数 / book_chapters 行数 /
+/// 章节近似大小 sum length(content) / 目录缓存大小 / 总大小）
+async fn get_cache_info(State(state): State<AppState>) -> Json<ReturnData> {
+    match state.storage.get_cache_info().await {
+        Ok(info) => Json(ReturnData::ok(
+            serde_json::to_value(info).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("getCacheInfo 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/clearCache：清空缓存（body/query {type: "toc"|"chapters"|"all"}）
+async fn clear_cache(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let mut cache_type = params.get("type").cloned().unwrap_or_default();
+    if let Some(body) = body {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(v) = json.get("type").and_then(|v| v.as_str()) {
+                cache_type = v.to_string();
+            }
+        }
+    }
+    if cache_type != "toc" && cache_type != "chapters" && cache_type != "all" {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.clear_cache(&cache_type).await {
+        Ok((toc_deleted, chapters_deleted)) => Json(ReturnData::ok(serde_json::json!({
+            "deletedToc": toc_deleted,
+            "deletedChapters": chapters_deleted,
+        }))),
+        Err(e) => {
+            tracing::error!("clearCache 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+// ---------------- 全书搜索（仅本地书） ----------------
+
+/// GET/POST /reader3/searchBookContent：全书搜索（params key + bookUrl）
+/// 本地书：book_chapters 表 LIKE 匹配正文 → data: [{chapterIndex, title, snippet}]
+/// 书源书：返回提示“仅支持本地书内容搜索”
+async fn search_book_content(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let key = param_of(&params, body_json.as_ref(), "key");
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    if key.is_empty() {
+        return Json(ReturnData::err("请输入搜索关键字"));
+    }
+    if book_url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    // 本地书判定：书架书（origin/url 形态）或 book_chapters 已有章节
+    let shelf = state
+        .storage
+        .find_book(&namespace, &book_url)
+        .await
+        .ok()
+        .flatten();
+    let has_chapters = state.storage.count_chapters(&book_url).await.unwrap_or(0) > 0;
+    match &shelf {
+        Some(book) => {
+            if !crate::service::local_book::is_local_book(&book.book_url, &book.origin) {
+                return Json(ReturnData::err("仅支持本地书内容搜索"));
+            }
+        }
+        None if !has_chapters => return Json(ReturnData::err("书籍不存在")),
+        None => {}
+    }
+    match state.storage.search_book_content(&book_url, &key, 100).await {
+        Ok(hits) => Json(ReturnData::ok(
+            serde_json::to_value(hits).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("searchBookContent 失败 [{book_url}]: {e}");
+            Json(ReturnData::err("搜索失败"))
+        }
+    }
+}
+
+// ---------------- 书源订阅 ----------------
+
+/// GET/POST /reader3/getSourceSubs：订阅列表（url/name/enabled）
+async fn get_source_subs(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = body;
+    match state.storage.get_source_subs(&namespace).await {
+        Ok(list) => Json(ReturnData::ok(
+            serde_json::to_value(list).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("getSourceSubs [{namespace}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// 抓取订阅 URL → 校验书源数组 → 订阅入库（raw_json 存原文）+ 批量导入书源（已存在覆盖）
+/// （saveSourceSub / refreshSourceSub 共用）；返回导入书源数
+async fn fetch_and_store_source_sub(
+    state: &AppState,
+    ns: &str,
+    url: &str,
+    name: &str,
+) -> Result<usize, ReturnData> {
+    let headers_map: HashMap<String, String> = HashMap::new();
+    let resp = match crate::service::crawler::fetch(url, &headers_map, 15, "GET", None, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("订阅抓取失败 [{url}]: {e}");
+            return Err(ReturnData::err("远程书源链接错误"));
+        }
+    };
+    // 校验：必须是书源数组（每项含非空 bookSourceUrl）
+    let json: serde_json::Value = match serde_json::from_str(&resp.body) {
+        Ok(v) => v,
+        Err(_) => return Err(ReturnData::err("书源数据格式错误")),
+    };
+    let sources: Vec<crate::model::BookSource> = match serde_json::from_value(json) {
+        Ok(s) => s,
+        Err(_) => return Err(ReturnData::err("书源数据格式错误")),
+    };
+    if sources.is_empty() || sources.iter().any(|s| s.book_source_url.trim().is_empty()) {
+        return Err(ReturnData::err("书源数据格式错误"));
+    }
+    // F-7 书源数上限（同 saveFromRemoteSource：已存在覆盖不计名额，超限整批拒绝）
+    if let Some(limit) = state.storage.book_source_limit_for(ns).await.ok().flatten() {
+        if limit > 0 {
+            let mut new_count = 0i64;
+            for s in &sources {
+                let exists = state
+                    .storage
+                    .find_book_source(ns, &s.book_source_url)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if !exists {
+                    new_count += 1;
+                }
+            }
+            match state.storage.count_book_sources(ns).await {
+                Ok(count) if count + new_count > limit => {
+                    return Err(ReturnData::err("超过书源数上限"));
+                }
+                Ok(_) => {}
+                Err(_) => return Err(ReturnData::err("系统错误")),
+            }
+        }
+    }
+    // 订阅入库 + 批量导入书源
+    if let Err(e) = state
+        .storage
+        .save_source_sub(ns, url, name, &resp.body)
+        .await
+    {
+        tracing::error!("保存订阅失败 [{url}]: {e}");
+        return Err(ReturnData::err("保存失败"));
+    }
+    if let Err(e) = state.storage.save_book_sources(ns, &sources).await {
+        tracing::error!("订阅书源入库失败 [{url}]: {e}");
+        return Err(ReturnData::err("保存失败"));
+    }
+    Ok(sources.len())
+}
+
+/// POST /reader3/saveSourceSub：订阅书源集合（body {url, name}）——抓取校验后入库 + 批量导入书源
+async fn save_source_sub(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("请输入订阅链接"));
+    }
+    let mut name = param_of(&params, body_json.as_ref(), "name");
+    if name.is_empty() {
+        name = url.clone();
+    }
+    match fetch_and_store_source_sub(&state, &namespace, &url, &name).await {
+        Ok(count) => Json(ReturnData::ok(serde_json::json!({ "count": count }))),
+        Err(ret) => Json(ret),
+    }
+}
+
+/// POST /reader3/refreshSourceSub：重新拉取订阅并覆盖书源（url 参数；订阅需已存在）
+async fn refresh_source_sub(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("请输入订阅链接"));
+    }
+    let sub = match state.storage.find_source_sub(&namespace, &url).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Json(ReturnData::err("订阅不存在")),
+        Err(_) => return Json(ReturnData::err("系统错误")),
+    };
+    match fetch_and_store_source_sub(&state, &namespace, &url, &sub.name).await {
+        Ok(count) => Json(ReturnData::ok(serde_json::json!({ "count": count }))),
+        Err(ret) => Json(ret),
+    }
+}
+
+/// POST /reader3/deleteSourceSub：删除订阅（url 参数；仅删订阅行，不影响已导入书源）
+async fn delete_source_sub(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_source_sub(&namespace, &url).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("deleteSourceSub 失败 [{url}]: {e}");
             Json(ReturnData::err("删除失败"))
         }
     }

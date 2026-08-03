@@ -111,6 +111,7 @@ export interface ExploreSourceInfo {
 export interface ExploreCategory {
   title: string
   url: string
+  type?: string
 }
 
 /** 书架分组（/reader3/getBookGroups → BookGroup，camelCase；books.group 存分组 id，0=未分组） */

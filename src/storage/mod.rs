@@ -3109,4 +3109,200 @@ mod tests {
         assert_eq!(storage.count_all_book_sources().await.unwrap(), 2);
         cleanup(storage, "sysinfo").await;
     }
+
+    /// 缓存管理：getCacheInfo 统计（toc_cache 行数 / book_chapters 行数 / sum length 大小）+
+    /// clearCache 按 type 清空（toc / chapters / all）
+    #[tokio::test]
+    async fn test_cache_info_and_clear() {
+        let storage = test_storage("cache").await;
+
+        // 空库：全零
+        let info = storage.get_cache_info().await.unwrap();
+        assert_eq!(info.toc_cache_count, 0);
+        assert_eq!(info.chapter_count, 0);
+        assert_eq!(info.chapter_size, 0);
+        assert_eq!(info.total_size, 0);
+
+        // 写入目录缓存 2 条 + 章节 3 条
+        storage.cache_toc("https://book.com/a", "https://book.com/toc", "[{\"title\":\"第一章\"}]").await.unwrap();
+        storage.cache_toc("https://book.com/b", "https://book.com/toc2", "[{\"title\":\"第二章\"}]").await.unwrap();
+        storage.save_chapters("local://book1", &[
+            ("第一章".to_string(), "正文一甲乙丙丁".to_string()),
+            ("第二章".to_string(), "正文二戊己庚辛壬癸".to_string()),
+            ("第三章".to_string(), "正文三子丑寅卯".to_string()),
+        ])
+        .await
+        .unwrap();
+
+        let info = storage.get_cache_info().await.unwrap();
+        assert_eq!(info.toc_cache_count, 2);
+        assert_eq!(info.toc_cache_size, 46, "两条 chapters_json 各 23 字节");
+        assert_eq!(info.chapter_count, 3);
+        assert_eq!(info.chapter_size, 69, "7+9+7 个汉字 × 3 字节");
+        assert_eq!(info.total_size, info.toc_cache_size + info.chapter_size);
+
+        // 只清 toc
+        let (toc_del, chap_del) = storage.clear_cache("toc").await.unwrap();
+        assert_eq!(toc_del, 2);
+        assert_eq!(chap_del, 0);
+        let info = storage.get_cache_info().await.unwrap();
+        assert_eq!(info.toc_cache_count, 0);
+        assert_eq!(info.chapter_count, 3, "章节缓存不受影响");
+
+        // 只清 chapters
+        let (toc_del, chap_del) = storage.clear_cache("chapters").await.unwrap();
+        assert_eq!(toc_del, 0);
+        assert_eq!(chap_del, 3);
+        let info = storage.get_cache_info().await.unwrap();
+        assert_eq!(info.chapter_count, 0);
+        assert_eq!(info.total_size, 0);
+
+        // all：全清（再写入后验证）
+        storage.cache_toc("https://book.com/a", "https://book.com/toc", "[]").await.unwrap();
+        storage.save_chapters("local://book1", &[("第四章".to_string(), "正文四".to_string())]).await.unwrap();
+        let (toc_del, chap_del) = storage.clear_cache("all").await.unwrap();
+        assert_eq!(toc_del, 1);
+        assert_eq!(chap_del, 1);
+        let info = storage.get_cache_info().await.unwrap();
+        assert_eq!(info.toc_cache_count, 0);
+        assert_eq!(info.chapter_count, 0);
+        assert_eq!(info.total_size, 0);
+
+        // 未知 type：不删任何表
+        let (toc_del, chap_del) = storage.clear_cache("unknown").await.unwrap();
+        assert_eq!(toc_del, 0);
+        assert_eq!(chap_del, 0);
+
+        cleanup(storage, "cache").await;
+    }
+
+    /// 全书搜索：LIKE 匹配 + 命中摘要（前后截取）+ %/_ 转义 + 章节序 + limit
+    #[tokio::test]
+    async fn test_search_book_content() {
+        let storage = test_storage("search").await;
+        storage
+            .save_chapters(
+                "local://book1",
+                &[
+                    ("第一章".to_string(), "这是第一章的正文，关键词出现了。".to_string()),
+                    ("第二章".to_string(), "本章没有匹配内容。".to_string()),
+                    ("第三章".to_string(), "在很久很久以前，有一个非常非常长的开头铺垫，它洋洋洒洒写了很多很多字，然后关键词在这里再次出现，后面还有一点内容。".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        storage
+            .save_chapters(
+                "local://book2",
+                &[("第一章".to_string(), "另一本书里的关键词。".to_string())],
+            )
+            .await
+            .unwrap();
+
+        // 命中两章，按章节序返回
+        let hits = storage.search_book_content("local://book1", "关键词", 50).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].chapter_index, 0);
+        assert_eq!(hits[0].title, "第一章");
+        assert!(hits[0].snippet.contains("关键词"));
+        assert!(hits[0].snippet.starts_with("这是第一章"));
+        assert_eq!(hits[1].chapter_index, 2);
+        assert!(hits[1].snippet.contains("关键词"));
+        assert!(hits[1].snippet.starts_with("…"), "超长段落应截断补省略号: {}", hits[1].snippet);
+
+        // 其他书不串
+        let hits = storage.search_book_content("local://book2", "关键词", 50).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "第一章");
+
+        // 无命中 / 书不存在
+        assert!(storage.search_book_content("local://book1", "不存在词", 50).await.unwrap().is_empty());
+        assert!(storage.search_book_content("local://ghost", "关键词", 50).await.unwrap().is_empty());
+
+        // 大小写不敏感（ASCII）
+        storage
+            .save_chapters("local://book3", &[("Ch1".to_string(), "Hello World here".to_string())])
+            .await
+            .unwrap();
+        let hits = storage.search_book_content("local://book3", "world", 50).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("World"));
+
+        // limit 生效
+        let hits = storage.search_book_content("local://book1", "关键词", 1).await.unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // %/_ 作为字面量转义（不当作 LIKE 通配符）
+        storage
+            .save_chapters(
+                "local://book4",
+                &[
+                    ("C1".to_string(), "进度50%完成。".to_string()),
+                    ("C2".to_string(), "完全没有任何特殊符号的一章。".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        let hits = storage.search_book_content("local://book4", "50%", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "% 应转义为字面量");
+        assert_eq!(hits[0].title, "C1");
+        let hits = storage.search_book_content("local://book4", "5_", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "_ 应转义为字面量");
+        let hits = storage.search_book_content("local://book4", "5%", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        let hits = storage.search_book_content("local://book4", "%", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "% 转义后只匹配含字面 % 的行");
+        assert_eq!(hits[0].title, "C1");
+        let hits = storage.search_book_content("local://book4", "_", 10).await.unwrap();
+        assert!(hits.is_empty(), "_ 转义后不应匹配所有行");
+        assert_eq!(storage.count_chapters("local://book4").await.unwrap(), 2);
+        assert_eq!(storage.count_chapters("local://ghost").await.unwrap(), 0);
+
+        cleanup(storage, "search").await;
+    }
+
+    /// 书源订阅：CRUD 往返 + 命名空间隔离 + default 回退
+    #[tokio::test]
+    async fn test_source_sub_crud() {
+        let storage = test_storage("subs").await;
+        let raw = r#"[{"bookSourceUrl":"https://s1.com","bookSourceName":"源1"}]"#;
+
+        // 保存 → 查询往返（raw_json 原文保留）
+        storage.save_source_sub("default", "https://sub.com/all.json", "全部书源", raw).await.unwrap();
+        let list = storage.get_source_subs("default").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].url, "https://sub.com/all.json");
+        assert_eq!(list[0].name, "全部书源");
+        assert!(list[0].enabled);
+        assert_eq!(list[0].raw_json.as_deref(), Some(raw));
+        assert_eq!(list[0].user_namespace, "default");
+
+        // 覆盖保存（改名）
+        storage.save_source_sub("default", "https://sub.com/all.json", "全部书源v2", raw).await.unwrap();
+        let list = storage.get_source_subs("default").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "全部书源v2");
+
+        // 按 URL 查找
+        let sub = storage.find_source_sub("default", "https://sub.com/all.json").await.unwrap().unwrap();
+        assert_eq!(sub.name, "全部书源v2");
+        assert!(storage.find_source_sub("default", "https://sub.com/ghost").await.unwrap().is_none());
+
+        // 命名空间隔离 + default 回退
+        assert_eq!(storage.get_source_subs("alice").await.unwrap().len(), 1, "alice 无订阅回退 default");
+        assert!(storage.find_source_sub("alice", "https://sub.com/all.json").await.unwrap().is_some());
+        storage.save_source_sub("alice", "https://sub.com/a.json", "爱丽丝订阅", raw).await.unwrap();
+        let alice = storage.get_source_subs("alice").await.unwrap();
+        assert_eq!(alice.len(), 1, "有自有订阅后不再回退 default");
+        assert_eq!(alice[0].name, "爱丽丝订阅");
+
+        // 删除：只影响本命名空间；不存在返回 0 行
+        assert_eq!(storage.delete_source_sub("alice", "https://sub.com/all.json").await.unwrap(), 0);
+        assert_eq!(storage.delete_source_sub("alice", "https://sub.com/a.json").await.unwrap(), 1);
+        assert_eq!(storage.get_source_subs("alice").await.unwrap().len(), 1, "回退 default");
+        assert_eq!(storage.delete_source_sub("default", "https://sub.com/all.json").await.unwrap(), 1);
+        assert!(storage.get_source_subs("default").await.unwrap().is_empty());
+
+        cleanup(storage, "subs").await;
+    }
 }

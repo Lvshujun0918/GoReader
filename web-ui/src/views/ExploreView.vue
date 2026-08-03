@@ -43,9 +43,10 @@
             :key="c.url"
             type="button"
             class="cat"
-            :class="{ active: activeUrl === c.url }"
-            @click="switchCategory(c.url)"
+            :class="{ active: activeUrl === c.url, link: c.type === 'link' }"
+            @click="openCategory(c)"
           >
+            <template v-if="c.type === 'link'">↗</template>
             {{ c.title || '默认' }}
           </button>
         </div>
@@ -74,7 +75,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { getExploreSources, getExploreUrls, exploreBook } from '@/api/explore'
 import type { BookSource, ExploreCategory, ExploreSourceInfo, SearchBook } from '@/types'
@@ -177,6 +178,14 @@ function switchCategory(url: string) {
   loadBooks(1)
 }
 
+function openCategory(c: ExploreCategory) {
+  if (c.type === 'link') {
+    window.open(c.url, '_blank', 'noopener')
+    return
+  }
+  switchCategory(c.url)
+}
+
 async function loadBooks(p: number) {
   if (!source.value || !activeUrl.value) return
   if (p === 1) loadingBooks.value = true
@@ -204,7 +213,22 @@ function goBook(b: SearchBook) {
   router.push(`/book/${encodeURIComponent(b.bookUrl)}`)
 }
 
-onMounted(loadSources)
+function onCatsWheel(e: WheelEvent) {
+  const el = e.currentTarget as HTMLElement
+  if (el.scrollWidth > el.clientWidth) {
+    e.preventDefault()
+    el.scrollLeft += e.deltaY
+  }
+}
+
+onMounted(() => {
+  loadSources()
+  const catsEl = document.querySelector('.cats')
+  catsEl?.addEventListener('wheel', onCatsWheel as EventListener, { passive: false })
+})
+onBeforeUnmount(() => {
+  document.querySelector('.cats')?.removeEventListener('wheel', onCatsWheel as EventListener)
+})
 </script>
 
 <style scoped>
@@ -357,6 +381,13 @@ onMounted(loadSources)
   padding-bottom: 4px;
   overflow-x: auto;
   scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
+  overscroll-behavior-x: contain;
+  cursor: grab;
+}
+.cats:active {
+  cursor: grabbing;
 }
 .cats::-webkit-scrollbar {
   display: none;
@@ -381,6 +412,10 @@ onMounted(loadSources)
   border-color: var(--accent, #4f46e5);
   color: var(--accent, #4f46e5);
   background: var(--accent-soft, #eef2ff);
+}
+.cat.link {
+  border-style: dashed;
+  color: var(--text-3, #999);
 }
 .book-grid {
   display: grid;
