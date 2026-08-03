@@ -192,6 +192,7 @@ async fn register(
         password: gen_encrypted_password(password, &salt),
         salt,
         token: token.clone(),
+        token_map: None,
         enable_webdav: config.default_user_enable_webdav,
         enable_local_store: config.default_user_enable_local_store,
         enable_book_source: config.default_user_enable_book_source,
@@ -201,6 +202,7 @@ async fn register(
         last_login_at: now,
         created_at: now,
         user_namespace: username.to_string(),
+        raw_json: None,
     };
     if let Err(e) = state.storage.insert_user(&user).await {
         tracing::error!("创建用户 {username} 失败: {e}");

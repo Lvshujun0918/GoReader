@@ -38,6 +38,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             password TEXT NOT NULL,
             salt TEXT NOT NULL,
             token TEXT DEFAULT '',
+            token_map TEXT,
             enable_webdav INTEGER DEFAULT 0,
             enable_local_store INTEGER DEFAULT 0,
             enable_book_source INTEGER DEFAULT 1,
@@ -46,7 +47,8 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             book_limit INTEGER DEFAULT 0,
             last_login_at INTEGER DEFAULT 0,
             created_at INTEGER DEFAULT 0,
-            user_namespace TEXT DEFAULT ''
+            user_namespace TEXT DEFAULT '',
+            raw_json TEXT
         );
         "#,
     )
@@ -73,27 +75,62 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             origin TEXT DEFAULT '',
             origin_name TEXT DEFAULT '',
             kind TEXT,
+            custom_tag TEXT,
             cover_url TEXT,
-            intro TEXT,
-            toc_url TEXT DEFAULT '',
-            charset TEXT,
             custom_cover_url TEXT,
-            can_update INTEGER DEFAULT 1,
+            intro TEXT,
+            custom_intro TEXT,
+            charset TEXT,
+            type INTEGER DEFAULT 0,
+            group_name INTEGER DEFAULT 0,
+            latest_chapter_title TEXT,
+            latest_chapter_time INTEGER DEFAULT 0,
+            last_check_time INTEGER DEFAULT 0,
+            last_check_count INTEGER DEFAULT 0,
+            total_chapter_num INTEGER DEFAULT 0,
+            dur_chapter_title TEXT,
             dur_chapter_index INTEGER DEFAULT 0,
             dur_chapter_pos INTEGER DEFAULT 0,
             dur_chapter_time INTEGER DEFAULT 0,
-            dur_chapter_title TEXT,
-            group_name INTEGER DEFAULT 0,
-            type INTEGER DEFAULT 0,
+            word_count TEXT,
+            can_update INTEGER DEFAULT 1,
+            order_num INTEGER DEFAULT 0,
+            origin_order INTEGER DEFAULT 0,
+            use_replace_rule INTEGER DEFAULT 1,
+            variable TEXT,
+            read_config TEXT,
+            is_in_shelf INTEGER DEFAULT 1,
             last_check_error TEXT,
+            info_html TEXT,
+            toc_html TEXT,
             user_namespace TEXT DEFAULT '',
             created_at INTEGER DEFAULT 0,
+            raw_json TEXT,
             PRIMARY KEY (book_url, user_namespace)
         );
         "#,
     )
     .execute(&pool)
     .await?;
+
+    // 幂等补列（兼容旧库：缺列则 ALTER TABLE 补上）
+    let columns = [
+        ("users", &["token_map", "raw_json"][..]),
+        (
+            "books",
+            &[
+                "custom_tag", "custom_intro", "latest_chapter_title", "latest_chapter_time",
+                "last_check_time", "last_check_count", "total_chapter_num", "word_count",
+                "order_num", "origin_order", "use_replace_rule", "variable", "read_config",
+                "is_in_shelf", "info_html", "toc_html", "raw_json",
+            ][..],
+        ),
+    ];
+    for (table, cols) in columns {
+        for col in cols {
+            ensure_column(&pool, table, col).await?;
+        }
+    }
 
     tracing::info!("storage initialized at {}", db_path.display());
     Ok(Storage {
@@ -178,4 +215,17 @@ impl Storage {
         .await?;
         Ok(books)
     }
+}
+
+/// 幂等补列：列不存在则 ALTER TABLE ADD COLUMN（旧库升级用）
+async fn ensure_column(pool: &SqlitePool, table: &str, column: &str) -> anyhow::Result<()> {
+    let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"))
+        .fetch_one(pool)
+        .await?;
+    if row.0 == 0 {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} TEXT");
+        sqlx::query(&sql).execute(pool).await?;
+        tracing::info!("ALTER TABLE {table} ADD COLUMN {column}");
+    }
+    Ok(())
 }

@@ -59,34 +59,46 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
     Ok(())
 }
 
-/// users.json（Map<username, User>）→ users 表；返回迁移的用户名列表
+/// users.json（Map<username, User>）→ users 表（全字段 + raw_json 原文保底）；返回迁移的用户名列表
 async fn migrate_users(pool: &SqlitePool, path: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("读取 {} 失败", path.display()))?;
-    let user_map: HashMap<String, User> = serde_json::from_str(&text)
+    let user_map: HashMap<String, serde_json::Value> = serde_json::from_str(&text)
         .with_context(|| format!("解析 {} 失败", path.display()))?;
 
     let mut usernames = Vec::with_capacity(user_map.len());
     let mut tx = pool.begin().await?;
-    for (key, mut user) in user_map {
+    for (key, value) in user_map {
+        let mut user: User = match serde_json::from_value(value.clone()) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("解析用户 {} 失败（{}），保留 raw_json", key, e);
+                User { username: key.clone(), ..Default::default() }
+            }
+        };
         if user.username.is_empty() {
             user.username = key;
         }
         // user_namespace = username（用户数据命名空间）
         user.user_namespace = user.username.clone();
+        // raw_json：原始 JSON 全量保底（未知字段不丢）
+        user.raw_json = Some(value.to_string());
+        // token_map：JSON 字符串（legacy Map<String, Long>）
+        let token_map_json = user.token_map.as_ref().map(|v| v.to_string());
         sqlx::query(
             r#"
             INSERT OR REPLACE INTO users
-                (username, password, salt, token, enable_webdav, enable_local_store,
+                (username, password, salt, token, token_map, enable_webdav, enable_local_store,
                  enable_book_source, enable_rss_source, book_source_limit, book_limit,
-                 last_login_at, created_at, user_namespace)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 last_login_at, created_at, user_namespace, raw_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             "#,
         )
         .bind(&user.username)
         .bind(&user.password)
         .bind(&user.salt)
         .bind(&user.token)
+        .bind(&token_map_json)
         .bind(user.enable_webdav)
         .bind(user.enable_local_store)
         .bind(user.enable_book_source)
@@ -96,6 +108,7 @@ async fn migrate_users(pool: &SqlitePool, path: &Path) -> Result<Vec<String>> {
         .bind(user.last_login_at)
         .bind(user.created_at)
         .bind(&user.user_namespace)
+        .bind(&user.raw_json)
         .execute(&mut *tx)
         .await?;
         usernames.push(user.username.clone());
@@ -121,7 +134,7 @@ async fn migrate_bookshelves(pool: &SqlitePool, data_dir: &Path, namespaces: &[S
                 continue;
             }
         };
-        let books: Vec<Book> = match serde_json::from_str(&text) {
+        let books: Vec<serde_json::Value> = match serde_json::from_str(&text) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("解析 {} 失败（{}），跳过该命名空间", path.display(), e);
@@ -130,19 +143,33 @@ async fn migrate_bookshelves(pool: &SqlitePool, data_dir: &Path, namespaces: &[S
         };
         let mut count = 0usize;
         let mut tx = pool.begin().await?;
-        for book in books {
+        for value in books {
+            let mut book: Book = match serde_json::from_value(value.clone()) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("解析书籍失败（{}），跳过", e);
+                    continue;
+                }
+            };
             if book.book_url.trim().is_empty() {
                 continue; // 无主键的脏数据跳过
             }
+            // raw_json：每本书原始 JSON 全量保底（未知字段不丢）
+            book.raw_json = Some(value.to_string());
+            book.user_namespace = ns.clone();
             sqlx::query(
                 r#"
                 INSERT OR REPLACE INTO books
-                    (book_url, name, author, origin, origin_name, kind, cover_url, intro,
-                     toc_url, charset, custom_cover_url, can_update, dur_chapter_index,
-                     dur_chapter_pos, dur_chapter_time, dur_chapter_title, group_name,
-                     type, last_check_error, user_namespace, created_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                        ?16, ?17, ?18, ?19, ?20, ?21)
+                    (book_url, name, author, origin, origin_name, kind, custom_tag, cover_url,
+                     custom_cover_url, intro, custom_intro, charset, type, group_name,
+                     latest_chapter_title, latest_chapter_time, last_check_time, last_check_count,
+                     total_chapter_num, dur_chapter_title, dur_chapter_index, dur_chapter_pos,
+                     dur_chapter_time, word_count, can_update, order_num, origin_order,
+                     use_replace_rule, variable, read_config, is_in_shelf, last_check_error,
+                     info_html, toc_html, user_namespace, created_at, raw_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                        ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                        ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
                 "#,
             )
             .bind(&book.book_url)
@@ -151,21 +178,37 @@ async fn migrate_bookshelves(pool: &SqlitePool, data_dir: &Path, namespaces: &[S
             .bind(&book.origin)
             .bind(&book.origin_name)
             .bind(&book.kind)
+            .bind(&book.custom_tag)
             .bind(&book.cover_url)
-            .bind(&book.intro)
-            .bind(&book.toc_url)
-            .bind(&book.charset)
             .bind(&book.custom_cover_url)
-            .bind(book.can_update)
+            .bind(&book.intro)
+            .bind(&book.custom_intro)
+            .bind(&book.charset)
+            .bind(book.book_type)
+            .bind(book.group)
+            .bind(&book.latest_chapter_title)
+            .bind(book.latest_chapter_time)
+            .bind(book.last_check_time)
+            .bind(book.last_check_count)
+            .bind(book.total_chapter_num)
+            .bind(&book.dur_chapter_title)
             .bind(book.dur_chapter_index)
             .bind(book.dur_chapter_pos)
             .bind(book.dur_chapter_time)
-            .bind(&book.dur_chapter_title)
-            .bind(book.group)
-            .bind(book.book_type)
+            .bind(&book.word_count)
+            .bind(book.can_update)
+            .bind(book.order)
+            .bind(book.origin_order)
+            .bind(book.use_replace_rule)
+            .bind(&book.variable)
+            .bind(&book.read_config.as_ref().map(|v| v.to_string()))
+            .bind(book.is_in_shelf)
             .bind(&book.last_check_error)
-            .bind(ns)
+            .bind(&book.info_html)
+            .bind(&book.toc_html)
+            .bind(&book.user_namespace)
             .bind(0i64) // created_at：迁移数据时间未知，置 0（顺序由 rowid 保持）
+            .bind(&book.raw_json)
             .execute(&mut *tx)
             .await?;
             count += 1;
