@@ -2,7 +2,8 @@
 //!
 //! 规则语法（对齐 legado analyzeRule）：
 //! - 三段式：`规则体##@前缀##替换规则`（## 分隔，后两段可选）
-//! - 类型检测：`{...}` JSONPath / `//` XPath / `@js:` JS（v1 暂不支持）/ 其余 CSS 或 Regex
+//! - 类型检测：`{...}` JSONPath / `//` XPath / `@js:`|`js:` JS / 其余 CSS 或 Regex
+//! - `{{...}}` 内嵌表达式：`{{$.x}}`/`{{$[n]}}` JSONPath 提取；其余按 JS 执行（注入 result/key/page），结果替换回规则
 //! - 多规则：`&&` 分隔依次执行
 //! - 结果：字符串列表（legado 返回字符串列表语义）
 
@@ -26,22 +27,55 @@ pub struct Rule {
 pub enum RuleKind {
     Css,
     JsonPath,
+    Regex,
     XPath, // v2 支持（sxd-xpath）
     Js,    // v2 支持（rquickjs）
     Url,   // 直接拼接/替换
 }
 
-/// 解析规则字符串
+/// 解析规则字符串（对齐 legado SourceRule）
+/// - `@@` 前缀去掉（默认规则）
+/// - `##` 两段式：第二段为替换规则（正则替换）；若第二段以 `@` 开头视为前缀拼接（兼容 legacy 书源旧格式）
 pub fn parse_rule(rule: &str) -> Rule {
-    let parts: Vec<&str> = rule.splitn(3, "##").collect();
-    let main = parts[0].trim();
-    let prefix = parts.get(1).map(|s| s.trim().to_string());
-    let replace = parts.get(2).map(|s| s.trim().to_string());
+    let parts: Vec<&str> = rule.splitn(2, "##").collect();
+    let raw_main = parts[0].trim();
+    let tail = parts.get(1).map(|s| s.trim().to_string());
 
-    let kind = detect_kind(main);
+    // 去掉 @@ 前缀
+    let (main, kind) = if raw_main.starts_with("@@") {
+        (raw_main[2..].trim().to_string(), RuleKind::Css)
+    } else {
+        let k = detect_kind(raw_main);
+        // @CSS: 去前缀
+        if raw_main.starts_with("@CSS:") {
+            (raw_main[5..].trim().to_string(), RuleKind::Css)
+        } else if raw_main.starts_with("@XPath:") {
+            (raw_main[6..].trim().to_string(), RuleKind::XPath)
+        } else if raw_main.starts_with("@Json:") {
+            (raw_main[6..].trim().to_string(), RuleKind::JsonPath)
+        } else if raw_main.starts_with("@js:") {
+            (raw_main[4..].trim().to_string(), RuleKind::Js)
+        } else if raw_main.starts_with("js:") {
+            (raw_main[3..].trim().to_string(), RuleKind::Js)
+        } else {
+            (raw_main.to_string(), k)
+        }
+    };
+
+    // ## 第二段：@ 开头 → 前缀；否则 → 替换规则
+    let mut prefix = None;
+    let mut replace = None;
+    if let Some(tail) = tail {
+        if tail.starts_with('@') {
+            prefix = Some(tail);
+        } else {
+            replace = Some(tail);
+        }
+    }
+
     Rule {
         kind,
-        body: main.to_string(),
+        body: main,
         prefix,
         replace,
     }
@@ -49,12 +83,23 @@ pub fn parse_rule(rule: &str) -> Rule {
 
 fn detect_kind(body: &str) -> RuleKind {
     let b = body.trim();
-    if b.starts_with('{') {
-        RuleKind::JsonPath
-    } else if b.starts_with("//") {
+    // 对齐 legado SourceRule 类型检测（AnalyzeRule.kt）
+    if b.starts_with("@CSS:") {
+        RuleKind::Css // @CSS: 显式 CSS
+    } else if b.starts_with("@@") {
+        RuleKind::Css // @@ 默认规则（去前缀由 parse 处理）
+    } else if b.starts_with("@XPath:") {
         RuleKind::XPath
+    } else if b.starts_with("@Json:") {
+        RuleKind::JsonPath
+    } else if b.starts_with("$.") || b.starts_with("$[") || b.starts_with('{') {
+        RuleKind::JsonPath // $. / $[ 或 JSON 片段
+    } else if b.starts_with('/') {
+        RuleKind::XPath // XPath 特征明显，无需标识头
     } else if b.starts_with("@js:") || b.starts_with("js:") {
         RuleKind::Js
+    } else if b.contains("$1") || b.contains("$2") {
+        RuleKind::Regex // $N 引用 → 正则
     } else if b.starts_with('@') {
         RuleKind::Url
     } else {
@@ -69,17 +114,114 @@ pub fn apply(rule: &str, html: &str) -> Vec<String> {
 }
 
 fn apply_rule(rule: &Rule, html: &str) -> Vec<String> {
+    apply_rule_inner(rule, html, 0)
+}
+
+fn apply_rule_inner(rule: &Rule, html: &str, depth: usize) -> Vec<String> {
+    // {{...}} 内嵌表达式：先展开，再重新解析执行（类型可能变化，如 {{$.x}} 拼接出 CSS）
+    let rule = if depth < 4 && rule.body.contains("{{") {
+        let expanded = expand_inline(&rule.body, html);
+        if expanded != rule.body {
+            // 重建完整规则串（保留 ##前缀/##替换段）后重新解析
+            let mut full = expanded;
+            if let Some(p) = &rule.prefix {
+                full.push_str("##");
+                full.push_str(p);
+            } else if let Some(r) = &rule.replace {
+                full.push_str("##");
+                full.push_str(r);
+            }
+            return apply_rule_inner(&parse_rule(&full), html, depth + 1);
+        }
+        rule
+    } else {
+        rule
+    };
+    // 空规则（如 {{...}} 失败展开为空）→ 空结果
+    if rule.body.trim().is_empty() {
+        return vec![];
+    }
     let results = match rule.kind {
         RuleKind::Css => css_select(rule, html),
         RuleKind::JsonPath => json_path(rule, html),
-        RuleKind::Url => vec![url_replace(rule, html)],
-        RuleKind::XPath | RuleKind::Js => {
-            tracing::warn!("规则类型 {:?} 暂未实现（v2）：{}", rule.kind, rule.body);
-            vec![]
+        RuleKind::Regex => regex_match(&rule.body, html),
+        RuleKind::XPath => crate::parser::xpath::xpath_select(&rule.body, html),
+        RuleKind::Js => {
+            // JS 规则：注入 result/key/page/baseUrl 环境
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("result".to_string(), html.to_string());
+            vars.insert("key".to_string(), String::new());
+            vars.insert("page".to_string(), "1".to_string());
+            vars.insert("baseUrl".to_string(), String::new());
+            match crate::parser::js::eval_js(&rule.body, &vars) {
+                Ok(s) if !s.is_empty() => vec![s],
+                _ => vec![],
+            }
         }
+        RuleKind::Url => vec![url_replace(rule, html)],
     };
     // 前缀/替换处理（legado：@@/替换在结果上应用）
     apply_post(results, rule)
+}
+
+/// 展开规则中的 `{{...}}` 内嵌表达式（legado 模板替换语义）：
+/// - `{{$.xxx}}` / `{{$[n]}}`：JSONPath 从当前上下文文本提取（复用 json_path 逻辑）
+/// - 其他内容：作为 JS 执行（注入 result=上下文文本 / key / page），结果替换回规则
+/// - 提取失败 / JS 报错 / 结果为空 → 替换为空串；未闭合的 `{{` → 原样返回
+///
+/// 注意：JS 字符串内若含 `}}` 会提前截断（v1 限制，规则 JS 避免字面 `}}`）
+fn expand_inline(body: &str, text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = match after.find("}}") {
+            Some(e) => e,
+            None => return body.to_string(), // 未闭合：不处理
+        };
+        let expr = after[..end].trim();
+        let replaced = if expr.starts_with("$.") || expr.starts_with("$[") {
+            inline_json_path(expr, text)
+        } else {
+            inline_js(expr, text)
+        };
+        out.push_str(&replaced);
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 内嵌 JSONPath：`{{$.a.b}}` / `{{$[0].c}}` → 从上下文文本提取
+/// （多结果以换行拼接；无结果 → 空串）
+fn inline_json_path(expr: &str, text: &str) -> String {
+    let path = if expr.starts_with("$.") {
+        &expr[2..]
+    } else if expr.starts_with("$[") {
+        &expr[1..]
+    } else {
+        expr
+    };
+    let mut results = vec![];
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(v) => walk_json(&v, path, &mut results),
+        Err(_) => results = json_from_html(path, text),
+    }
+    if results.is_empty() {
+        String::new()
+    } else {
+        results.join("\n")
+    }
+}
+
+/// 内嵌 JS：`{{expr}}` → 执行（注入 result=上下文文本 / key / page），失败 → 空串
+fn inline_js(expr: &str, text: &str) -> String {
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("result".to_string(), text.to_string());
+    vars.insert("key".to_string(), String::new());
+    vars.insert("page".to_string(), "1".to_string());
+    crate::parser::js::eval_js(expr, &vars).unwrap_or_default()
 }
 
 /// CSS 选择器执行
@@ -213,6 +355,21 @@ fn walk_json(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
                     } else {
                         return;
                     }
+                } else if seg == "*" {
+                    // [*] 通配：对每个元素继续剩余路径；无剩余路径时输出对象（JSON 序列化）
+                    let rest = &segments[i + 1..];
+                    if rest.is_empty() {
+                        for item in arr {
+                            out.push(serde_json::to_string(item).unwrap_or_default());
+                        }
+                    } else {
+                        for item in arr {
+                            let mut r = vec![];
+                            walk_json_segments(item, rest, &mut r);
+                            out.extend(r);
+                        }
+                    }
+                    return;
                 } else {
                     // 数组展开：对每个元素继续剩余路径
                     let rest = &segments[i..];
@@ -234,11 +391,14 @@ fn walk_json(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
                     out.push(s.to_string());
                 } else if item.is_number() || item.is_boolean() {
                     out.push(item.to_string());
+                } else if item.is_object() {
+                    out.push(serde_json::to_string(item).unwrap_or_default());
                 }
             }
         }
         v if v.is_string() => out.push(v.as_str().unwrap().to_string()),
         v if v.is_number() || v.is_boolean() => out.push(v.to_string()),
+        v if v.is_object() => out.push(serde_json::to_string(v).unwrap_or_default()),
         _ => {}
     }
 }
@@ -338,11 +498,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_three_part() {
-        let r = parse_rule("div.book##@https://a.com##\\s+## ");
+    fn test_parse_prefix() {
+        // ## 第二段 @ 开头 → 前缀（兼容 legacy 旧格式）
+        let r = parse_rule("div.book##@https://a.com");
         assert_eq!(r.kind, RuleKind::Css);
         assert_eq!(r.prefix.as_deref(), Some("@https://a.com"));
-        assert!(r.replace.is_some());
+        assert!(r.replace.is_none());
+    }
+
+    #[test]
+    fn test_parse_legado_flags() {
+        assert_eq!(parse_rule("@Json:$.list.name").kind, RuleKind::JsonPath);
+        assert_eq!(parse_rule("$.list.name").kind, RuleKind::JsonPath);
+        assert_eq!(parse_rule("@XPath://div/a").kind, RuleKind::XPath);
+        assert_eq!(parse_rule("//div/a").kind, RuleKind::XPath);
+        assert_eq!(parse_rule("@@div.book").kind, RuleKind::Css);
+        assert_eq!(parse_rule("a@href").kind, RuleKind::Css);
     }
 
     #[test]
@@ -364,5 +535,72 @@ mod tests {
         let json = r#"{"data":{"list":[{"name":"书1"},{"name":"书2"}]}}"#;
         let r = apply("{$.data.list.name}", json);
         assert_eq!(r, vec!["书1".to_string(), "书2".to_string()]);
+    }
+
+    #[test]
+    fn test_js_rule() {
+        let html = "abc123";
+        // js: / @js: 前缀剥离 + result 变量注入
+        assert_eq!(apply("js:result.length", html), vec!["6".to_string()]);
+        assert_eq!(
+            apply("@js:result.toUpperCase()", html),
+            vec!["ABC123".to_string()]
+        );
+        // JS 失败 → 空结果
+        assert!(apply("@js:throw new Error('x')", html).is_empty());
+        // JS 返回空串 → 空结果
+        assert!(apply("@js:''", html).is_empty());
+    }
+
+    #[test]
+    fn test_inline_js_substitution() {
+        let html = r#"<html><body><div class="book">书名A</div><div class="book">书名B</div></body></html>"#;
+        // {{...}} JS 构建 CSS 选择器，替换回规则后执行
+        let r = apply("{{'div.' + 'book'}}", html);
+        assert_eq!(r.len(), 2);
+        // JS 可读取注入的 result（当前上下文文本），条件返回正则规则
+        let html2 = "书名：测试书 作者：张三";
+        let rule = r#"{{result.startsWith('书名') ? '书名：(.+?)\\s' : 'div'}}"#;
+        let r2 = apply(rule, html2);
+        assert_eq!(r2.first().map(String::as_str), Some("测试书"));
+        // JS 失败 → 展开为空 → 空结果
+        assert!(apply("{{nonexistent.fn()}}", html).is_empty());
+        // 未闭合 {{ 原样处理（按 JsonPath 分支解析失败 → 空结果），不 panic
+        assert!(apply("{{div.book", html).is_empty());
+    }
+
+    #[test]
+    fn test_inline_jsonpath_substitution() {
+        let json = r#"{"data":{"n":42}}"#;
+        // {{$.x}} → JSONPath 提取（非 JS 执行），替换回规则后执行
+        let r = apply("@js:{{$.data.n}}", json);
+        assert_eq!(r, vec!["42".to_string()]);
+        // 提取失败 → 替换为空 → 空结果
+        let r2 = apply("@js:{{$.missing}}", json);
+        assert!(r2.is_empty());
+    }
+
+    #[test]
+    fn test_expand_inline() {
+        // 数组下标形式 {{$.a[0]}}
+        assert_eq!(
+            expand_inline("{{$.list[0]}}", r#"{"list":["书1","书2"]}"#),
+            "书1"
+        );
+        // 多结果以换行拼接
+        assert_eq!(
+            expand_inline(
+                "{{$.list.name}}",
+                r#"{"list":[{"name":"书1"},{"name":"书2"}]}"#
+            ),
+            "书1\n书2"
+        );
+        // 上下文非完整 JSON → 逐行提取 JSON 片段（json_from_html 回退）
+        assert_eq!(
+            expand_inline("{{$.data.name}}", "前文\n{\"data\":{\"name\":\"内嵌\"}}\n后文"),
+            "内嵌"
+        );
+        // 未闭合 {{ 原样返回
+        assert_eq!(expand_inline("{{div.book", "<html></html>"), "{{div.book");
     }
 }

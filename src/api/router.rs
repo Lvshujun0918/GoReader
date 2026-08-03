@@ -56,6 +56,8 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/health", get(health))
         .route("/reader3/getBookshelf", get(get_bookshelf))
         .route("/reader3/getBookSources", get(get_book_sources))
+        .route("/reader3/searchBook", get(search_book).post(search_book))
+        .route("/reader3/searchBookMulti", get(search_book_multi).post(search_book_multi))
         .route("/reader3/login", post(login))
         .with_state(state)
         // TODO: 挂载 legacy 前端静态资源（rust-embed，兼容阶段复用 legacy dist）
@@ -230,6 +232,129 @@ async fn get_book_sources(
             Json(ReturnData::err("系统错误"))
         }
     }
+}
+
+/// POST/GET /reader3/searchBook：单书源搜索（bookSource 参数：书源 URL 或完整 JSON）
+async fn search_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    // 参数解析（POST body JSON 优先，GET query 兜底）
+    let mut key = params.get("key").cloned().unwrap_or_default();
+    let mut page = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1i64);
+    let mut book_source_param = params.get("bookSource").cloned().unwrap_or_default();
+    if let Some(body) = body {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(v) = json.get("key").and_then(|v| v.as_str()) {
+                key = v.to_string();
+            }
+            if let Some(v) = json.get("page").and_then(|v| v.as_i64()) {
+                page = v;
+            }
+            if let Some(v) = json.get("bookSource").and_then(|v| v.as_str()) {
+                book_source_param = v.to_string();
+            }
+        }
+    }
+    if key.is_empty() {
+        return Json(ReturnData::err("请输入搜索关键字"));
+    }
+    if book_source_param.is_empty() {
+        return Json(ReturnData::err("未配置书源"));
+    }
+
+    // 解析书源：完整 JSON 或 URL（从库查）
+    let source: Option<crate::model::BookSource> = if book_source_param.trim_start().starts_with('{') {
+        serde_json::from_str(&book_source_param).ok()
+    } else {
+        state.storage.find_book_source(&namespace, &book_source_param).await.ok().flatten()
+    };
+    let Some(source) = source else {
+        return Json(ReturnData::err("书源不存在"));
+    };
+
+    match crate::service::search::search_one_source(&source, &key, page).await {
+        Ok(books) => Json(ReturnData::ok(serde_json::to_value(books).unwrap_or(serde_json::Value::Null))),
+        Err(e) => {
+            tracing::error!("搜索失败 [{}]: {e}", source.book_source_name);
+            Json(ReturnData::err("搜索失败"))
+        }
+    }
+}
+
+/// POST/GET /reader3/searchBookMulti：多书源并发搜索（可选 bookSourceGroup 过滤）
+async fn search_book_multi(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let mut key = params.get("key").cloned().unwrap_or_default();
+    let mut page = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1i64);
+    let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
+    if let Some(body) = body {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(v) = json.get("key").and_then(|v| v.as_str()) {
+                key = v.to_string();
+            }
+            if let Some(v) = json.get("page").and_then(|v| v.as_i64()) {
+                page = v;
+            }
+            if let Some(v) = json.get("bookSourceGroup").and_then(|v| v.as_str()) {
+                group = v.to_string();
+            }
+        }
+    }
+    if key.is_empty() {
+        return Json(ReturnData::err("请输入搜索关键字"));
+    }
+    let sources = match state.storage.get_book_sources(&namespace).await {
+        Ok(s) => s,
+        Err(_) => return Json(ReturnData::err("系统错误")),
+    };
+    let sources: Vec<crate::model::BookSource> = sources
+        .into_iter()
+        .filter(|s| s.enabled && s.search_url.is_some())
+        .filter(|s| {
+            group.is_empty()
+                || s.book_source_group
+                    .as_deref()
+                    .map(|g| g.split(' ').any(|part| part == group))
+                    .unwrap_or(false)
+        })
+        .collect();
+    if sources.is_empty() {
+        return Json(ReturnData::err("未配置书源"));
+    }
+
+    // 并发搜索（限制并发数 8）
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    let mut handles = Vec::with_capacity(sources.len());
+    for source in sources {
+        let sem = semaphore.clone();
+        let key = key.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            crate::service::search::search_one_source(&source, &key, page).await.unwrap_or_default()
+        }));
+    }
+    let mut all: Vec<crate::service::search::SearchBook> = Vec::new();
+    for h in handles {
+        if let Ok(books) = h.await {
+            all.extend(books);
+        }
+    }
+    Json(ReturnData::ok(serde_json::to_value(all).unwrap_or(serde_json::Value::Null)))
 }
 
 /// GET /reader3/getBookshelf：按命名空间返回书架（user_namespace 取自 accessToken；非 secure 用 default）

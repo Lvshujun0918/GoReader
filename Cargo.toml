@@ -27,6 +27,9 @@ dotenvy = "0.15"
 scraper = "0.20"          # CSS Selector
 jsonpath_lib = "0.3"      # JSONPath
 regex = "1"               # Regex
+sxd-document = "0.3"      # XPath（XML 文档）
+sxd-xpath = "0.4"         # XPath 求值
+boa_engine = "0.19"       # JS 引擎（纯 Rust，书源 JS 规则）
 
 # RSS
 feed-rs = "1"

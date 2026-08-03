@@ -67,6 +67,9 @@ pub struct BookSource {
     #[serde(rename = "exploreUrl")]
     #[sqlx(rename = "explore_url")]
     pub explore_url: Option<String>,
+    #[serde(rename = "searchUrl")]
+    #[sqlx(rename = "search_url")]
+    pub search_url: Option<String>,
     // ---- 规则（legacy + legado 两套命名，均为嵌套对象）----
     #[serde(rename = "ruleExplore")]
     #[sqlx(rename = "rule_explore")]

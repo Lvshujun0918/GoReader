@@ -145,6 +145,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             respond_time INTEGER DEFAULT 0,
             weight INTEGER DEFAULT 0,
             explore_url TEXT,
+            search_url TEXT,
             rule_explore TEXT,
             rule_search TEXT,
             rule_book_info TEXT,
@@ -187,10 +188,16 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     }
 
     tracing::info!("storage initialized at {}", db_path.display());
-    Ok(Storage {
+
+    // JSON → SQLite 迁移（幂等：users 表非空跳过）
+    let storage = Storage {
         pool,
         config: config.clone(),
-    })
+    };
+    if let Err(e) = crate::storage::migrate::migrate_if_needed(&storage).await {
+        tracing::error!("JSON→SQLite 迁移失败（服务继续启动，数据仍保留在 JSON）：{e}");
+    }
+    Ok(storage)
 }
 
 impl Storage {
@@ -219,6 +226,34 @@ impl Storage {
             "SELECT * FROM book_sources WHERE user_namespace = 'default' ORDER BY custom_order, book_source_name",
         )
         .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// 按 URL 查书源（精确或前缀匹配，兼容 ##@ 后缀；用户命名空间 + fallback default）
+    pub async fn find_book_source(
+        &self,
+        ns: &str,
+        book_source_url: &str,
+    ) -> Result<Option<crate::model::BookSource>> {
+        let like = format!("{book_source_url}%");
+        let r = sqlx::query_as::<_, crate::model::BookSource>(
+            "SELECT * FROM book_sources WHERE user_namespace = ?1 AND (book_source_url = ?2 OR book_source_url LIKE ?3)",
+        )
+        .bind(ns)
+        .bind(book_source_url)
+        .bind(&like)
+        .fetch_optional(&self.pool)
+        .await?;
+        if r.is_some() || ns == "default" {
+            return Ok(r);
+        }
+        sqlx::query_as::<_, crate::model::BookSource>(
+            "SELECT * FROM book_sources WHERE user_namespace = 'default' AND (book_source_url = ?1 OR book_source_url LIKE ?2)",
+        )
+        .bind(book_source_url)
+        .bind(&like)
+        .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
     }

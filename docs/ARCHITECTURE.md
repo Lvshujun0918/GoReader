@@ -76,15 +76,17 @@ book_groups(id, group_name, order_num, user_namespace)
 
 | 规则类型 | Rust 实现 | 状态 |
 |---|---|---|
-| CSS Selector | `scraper` | ✅ 依赖就绪 |
-| JSONPath | `jsonpath_lib` | ✅ 依赖就绪 |
-| Regex | `regex` | ✅ 依赖就绪 |
-| XPath | `sxd-xpath`/`sxd-document` | 待加入 |
-| JavaScript | `rquickjs`（需 C 编译器） | 待加入（DE 编译） |
+| CSS Selector | `scraper` | ✅（含 @CSS:/@@ 前缀、a@href 属性） |
+| JSONPath | 自实现遍历 | ✅（@Json:/$./$[ 前缀、[*] 通配、{{$.x}} 内嵌） |
+| Regex | `regex` | ✅（$N 引用、##替换） |
+| XPath | `sxd-xpath`/`sxd-document` | 🔄 实现中 |
+| JavaScript | `boa_engine`（纯 Rust） | 🔄 实现中（含 {{}} 内嵌 JS） |
 
-对齐 `warpdotsys/legado`（阅读Sigma）的 analyzeRule 语义：
-- 规则字符串语法兼容（`规则##@前缀##替换` 等）
-- 规则执行顺序/结果类型兼容
+对齐 `warpdotsys/legado`（阅读Sigma）的 analyzeRule 语义（参考 docs/legado-ref/ 源码与文档）：
+- 规则标志：@@ / @CSS: / @XPath: / @Json: / $. / $[ / // / @js:
+- 三段/两段式 `##` 拆分 + 替换规则
+- URL 附加参数（,{"js":..}/{"bodyJs":..}）与并发率（concurrent_rate）
+- 参考文档：docs/legado-ref/ruleHelp.md + AnalyzeRule.kt 源码
 
 ## 6. 书籍格式（远期 4）
 
@@ -106,11 +108,13 @@ book_groups(id, group_name, order_num, user_namespace)
 ## 8. 迭代路线（垂直切片）
 
 - [x] 0. 骨架：axum + SQLite 初始化 + /health + /reader3/getBookshelf 占位
-- [ ] 1. 数据迁移（JSON→SQLite）+ users 表 + login/token 校验
-- [ ] 2. getBookshelf/getBookSources 真实数据 + 前端 dist 内嵌（复用 legacy）
-- [ ] 3. 书源搜索链路（crawler + 规则引擎 + 搜索 API）
-- [ ] 4. 详情/目录/正文 + 阅读页 API
-- [ ] 5. 本地书（TXT/EPUB/PDF/CBZ/MOBI）
-- [ ] 6. RSS/TTS/WebDAV/文件管理
-- [ ] 7. 多用户管理 + 管理 API 全量对齐
+- [x] 1. 数据迁移（JSON→SQLite 零丢失：raw_json 保底，真实 169 本/429 源验证）+ login/token
+- [x] 2a. getBookSources 真实数据（429 源全量迁移）
+- [x] 2b. 规则引擎 v1（CSS/JSONPath/Regex + legado 标志对齐 + 搜索链路：真实搜索 15 条验证）
+- [ ] 2c. 规则引擎完整：XPath/JS/内嵌 JS/URL 附加参数/并发率（并行 subagent 推进中）
+- [ ] 3. 详情/目录/正文 + 阅读页 API
+- [ ] 4. 本地书（TXT/EPUB/PDF/CBZ/MOBI）
+- [ ] 5. RSS/TTS/WebDAV/文件管理
+- [ ] 6. 多用户管理 + 管理 API 全量对齐
+- [ ] 7. 新前端（Vue3+Vite+TS，不复用 legacy 产物——见 docs/FRONTEND.md）
 - [ ] 8. musl 交叉编译 + scratch 镜像 + 双形态发布
