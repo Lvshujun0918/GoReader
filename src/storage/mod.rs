@@ -67,7 +67,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS books (
-            book_url TEXT PRIMARY KEY,
+            book_url TEXT,
             name TEXT DEFAULT '',
             author TEXT DEFAULT '',
             origin TEXT DEFAULT '',
@@ -87,7 +87,8 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             type INTEGER DEFAULT 0,
             last_check_error TEXT,
             user_namespace TEXT DEFAULT '',
-            created_at INTEGER DEFAULT 0
+            created_at INTEGER DEFAULT 0,
+            PRIMARY KEY (book_url, user_namespace)
         );
         "#,
     )
