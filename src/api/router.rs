@@ -7044,9 +7044,9 @@ mod tests {
         let ret = clear_cache(AxumState(state.clone()), Query(HashMap::new()), Some(body)).await;
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "参数错误");
-        // 空 body + 空 query → 参数错误
+        // 空 body + 空 query → 默认 all（成功）
         let ret = clear_cache(AxumState(state.clone()), Query(HashMap::new()), None).await;
-        assert_eq!(ret.0.error_msg, "参数错误");
+        assert!(ret.0.is_success);
 
         cleanup(state, dir).await;
     }
