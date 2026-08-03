@@ -152,11 +152,21 @@ const FONT_STACK: Record<FontKind, string> = {
   serif: "Georgia, 'Songti SC', 'SimSun', 'Noto Serif CJK SC', serif",
 }
 const fontKind = ref<FontKind>('system')
+const fontOpen = ref(false)
+const fontLabel = computed(() => FONT_OPTIONS.find((o) => o.value === fontKind.value)?.label ?? '系统')
 {
   const raw = localStorage.getItem('reader_font_family')
   if (FONT_OPTIONS.some((o) => o.value === raw)) fontKind.value = raw as FontKind
 }
 watch(fontKind, (v) => persist('reader_font_family', v))
+// 点击其他区域关闭字体下拉
+function onDocClick(e: MouseEvent) {
+  if (fontOpen.value && !(e.target as HTMLElement)?.closest('.font-picker')) {
+    fontOpen.value = false
+  }
+}
+onMounted(() => document.addEventListener('mousedown', onDocClick))
+onBeforeUnmount(() => document.removeEventListener('mousedown', onDocClick))
 const fontFamilyStyle = computed(() => FONT_STACK[fontKind.value])
 
 /* ---------------- 2.2 字距 / 首行缩进 / 对齐 ---------------- */
@@ -1299,17 +1309,31 @@ onBeforeUnmount(() => {
 
           <div class="set-row">
             <span class="set-label">字体</span>
-            <div class="seg-row font-row">
+            <div class="font-picker">
               <button
-                v-for="opt in FONT_OPTIONS"
-                :key="opt.value"
                 type="button"
-                class="seg-btn"
-                :class="{ active: fontKind === opt.value }"
-                @click="fontKind = opt.value"
+                class="font-trigger"
+                :style="{ fontFamily: fontFamilyStyle || undefined }"
+                @click="fontOpen = !fontOpen"
               >
-                {{ opt.label }}
+                {{ fontLabel }}
+                <span class="font-caret" :class="{ open: fontOpen }">▾</span>
               </button>
+              <transition name="fade-drop">
+                <div v-if="fontOpen" class="font-menu">
+                  <button
+                    v-for="opt in FONT_OPTIONS"
+                    :key="opt.value"
+                    type="button"
+                    class="font-item"
+                    :class="{ active: fontKind === opt.value }"
+                    :style="{ fontFamily: FONT_STACK[opt.value] || undefined }"
+                    @click="fontKind = opt.value; fontOpen = false"
+                  >
+                    {{ opt.label }} — 阅读字体预览
+                  </button>
+                </div>
+              </transition>
             </div>
           </div>
 
@@ -1804,14 +1828,80 @@ onBeforeUnmount(() => {
   gap: 6px;
   flex-wrap: wrap;
 }
-.font-row {
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  padding-bottom: 4px;
-  scrollbar-width: none;
+.font-picker {
+  position: relative;
 }
-.font-row::-webkit-scrollbar {
-  display: none;
+.font-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-1);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+.font-trigger:hover {
+  border-color: var(--accent);
+}
+.font-caret {
+  font-size: 10px;
+  color: var(--text-3);
+  transition: transform 0.2s ease;
+}
+.font-caret.open {
+  transform: rotate(180deg);
+}
+.font-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--bg-float);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+  padding: 4px;
+}
+.font-item {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-1);
+  background: none;
+  border: none;
+  border-radius: 6px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.font-item:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.font-item.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.fade-drop-enter-active,
+.fade-drop-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.fade-drop-enter-from,
+.fade-drop-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
 }
 .seg-btn {
   padding: 4px 14px;
