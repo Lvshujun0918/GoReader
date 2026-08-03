@@ -129,7 +129,7 @@ pub struct UrlSuffix {
 }
 
 /// 切分 `url,{...}` 后缀：从最后一个「逗号后整段为合法 JSON」的位置切分
-fn split_url_suffix(url: &str) -> (String, UrlSuffix) {
+pub(crate) fn split_url_suffix(url: &str) -> (String, UrlSuffix) {
     let mut split: Option<(usize, UrlSuffix)> = None;
     for (i, ch) in url.char_indices() {
         if ch != ',' {

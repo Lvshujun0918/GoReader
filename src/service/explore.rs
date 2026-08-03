@@ -176,14 +176,31 @@ pub async fn explore_url(
     // URL 模板（{{page}}）
     let url = url.replace("{{page}}", "1").replace("{page}", "1");
     // 相对 URL 拼书源 baseUrl
-    let url = if url.starts_with('/') && !url.starts_with("//") {
+    let raw_url = if url.starts_with('/') && !url.starts_with("//") {
         let base = source.book_source_url.split("##").next().unwrap_or("").trim_end_matches('/');
         format!("{base}{url}")
     } else {
-        url
+        url.to_string()
     };
-    let headers = source.header.as_deref().map(crawler::parse_header).unwrap_or_default();
-    let resp = crawler::fetch(&url, &headers, 15, "GET", None, None).await?;
+    // URL 后缀（,{...}：charset/method/body——对齐搜索链路）
+    let (final_url, suffix) = crate::service::search::split_url_suffix(&raw_url);
+    let mut headers = source.header.as_deref().map(crawler::parse_header).unwrap_or_default();
+    if let Some(extra) = &suffix.headers {
+        for (k, v) in extra {
+            headers.insert(k.clone(), v.clone());
+        }
+    }
+    let post_body = suffix.body.as_ref().map(|b| b.replace("{{page}}", "1").replace("{page}", "1"));
+    let resp = crawler::fetch(
+        &final_url,
+        &headers,
+        15,
+        suffix.method.as_deref().unwrap_or("GET"),
+        post_body.as_deref(),
+        suffix.charset.as_deref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("抓取失败（{}）: {}", final_url, e))?;
 
     let rule: crate::service::search::SearchRule = match &source.rule_explore {
         Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
