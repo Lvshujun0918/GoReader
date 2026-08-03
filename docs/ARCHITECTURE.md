@@ -100,6 +100,24 @@ book_groups(id, group_name, order_num, user_namespace)
 | **MOBI/AZW3** | `mobi` | 计划（新增） |
 | FB2 | XML | 计划（新增） |
 
+## 6.5 OPDS 支持（计划）
+
+**目标**：对外提供 OPDS（Open Publication Distribution System）目录——外部阅读器可直接浏览书架、搜索、下载书籍，无需 Web 前端。
+
+| 端点 | 说明 |
+|---|---|
+| `GET /opds` | OPDS 根目录（书架 → 分类/书籍条目，Atom+XML） |
+| `GET /opds/search?q={key}` | OPDS OpenSearch（搜索书架） |
+| `GET /opds/books/{id}/download` | acquisition link（正文导出 / 本地书文件下载） |
+| `GET /opds/covers/{id}` | 封面（复用 /assets） |
+
+**协议**：OPDS 1.2（Atom + OPDS 扩展命名空间），兼容主流客户端（Legado / KyBook / Apple Books / Calibre）
+**认证**：secure 模式支持 Basic（复用 WebDAV 认证逻辑）或 token
+**数据源**：books 表（书架）→ 目录条目；正文（ruleContent）→ 下载导出；本地书（TXT/EPUB/MOBI）→ 文件下载
+**内容类型**：`application/atom+xml;profile=opds-catalog`、`application/epub+zip` 等
+
+**实现切片**：与 WebDAV 同批（协议服务层），前端无关。
+
 ## 7. 产物策略
 
 - **scratch 镜像**（musl 静态编译，系统层 CVE=0）+ **裸静态二进制**（Release 附件 + systemd 示例）
@@ -118,4 +136,5 @@ book_groups(id, group_name, order_num, user_namespace)
 - [ ] 5. RSS/TTS/WebDAV/文件管理
 - [ ] 6. 多用户管理 + 管理 API 全量对齐
 - [ ] 7. 新前端（Vue3+Vite+TS，不复用 legacy 产物——见 docs/FRONTEND.md）
+- [ ] 7.5 **OPDS 支持**（新增）：书架/书籍以 OPDS 目录协议暴露——外部阅读器（Legado/KyBook/Calibre 等）直接浏览/搜索/下载
 - [ ] 8. musl 交叉编译 + scratch 镜像 + 双形态发布
