@@ -34,6 +34,9 @@ boa_engine = "0.19"       # JS 引擎（纯 Rust，书源 JS 规则）
 # RSS
 feed-rs = "1"
 
+# Edge TTS（微软语音 WebSocket 合成）
+tokio-tungstenite = "0.24"
+
 # 工具
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

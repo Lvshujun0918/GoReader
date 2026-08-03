@@ -4,7 +4,9 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import { useUserStore } from '@/stores/user'
-import { listFiles, downloadFile, uploadFile, mkdir, deleteFile } from '@/api/file'
+import { listFiles, getFile, saveFile, downloadFile, uploadFile, mkdir, deleteFile } from '@/api/file'
+import { isNeedSecureKey } from '@/api/users'
+import { downloadBlob } from '@/utils/download'
 import type { FileItem } from '@/types'
 
 const router = useRouter()
@@ -28,10 +30,41 @@ const selectedPath = ref<string | null>(null)
 const uploadOpen = ref(false)
 const pickedFile = ref<File | null>(null)
 const uploading = ref(false)
+const uploadProgress = ref(0)
 const mkdirOpen = ref(false)
 const folderName = ref('')
+const previewOpen = ref(false)
+const previewItem = ref<FileItem | null>(null)
+const previewContent = ref('')
+const previewLoading = ref(false)
+const renameOpen = ref(false)
+const renameBusy = ref(false)
+const renameTarget = ref<FileItem | null>(null)
+const renameName = ref('')
 
 const pickedName = computed(() => pickedFile.value?.name || '')
+
+/* ---------------- 文本文件识别 ---------------- */
+const TEXT_EXTS = new Set([
+  'txt', 'json', 'md', 'markdown', 'log', 'ini', 'conf', 'cfg', 'xml', 'html', 'htm',
+  'css', 'js', 'mjs', 'ts', 'csv', 'yml', 'yaml', 'toml', 'srt', 'vtt', 'lrc',
+  'properties', 'sh', 'bat', 'cmd', 'sql', 'nfo', 'py', 'java', 'c', 'h', 'cpp', 'rs', 'go',
+])
+
+function isTextFile(name: string): boolean {
+  const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : ''
+  return TEXT_EXTS.has(ext)
+}
+
+/** 预览大小上限：超过则点击文件直接下载（getFile 整体读入内存） */
+const PREVIEW_MAX_SIZE = 5 * 1024 * 1024
+
+/** secure 模式书仓（__LOCAL_STORE__）写/删需管理密码：轻提示（暂未接入 secureKey 输入框） */
+function secureWriteHint(err: unknown): void {
+  if (isNeedSecureKey(err)) {
+    ElMessage.info('书仓写入/删除需管理密码（secure 模式），暂未接入 secureKey 输入（TODO）')
+  }
+}
 
 /* ---------------- 路径工具 ---------------- */
 function joinPath(parent: string, name: string): string {
@@ -83,6 +116,11 @@ function enter(item: FileItem) {
     path.value = joinPath(path.value, item.name)
     selectedPath.value = null
     void loadList()
+    return
+  }
+  // 文本类小文件：预览（GET file/get）；其余：下载
+  if (isTextFile(item.name) && (!(typeof item.size === 'number') || item.size <= PREVIEW_MAX_SIZE)) {
+    void openPreview(item)
   } else {
     void download(item)
   }
@@ -95,27 +133,92 @@ function toggleSelect(item: FileItem) {
 /* ---------------- 下载 ---------------- */
 async function download(item: FileItem) {
   try {
-    const blob = await downloadFile(item.path)
-    // legacy 错误体也是 HTTP 200 的 JSON，blob 模式下手动识别
-    if (blob.type.includes('application/json')) {
-      try {
-        const parsed = JSON.parse(await blob.text()) as { errorMsg?: string }
-        if (parsed?.errorMsg) ElMessage.error(parsed.errorMsg)
-      } catch {
-        ElMessage.error('下载失败')
-      }
-      return
-    }
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = item.name
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
+    const blob = await downloadFile(item.path, home.value)
+    await downloadBlob(blob, item.name)
   } catch {
     // 请求层已提示
+  }
+}
+
+/* ---------------- 预览（文本类文件，GET file/get） ---------------- */
+async function openPreview(item: FileItem) {
+  previewItem.value = item
+  previewContent.value = ''
+  previewOpen.value = true
+  previewLoading.value = true
+  try {
+    const res = await getFile(item.path, home.value)
+    previewContent.value = res.data ?? ''
+  } catch {
+    previewContent.value = ''
+  } finally {
+    previewLoading.value = false
+  }
+}
+
+function closePreview() {
+  previewOpen.value = false
+  previewItem.value = null
+  previewContent.value = ''
+}
+
+/* ---------------- 重命名（后端无 API：文本文件用 读旧→写新→删旧 组合） ---------------- */
+function openRename() {
+  const target = files.value.find((f) => f.path === selectedPath.value)
+  if (!target) return
+  if (target.isDirectory) {
+    ElMessage.info('目录重命名暂不支持（后端暂无重命名 API，TODO）')
+    return
+  }
+  if (!isTextFile(target.name)) {
+    ElMessage.info('重命名暂仅支持文本文件（后端无重命名 API，二进制文件为 TODO）')
+    return
+  }
+  renameTarget.value = target
+  renameName.value = target.name
+  renameOpen.value = true
+}
+
+async function doRename() {
+  const target = renameTarget.value
+  if (!target || renameBusy.value) return
+  const name = renameName.value.trim()
+  if (!name) {
+    ElMessage.warning('请输入新名称')
+    return
+  }
+  if (name.includes('/') || name.includes('\\')) {
+    ElMessage.warning('名称不能包含路径分隔符')
+    return
+  }
+  if (name.startsWith('.')) {
+    ElMessage.warning('名称不能以 . 开头')
+    return
+  }
+  const dir = target.path.includes('/') ? target.path.slice(0, target.path.lastIndexOf('/')) : ''
+  const newPath = joinPath(dir, name)
+  if (newPath === target.path) {
+    renameOpen.value = false
+    return
+  }
+  if (files.value.some((f) => f.path !== target.path && f.path === newPath)) {
+    ElMessage.warning('同名文件已存在')
+    return
+  }
+  renameBusy.value = true
+  try {
+    // 组合实现：读旧内容 → 写新路径 → 删旧文件（写失败则旧文件保留，不删除）
+    const res = await getFile(target.path, home.value)
+    await saveFile(newPath, res.data ?? '', home.value)
+    await deleteFile(target.path, home.value)
+    ElMessage.success('重命名成功')
+    renameOpen.value = false
+    selectedPath.value = null
+    await loadList()
+  } catch (err) {
+    secureWriteHint(err)
+  } finally {
+    renameBusy.value = false
   }
 }
 
@@ -136,14 +239,15 @@ async function doUpload() {
     return
   }
   uploading.value = true
+  uploadProgress.value = 0
   try {
-    await uploadFile(pickedFile.value, path.value)
+    await uploadFile(pickedFile.value, path.value, home.value, (p) => (uploadProgress.value = p))
     ElMessage.success('上传成功')
     uploadOpen.value = false
     pickedFile.value = null
     await loadList()
-  } catch {
-    // 请求层已提示
+  } catch (err) {
+    secureWriteHint(err)
   } finally {
     uploading.value = false
   }
@@ -157,13 +261,13 @@ async function doMkdir() {
     return
   }
   try {
-    await mkdir(joinPath(path.value, name))
+    await mkdir(path.value, name, home.value)
     ElMessage.success('创建成功')
     mkdirOpen.value = false
     folderName.value = ''
     await loadList()
-  } catch {
-    // 请求层已提示
+  } catch (err) {
+    secureWriteHint(err)
   }
 }
 
@@ -181,12 +285,12 @@ async function removeSelected() {
     return // 用户取消
   }
   try {
-    await deleteFile(target.path)
+    await deleteFile(target.path, home.value)
     ElMessage.success('已删除')
     selectedPath.value = null
     await loadList()
-  } catch {
-    // 请求层已提示
+  } catch (err) {
+    secureWriteHint(err)
   }
 }
 
@@ -271,6 +375,15 @@ onMounted(() => {
           <button class="tool-btn" type="button" @click="openUpload">上传</button>
           <button class="tool-btn" type="button" @click="mkdirOpen = true">新建文件夹</button>
           <button
+            class="tool-btn"
+            type="button"
+            :disabled="!selectedPath"
+            title="文本文件可用"
+            @click="openRename"
+          >
+            重命名
+          </button>
+          <button
             class="tool-btn danger"
             type="button"
             :disabled="!selectedPath"
@@ -344,6 +457,12 @@ onMounted(() => {
           <input type="file" @change="onPick" />
           <span>{{ pickedName || '选择文件' }}</span>
         </label>
+        <div v-if="uploading" class="upload-progress">
+          <div class="upload-progress-wrap">
+            <div class="upload-progress-bar" :style="{ width: `${uploadProgress}%` }" />
+          </div>
+          <span class="upload-progress-text">{{ uploadProgress }}%</span>
+        </div>
         <div class="dlg-actions">
           <button class="btn-plain" type="button" @click="uploadOpen = false">取消</button>
           <button
@@ -380,6 +499,60 @@ onMounted(() => {
             @click="doMkdir"
           >
             创建
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 文件预览弹窗（txt 类，GET file/get） -->
+    <div v-if="previewOpen" class="dlg-overlay" @click.self="closePreview">
+      <div class="dlg preview-dlg">
+        <div class="preview-head">
+          <h3 class="dlg-title" :title="previewItem?.name">{{ previewItem?.name }}</h3>
+          <div class="preview-actions">
+            <button
+              class="btn-plain"
+              type="button"
+              :disabled="!previewItem"
+              @click="previewItem && download(previewItem)"
+            >
+              下载
+            </button>
+            <button class="btn-plain" type="button" @click="closePreview">关闭</button>
+          </div>
+        </div>
+        <div class="preview-body">
+          <p v-if="previewLoading" class="list-hint">加载中…</p>
+          <pre v-else class="preview-content">{{ previewContent }}</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- 重命名弹窗（后端无 API：读旧→写新→删旧，仅文本文件） -->
+    <div v-if="renameOpen" class="dlg-overlay" @click.self="renameOpen = false">
+      <div class="dlg">
+        <h3 class="dlg-title">重命名</h3>
+        <p class="dlg-path">{{ renameTarget?.path }}</p>
+        <input
+          v-model="renameName"
+          class="dlg-input"
+          type="text"
+          placeholder="新名称"
+          spellcheck="false"
+          @keyup.enter="doRename"
+        />
+        <p class="rename-tip">后端暂无重命名 API：以「读取内容 → 写入新路径 → 删除旧文件」组合实现（仅文本文件）。</p>
+        <div class="dlg-actions">
+          <button class="btn-plain" type="button" :disabled="renameBusy" @click="renameOpen = false">
+            取消
+          </button>
+          <button
+            class="btn-primary"
+            type="button"
+            :disabled="renameBusy || !renameName.trim()"
+            @click="doRename"
+          >
+            {{ renameBusy ? '重命名中…' : '确定' }}
           </button>
         </div>
       </div>
@@ -781,6 +954,92 @@ onMounted(() => {
 }
 .dlg-input:focus {
   border-color: var(--accent);
+}
+
+/* 上传进度条 */
+.upload-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.upload-progress-wrap {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+.upload-progress-bar {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+.upload-progress-text {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 300;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+
+/* 预览弹窗 */
+.preview-dlg {
+  width: min(620px, 100%);
+  display: flex;
+  flex-direction: column;
+  max-height: 82vh;
+}
+.preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.preview-head .dlg-title {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preview-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.preview-body {
+  min-height: 120px;
+  max-height: 56vh;
+  overflow: auto;
+  padding: 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.preview-body .list-hint {
+  padding: 40px 0;
+}
+.preview-content {
+  margin: 0;
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  font-weight: 300;
+  line-height: 1.7;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 重命名提示 */
+.rename-tip {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  line-height: 1.7;
+  color: var(--text-3);
 }
 .dlg-actions {
   display: flex;

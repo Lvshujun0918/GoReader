@@ -114,11 +114,17 @@ export interface ExploreCategory {
   type?: string
 }
 
-/** 书架分组（/reader3/getBookGroups → BookGroup，camelCase；books.group 存分组 id，0=未分组） */
+/** 书架分组（/reader3/getBookGroups → BookGroup，camelCase；books.group 存分组 id，0=未分组）
+ * 契约扩展：orderNum（=legacy order 排序）+ bookCount（组内书数，后端并行实现中——
+ * 后端未返回时前端以本地书架统计兜底）。 */
 export interface BookGroup {
   id: number
   name: string
-  order: number
+  /** 排序（后端当前输出 order；契约对齐名 orderNum，二者兼容读取） */
+  order?: number
+  orderNum?: number
+  /** 组内书数（契约字段，后端返回时优先使用，否则本地统计） */
+  bookCount?: number
   [key: string]: unknown
 }
 

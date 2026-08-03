@@ -122,6 +122,14 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/getBookGroups", get(get_book_groups).post(get_book_groups))
         .route("/reader3/saveBookGroup", post(save_book_group))
         .route("/reader3/updateBookGroupId", post(update_book_group_id))
+        .route("/reader3/deleteBookGroup", post(delete_book_group))
+        // 命名兼容批（legacy 别名路由——外部客户端兼容）
+        .route("/reader3/getChapterList", get(get_book_toc).post(get_book_toc))
+        .route("/reader3/getRssContent", get(get_rss_article).post(get_rss_article))
+        .route("/reader3/getUserList", get(get_users).post(get_users))
+        .route("/reader3/getBookGroupList", get(get_book_groups).post(get_book_groups))
+        .route("/reader3/saveBookGroupName", post(save_book_group))
+        .route("/reader3/updateBookGroup", post(save_book_group))
         // F-28 替换规则
         .route("/reader3/getReplaceRules", get(get_replace_rules).post(get_replace_rules))
         .route("/reader3/saveReplaceRule", post(save_replace_rule))
@@ -1356,6 +1364,17 @@ async fn get_book_toc(
         }
         return Json(ReturnData::err("本地书文件不存在"));
     }
+    // legacy 本地书（origin=loc_book——toc_url 可能是分章正则或 storage/ 文件路径）——查书架定位文件
+    if toc_url.starts_with("storage/") || toc_url.starts_with("spin") || toc_url.contains("(?") || toc_url.contains("序章") || toc_url.contains("楔子") {
+        let mut req_url = param_of(&params, body_json.as_ref(), "url");
+        if req_url.is_empty() {
+            req_url = toc_url.clone();
+        }
+        if let Some(ret) = get_book_toc_loc_book(&state, &namespace, &req_url, &toc_url).await {
+            return ret;
+        }
+        return Json(ReturnData::err("本地书文件不存在"));
+    }
     // F-10：目录缓存命中（TTL 5 分钟，同 tocUrl 直读）直接返回，不依赖书源
     if let Ok(Some(cached)) = state.storage.get_toc_cache(&toc_url, TOC_CACHE_TTL_MS).await {
         if let Ok(chapters) =
@@ -1416,19 +1435,42 @@ async fn get_book_content(
         }
         return Json(ReturnData::err("本地书章节不存在"));
     }
-    // 文件型本地书：bookUrl#index
-    if chapter_url.contains(".txt#") {
+    // legacy 本地书：bookUrl#index（bookUrl 可能是 storage/ 路径——不限于 .txt）
+    if chapter_url.contains("#") && (chapter_url.starts_with("storage/") || chapter_url.contains(".txt#")) {
         if let Some(ret) = get_book_content_file(&state, &namespace, &chapter_url).await {
             return ret;
         }
         return Json(ReturnData::err("本地书章节不存在"));
+    }
+    // F-10：书源书正文缓存——book_url 为键 + chapter_index = chapterUrl md5 哈希，
+    // 同 chapterUrl 直读（永久，清理接口 clearCache 可清）；local:// 键域不参与
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    if !book_url.is_empty() && !book_url.starts_with("local://") {
+        let idx = crate::util::md5::chapter_url_hash(&chapter_url);
+        if let Ok(Some(content)) = state.storage.get_chapter_content(&book_url, idx).await {
+            if !content.trim().is_empty() {
+                tracing::debug!("getBookContent 命中正文缓存 [{book_url} #{idx}]");
+                return Json(ReturnData::ok(serde_json::json!({ "content": content })));
+            }
+        }
     }
     let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
     };
     match crate::service::book::analyze_content(&chapter_url, &source, 5).await {
-        Ok(content) => Json(ReturnData::ok(serde_json::json!({ "content": content }))),
+        Ok(content) => {
+            // 抓取成功 → 写回正文缓存（仅书源书且带 bookUrl）
+            if !book_url.is_empty() && !book_url.starts_with("local://") {
+                let idx = crate::util::md5::chapter_url_hash(&chapter_url);
+                let title = param_of(&params, body_json.as_ref(), "title");
+                let _ = state
+                    .storage
+                    .cache_chapter_content(&book_url, idx, &title, &content)
+                    .await;
+            }
+            Json(ReturnData::ok(serde_json::json!({ "content": content })))
+        }
         Err(e) => {
             tracing::error!("getBookContent 失败 [{chapter_url}]: {e}");
             Json(ReturnData::err("获取正文失败"))
@@ -2517,7 +2559,7 @@ async fn delete_bookmark(
     }
 }
 
-/// GET/POST /reader3/getBookGroups：书架分组列表
+/// GET/POST /reader3/getBookGroups：书架分组列表（含组内书数 bookCount；order/orderNum 双字段）
 async fn get_book_groups(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -2528,7 +2570,8 @@ async fn get_book_groups(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
-    match state.storage.list_book_groups(&namespace).await {
+    let _ = body;
+    match state.storage.list_book_groups_with_count(&namespace).await {
         Ok(groups) => Json(ReturnData::ok(
             serde_json::to_value(groups).unwrap_or(serde_json::Value::Null),
         )),
@@ -2539,7 +2582,8 @@ async fn get_book_groups(
     }
 }
 
-/// POST /reader3/saveBookGroup：保存分组（body：id?/name/order?；id>0 覆盖，否则新建）
+/// POST /reader3/saveBookGroup：保存分组（body：id?/name/order?；id>0 覆盖，否则新建）。
+/// 分组重命名契约：body 仅 {id,name}（无 order）→ 只改名称、保留排序
 async fn save_book_group(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -2553,12 +2597,29 @@ async fn save_book_group(
     let Some(body) = body else {
         return Json(ReturnData::err("参数错误"));
     };
-    let group: crate::model::BookGroup = match serde_json::from_slice(&body) {
+    let v: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let group: crate::model::BookGroup = match serde_json::from_value(v.clone()) {
         Ok(g) => g,
         Err(_) => return Json(ReturnData::err("参数错误")),
     };
     if group.name.is_empty() {
         return Json(ReturnData::err("分组名称不能为空"));
+    }
+    // 仅 {id,name} → 重命名（保留 order；saveBookGroupName/updateBookGroup 兼容契约）
+    if group.id > 0 && v.get("order").is_none() && v.get("orderNum").is_none() {
+        return match state.storage.rename_book_group(&namespace, group.id, &group.name).await {
+            Ok(0) => Json(ReturnData::err("分组不存在")),
+            Ok(_) => Json(ReturnData::ok(
+                serde_json::to_value(group).unwrap_or(serde_json::Value::Null),
+            )),
+            Err(e) => {
+                tracing::error!("saveBookGroup 重命名失败: {e}");
+                Json(ReturnData::err("保存失败"))
+            }
+        };
     }
     match state.storage.save_book_group(&namespace, &group).await {
         Ok(saved) => Json(ReturnData::ok(
@@ -2567,6 +2628,40 @@ async fn save_book_group(
         Err(e) => {
             tracing::error!("saveBookGroup 失败: {e}");
             Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/deleteBookGroup：删除分组（body/query：id；组内书 group 置 0）
+async fn delete_book_group(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let id = params
+        .get("id")
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| {
+            body_json
+                .as_ref()
+                .and_then(|b| b.get("id").and_then(|v| v.as_i64()))
+        })
+        .unwrap_or(-1);
+    if id <= 0 {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_book_group(&namespace, id).await {
+        Ok(0) => Json(ReturnData::err("分组不存在")),
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("deleteBookGroup [{id}] 失败: {e}");
+            Json(ReturnData::err("删除失败"))
         }
     }
 }
@@ -3133,6 +3228,110 @@ async fn txt_toc_rule_regexes(state: &AppState, ns: &str) -> Vec<String> {
     }
 }
 
+/// legacy 本地书文件定位：book_url 指向的文件可能缺失（legacy 导入时改名 index.epub）
+/// 兜底：父目录 index.epub → 任意 epub/txt
+fn resolve_loc_book_file(storage_dir: &std::path::Path, book_url: &str) -> Option<std::path::PathBuf> {
+    let path = storage_dir.join(book_url.trim_start_matches("storage/"));
+    if path.is_file() {
+        return Some(path);
+    }
+    // legacy 的 epub 是目录（{书名}.epub/ 内含 index.epub）
+    if path.is_dir() {
+        let idx = path.join("index.epub");
+        if idx.is_file() {
+            return Some(idx);
+        }
+        let rd = std::fs::read_dir(&path).ok()?;
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() && p.to_string_lossy().to_lowercase().ends_with(".epub") {
+                return Some(p);
+            }
+        }
+    }
+    let parent = path.parent()?;
+    let idx = parent.join("index.epub");
+    if idx.is_file() {
+        return Some(idx);
+    }
+    let rd = std::fs::read_dir(parent).ok()?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_file() {
+            let lower = p.to_string_lossy().to_lowercase();
+            if lower.ends_with(".epub") || lower.ends_with(".txt") {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// legacy 本地书目录：toc_url 是分章正则（或空）——查书架定位 TXT 文件 → 按规则分章
+async fn get_book_toc_loc_book(
+    state: &AppState,
+    namespace: &str,
+    req_url: &str,
+    toc_rule: &str,
+) -> Option<Json<ReturnData>> {
+    // 书架找本地书：优先按传入 url 精确匹配，兜底第一本 loc_book
+    let books = state.storage.list_books(namespace).await.ok()?;
+    let book = books
+        .iter()
+        .find(|b| b.origin == "loc_book" && !b.book_url.is_empty() && b.book_url == req_url)
+        .or_else(|| books.iter().find(|b| b.origin == "loc_book" && !b.book_url.is_empty()))
+        .or_else(|| books.iter().find(|b| b.origin == "loc_book"))?;
+    let book_url = &book.book_url;
+    tracing::debug!("loc_book toc: req={req_url} matched={book_url}");
+    if !book_url.starts_with("storage/") {
+        tracing::debug!("loc_book toc: book_url 非 storage 路径");
+        return None;
+    }
+    let Some(path) = resolve_loc_book_file(&state.storage.config.storage_dir(), book_url) else {
+        tracing::debug!("loc_book toc: 文件定位失败 [{book_url}]");
+        return None;
+    };
+    let path_lower = path.to_string_lossy().to_lowercase();
+    let imported = if path_lower.ends_with(".epub") {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!("loc_book toc: 读取失败 [{path:?}] {e}");
+                return None;
+            }
+        };
+        match crate::service::local_book::parse_epub(&bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!("loc_book toc: epub 解析失败 {e}");
+                return None;
+            }
+        }
+    } else {
+        match crate::service::local_book::parse_txt_file(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!("loc_book toc: txt 解析失败 {e}");
+                return None;
+            }
+        }
+    };
+    let chapters = imported.chapters;
+    let list: Vec<serde_json::Value> = chapters
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            serde_json::json!({
+                "title": c.title,
+                "url": format!("{book_url}#{i}"),
+                "isVolume": false,
+                "index": i,
+            })
+        })
+        .collect();
+    Some(Json(ReturnData::ok(serde_json::Value::Array(list))))
+}
+
 /// 文件型本地书目录：读 TXT 分章 → 章节列表（chapterUrl = bookUrl#index）
 async fn get_book_toc_file(state: &AppState, ns: &str, book_url: &str) -> Option<Json<ReturnData>> {
     let path = resolve_storage_path(&state.storage.config.storage_dir(), book_url)?;
@@ -3154,13 +3353,19 @@ async fn get_book_toc_file(state: &AppState, ns: &str, book_url: &str) -> Option
     Some(Json(ReturnData::ok(serde_json::Value::Array(list))))
 }
 
-/// 文件型本地书正文：bookUrl#index → 读 TXT → 提取章节
+/// 文件型本地书正文：bookUrl#index → 读文件（TXT/EPUB）→ 提取章节
 async fn get_book_content_file(state: &AppState, ns: &str, chapter_url: &str) -> Option<Json<ReturnData>> {
     let (book_part, idx_part) = chapter_url.rsplit_once('#')?;
     let index: usize = idx_part.parse().ok()?;
-    let path = resolve_storage_path(&state.storage.config.storage_dir(), book_part)?;
-    let user_rules = txt_toc_rule_regexes(state, ns).await;
-    let imported = crate::service::local_book::parse_txt_file_with_rules(&path, &user_rules).ok()?;
+    let path = resolve_loc_book_file(&state.storage.config.storage_dir(), book_part)?;
+    let path_lower = path.to_string_lossy().to_lowercase();
+    let imported = if path_lower.ends_with(".epub") {
+        let bytes = std::fs::read(&path).ok()?;
+        crate::service::local_book::parse_epub(&bytes).ok()?
+    } else {
+        let user_rules = txt_toc_rule_regexes(state, ns).await;
+        crate::service::local_book::parse_txt_file_with_rules(&path, &user_rules).ok()?
+    };
     let content = imported.chapters.get(index)?.content.clone();
     Some(Json(ReturnData::ok(serde_json::json!({ "content": content }))))
 }
@@ -4549,6 +4754,280 @@ mod tests {
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "超过书源数上限");
         assert!(state.storage.get_source_subs("default").await.unwrap().is_empty(), "超限时订阅不落库");
+
+        cleanup(state, dir).await;
+    }
+
+    /// 分组收尾：getBookGroups 输出 {id,name,order,orderNum,bookCount}（COUNT 子查询）
+    #[tokio::test]
+    async fn test_book_groups_with_count_api() {
+        let (state, dir) = test_state("grpcnt").await;
+        let g1 = state
+            .storage
+            .save_book_group("default", &crate::model::BookGroup { name: "玄幻".into(), order: 1, ..Default::default() })
+            .await
+            .unwrap();
+        let g2 = state
+            .storage
+            .save_book_group("default", &crate::model::BookGroup { name: "言情".into(), order: 2, ..Default::default() })
+            .await
+            .unwrap();
+        for url in ["https://b.com/1", "https://b.com/2", "https://b.com/3"] {
+            state
+                .storage
+                .upsert_book("default", &crate::model::Book { book_url: url.into(), name: url.into(), ..Default::default() })
+                .await
+                .unwrap();
+        }
+        state.storage.update_book_group_id("default", "https://b.com/1", g1.id).await.unwrap();
+        state.storage.update_book_group_id("default", "https://b.com/2", g1.id).await.unwrap();
+        state.storage.update_book_group_id("default", "https://b.com/3", g2.id).await.unwrap();
+
+        let ret = get_book_groups(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], g1.id);
+        assert_eq!(arr[0]["name"], "玄幻");
+        assert_eq!(arr[0]["order"], 1, "legacy order 字段保留");
+        assert_eq!(arr[0]["orderNum"], 1, "orderNum 别名同值");
+        assert_eq!(arr[0]["bookCount"], 2, "组内书数");
+        assert_eq!(arr[1]["name"], "言情");
+        assert_eq!(arr[1]["bookCount"], 1);
+        assert_eq!(arr[1]["orderNum"], 2);
+
+        cleanup(state, dir).await;
+    }
+
+    /// 分组收尾：saveBookGroup 仅 {id,name} → 重命名保留 order；deleteBookGroup 组内书置 0
+    #[tokio::test]
+    async fn test_save_book_group_rename_and_delete_api() {
+        let (state, dir) = test_state("grpren").await;
+
+        // 新建 {name, order}
+        let body = Bytes::from(r#"{"name":"玄幻","order":3}"#);
+        let ret = save_book_group(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let gid = ret.0.data["id"].as_i64().expect("新建应返回 id");
+
+        // 仅 {id,name} → 重命名（order 保留）
+        let body = Bytes::from(format!(r#"{{"id":{gid},"name":"玄幻v2"}}"#));
+        let ret = save_book_group(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let list = state.storage.list_book_groups_with_count("default").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "玄幻v2");
+        assert_eq!(list[0].order, 3, "重命名应保留排序");
+        assert_eq!(list[0].id, gid);
+
+        // 重命名不存在的分组 → 分组不存在；空名称 → 分组名称不能为空；非 JSON → 参数错误
+        let body = Bytes::from(r#"{"id":9999,"name":"幽灵"}"#);
+        let ret = save_book_group(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "分组不存在");
+        let body = Bytes::from(format!(r#"{{"id":{gid},"name":""}}"#));
+        let ret = save_book_group(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "分组名称不能为空");
+        let ret = save_book_group(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(Bytes::from("nope"))).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        // 带 order 的 {id,name,order} → 仍走全量覆盖（兼容旧行为）
+        let body = Bytes::from(format!(r#"{{"id":{gid},"name":"玄幻v3","order":9}}"#));
+        let ret = save_book_group(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let list = state.storage.list_book_groups_with_count("default").await.unwrap();
+        assert_eq!(list[0].name, "玄幻v3");
+        assert_eq!(list[0].order, 9);
+
+        // 删除：组内书 group 置 0，分组移除
+        state
+            .storage
+            .upsert_book("default", &crate::model::Book { book_url: "https://b.com/1".into(), name: "书1".into(), ..Default::default() })
+            .await
+            .unwrap();
+        state.storage.update_book_group_id("default", "https://b.com/1", gid).await.unwrap();
+        let body = Bytes::from(format!(r#"{{"id":{gid}}}"#));
+        let ret = delete_book_group(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(
+            state.storage.find_book("default", "https://b.com/1").await.unwrap().unwrap().group,
+            0,
+            "组内书应置 0"
+        );
+        assert!(state.storage.list_book_groups("default").await.unwrap().is_empty());
+
+        // 再删 → 分组不存在；缺 id → 参数错误；query 形式 id 同样生效
+        let body = Bytes::from(format!(r#"{{"id":{gid}}}"#));
+        let ret = delete_book_group(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "分组不存在");
+        let ret = delete_book_group(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(Bytes::from(r#"{"name":"x"}"#))).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let params: HashMap<String, String> = [("id".into(), gid.to_string())].into_iter().collect();
+        let ret = delete_book_group(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "分组不存在", "query 形式 id 应被识别");
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-10 正文缓存：getBookContent 先查 book_chapters（chapterUrl md5 键）命中直读，
+    /// 抓取成功后写回；local:// 与缺 bookUrl 不参与缓存
+    #[tokio::test]
+    async fn test_get_book_content_cache_api() {
+        let (state, dir) = test_state("contentcache").await;
+        let base_url = serve_bodies(vec![
+            r#"<html><body><div class="content">正文一。</div></body></html>"#.to_string(),
+            r#"<html><body><div class="content">正文二。</div></body></html>"#.to_string(),
+        ])
+        .await;
+        let base = base_url.trim_end_matches("/sources.json").to_string();
+        state
+            .storage
+            .save_book_source("default", &crate::model::BookSource {
+                book_source_url: base.clone(),
+                book_source_name: "缓存测试源".into(),
+                rule_content: Some(serde_json::json!({ "content": "div.content@text" })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let book_url = "https://book.com/a";
+        let ch1 = format!("{base}/ch1.html");
+        let ch2 = format!("{base}/ch2.html");
+        let idx1 = crate::util::md5::chapter_url_hash(&ch1);
+        let params = |chapter_url: &str| -> HashMap<String, String> {
+            [
+                ("chapterUrl".into(), chapter_url.to_string()),
+                ("bookUrl".into(), book_url.to_string()),
+                ("bookSource".into(), base.clone()),
+            ]
+            .into_iter()
+            .collect()
+        };
+
+        // 首次：抓取成功 → 返回 + 写回缓存
+        let ret = get_book_content(AxumState(state.clone()), Query(params(&ch1)), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["content"], "正文一。");
+        assert_eq!(
+            state.storage.get_chapter_content(book_url, idx1).await.unwrap().as_deref(),
+            Some("正文一。"),
+            "抓取成功应写回 book_chapters"
+        );
+
+        // 二次同 chapterUrl：命中缓存直读（若再抓取会拿到正文二。→ 断言失败即回归）
+        let ret = get_book_content(AxumState(state.clone()), Query(params(&ch1)), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["content"], "正文一。", "缓存命中应直读不回源");
+
+        // 不同 chapterUrl → 未命中，抓取正文二。并写回
+        let ret = get_book_content(AxumState(state.clone()), Query(params(&ch2)), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["content"], "正文二。");
+        let idx2 = crate::util::md5::chapter_url_hash(&ch2);
+        assert_eq!(state.storage.get_chapter_content(book_url, idx2).await.unwrap().as_deref(), Some("正文二。"));
+
+        // 缺 bookUrl：照常抓取返回，但不落缓存
+        let p: HashMap<String, String> = [
+            ("chapterUrl".into(), format!("{base}/ch3.html")),
+            ("bookSource".into(), base.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = get_book_content(AxumState(state.clone()), Query(p), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert!(state.storage.get_chapter_content("", crate::util::md5::chapter_url_hash(&format!("{base}/ch3.html"))).await.unwrap().is_none());
+
+        // local:// 章节不走缓存（不命中、不写回）
+        let p: HashMap<String, String> = [
+            ("chapterUrl".into(), "local://book1/0".into()),
+            ("bookUrl".into(), "local://book1".into()),
+        ]
+        .into_iter()
+        .collect();
+        let ret = get_book_content(AxumState(state.clone()), Query(p), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "本地书章节不存在");
+        assert_eq!(state.storage.count_chapters("local://book1").await.unwrap(), 0, "local:// 不落正文缓存");
+
+        cleanup(state, dir).await;
+    }
+
+    /// 命名兼容批：6 条 legacy 别名路由端到端（真实 router + HTTP 请求）
+    #[tokio::test]
+    async fn test_alias_routes_end_to_end() {
+        let (state, dir) = test_state("alias").await;
+        let app = router(state.storage.config.clone(), state.storage.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // getChapterList（= getBookToc）：缺参 → 业务错误（路由可达，非 404）
+        let resp = client.get(format!("{base}/reader3/getChapterList")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: Value = resp.json().await.unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap());
+        assert_eq!(json["errorMsg"], "请输入目录链接");
+
+        // getRssContent（= getRssArticle）：缺 url → 业务错误
+        let resp = client.get(format!("{base}/reader3/getRssContent")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: Value = resp.json().await.unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap());
+
+        // getUserList（= getUsers）：非 secure 模式管理接口拒绝（而非 404）
+        let resp = client.get(format!("{base}/reader3/getUserList")).send().await.unwrap();
+        let json: Value = resp.json().await.unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap());
+
+        // getBookGroupList（= getBookGroups）：空列表
+        let resp = client.get(format!("{base}/reader3/getBookGroupList")).send().await.unwrap();
+        let json: Value = resp.json().await.unwrap();
+        assert!(json["isSuccess"].as_bool().unwrap());
+        assert_eq!(json["data"].as_array().unwrap().len(), 0);
+
+        // saveBookGroupName（= saveBookGroup）：新建
+        let resp = client
+            .post(format!("{base}/reader3/saveBookGroupName"))
+            .json(&serde_json::json!({ "name": "分组A" }))
+            .send()
+            .await
+            .unwrap();
+        let json: Value = resp.json().await.unwrap();
+        assert!(json["isSuccess"].as_bool().unwrap(), "{}", json);
+        let gid = json["data"]["id"].as_i64().expect("新建应返回 id");
+
+        // updateBookGroup（= saveBookGroup）：重命名 {id,name}
+        let resp = client
+            .post(format!("{base}/reader3/updateBookGroup"))
+            .json(&serde_json::json!({ "id": gid, "name": "分组A2" }))
+            .send()
+            .await
+            .unwrap();
+        let json: Value = resp.json().await.unwrap();
+        assert!(json["isSuccess"].as_bool().unwrap(), "{}", json);
+
+        // getBookGroupList 复核：改名生效 + 双字段 + 书数
+        let resp = client.get(format!("{base}/reader3/getBookGroupList")).send().await.unwrap();
+        let json: Value = resp.json().await.unwrap();
+        let arr = json["data"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "分组A2");
+        assert_eq!(arr[0]["orderNum"], arr[0]["order"], "order/orderNum 同值");
+        assert_eq!(arr[0]["bookCount"], 0);
+
+        // deleteBookGroup：删除成功
+        let resp = client
+            .post(format!("{base}/reader3/deleteBookGroup"))
+            .json(&serde_json::json!({ "id": gid }))
+            .send()
+            .await
+            .unwrap();
+        let json: Value = resp.json().await.unwrap();
+        assert!(json["isSuccess"].as_bool().unwrap(), "{}", json);
 
         cleanup(state, dir).await;
     }

@@ -881,6 +881,26 @@ impl Storage {
         Ok(r.map(|x| x.0))
     }
 
+    /// 书源书正文缓存写回（chapter_index = chapterUrl md5 哈希；与本地书顺序索引键域不重叠）
+    pub async fn cache_chapter_content(
+        &self,
+        book_url: &str,
+        index: i64,
+        title: &str,
+        content: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO book_chapters (book_url, chapter_index, title, content) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(book_url)
+        .bind(index)
+        .bind(title)
+        .bind(content)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// 删除本地书（含章节）
     pub async fn delete_local_book(&self, book_url: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -1195,6 +1215,59 @@ impl Storage {
         .bind(group)
         .execute(&self.pool)
         .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 分组列表（带组内书数统计：books.group_name = 分组 id 计数）
+    pub async fn list_book_groups_with_count(
+        &self,
+        ns: &str,
+    ) -> Result<Vec<crate::model::BookGroupWithCount>> {
+        let rows = sqlx::query_as::<_, (i64, String, i64, i64)>(
+            "SELECT g.id, g.name, g.order_num,               (SELECT COUNT(*) FROM books b               WHERE b.user_namespace = g.user_namespace AND b.group_name = g.id) AS book_count               FROM book_groups g WHERE g.user_namespace = ?1 ORDER BY g.order_num, g.id",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, order, book_count)| crate::model::BookGroupWithCount {
+                id,
+                name,
+                order,
+                order_num: order,
+                book_count,
+            })
+            .collect())
+    }
+
+    /// 分组重命名（仅改 name，保留 order 与 id；不存在返回 0 行）
+    pub async fn rename_book_group(&self, ns: &str, id: i64, name: &str) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE book_groups SET name = ?3 WHERE user_namespace = ?1 AND id = ?2",
+        )
+        .bind(ns)
+        .bind(id)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 删除分组（事务：组内书 group_name 置 0 后删分组）；返回删除的分组行数
+    pub async fn delete_book_group(&self, ns: &str, id: i64) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE books SET group_name = 0 WHERE user_namespace = ?1 AND group_name = ?2")
+            .bind(ns)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let r = sqlx::query("DELETE FROM book_groups WHERE user_namespace = ?1 AND id = ?2")
+            .bind(ns)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(r.rows_affected())
     }
 
@@ -3303,5 +3376,137 @@ mod tests {
         assert!(storage.get_source_subs("default").await.unwrap().is_empty());
 
         cleanup(storage, "subs").await;
+    }
+
+    /// 书源书正文缓存：chapterUrl md5 哈希键写入 → 同键读取；与本地书顺序索引键域不重叠；覆盖写
+    #[tokio::test]
+    async fn test_chapter_content_cache_roundtrip() {
+        let storage = test_storage("chapcache").await;
+        let book_url = "https://book.com/a";
+        let url1 = "https://book.com/1.html";
+        let url2 = "https://book.com/2.html";
+        let idx1 = crate::util::md5::chapter_url_hash(url1);
+        let idx2 = crate::util::md5::chapter_url_hash(url2);
+        assert!(idx1 > 0 && idx2 > 0, "哈希恒为正");
+        assert_ne!(idx1, idx2, "不同 chapterUrl 哈希不同");
+
+        // 写入 → 同 chapterUrl 直读
+        storage
+            .cache_chapter_content(book_url, idx1, "第一章", "第一章正文内容。")
+            .await
+            .unwrap();
+        let got = storage.get_chapter_content(book_url, idx1).await.unwrap();
+        assert_eq!(got.as_deref(), Some("第一章正文内容。"));
+        assert_eq!(storage.get_chapter_content(book_url, idx2).await.unwrap(), None, "未缓存键应无命中");
+
+        // 覆盖写（同一 chapterUrl 再次缓存更新正文）
+        storage
+            .cache_chapter_content(book_url, idx1, "第一章", "更新后的正文。")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_chapter_content(book_url, idx1).await.unwrap().as_deref(),
+            Some("更新后的正文。")
+        );
+
+        // 与本地书顺序索引共存：哈希键域（~2^60）不重叠 0..n
+        storage
+            .save_chapters(book_url, &[("本地1".to_string(), "本地内容1".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(storage.count_chapters(book_url).await.unwrap(), 2, "缓存行 + 本地行共存");
+        assert_eq!(
+            storage.get_chapter_content(book_url, 0).await.unwrap().as_deref(),
+            Some("本地内容1")
+        );
+        assert_eq!(
+            storage.get_chapter_content(book_url, idx1).await.unwrap().as_deref(),
+            Some("更新后的正文。")
+        );
+
+        // 不同书同 chapterUrl → 按 book_url 隔离
+        storage
+            .cache_chapter_content("https://book.com/b", idx1, "第一章", "B 书正文。")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_chapter_content("https://book.com/a", idx1).await.unwrap().as_deref(),
+            Some("更新后的正文。")
+        );
+        assert_eq!(
+            storage.get_chapter_content("https://book.com/b", idx1).await.unwrap().as_deref(),
+            Some("B 书正文。")
+        );
+
+        cleanup(storage, "chapcache").await;
+    }
+
+    /// 分组收尾：带书数列表 / 重命名保留 order / 删除分组组内书置 0 + 命名空间隔离
+    #[tokio::test]
+    async fn test_book_group_count_rename_delete() {
+        let storage = test_storage("grpfin").await;
+        let g1 = storage
+            .save_book_group("default", &crate::model::BookGroup {
+                name: "玄幻".into(),
+                order: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let g2 = storage
+            .save_book_group("default", &crate::model::BookGroup {
+                name: "言情".into(),
+                order: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 书：g1 两本、g2 一本、未分组一本（group 0 不计入任何组）
+        storage.upsert_book("default", &shelf_book("https://b.com/1", "书1")).await.unwrap();
+        storage.upsert_book("default", &shelf_book("https://b.com/2", "书2")).await.unwrap();
+        storage.upsert_book("default", &shelf_book("https://b.com/3", "书3")).await.unwrap();
+        storage.upsert_book("default", &shelf_book("https://b.com/4", "书4")).await.unwrap();
+        storage.update_book_group_id("default", "https://b.com/1", g1.id).await.unwrap();
+        storage.update_book_group_id("default", "https://b.com/2", g1.id).await.unwrap();
+        storage.update_book_group_id("default", "https://b.com/3", g2.id).await.unwrap();
+
+        // 带书数列表（bookCount + orderNum 别名）
+        let list = storage.list_book_groups_with_count("default").await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "玄幻");
+        assert_eq!(list[0].book_count, 2);
+        assert_eq!(list[0].order, 1);
+        assert_eq!(list[0].order_num, 1);
+        assert_eq!(list[1].name, "言情");
+        assert_eq!(list[1].book_count, 1);
+
+        // 重命名：仅改 name，order/id 保留；不存在返回 0 行
+        assert_eq!(storage.rename_book_group("default", g1.id, "玄幻v2").await.unwrap(), 1);
+        assert_eq!(storage.rename_book_group("default", 9999, "幽灵").await.unwrap(), 0);
+        let list = storage.list_book_groups_with_count("default").await.unwrap();
+        assert_eq!(list[0].name, "玄幻v2");
+        assert_eq!(list[0].order, 1, "重命名保留 order");
+        assert_eq!(list[0].id, g1.id, "重命名保留 id");
+        assert_eq!(list[0].book_count, 2, "重命名不影响书数");
+
+        // 删除 g1：组内书置 0，组删除；g2 与书不受影响
+        assert_eq!(storage.delete_book_group("default", g1.id).await.unwrap(), 1);
+        assert_eq!(storage.delete_book_group("default", g1.id).await.unwrap(), 0, "重复删除 0 行");
+        let list = storage.list_book_groups_with_count("default").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "言情");
+        let b1 = storage.find_book("default", "https://b.com/1").await.unwrap().unwrap();
+        assert_eq!(b1.group, 0, "组内书应置 0（未分组）");
+        let b2 = storage.find_book("default", "https://b.com/2").await.unwrap().unwrap();
+        assert_eq!(b2.group, 0);
+        let b3 = storage.find_book("default", "https://b.com/3").await.unwrap().unwrap();
+        assert_eq!(b3.group, g2.id, "其他组书不受影响");
+
+        // 命名空间隔离：alice 删除不了 default 的分组
+        assert_eq!(storage.delete_book_group("alice", g2.id).await.unwrap(), 0);
+        assert_eq!(storage.list_book_groups("default").await.unwrap().len(), 1);
+        assert_eq!(storage.rename_book_group("alice", g2.id, "越权改名").await.unwrap(), 0);
+
+        cleanup(storage, "grpfin").await;
     }
 }

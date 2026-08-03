@@ -1,31 +1,25 @@
-import { get } from './request'
-import { useUserStore } from '@/stores/user'
+import request from './request'
 import type { ReturnData, SystemInfo } from '@/types'
 
 /**
  * 系统信息 + 书源导出
  *
  * GET /reader3/getSystemInfo      → ReturnData<SystemInfo>（版本/端口/用户数/书数/书源数）
- * GET /reader3/exportBookSources  → 当前命名空间书源 JSON 附件下载（attachment）
+ * GET /reader3/exportBookSources  → 当前命名空间书源 JSON 附件下载
  */
 
 /** GET /reader3/getSystemInfo */
 export function getSystemInfo(): Promise<ReturnData<SystemInfo>> {
-  return get<SystemInfo>('/getSystemInfo')
+  return request.get('/getSystemInfo').then((r) => r.data as ReturnData<SystemInfo>)
 }
 
-/** GET /reader3/exportBookSources：直接触发浏览器下载（后端返回 attachment） */
-export function exportBookSources(): void {
-  const store = useUserStore()
-  const params = new URLSearchParams()
-  if (store.accessToken) {
-    params.set('accessToken', store.accessToken)
-  }
-  const url = `/reader3/exportBookSources?${params.toString()}`
-  const a = document.createElement('a')
-  a.href = url
-  a.download = 'bookSource.json'
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
+/**
+ * GET /reader3/exportBookSources：当前命名空间书源 JSON，返回 Blob。
+ * 成功：application/json 的书源数组（文件名 bookSource.json）；
+ * 失败：legacy ReturnData JSON 错误体（由调用方经 utils/download.ts downloadBlob 识别提示）。
+ */
+export function exportBookSources(): Promise<Blob> {
+  return request
+    .get('/exportBookSources', { responseType: 'blob', timeout: 60_000 })
+    .then((r) => r.data as Blob)
 }

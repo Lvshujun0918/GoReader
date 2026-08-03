@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
-import { getBookInfo } from '@/api/books'
+import { getBookInfo, searchBookSource } from '@/api/books'
 import { searchBookContent } from '@/api/cache'
-import type { Book, BookInfo, ContentSearchHit } from '@/types'
+import type { Book, BookInfo, ContentSearchHit, SearchBook } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -198,6 +199,109 @@ function goToHit(hit: ContentSearchHit) {
   void router.push(`/reader/${encodeURIComponent(bookUrl.value)}?chapter=${hit.chapterIndex}`)
 }
 
+/* ================= 换源（GET /reader3/searchBookSource：搜索同书其他书源，点击切换） ================= */
+
+const sourceOpen = ref(false)
+const sourceBusy = ref(false)
+const sourceSwitching = ref(false)
+const sourceResults = ref<SearchBook[]>([])
+const sourceMsg = ref('')
+const sourceMsgError = ref(false)
+const currentOrigin = ref('')
+
+/** 判断是否接口未实现（404 / 后端未就绪） */
+function isNotImplemented(err: unknown): boolean {
+  const e = err as { response?: { status?: number }; message?: string } | null | undefined
+  const status = e?.response?.status
+  if (status === 404 || status === 501) return true
+  const msg = e?.message ?? ''
+  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
+}
+
+/** 书架书且有书源才可换源（本地书无 origin 不显示入口） */
+function canSwitchSource(): boolean {
+  return !!shelfBook.value && !!shelfBook.value.origin
+}
+
+function openSource() {
+  sourceOpen.value = true
+  document.body.style.overflow = 'hidden'
+  void runSourceSearch()
+}
+
+function closeSource() {
+  if (sourceBusy.value || sourceSwitching.value) return
+  sourceOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 搜索同书其他书源：url=当前书 bookUrl + bookSource=当前源 */
+async function runSourceSearch() {
+  const b = shelfBook.value
+  if (!b || !b.origin) return
+  sourceBusy.value = true
+  sourceResults.value = []
+  sourceMsg.value = ''
+  sourceMsgError.value = false
+  currentOrigin.value = b.origin
+  try {
+    const res = await searchBookSource(b.bookUrl, b.origin, { silent: true })
+    // 按书源去重（同一源多条结果只留首个）
+    const seen = new Set<string>()
+    sourceResults.value = (res.data ?? []).filter((r) => {
+      const k = r.origin || r.originName
+      if (!k || seen.has(k)) return false
+      seen.add(k)
+      return true
+    })
+    if (sourceResults.value.length === 0) {
+      sourceMsg.value = '未找到其他书源'
+      sourceMsgError.value = false
+    }
+  } catch (err) {
+    sourceMsg.value = isNotImplemented(err)
+      ? '换源搜索接口后端暂未提供（GET /reader3/searchBookSource）'
+      : `换源搜索失败：${err instanceof Error ? err.message : '请稍后重试'}`
+    sourceMsgError.value = true
+  } finally {
+    sourceBusy.value = false
+  }
+}
+
+/** 点击结果 → 切换书源：saveBook 更新 origin/originName/tocUrl（bookUrl 保持书架主键不变） */
+async function switchSource(r: SearchBook) {
+  const b = shelfBook.value
+  if (!b || sourceSwitching.value) return
+  if (!r.origin || r.origin === currentOrigin.value) return
+  sourceSwitching.value = true
+  try {
+    await saveBook({
+      bookUrl: b.bookUrl,
+      origin: r.origin,
+      originName: r.originName,
+      tocUrl: r.tocUrl,
+    } as Book)
+    // 本地同步书架条目 + 用新源刷新详情
+    b.origin = r.origin
+    b.originName = r.originName
+    b.tocUrl = r.tocUrl
+    currentOrigin.value = r.origin
+    info.value = null
+    try {
+      const infoRes = await getBookInfo(bookUrl.value, r.origin)
+      if (infoRes.isSuccess) info.value = infoRes.data
+    } catch {
+      // 详情刷新失败：书架数据兜底展示
+    }
+    ElMessage.success(`已切换到「${r.originName || r.origin}」`)
+    closeSource()
+  } catch {
+    // 失败提示由 request.ts 统一 toast（saveBook 非 silent）
+  } finally {
+    sourceSwitching.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -270,6 +374,8 @@ onMounted(load)
             </button>
             <!-- 全书搜索（书架书本地正文搜索；命中后跳阅读页该章） -->
             <button v-if="shelfBook" class="search-btn" type="button" @click="openSearch">全书搜索</button>
+            <!-- 换源（书架书且带书源：搜索同书其他书源并切换） -->
+            <button v-if="canSwitchSource()" class="search-btn" type="button" @click="openSource">换源</button>
           </div>
         </div>
       </div>
@@ -319,6 +425,66 @@ onMounted(load)
                 </li>
               </ul>
             </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+    <!-- 换源弹层（GET /reader3/searchBookSource：搜索同书其他书源，点击切换） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="sourceOpen" class="dlg-overlay" @click.self="closeSource">
+          <div
+            class="dlg dlg-source"
+            role="dialog"
+            aria-modal="true"
+            aria-label="换源"
+            tabindex="-1"
+            @keydown.esc="closeSource"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">换源 · {{ display.name }}</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="sourceBusy || sourceSwitching" @click="closeSource">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <div class="source-body">
+              <p class="field-tip">搜索《{{ display.name }}》的其他书源（当前：{{ currentOrigin || '—' }}），点击结果即可切换。</p>
+
+              <!-- 搜索中 -->
+              <div v-if="sourceBusy" class="source-busy">
+                <svg class="mini-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                  <path d="M21 12a9 9 0 1 1-6.2-8.56" />
+                </svg>
+                <span>正在搜索其他书源…</span>
+              </div>
+
+              <!-- 结果列表：书源名 + 来源，当前源置灰标记 -->
+              <ul v-else-if="sourceResults.length" class="source-list">
+                <li v-for="(r, i) in sourceResults" :key="i">
+                  <button
+                    class="source-row"
+                    type="button"
+                    :disabled="sourceSwitching || r.origin === currentOrigin"
+                    :title="r.origin === currentOrigin ? '当前书源' : '切换到该书源'"
+                    @click="switchSource(r)"
+                  >
+                    <span class="source-name">{{ r.originName || r.origin || '未知书源' }}</span>
+                    <span class="source-url">{{ r.origin }}</span>
+                    <span v-if="r.origin === currentOrigin" class="source-cur">当前</span>
+                  </button>
+                </li>
+              </ul>
+
+              <!-- 空 / 失败提示 -->
+              <template v-else>
+                <p v-if="sourceMsg" class="search-msg" :class="{ error: sourceMsgError }">{{ sourceMsg }}</p>
+                <div v-if="sourceMsgError" class="source-retry">
+                  <button class="ghost-btn" type="button" @click="runSourceSearch">重试</button>
+                </div>
+              </template>
+            </div>
           </div>
         </div>
       </Transition>
@@ -804,6 +970,102 @@ onMounted(load)
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+/* ================= 换源弹层 ================= */
+.dlg-source {
+  width: min(480px, 100%);
+}
+.source-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+}
+.source-busy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 4px;
+  font-size: 12.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.mini-spin {
+  width: 13px;
+  height: 13px;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+.source-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.source-row {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.source-row:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.source-row:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.source-name {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-1);
+}
+.source-url {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.source-cur {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+}
+.source-retry {
+  display: flex;
+  justify-content: flex-start;
 }
 
 /* 弹窗动画：fade 200ms */

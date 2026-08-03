@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { deleteBookSource, getBookSources, saveBookSource, saveBookSources } from '@/api/sources'
 import { deleteSourceSub, getSourceSubs, refreshSourceSub, saveSourceSub } from '@/api/sourceSubs'
 import { exportBookSources } from '@/api/system'
+import { downloadBlob } from '@/utils/download'
 import type { BookSource, SourceSub } from '@/types'
 
 const router = useRouter()
@@ -150,6 +152,56 @@ async function confirmAdd() {
     // 错误提示已由拦截器处理
   } finally {
     addBusy.value = false
+  }
+}
+
+/* ================= 导出（blob 下载 bookSource.json） ================= */
+const exporting = ref(false)
+
+async function doExport() {
+  if (exporting.value) return
+  exporting.value = true
+  try {
+    const blob = await exportBookSources()
+    await downloadBlob(blob, 'bookSource.json')
+  } catch {
+    // 请求层已提示
+  } finally {
+    exporting.value = false
+  }
+}
+
+/* ================= 本地文件导入（input file → 解析 JSON → saveBookSources） ================= */
+const localFileInput = ref<HTMLInputElement | null>(null)
+const localImportBusy = ref(false)
+
+function openLocalImport() {
+  localFileInput.value?.click()
+}
+
+async function onLocalFilePick(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = '' // 允许再次选择同一文件
+  if (!file || localImportBusy.value) return
+  localImportBusy.value = true
+  try {
+    const raw: unknown = JSON.parse(await file.text())
+    const list = normalizeSources(raw)
+    if (list.length === 0) {
+      ElMessage.warning('未识别到书源（需为书源数组或含 bookSourceList 的对象）')
+      return
+    }
+    const res = await saveBookSources(list)
+    ElMessage.success(`成功导入 ${res.data?.count ?? list.length} 个书源`)
+    await load()
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      ElMessage.error('文件不是有效的 JSON')
+    }
+    // 其余错误（网络/后端失败）已由请求拦截器提示
+  } finally {
+    localImportBusy.value = false
   }
 }
 
@@ -443,9 +495,27 @@ onMounted(() => {
         <h1 class="page-title">书源管理</h1>
         <span class="count">{{ sources.length }} 个 · {{ enabledCount }} 启用</span>
         <div class="head-actions">
+          <button class="ghost-btn" type="button" :disabled="localImportBusy" @click="openLocalImport">
+            {{ localImportBusy ? '导入中…' : '本地导入' }}
+          </button>
           <button class="ghost-btn" type="button" @click="openImport">远程导入</button>
-          <button class="ghost-btn" type="button" title="下载当前账号全部书源（bookSource.json）" @click="exportBookSources">导出</button>
+          <button
+            class="ghost-btn"
+            type="button"
+            :disabled="exporting"
+            title="下载当前账号全部书源（bookSource.json）"
+            @click="doExport"
+          >
+            {{ exporting ? '导出中…' : '导出' }}
+          </button>
           <button class="accent-outline-btn" type="button" @click="openAdd">新增书源</button>
+          <input
+            ref="localFileInput"
+            class="local-file-input"
+            type="file"
+            accept=".json,application/json"
+            @change="onLocalFilePick"
+          />
         </div>
       </div>
 
@@ -801,6 +871,9 @@ onMounted(() => {
   margin-left: auto;
   display: flex;
   gap: 8px;
+}
+.local-file-input {
+  display: none;
 }
 .ghost-btn {
   padding: 7px 16px;

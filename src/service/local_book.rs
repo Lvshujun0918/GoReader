@@ -398,6 +398,16 @@ fn extract_title(html: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parse_legacy_epub_dir() {
+        let p = "C:/Users/chong/pr-review/reader-dev/target/search-test/storage/data/transwarp/狼爱似火_迷羊/狼爱似火.epub/index.epub";
+        let bytes = std::fs::read(p).expect("read");
+        match parse_epub(&bytes) {
+            Ok(b) => println!("OK: {} 章, title={}", b.chapters.len(), b.meta.title),
+            Err(e) => println!("ERR: {e}"),
+        }
+    }
+
     const SAMPLE: &str = "第一章 起点\n内容一。\n第二章 成长\n内容二。\n尾声\n结局。";
 
     /// 默认规则分章：第X章 + 尾声
@@ -448,3 +458,4 @@ mod tests {
         assert_eq!(book.chapters[0].content, "内容。");
     }
 }
+

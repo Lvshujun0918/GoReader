@@ -5,10 +5,11 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import { deleteHttpTts, getHttpTtsList, saveHttpTts } from '@/api/httpTts'
 import { clearCache, getCacheInfo } from '@/api/cache'
-import { backupToWebdav } from '@/api/backup'
+import { backupToWebdav, downloadBackupZip } from '@/api/backup'
 import { getSystemInfo } from '@/api/system'
 import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
 import { useUserStore } from '@/stores/user'
+import { downloadBlob } from '@/utils/download'
 import type { CacheClearType, CacheInfo, HttpTts, SystemInfo, TxtTocRule } from '@/types'
 
 const router = useRouter()
@@ -359,6 +360,7 @@ async function copyOpdsUrl() {
 /* ================= 数据备份（WebDAV） ================= */
 const backupBusy = ref(false)
 const backupPath = ref('')
+const backupDownloadBusy = ref(false)
 
 async function runBackup() {
   if (backupBusy.value) return
@@ -376,6 +378,23 @@ async function runBackup() {
     // 错误提示已由拦截器处理
   } finally {
     backupBusy.value = false
+  }
+}
+
+/** 下载备份 zip：返回绝对路径 → 取其文件名拼 __HOME__/webdav/legado 相对路径 → file/download */
+async function downloadBackup() {
+  if (backupDownloadBusy.value) return
+  const abs = backupPath.value
+  if (!abs) return
+  backupDownloadBusy.value = true
+  try {
+    const blob = await downloadBackupZip(abs)
+    const name = abs.split(/[\\/]/).filter(Boolean).pop() || 'backup.zip'
+    await downloadBlob(blob, name)
+  } catch {
+    // 请求层已提示
+  } finally {
+    backupDownloadBusy.value = false
   }
 }
 </script>
@@ -491,7 +510,18 @@ async function runBackup() {
             {{ backupBusy ? '备份中…' : '立即备份' }}
           </button>
         </div>
-        <p v-if="backupPath" class="card-note mono backup-path">已备份至：{{ backupPath }}</p>
+        <div v-if="backupPath" class="row">
+          <span class="row-label">下载备份</span>
+          <span class="row-value mono backup-path" :title="backupPath">{{ backupPath }}</span>
+          <button
+            class="row-action"
+            type="button"
+            :disabled="backupDownloadBusy"
+            @click="downloadBackup"
+          >
+            {{ backupDownloadBusy ? '下载中…' : '下载备份' }}
+          </button>
+        </div>
       </section>
 
       <!-- 缓存（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache） -->

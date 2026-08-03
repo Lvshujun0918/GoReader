@@ -14,7 +14,7 @@ pub mod user;
 
 pub use book::Book;
 pub use book_chapter::{BookChapter, BookInfo};
-pub use book_group::BookGroup;
+pub use book_group::{BookGroup, BookGroupWithCount};
 pub use book_source::BookSource;
 pub use bookmark::Bookmark;
 pub use http_tts::HttpTts;

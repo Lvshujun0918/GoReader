@@ -16,14 +16,29 @@ export function deleteBook(bookUrl: string): Promise<ReturnData<null>> {
   return post<null>('/deleteBook', { bookUrl })
 }
 
-/** GET /reader3/getBookGroups：书架分组列表 */
+/** GET /reader3/getBookGroups：书架分组列表（契约：data [{id,name,orderNum,bookCount}]；后端当前输出 order） */
 export function getBookGroups(): Promise<ReturnData<BookGroup[]>> {
   return get<BookGroup[]>('/getBookGroups')
 }
 
-/** POST /reader3/saveBookGroup：新建分组（body 传 {name} 即可，id<=0 自动新建） */
-export function saveBookGroup(name: string): Promise<ReturnData<BookGroup>> {
-  return post<BookGroup>('/saveBookGroup', { name })
+/**
+ * POST /reader3/saveBookGroup：新建 / 重命名分组
+ * body {id?, name, order?}：id 缺省或 <=0 自动新建；id>0 按 id 覆盖（重命名）。
+ */
+export function saveBookGroup(group: {
+  id?: number
+  name: string
+  order?: number
+}): Promise<ReturnData<BookGroup>> {
+  return post<BookGroup>('/saveBookGroup', group)
+}
+
+/**
+ * POST /reader3/deleteBookGroup：删除分组（body {id}，组内书置未分组）。
+ * 后端并行实现中（可能 404）：调用方传 { silent: true } 自行降级提示。
+ */
+export function deleteBookGroup(id: number, opts?: { silent?: boolean }): Promise<ReturnData<null>> {
+  return post<null>('/deleteBookGroup', { id }, opts)
 }
 
 /**
