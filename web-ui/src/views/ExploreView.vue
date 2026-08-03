@@ -13,11 +13,14 @@
         <button class="han-btn" type="button" :title="'简繁转换（当前：' + hanLabel + '）'" @click="toggleHan(); updateHanLabel()">
           {{ hanLabel }}
         </button>
+        <button class="han-btn" type="button" title="内容宽度（与阅读页同一设置）" @click="cycleWidth">
+          {{ WIDTH_OPTIONS.find((o) => o.value === contentWidth)?.label ?? '适中' }}
+        </button>
       </div>
     </header>
 
     <!-- 书源列表（legado 语义：所有 enabledExplore 书源） -->
-    <main v-if="!source" class="main">
+    <main v-if="!source" class="main" :style="{ maxWidth: contentWidth }">
       <p class="page-hint">书源探索</p>
       <div v-if="sourcesLoading" class="state">
         <p class="state-text">加载中…</p>
@@ -37,7 +40,7 @@
     </main>
 
     <!-- 书源探索页：分类 + 书籍 -->
-    <main v-else class="main">
+    <main v-else class="main" :style="{ maxWidth: contentWidth }">
       <div v-if="catsLoading" class="state"><p class="state-text">加载分类…</p></div>
       <p v-else-if="catsError" class="state-error">{{ catsError }} <button class="retry" type="button" @click="loadCategories">重试</button></p>
       <template v-else>
@@ -109,6 +112,21 @@ function updateHanLabel() {
   hanLabel.value = hanMode.value === 'auto' ? '自动' : hanMode.value === 'trad' ? '繁' : '简'
 }
 updateHanLabel()
+const contentWidth = ref('900px')
+{
+  const raw = localStorage.getItem('reader_content_width')
+  if (raw === '720px' || raw === '900px' || raw === '1080px') contentWidth.value = raw
+}
+const WIDTH_OPTIONS = [
+  { label: '窄', value: '720px' },
+  { label: '适中', value: '900px' },
+  { label: '宽', value: '1080px' },
+]
+function cycleWidth() {
+  const idx = WIDTH_OPTIONS.findIndex((o) => o.value === contentWidth.value)
+  contentWidth.value = WIDTH_OPTIONS[(idx + 1) % WIDTH_OPTIONS.length].value
+  localStorage.setItem('reader_content_width', contentWidth.value)
+}
 const sourcesLoading = ref(true)
 const sourcesError = ref('')
 
@@ -329,7 +347,6 @@ onBeforeUnmount(() => {
   color: var(--accent, #4f46e5);
 }
 .main {
-  max-width: 720px;
   margin: 0 auto;
   padding: 24px 20px 80px;
 }
