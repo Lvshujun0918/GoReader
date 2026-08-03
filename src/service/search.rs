@@ -370,20 +370,9 @@ fn analyze_book_list(
         .collect()
 }
 
-/// CSS 书单：选择器 → 元素 html 列表
+/// CSS 书单：链式 CSS（legado）→ 元素 html 列表
 fn css_items(rule: &str, body: &str) -> Vec<String> {
-    use scraper::{Html, Selector};
-    let document = Html::parse_document(body);
-    // 规则可能带 ## 段，只取主规则
-    let main = rule.split("##").next().unwrap_or(rule).trim();
-    if let Ok(selector) = Selector::parse(main) {
-        return document
-            .select(&selector)
-            .map(|el| el.html().to_string())
-            .collect();
-    }
-    // CSS 失败回退 Regex
-    apply(rule, body)
+    crate::parser::css_chain::css_chain(rule, body)
 }
 
 /// URL 型字段规则（legado isUrl 语义）：展开内嵌后若是路径/URL 直接拼接，否则走规则解析
@@ -438,23 +427,18 @@ fn field(context: &str, rule: Option<&str>, default: &str) -> String {
     let r = parse_rule(&rule);
     match r.kind {
         RuleKind::Css => {
-            // 元素内 CSS 选择（支持 a@href 属性语法——legado）
-            use scraper::{Html, Selector};
-            let (selector, attr) = match r.body.split_once('@') {
-                Some((sel, at)) if !sel.is_empty() => (sel.trim(), Some(at.trim().to_string())),
-                _ => (r.body.as_str(), None),
-            };
-            let doc = Html::parse_fragment(context);
-            if let Ok(sel) = Selector::parse(selector) {
-                if let Some(el) = doc.select(&sel).next() {
-                    if let Some(attr) = attr {
-                        if let Some(v) = el.value().attr(&attr) {
-                            return v.trim().to_string();
-                        }
-                        return default.to_string();
+            // 链式 CSS（legado：class./tag./@text/@href 等）
+            let v = crate::parser::css_chain::css_chain(&r.body, context);
+            if let Some(first) = v.first() {
+                // 无 @ 的单选择器规则：元素 HTML → 取文本（兼容旧书源写法）
+                if !r.body.contains('@') {
+                    let doc = scraper::Html::parse_fragment(first);
+                    let txt = doc.root_element().text().collect::<String>().trim().to_string();
+                    if !txt.is_empty() {
+                        return txt;
                     }
-                    return el.text().collect::<String>().trim().to_string();
                 }
+                return first.clone();
             }
             default.to_string()
         }

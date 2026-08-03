@@ -302,6 +302,10 @@ async fn search_book_multi(
     let mut key = params.get("key").cloned().unwrap_or_default();
     let mut page = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1i64);
     let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
+    let mut max_sources = params
+        .get("maxSources")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
     if let Some(body) = body {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
             if let Some(v) = json.get("key").and_then(|v| v.as_str()) {
@@ -313,6 +317,9 @@ async fn search_book_multi(
             if let Some(v) = json.get("bookSourceGroup").and_then(|v| v.as_str()) {
                 group = v.to_string();
             }
+            if let Some(v) = json.get("maxSources").and_then(|v| v.as_u64()) {
+                max_sources = v as usize;
+            }
         }
     }
     if key.is_empty() {
@@ -322,7 +329,7 @@ async fn search_book_multi(
         Ok(s) => s,
         Err(_) => return Json(ReturnData::err("系统错误")),
     };
-    let sources: Vec<crate::model::BookSource> = sources
+    let mut sources: Vec<crate::model::BookSource> = sources
         .into_iter()
         .filter(|s| s.enabled && s.search_url.is_some())
         .filter(|s| {
@@ -333,6 +340,10 @@ async fn search_book_multi(
                     .unwrap_or(false)
         })
         .collect();
+    // 防炸：限制搜索源数量（前端按组搜索时通常远小于此）
+    if sources.len() > max_sources {
+        sources.truncate(max_sources);
+    }
     if sources.is_empty() {
         return Json(ReturnData::err("未配置书源"));
     }

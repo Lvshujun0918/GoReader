@@ -31,6 +31,7 @@ fn css_chain_single(rule: &str, doc_html: &str) -> Vec<String> {
             return extract_attr(&current, part);
         }
         let (selector, index) = split_selector_index(part);
+        let selector = normalize_selector(selector);
         let mut next: Vec<String> = Vec::new();
         for item in &current {
             let doc = if i == 0 {
@@ -38,7 +39,7 @@ fn css_chain_single(rule: &str, doc_html: &str) -> Vec<String> {
             } else {
                 Html::parse_fragment(item)
             };
-            if let Ok(sel) = Selector::parse(selector) {
+            if let Ok(sel) = Selector::parse(&selector) {
                 let els: Vec<_> = doc.select(&sel).collect();
                 if let Some(idx) = index {
                     if let Some(el) = els.get(idx) {
@@ -53,7 +54,7 @@ fn css_chain_single(rule: &str, doc_html: &str) -> Vec<String> {
         }
         // 单段规则且 CSS 解析无结果 → 回退正则（legacy 兼容）
         if next.is_empty() && parts.len() == 1 && i == 0 {
-            if let Ok(re) = regex::Regex::new(selector) {
+            if let Ok(re) = regex::Regex::new(&selector) {
                 let r: Vec<String> = re
                     .captures_iter(doc_html)
                     .map(|c| {
@@ -85,6 +86,19 @@ fn is_attr_extractor(part: &str) -> bool {
         "text" | "textNodes" | "ownText" | "html" | "all" | "href" | "src" | "value" | "data-src"
             | "data-original" | "data-url"
     )
+}
+
+/// legado 简写转换：class.active → .active；tag.div → div；id.xxx → #xxx
+fn normalize_selector(sel: &str) -> String {
+    if let Some(c) = sel.strip_prefix("class.") {
+        format!(".{}", c)
+    } else if let Some(c) = sel.strip_prefix("id.") {
+        format!("#{}", c)
+    } else if let Some(c) = sel.strip_prefix("tag.") {
+        c.to_string()
+    } else {
+        sel.to_string()
+    }
 }
 
 /// 拆分选择器与索引：`tag.dd.1` → ("tag.dd", Some(1))；`div.book` → ("div.book", None)
@@ -217,6 +231,16 @@ mod tests {
         let html = r#"<p>甲</p><span>乙</span>"#;
         let r = css_chain("p@text&&span@text", html);
         assert_eq!(r, vec!["甲".to_string(), "乙".to_string()]);
+    }
+
+    #[test]
+    fn test_legado_shortcuts() {
+        let html = r#"<div class="active"><span>书名</span></div><div class="active"><span>书2</span></div>"#;
+        let r = css_chain("class.active@span@text", html);
+        assert_eq!(r, vec!["书名".to_string(), "书2".to_string()]);
+        let html2 = r#"<ul id="list"><li>x</li></ul>"#;
+        let r2 = css_chain("id.list@li@text", html2);
+        assert_eq!(r2, vec!["x".to_string()]);
     }
 
     #[test]
