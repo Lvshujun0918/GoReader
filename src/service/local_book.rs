@@ -165,6 +165,20 @@ pub fn parse_txt(bytes: &[u8]) -> Result<ImportedBook> {
     })
 }
 
+/// 读 TXT 文件并分章（legacy 本地书：bookUrl = storage/data/.../xx.txt）
+pub fn parse_txt_file(path: &std::path::Path) -> Result<ImportedBook> {
+    let bytes = std::fs::read(path)?;
+    parse_txt(&bytes)
+}
+
+/// 判断是否本地书（local:// 或文件路径型 legacy 本地书）
+pub fn is_local_book(book_url: &str, origin: &str) -> bool {
+    book_url.starts_with("local://")
+        || origin == "loc_book"
+        || book_url.starts_with("storage/")
+        || book_url.ends_with(".txt")
+}
+
 // ---------- 工具 ----------
 
 fn read_zip<R: std::io::Read + std::io::Seek>(

@@ -122,7 +122,8 @@ fn book_entry(book: &crate::model::Book, ns: &str) -> String {
 }
 
 /// 下载：TXT 导出（目录 + 正文拼接，上限章节防超时）
-pub async fn download(storage: &Storage, ns: &str, book_id: &str, max_chapters: usize) -> Result<(String, Vec<u8>)> {
+pub async fn download(storage: &Storage, ns: &str, book_id: &str, max_chapters: Option<usize>) -> Result<(String, Vec<u8>)> {
+    let max_chapters = max_chapters.unwrap_or(usize::MAX);
     let book_url = decode_id(book_id);
     let book = storage
         .list_books(ns)

@@ -28,6 +28,30 @@ const router = createRouter({
       component: () => import('@/views/ReaderView.vue'),
       meta: { title: '阅读' },
     },
+    {
+      path: '/search',
+      name: 'search',
+      component: () => import('@/views/SearchView.vue'),
+      meta: { title: '搜索' },
+    },
+    {
+      path: '/sources',
+      name: 'sources',
+      component: () => import('@/views/SourceManageView.vue'),
+      meta: { title: '书源管理' },
+    },
+    {
+      path: '/rss',
+      name: 'rss',
+      component: () => import('@/views/RssView.vue'),
+      meta: { title: 'RSS' },
+    },
+    {
+      path: '/settings',
+      name: 'settings',
+      component: () => import('@/views/SettingsView.vue'),
+      meta: { title: '设置' },
+    },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })

@@ -161,10 +161,12 @@ async function init() {
     // 正文/目录接口需要 bookSource=book.origin，先从书架定位本书
     const shelfRes = await getBookshelf()
     const found = (shelfRes.data ?? []).find((b) => b.bookUrl === bookUrl.value)
-    if (!found?.origin || !found.tocUrl) {
+    if (!found?.origin) {
       notFound.value = true
       return
     }
+    // 本地书 tocUrl 可能为空——用 bookUrl 兜底
+    if (!found.tocUrl) found.tocUrl = found.bookUrl
     shelfBook.value = found
     bookName.value = found.name
 

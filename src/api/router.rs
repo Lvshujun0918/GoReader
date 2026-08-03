@@ -596,33 +596,33 @@ async fn get_book_info(
     if url.is_empty() {
         return Json(ReturnData::err("请输入书籍链接"));
     }
-    // 本地书（local://）——查书架返回信息，不走书源
-    if url.starts_with("local://") {
-        let books = match state.storage.list_books(&namespace).await {
-            Ok(b) => b,
-            Err(_) => return Json(ReturnData::err("系统错误")),
+    // 本地书（local:// 或文件路径型）——查书架返回信息，不走书源
+    let books = match state.storage.list_books(&namespace).await {
+        Ok(b) => b,
+        Err(_) => return Json(ReturnData::err("系统错误")),
+    };
+    let shelf_match = books.iter().find(|b| b.book_url == url);
+    if shelf_match.is_some() && crate::service::local_book::is_local_book(&url, shelf_match.unwrap().origin.as_str()) {
+        let book = shelf_match.unwrap();
+        let info = crate::model::book_chapter::BookInfo {
+            name: book.name.clone(),
+            author: book.author.clone(),
+            kind: book.kind.clone(),
+            intro: book.intro.clone(),
+            cover_url: book.custom_cover_url.clone().or_else(|| book.cover_url.clone()),
+            toc_url: Some(if book.toc_url.is_empty() { book.book_url.clone() } else { book.toc_url.clone() }),
+            book_url: book.book_url.clone(),
+            origin: book.origin.clone(),
+            origin_name: book.origin_name.clone(),
+            language: book.language.clone(),
+            publisher: book.publisher.clone(),
+            published_at: book.published_at.clone(),
+            ..Default::default()
         };
-        if let Some(book) = books.iter().find(|b| b.book_url == url) {
-            let info = crate::model::book_chapter::BookInfo {
-                name: book.name.clone(),
-                author: book.author.clone(),
-                kind: book.kind.clone(),
-                intro: book.intro.clone(),
-                cover_url: book
-                    .custom_cover_url
-                    .clone()
-                    .or_else(|| book.cover_url.clone()),
-                toc_url: Some(book.toc_url.clone()),
-                book_url: book.book_url.clone(),
-                origin: book.origin.clone(),
-                origin_name: book.origin_name.clone(),
-                language: book.language.clone(),
-                publisher: book.publisher.clone(),
-                published_at: book.published_at.clone(),
-                ..Default::default()
-            };
-            return Json(ReturnData::ok(serde_json::to_value(info).unwrap_or(serde_json::Value::Null)));
-        }
+        return Json(ReturnData::ok(serde_json::to_value(info).unwrap_or(serde_json::Value::Null)));
+    }
+    if url.starts_with("local://") || url.ends_with(".txt") {
+        // 书架无此本地书
         return Json(ReturnData::err("未找到这本书（可能不在书架中）"));
     }
     let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
@@ -674,6 +674,13 @@ async fn get_book_toc(
         }
         return Json(ReturnData::err("本地书目录不存在"));
     }
+    // 文件型本地书（legacy：bookUrl = storage/data/.../xx.txt）——读 TXT 分章
+    if toc_url.ends_with(".txt") {
+        if let Some(ret) = get_book_toc_file(&state, &toc_url).await {
+            return ret;
+        }
+        return Json(ReturnData::err("本地书文件不存在"));
+    }
     let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
@@ -711,6 +718,13 @@ async fn get_book_content(
     // 本地书（local://）——不走书源解析
     if chapter_url.starts_with("local://") {
         if let Some(ret) = get_book_content_local(&state, &chapter_url).await {
+            return ret;
+        }
+        return Json(ReturnData::err("本地书章节不存在"));
+    }
+    // 文件型本地书：bookUrl#index
+    if chapter_url.contains(".txt#") {
+        if let Some(ret) = get_book_content_file(&state, &chapter_url).await {
             return ret;
         }
         return Json(ReturnData::err("本地书章节不存在"));
@@ -897,8 +911,9 @@ async fn opds_download(
     headers: HeaderMap,
 ) -> Response {
     let _format = params.get("format").cloned().unwrap_or_else(|| "txt".to_string());
+    let max_chapters = params.get("maxChapters").and_then(|v| v.parse::<usize>().ok());
     match opds_ns(&state, &headers).await {
-        Ok(ns) => match crate::api::opds::download(&state.storage, &ns, &id, 100).await {
+        Ok(ns) => match crate::api::opds::download(&state.storage, &ns, &id, max_chapters).await {
             Ok((name, bytes)) => Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/plain; charset=utf-8")
@@ -1070,6 +1085,49 @@ async fn upload_local_book(
     Json(ReturnData::ok(serde_json::to_value(book).unwrap_or(serde_json::Value::Null)))
 }
 
+/// storage 内安全路径解析（防穿越）
+fn resolve_storage_path(storage_dir: &std::path::Path, book_url: &str) -> Option<std::path::PathBuf> {
+    let rel = book_url.trim_start_matches("storage/");
+    let candidate = storage_dir.join(rel);
+    let abs = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+    let root = storage_dir.canonicalize().unwrap_or_else(|_| storage_dir.to_path_buf());
+    if abs.starts_with(&root) && abs.is_file() {
+        Some(abs)
+    } else {
+        None
+    }
+}
+
+/// 文件型本地书目录：读 TXT 分章 → 章节列表（chapterUrl = bookUrl#index）
+async fn get_book_toc_file(state: &AppState, book_url: &str) -> Option<Json<ReturnData>> {
+    let path = resolve_storage_path(&state.storage.config.storage_dir(), book_url)?;
+    let imported = crate::service::local_book::parse_txt_file(&path).ok()?;
+    let list: Vec<serde_json::Value> = imported
+        .chapters
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            serde_json::json!({
+                "title": c.title,
+                "url": format!("{book_url}#{i}"),
+                "isVolume": false,
+                "index": i,
+            })
+        })
+        .collect();
+    Some(Json(ReturnData::ok(serde_json::Value::Array(list))))
+}
+
+/// 文件型本地书正文：bookUrl#index → 读 TXT → 提取章节
+async fn get_book_content_file(state: &AppState, chapter_url: &str) -> Option<Json<ReturnData>> {
+    let (book_part, idx_part) = chapter_url.rsplit_once('#')?;
+    let index: usize = idx_part.parse().ok()?;
+    let path = resolve_storage_path(&state.storage.config.storage_dir(), book_part)?;
+    let imported = crate::service::local_book::parse_txt_file(&path).ok()?;
+    let content = imported.chapters.get(index)?.content.clone();
+    Some(Json(ReturnData::ok(serde_json::json!({ "content": content }))))
+}
+
 /// 本地书目录（local://book_id/toc）
 async fn get_book_toc_local(
     state: &AppState,
@@ -1129,11 +1187,13 @@ async fn fallback_handler(
         )
             .into_response();
     }
-    // 前端静态资源（/static/** 等构建产物——按扩展名 MIME）
+    // 前端静态资源（/static/** 等构建产物——按扩展名 MIME，防路径穿越）
     let web_root = std::path::PathBuf::from(&state.storage.config.web_root);
     let rel = path.trim_start_matches('/');
     let file = web_root.join(rel);
-    if file.is_file() {
+    let file_abs = file.canonicalize().unwrap_or_else(|_| file.clone());
+    let root_abs = web_root.canonicalize().unwrap_or_else(|_| web_root.clone());
+    if file_abs.starts_with(&root_abs) && file.is_file() {
         if let Ok(bytes) = tokio::fs::read(&file).await {
             return Response::builder()
                 .status(StatusCode::OK)

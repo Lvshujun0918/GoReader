@@ -267,6 +267,12 @@ async fn move_copy(file: &Path, headers: &HeaderMap, copy: bool) -> Response {
     }
     let rel = dest_path.trim_start_matches("/reader3/webdav").trim_start_matches('/');
     let target = home.join(rel);
+    // 安全校验：目标必须在 webdav 根内（防路径穿越任意写入）
+    let home_abs = home.canonicalize().unwrap_or_else(|_| home.clone());
+    let target_abs = target.canonicalize().unwrap_or_else(|_| target.clone());
+    if !target_abs.starts_with(&home_abs) {
+        return webdav_status(StatusCode::FORBIDDEN, None);
+    }
     if !file.exists() {
         return webdav_status(StatusCode::NOT_FOUND, None);
     }
