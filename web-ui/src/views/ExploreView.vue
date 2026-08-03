@@ -57,7 +57,15 @@
         <div v-else class="book-grid">
           <button v-for="b in books" :key="b.bookUrl" type="button" class="book-card" @click="goBook(b)">
             <span class="book-cover" :style="{ background: coverGradient(b.name) }">
-              {{ b.name.charAt(0) }}
+              <img
+                v-if="b.coverUrl && !failedCovers.has(b.bookUrl)"
+                :src="b.coverUrl"
+                :alt="b.name"
+                loading="lazy"
+                class="cover-img"
+                @error="failedCovers.add(b.bookUrl)"
+              />
+              <template v-else>{{ b.name.charAt(0) }}</template>
             </span>
             <span class="book-name">{{ b.name }}</span>
             <span class="book-author">{{ b.author || '未知作者' }}</span>
@@ -92,6 +100,7 @@ const catsLoading = ref(false)
 const catsError = ref('')
 const activeUrl = ref('')
 const books = ref<SearchBook[]>([])
+const failedCovers = new Set<string>()
 const page = ref(1)
 const loadingBooks = ref(false)
 const loadingMore = ref(false)
@@ -442,6 +451,12 @@ onBeforeUnmount(() => {
   font-weight: 300;
   color: rgba(255, 255, 255, 0.9);
   transition: transform 0.2s ease;
+  overflow: hidden;
+}
+.cover-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 .book-card:hover .book-cover {
   transform: translateY(-2px);

@@ -25,6 +25,7 @@ interface MergedResult {
 }
 
 const results = ref<MergedResult[]>([])
+const failedCovers = new Set<string>()
 /** 已返回结果的书源数（SSE 每源一个 book 事件，lastIndex 去重计数） */
 const searchedSources = ref(0)
 
@@ -322,6 +323,10 @@ onMounted(() => {
             class="result-item"
             @click="openBook(entry.book)"
           >
+            <span v-if="entry.book.coverUrl && !failedCovers.has(entry.book.bookUrl)" class="result-cover">
+              <img :src="entry.book.coverUrl" :alt="entry.book.name" loading="lazy" @error="failedCovers.add(entry.book.bookUrl)" />
+            </span>
+            <span v-else class="result-cover placeholder">{{ entry.book.name.charAt(0) }}</span>
             <div class="result-main">
               <p class="result-name" :title="entry.book.name">{{ entry.book.name }}</p>
               <p class="result-sub">
@@ -635,6 +640,9 @@ onMounted(() => {
 .result-item {
   display: flex;
   align-items: center;
+  gap: 12px;
+  display: flex;
+  align-items: center;
   gap: 14px;
   padding: 16px 4px;
   border-bottom: 1px solid var(--border);
@@ -646,6 +654,30 @@ onMounted(() => {
 }
 .result-item:hover {
   background: var(--surface);
+}
+.result-cover {
+  flex-shrink: 0;
+  width: 44px;
+  height: 58px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--accent-soft, #eef2ff);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 300;
+  color: var(--accent, #4f46e5);
+}
+.result-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.result-cover.placeholder {
+  font-size: 18px;
+  color: var(--text-3, #999);
+  background: var(--border, #ececec);
 }
 .result-main {
   flex: 1;
