@@ -119,6 +119,30 @@ pub struct Book {
     #[serde(rename = "tocHtml")]
     #[sqlx(rename = "toc_html")]
     pub toc_html: Option<String>,
+    /// 是否 CBZ 漫画（legado 扩展字段）
+    pub cbz: bool,
+    /// 展示封面（legado 扩展）
+    #[serde(rename = "displayCover")]
+    #[sqlx(rename = "display_cover")]
+    pub display_cover: Option<String>,
+    /// 展示简介（legado 扩展）
+    #[serde(rename = "displayIntro")]
+    #[sqlx(rename = "display_intro")]
+    pub display_intro: Option<String>,
+    /// 本地 EPUB 标记（legado 扩展，Boolean）
+    #[serde(rename = "localEpub")]
+    #[sqlx(rename = "local_epub")]
+    pub local_epub: bool,
+    /// 本地 PDF 标记（legado 扩展，Boolean）
+    #[serde(rename = "localPdf")]
+    #[sqlx(rename = "local_pdf")]
+    pub local_pdf: bool,
+    /// 是否 PDF（legado 扩展）
+    pub pdf: bool,
+    /// 是否拆分长章节（legado 扩展）
+    #[serde(rename = "splitLongChapter")]
+    #[sqlx(rename = "split_long_chapter")]
+    pub split_long_chapter: bool,
     /// 用户命名空间（secure 模式用户名 / default）
     #[serde(skip)]
     #[sqlx(rename = "user_namespace")]

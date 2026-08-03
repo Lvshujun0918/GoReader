@@ -165,11 +165,13 @@ async fn migrate_bookshelves(pool: &SqlitePool, data_dir: &Path, namespaces: &[S
                      latest_chapter_title, latest_chapter_time, last_check_time, last_check_count,
                      total_chapter_num, dur_chapter_title, dur_chapter_index, dur_chapter_pos,
                      dur_chapter_time, word_count, can_update, order_num, origin_order,
-                     use_replace_rule, variable, read_config, is_in_shelf, last_check_error,
-                     info_html, toc_html, user_namespace, created_at, raw_json)
+                     use_replace_rule, variable, read_config, is_in_shelf, cbz, display_cover,
+                     display_intro, local_epub, local_pdf, pdf, split_long_chapter,
+                     last_check_error, info_html, toc_html, user_namespace, created_at, raw_json)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                         ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-                        ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
+                        ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
+                        ?41, ?42, ?43, ?44)
                 "#,
             )
             .bind(&book.book_url)
@@ -203,6 +205,13 @@ async fn migrate_bookshelves(pool: &SqlitePool, data_dir: &Path, namespaces: &[S
             .bind(&book.variable)
             .bind(&book.read_config.as_ref().map(|v| v.to_string()))
             .bind(book.is_in_shelf)
+            .bind(book.cbz)
+            .bind(&book.display_cover)
+            .bind(&book.display_intro)
+            .bind(&book.local_epub)
+            .bind(&book.local_pdf)
+            .bind(book.pdf)
+            .bind(book.split_long_chapter)
             .bind(&book.last_check_error)
             .bind(&book.info_html)
             .bind(&book.toc_html)
