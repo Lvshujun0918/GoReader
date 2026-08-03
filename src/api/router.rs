@@ -4,11 +4,12 @@ use std::collections::HashMap;
 
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
+use futures::StreamExt;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -50,6 +51,9 @@ pub struct AppState {
     pub storage: Storage,
 }
 
+/// F-10：目录缓存 TTL（5 分钟）
+const TOC_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
+
 /// 构建路由
 pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     let state = AppState { storage };
@@ -76,6 +80,16 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         )
         .route("/reader3/deleteBook", post(delete_book))
         .route("/reader3/saveBook", post(save_book))
+        .route("/reader3/saveBookProgress", post(save_book_progress))
+        .route("/reader3/getExploreUrls", get(get_explore_urls).post(get_explore_urls))
+        .route("/reader3/exploreBook", get(explore_book).post(explore_book))
+        .route("/reader3/searchBookMultiSSE", get(search_book_multi_sse).post(search_book_multi_sse))
+        .route("/reader3/saveBookmark", post(save_bookmark))
+        .route("/reader3/getBookmarks", get(get_bookmarks).post(get_bookmarks))
+        .route("/reader3/deleteBookmark", post(delete_bookmark))
+        .route("/reader3/getBookGroups", get(get_book_groups).post(get_book_groups))
+        .route("/reader3/saveBookGroup", post(save_book_group))
+        .route("/reader3/updateBookGroupId", post(update_book_group_id))
         // SPA fallback：未匹配路由 → webdav 分流 / API 404 / 前端
         .fallback(fallback_handler)
         .route("/reader3/getBookshelf", get(get_bookshelf))
@@ -681,12 +695,31 @@ async fn get_book_toc(
         }
         return Json(ReturnData::err("本地书文件不存在"));
     }
+    // F-10：目录缓存命中（TTL 5 分钟，同 tocUrl 直读）直接返回，不依赖书源
+    if let Ok(Some(cached)) = state.storage.get_toc_cache(&toc_url, TOC_CACHE_TTL_MS).await {
+        if let Ok(chapters) =
+            serde_json::from_str::<Vec<crate::model::book_chapter::BookChapter>>(&cached)
+        {
+            tracing::debug!("getBookToc 命中目录缓存 [{toc_url}]");
+            return Json(ReturnData::ok(
+                serde_json::to_value(chapters).unwrap_or(serde_json::Value::Null),
+            ));
+        }
+    }
     let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
     };
     match crate::service::book::analyze_toc(&toc_url, &source, 20).await {
-        Ok(chapters) => Json(ReturnData::ok(serde_json::to_value(chapters).unwrap_or(serde_json::Value::Null))),
+        Ok(chapters) => {
+            // F-10：抓取成功后缓存目录（book_url 未知时以 toc_url 为键）
+            if let Ok(json) = serde_json::to_string(&chapters) {
+                let _ = state.storage.cache_toc(&toc_url, &toc_url, &json).await;
+            }
+            Json(ReturnData::ok(
+                serde_json::to_value(chapters).unwrap_or(serde_json::Value::Null),
+            ))
+        }
         Err(e) => {
             tracing::error!("getBookToc 失败 [{toc_url}]: {e}");
             Json(ReturnData::err("获取目录失败"))
@@ -959,8 +992,366 @@ async fn delete_book(
     }
 }
 
-/// POST /reader3/saveBook：编辑书（bookUrl/name/author/coverUrl/group）
+/// POST /reader3/saveBook：入架/编辑（完整 Book JSON）
+///
+/// 语义（对齐 legacy saveBook）：
+/// - body = 完整 Book JSON（camelCase，如搜索结果/书架书），bookUrl 必填
+/// - 书不在书架 → 全量 INSERT 入架（book_source 校验按任务规格简化为跳过）
+/// - 书已在书架 → 按 body 出现的字段增量 UPDATE（未提供字段保持原值，兼容旧版四字段编辑）
 async fn save_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let body_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let book: crate::model::Book = match serde_json::from_value(body_json.clone()) {
+        Ok(b) => b,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    let book_url = if book.book_url.is_empty() {
+        param_of(&params, Some(&body_json), "bookUrl")
+    } else {
+        book.book_url.clone()
+    };
+    if book_url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+
+    let exists = match state.storage.find_book(&namespace, &book_url).await {
+        Ok(b) => b.is_some(),
+        Err(e) => {
+            tracing::error!("saveBook 查询失败: {e}");
+            return Json(ReturnData::err("系统错误"));
+        }
+    };
+    let result = if exists {
+        // 编辑：按 body 出现的字段增量更新
+        let patch = body_json.as_object().cloned().unwrap_or_default();
+        state.storage.patch_book(&namespace, &book_url, &patch).await
+    } else {
+        // 新增入架：全量写入
+        let mut b = book;
+        b.book_url = book_url.clone();
+        b.user_namespace = namespace.clone();
+        if b.created_at == 0 {
+            b.created_at = now_millis();
+        }
+        state.storage.upsert_book(&namespace, &b).await.map(|_| 1u64)
+    };
+    match result {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveBook 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/saveBookProgress：保存阅读进度（body/query：bookUrl + durChapterIndex/durChapterPos/durChapterTime/durChapterTitle；兼容 legacy url/index 命名）
+async fn save_book_progress(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    let book_url = if book_url.is_empty() {
+        param_of(&params, body_json.as_ref(), "url")
+    } else {
+        book_url
+    };
+    if book_url.is_empty() {
+        return Json(ReturnData::err("请输入书籍链接"));
+    }
+    let int_of = |keys: &[&str]| -> Option<i64> {
+        for k in keys {
+            if let Some(v) = params.get(*k).and_then(|v| v.parse::<i64>().ok()) {
+                return Some(v);
+            }
+            if let Some(b) = body_json.as_ref() {
+                if let Some(v) = b.get(*k).and_then(|v| v.as_i64()) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    };
+    let index = int_of(&["durChapterIndex", "index"]).unwrap_or(0);
+    let pos = int_of(&["durChapterPos"]).unwrap_or(0);
+    let time = int_of(&["durChapterTime"]).unwrap_or_else(now_millis);
+    let title = if params.contains_key("durChapterTitle") {
+        params.get("durChapterTitle").cloned()
+    } else {
+        body_json
+            .as_ref()
+            .and_then(|b| b.get("durChapterTitle").and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    match state
+        .storage
+        .update_book_progress(&namespace, &book_url, title.as_deref(), index, pos, time)
+        .await
+    {
+        Ok(0) => Json(ReturnData::err("书籍未加入书架")),
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveBookProgress 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/getExploreUrls：返回书源的 exploreUrl 集合（bookSource 参数：书源 URL 或完整 JSON）
+async fn get_explore_urls(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
+    let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
+        return Json(ReturnData::err("书源不存在"));
+    };
+    let urls = crate::service::explore::parse_explore_urls(source.explore_url.as_deref().unwrap_or(""));
+    Json(ReturnData::ok(serde_json::to_value(urls).unwrap_or(serde_json::Value::Null)))
+}
+
+/// GET/POST /reader3/exploreBook：探索/书海（url=ruleFindUrl + bookSource + page）
+async fn explore_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    let url = if url.is_empty() {
+        param_of(&params, body_json.as_ref(), "ruleFindUrl")
+    } else {
+        url
+    };
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    let page: i64 = params
+        .get("page")
+        .and_then(|v| v.parse().ok())
+        .or_else(|| body_json.as_ref().and_then(|b| b.get("page").and_then(|v| v.as_i64())))
+        .unwrap_or(1);
+    let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
+    let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
+        return Json(ReturnData::err("书源不存在"));
+    };
+    // 分页占位（{{page}}/{page}）
+    let target = url
+        .replace("{{page}}", &page.to_string())
+        .replace("{page}", &page.to_string());
+    match crate::service::explore::explore_url(&target, &source).await {
+        Ok(books) => Json(ReturnData::ok(
+            serde_json::to_value(books).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("exploreBook 失败 [{target}]: {e}");
+            Json(ReturnData::err("探索失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/searchBookMultiSSE：多书源流式搜索（SSE）
+///
+/// 参数：key/bookSourceGroup/lastIndex/searchSize/concurrentCount（POST body 或 GET query）
+/// 输出：逐源 `event: book` + data {"lastIndex", "data":[SearchBook]}，结束 `event: end`；
+/// 校验失败输出 `event: error`（兼容 legacy searchBookMultiSSE）
+async fn search_book_multi_sse(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Response {
+    // 参数解析（POST body JSON 优先，GET query 兜底）
+    let mut key = params.get("key").cloned().unwrap_or_default();
+    let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
+    let mut last_index = params
+        .get("lastIndex")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(-1);
+    let mut search_size = params
+        .get("searchSize")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50);
+    let mut concurrent_count = params
+        .get("concurrentCount")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(24);
+    if let Some(body) = body {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(v) = json.get("key").and_then(|v| v.as_str()) {
+                key = v.to_string();
+            }
+            if let Some(v) = json.get("bookSourceGroup").and_then(|v| v.as_str()) {
+                group = v.to_string();
+            }
+            if let Some(v) = json.get("lastIndex").and_then(|v| v.as_i64()) {
+                last_index = v;
+            }
+            if let Some(v) = json.get("searchSize").and_then(|v| v.as_u64()) {
+                search_size = v as usize;
+            }
+            if let Some(v) = json.get("concurrentCount").and_then(|v| v.as_u64()) {
+                concurrent_count = v as usize;
+            }
+        }
+    }
+
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return sse_error(ret),
+    };
+    if key.is_empty() {
+        return sse_error(ReturnData::err("请输入搜索关键字"));
+    }
+    let sources = match state.storage.get_book_sources(&namespace).await {
+        Ok(s) => s,
+        Err(_) => return sse_error(ReturnData::err("系统错误")),
+    };
+    let sources: Vec<crate::model::BookSource> = sources
+        .into_iter()
+        .filter(|s| s.enabled && s.search_url.is_some())
+        .filter(|s| {
+            group.is_empty()
+                || s.book_source_group
+                    .as_deref()
+                    .map(|g| g.split(' ').any(|part| part == group))
+                    .unwrap_or(false)
+        })
+        .collect();
+    if sources.is_empty() {
+        return sse_error(ReturnData::err("未配置书源"));
+    }
+    if last_index >= sources.len() as i64 - 1 {
+        return sse_error(ReturnData::err("没有更多了"));
+    }
+    search_size = search_size.max(1);
+    concurrent_count = concurrent_count.max(1);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(
+        concurrent_count.min(64).max(4),
+    );
+    let total = sources.len() as i64;
+    let start = (last_index + 1).max(0) as usize;
+    let end = (start + search_size).min(sources.len());
+    tokio::spawn(async move {
+        // 并发受控（semaphore），结果到达即推送（FuturesUnordered 完成顺序）
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrent_count));
+        let mut tasks = futures::stream::FuturesUnordered::new();
+        for i in start..end {
+            let sem = sem.clone();
+            let key = key.clone();
+            let source = sources[i].clone();
+            tasks.push(Box::pin(async move {
+                let _permit = sem.acquire().await;
+                let books =
+                    crate::service::search::search_one_source(&source, &key, 1).await.unwrap_or_default();
+                let payload = serde_json::json!({ "lastIndex": i as i64, "data": books });
+                (i as i64, format!("event: book\ndata: {payload}\n\n"))
+            }));
+        }
+        let mut last = last_index;
+        while let Some((i, text)) = tasks.next().await {
+            last = i;
+            if tx.send(Ok(Bytes::from(text))).await.is_err() {
+                break; // 客户端断开
+            }
+        }
+        let end_payload = serde_json::json!({ "lastIndex": last, "isEnd": last >= total - 1 });
+        let _ = tx
+            .send(Ok(Bytes::from(format!("event: end\ndata: {end_payload}\n\n"))))
+            .await;
+    });
+
+    // mpsc receiver → TryStream → SSE body
+    let stream = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream; charset=utf-8")
+        .header("Cache-Control", "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// SSE 错误事件（兼容 legacy：event: error + data: ReturnData）
+fn sse_error(ret: ReturnData) -> Response {
+    let payload = serde_json::to_string(&ret).unwrap_or_default();
+    let body = format!("event: error\ndata: {payload}\n\n");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream; charset=utf-8")
+        .header("Cache-Control", "no-cache")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// POST /reader3/saveBookmark：保存书签（body：bookUrl/title/paragraphIndex/chapterIndex/createdAt）
+async fn save_bookmark(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let mut bookmark: crate::model::Bookmark = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    if bookmark.book_url.is_empty() || bookmark.title.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    bookmark.user_namespace = namespace.clone();
+    if bookmark.created_at == 0 {
+        bookmark.created_at = now_millis();
+    }
+    match state.storage.save_bookmark(&namespace, &bookmark).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("saveBookmark 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/getBookmarks：书签列表（bookUrl 参数）
+async fn get_bookmarks(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
@@ -975,18 +1366,122 @@ async fn save_book(
     if book_url.is_empty() {
         return Json(ReturnData::err("参数错误"));
     }
-    let name = body_json.as_ref().and_then(|b| b.get("name").and_then(|v| v.as_str()));
-    let author = body_json.as_ref().and_then(|b| b.get("author").and_then(|v| v.as_str()));
-    let cover_url = body_json.as_ref().and_then(|b| b.get("coverUrl").and_then(|v| v.as_str()));
-    let group = body_json.as_ref().and_then(|b| b.get("group").and_then(|v| v.as_i64()));
-    match state
-        .storage
-        .update_book(&namespace, &book_url, name, author, cover_url, group)
-        .await
-    {
+    match state.storage.list_bookmarks(&namespace, &book_url).await {
+        Ok(bookmarks) => Json(ReturnData::ok(
+            serde_json::to_value(bookmarks).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("getBookmarks 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/deleteBookmark：删除书签（body：bookUrl + title）
+async fn delete_bookmark(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    let title = param_of(&params, body_json.as_ref(), "title");
+    if book_url.is_empty() || title.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_bookmark(&namespace, &book_url, &title).await {
         Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
         Err(e) => {
-            tracing::error!("saveBook 失败: {e}");
+            tracing::error!("deleteBookmark 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/getBookGroups：书架分组列表
+async fn get_book_groups(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    match state.storage.list_book_groups(&namespace).await {
+        Ok(groups) => Json(ReturnData::ok(
+            serde_json::to_value(groups).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("getBookGroups 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/saveBookGroup：保存分组（body：id?/name/order?；id>0 覆盖，否则新建）
+async fn save_book_group(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let group: crate::model::BookGroup = match serde_json::from_slice(&body) {
+        Ok(g) => g,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    if group.name.is_empty() {
+        return Json(ReturnData::err("分组名称不能为空"));
+    }
+    match state.storage.save_book_group(&namespace, &group).await {
+        Ok(saved) => Json(ReturnData::ok(
+            serde_json::to_value(saved).unwrap_or(serde_json::Value::Null),
+        )),
+        Err(e) => {
+            tracing::error!("saveBookGroup 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/updateBookGroupId：书设分组（body：bookUrl + group）
+async fn update_book_group_id(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    let group = params
+        .get("group")
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| body_json.as_ref().and_then(|b| b.get("group").and_then(|v| v.as_i64())))
+        .unwrap_or(-1);
+    if book_url.is_empty() || group < 0 {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.update_book_group_id(&namespace, &book_url, group).await {
+        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Err(e) => {
+            tracing::error!("updateBookGroupId 失败: {e}");
             Json(ReturnData::err("保存失败"))
         }
     }

@@ -4,7 +4,10 @@
    ============================================================ */
 
 :root {
+  color-scheme: light;
   --bg: #fafafa;
+  --bg-float: rgba(250, 250, 250, 0.86);
+  --hover: #f4f4f5;
   --surface: #ffffff;
   --border: #e5e5e5;
   --border-strong: #d4d4d8;
@@ -19,6 +22,69 @@
     -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter',
     'Segoe UI', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei',
     system-ui, sans-serif;
+}
+
+/* ---------- 主题变量体系 ----------
+   浅色（默认 :root）/ 深色 / 纸色 三档，由阅读页顶部主题按钮切换，
+   以 html[data-theme] 挂载（html.dark hack 已废弃，见 main.ts）。 */
+html[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #17171a;
+  --bg-float: rgba(23, 23, 26, 0.86);
+  --hover: #26262c;
+  --surface: #1e1e23;
+  --border: #2e2e36;
+  --border-strong: #3f3f49;
+  --text-1: #ececf1;
+  --text-2: #a1a1ad;
+  --text-3: #63636e;
+  --accent: #8b87ff;
+  --accent-deep: #a5a2ff;
+  --accent-soft: rgba(139, 135, 255, 0.14);
+  /* Element Plus 深色映射 */
+  --el-bg-color: #1e1e23;
+  --el-bg-color-overlay: #24242b;
+  --el-border-color: #2e2e36;
+  --el-border-color-light: #2e2e36;
+  --el-border-color-lighter: #2e2e36;
+  --el-fill-color-blank: #1e1e23;
+  --el-fill-color-light: #26262c;
+  --el-text-color-primary: #ececf1;
+  --el-text-color-regular: #a1a1ad;
+  --el-text-color-placeholder: #63636e;
+  --el-message-bg-color: #24242b;
+  --el-message-text-color: #ececf1;
+  --el-message-border-color: #2e2e36;
+}
+
+html[data-theme='paper'] {
+  color-scheme: light;
+  --bg: #f6f1e6;
+  --bg-float: rgba(246, 241, 230, 0.88);
+  --hover: #eee7d6;
+  --surface: #fbf7ed;
+  --border: #e3dac4;
+  --border-strong: #d2c6a8;
+  --text-1: #3d382c;
+  --text-2: #6d6450;
+  --text-3: #a99f84;
+  --accent: #4f46e5;
+  --accent-deep: #4338ca;
+  --accent-soft: rgba(79, 70, 229, 0.08);
+  /* Element Plus 纸色映射 */
+  --el-bg-color: #fbf7ed;
+  --el-bg-color-overlay: #fbf7ed;
+  --el-border-color: #e3dac4;
+  --el-border-color-light: #e3dac4;
+  --el-border-color-lighter: #e3dac4;
+  --el-fill-color-blank: #fbf7ed;
+  --el-fill-color-light: #eee7d6;
+  --el-text-color-primary: #3d382c;
+  --el-text-color-regular: #6d6450;
+  --el-text-color-placeholder: #a99f84;
+  --el-message-bg-color: #fbf7ed;
+  --el-message-text-color: #3d382c;
+  --el-message-border-color: #e3dac4;
 }
 
 * {
@@ -40,6 +106,8 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+  /* 主题切换 200ms 淡变 */
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 #app {
@@ -50,7 +118,7 @@ body {
   background: var(--accent-soft);
 }
 
-/* 滚动条（浅色细条） */
+/* 滚动条（细条，随主题变量） */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -59,11 +127,11 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #d4d4d8;
+  background: var(--border-strong);
   border-radius: 8px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #bfbfc6;
+  background: var(--text-3);
 }
 
 /* ---------- 页面切换（fade 200ms，App.vue 引用） ---------- */
@@ -86,25 +154,9 @@ body {
   }
 }
 
-/* ---------- Element Plus 浅色化 ----------
-   main.ts（与后端契约复用）会向 <html> 添加 dark class 并引入
-   dark css-vars，这里把相关变量重映射回浅色主题 */
-html.dark {
-  --el-color-primary: #4f46e5;
-  --el-bg-color: #ffffff;
-  --el-bg-color-overlay: #ffffff;
-  --el-border-color: #e5e5e5;
-  --el-border-color-light: #e5e5e5;
-  --el-border-color-lighter: #e5e5e5;
-  --el-fill-color-blank: #ffffff;
-  --el-fill-color-light: #f4f4f5;
-  --el-text-color-primary: #18181b;
-  --el-text-color-regular: #52525b;
-  --el-text-color-placeholder: #a1a1aa;
-  --el-message-bg-color: #ffffff;
-  --el-message-text-color: #18181b;
-  --el-message-border-color: #e5e5e5;
-}
+/* ---------- Element Plus 主题映射 ----------
+   三档主题变量在各自 html[data-theme] 块内定义（见上）。
+   旧 html.dark hack（main.ts 强加 dark class + 此处重映射回浅色）已清理。 */
 
 /* 轻提示：白底细边框，极浅阴影 */
 .el-message {

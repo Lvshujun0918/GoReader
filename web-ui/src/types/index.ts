@@ -65,3 +65,50 @@ export interface BookChapter {
 export interface BookContent {
   content: string
 }
+
+/** 搜索结果（/reader3/searchBookMulti → SearchBook，全字段 camelCase） */
+export interface SearchBook {
+  bookUrl: string
+  origin: string
+  originName: string
+  type: number
+  name: string
+  author: string
+  kind?: string | null
+  coverUrl?: string | null
+  intro?: string | null
+  wordCount?: string | null
+  latestChapterTitle?: string | null
+  tocUrl: string
+  time?: number
+  variable?: string | null
+  originOrder?: number
+  [key: string]: unknown
+}
+
+/** 书源（/reader3/getBookSources → BookSource，legado 兼容 camelCase） */
+export interface BookSource {
+  bookSourceUrl: string
+  bookSourceName: string
+  bookSourceGroup?: string | null
+  bookSourceType: number
+  bookUrlPattern?: string | null
+  customOrder: number
+  enabled: boolean
+  enabledExplore: boolean
+  enabledCookieJar?: boolean | null
+  concurrentRate?: string | null
+  header?: string | null
+  loginUrl?: string | null
+  loginUi?: string | null
+  loginCheckJs?: string | null
+  loginJs?: string | null
+  bookSourceComment?: string | null
+  variableComment?: string | null
+  lastUpdateTime: number
+  respondTime: number
+  weight: number
+  exploreUrl?: string | null
+  searchUrl?: string | null
+  [key: string]: unknown
+}

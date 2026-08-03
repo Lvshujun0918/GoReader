@@ -271,6 +271,8 @@ onMounted(() => load())
       </div>
 
       <div class="user-area">
+        <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
+        <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
         <span class="user-chip">{{ store.username || '未登录' }}</span>
         <button class="logout-btn" type="button" @click="logout">退出</button>
       </div>
@@ -576,6 +578,21 @@ onMounted(() => load())
   align-items: center;
   gap: 14px;
   flex-shrink: 0;
+}
+.nav-link {
+  padding: 5px 2px;
+  border: none;
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.nav-link:hover {
+  color: var(--accent);
 }
 .user-chip {
   font-size: 13px;
