@@ -224,20 +224,9 @@ fn inline_js(expr: &str, text: &str) -> String {
     crate::parser::js::eval_js(expr, &vars).unwrap_or_default()
 }
 
-/// CSS 选择器执行
+/// CSS 选择器执行（legado 链式：&& 多规则 + @ 链 + 末段属性）
 fn css_select(rule: &Rule, html: &str) -> Vec<String> {
-    let document = Html::parse_document(html);
-    let selector = match Selector::parse(&rule.body) {
-        Ok(s) => s,
-        Err(_) => {
-            // CSS 失败回退 Regex（legado 语义：非 CSS 语法当正则）
-            return regex_match(&rule.body, html);
-        }
-    };
-    document
-        .select(&selector)
-        .map(|el| el.html().trim().to_string())
-        .collect()
+    crate::parser::css_chain::css_chain(&rule.body, html)
 }
 
 /// Regex 执行（legado：规则整体当正则，提取 group 1 或全匹配）
