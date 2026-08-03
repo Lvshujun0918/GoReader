@@ -1,0 +1,57 @@
+[package]
+name = "reader-dev"
+version = "0.1.0"
+edition = "2021"
+description = "阅读3服务器版 Rust 重构（API/数据兼容 legacy 分支，吸收 SQLite/多规则解析/书籍格式扩展）"
+license = "GPL-3.0"
+
+[dependencies]
+# Web
+axum = { version = "0.7", features = ["macros", "json", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+http = "1"
+
+# 数据库（SQLite，兼容迁移自 JSON storage）
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
+
+# HTTP 客户端（书源抓取）
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli", "deflate", "cookies"] }
+
+# 序列化/配置
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenvy = "0.15"
+
+# 解析（legado 多规则引擎）
+scraper = "0.20"          # CSS Selector
+jsonpath_lib = "0.3"      # JSONPath
+regex = "1"               # Regex
+
+# RSS
+feed-rs = "1"
+
+# 工具
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+md-5 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+urlencoding = "2"
+url = "2"
+futures = "0.3"
+rand = "0.8"
+once_cell = "1"
+encoding_rs = "0.8"       # 编码检测（兼容 EncodingDetect）
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+
+[profile.release.package."*"]
+opt-level = 3

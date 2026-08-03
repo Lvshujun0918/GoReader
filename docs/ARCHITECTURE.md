@@ -1,0 +1,116 @@
+# reader-dev (Rust) — 架构设计
+
+> 状态：骨架阶段（垂直切片迭代中）。稳定版（Kotlin）见 `legacy` 分支。
+> 开发策略：master 开发中，不发版不 release（可 pre-release/tag），docker-publish 有发版 guard。
+
+---
+
+## 1. 目标
+
+Rust 重构，**API 兼容 + 数据兼容迁移**，并吸收计划功能：
+- SQLite 兼容迁移（远期 2）
+- legado 多规则解析（远期 3）
+- 书籍格式扩展（远期 4）
+
+## 2. 模块结构
+
+```
+src/
+├── main.rs        启动/配置（READER_APP_* env，兼容 legacy）
+├── api/           HTTP 路由（/reader3/* 兼容）+ ReturnData（isSuccess/errorMsg/data）
+├── model/         实体（兼容 legacy：User/Book/BookChapter/BookSource/RssSource...）
+├── storage/       SQLite + JSON 迁移
+├── parser/        legado 多规则引擎（CSS/JSONPath/XPath/Regex/JS）
+├── service/       业务（书源/书架/书籍/RSS/TTS/本地书）
+└── util/          工具（md5/编码检测/加密...）
+```
+
+## 3. API 兼容约定（硬性）
+
+- 路由路径：`/reader3/*` 与 legacy 完全一致
+- 返回结构：`{"isSuccess": bool, "errorMsg": string, "data": ...}`（camelCase）
+- 认证：`accessToken`（`username:token` query/header），`secure` 模式行为一致
+- 参数名/语义与 legacy 一致（书源规则格式、搜索参数、分页等）
+- 前端：兼容阶段复用 legacy 构建产物（rust-embed 内嵌 dist），后续再演进
+
+## 4. 数据兼容迁移（设计）
+
+### 现状（legacy）
+- `storage/data/`：users.json / bookshelf.json / bookSource.json / rssSource.json / bookGroup.json / 各用户子目录 / 本地书文件
+- 用户隔离：secure 模式下 `storage/data/{username}/`，非 secure 为 `storage/data/default/`
+- 书籍正文/缓存：文件（`storage/data/{user}/books/...`、cache/）
+
+### 迁移策略（JSON → SQLite）
+1. **启动时自动检测**：`storage/reader.db` 不存在且 `storage/data/` 存在 JSON → 触发一次性迁移
+2. **迁移前自动备份**：`storage/backup-before-migrate-{ts}/`（原 JSON 完整拷贝）
+3. **逐表迁移**：
+   - users.json → `users` 表（含密码盐/token/权限字段）
+   - bookshelf.json → `books` 表（bookUrl 主键 + 全部字段）
+   - bookSource.json → `book_sources` 表（含规则 JSON 原样）
+   - rssSource.json / rssArticle 等 → 对应表
+   - bookGroup.json → `book_groups`
+   - 用户子目录 JSON → 按 `user_namespace` 列归入
+4. **迁移校验**：行数核对 + 抽样比对；失败自动回滚（备份恢复），保留 JSON
+5. **文件数据不动**：书籍正文/封面/缓存文件路径不变（SQLite 只存引用）
+6. **双向兼容**：迁移后 JSON 保留（只读归档）；SQLite 为唯一数据源
+7. **回滚路径**：`READER_APP_MIGRATE_SKIP=1` 跳过迁移（legacy 容器继续用 JSON）
+
+### 表结构（v1）
+```sql
+users(username PK, password, salt, token, enable_webdav, enable_local_store,
+      enable_book_source, enable_rss_source, book_source_limit, book_limit,
+      last_login_at, created_at, user_namespace)
+
+books(book_url PK, name, author, origin, origin_name, kind, cover_url, intro,
+      toc_url, charset, custom_cover_url, can_update, dur_chapter_index,
+      dur_chapter_pos, dur_chapter_time, dur_chapter_title, group, type,
+      last_check_error, user_namespace, created_at)
+
+book_sources(book_source_url PK, book_source_name, book_source_group,
+      book_source_type, rule_*, enabled, user_namespace, ...)
+
+book_groups(id, group_name, order_num, user_namespace)
+```
+
+## 5. 规则解析引擎（legado 多规则，逐项移植）
+
+| 规则类型 | Rust 实现 | 状态 |
+|---|---|---|
+| CSS Selector | `scraper` | ✅ 依赖就绪 |
+| JSONPath | `jsonpath_lib` | ✅ 依赖就绪 |
+| Regex | `regex` | ✅ 依赖就绪 |
+| XPath | `sxd-xpath`/`sxd-document` | 待加入 |
+| JavaScript | `rquickjs`（需 C 编译器） | 待加入（DE 编译） |
+
+对齐 `warpdotsys/legado`（阅读Sigma）的 analyzeRule 语义：
+- 规则字符串语法兼容（`规则##@前缀##替换` 等）
+- 规则执行顺序/结果类型兼容
+
+## 6. 书籍格式（远期 4）
+
+| 格式 | Rust 实现 | 状态 |
+|---|---|---|
+| TXT | 内置（编码检测 encoding_rs） | 计划 |
+| EPUB | `zip` + XML | 计划 |
+| PDF | `lopdf` | 计划 |
+| CBZ | `zip`（图片） | 计划 |
+| **MOBI/AZW3** | `mobi` | 计划（新增） |
+| FB2 | XML | 计划（新增） |
+
+## 7. 产物策略
+
+- **scratch 镜像**（musl 静态编译，系统层 CVE=0）+ **裸静态二进制**（Release 附件 + systemd 示例）
+- 前端 rust-embed 内嵌（兼容阶段复用 legacy dist）
+- CA 证书/tzdata 内置；数据目录 `storage/` 与 legacy 一致
+
+## 8. 迭代路线（垂直切片）
+
+- [x] 0. 骨架：axum + SQLite 初始化 + /health + /reader3/getBookshelf 占位
+- [ ] 1. 数据迁移（JSON→SQLite）+ users 表 + login/token 校验
+- [ ] 2. getBookshelf/getBookSources 真实数据 + 前端 dist 内嵌（复用 legacy）
+- [ ] 3. 书源搜索链路（crawler + 规则引擎 + 搜索 API）
+- [ ] 4. 详情/目录/正文 + 阅读页 API
+- [ ] 5. 本地书（TXT/EPUB/PDF/CBZ/MOBI）
+- [ ] 6. RSS/TTS/WebDAV/文件管理
+- [ ] 7. 多用户管理 + 管理 API 全量对齐
+- [ ] 8. musl 交叉编译 + scratch 镜像 + 双形态发布
