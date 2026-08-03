@@ -1,24 +1,24 @@
 /* ============================================================
-   夜读 · 全局主题（现代深色阅读主题 / 渐变 + 玻璃拟态）
+   夜读 · 主题 A（极简高级 · 浅色）
+   近白底 / 大留白 / 细字重 / 单一强调色 #4f46e5
    ============================================================ */
 
 :root {
-  --bg-base: #0a0d14;
-  --glass: rgba(255, 255, 255, 0.055);
-  --glass-strong: rgba(255, 255, 255, 0.08);
-  --glass-border: rgba(255, 255, 255, 0.1);
-  --text-1: #eef1f8;
-  --text-2: rgba(238, 241, 248, 0.64);
-  --text-3: rgba(238, 241, 248, 0.38);
-  --brand-1: #6366f1;
-  --brand-2: #8b5cf6;
-  --brand-3: #22d3ee;
-  --grad-brand: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #22d3ee 120%);
-  --radius-lg: 20px;
-  --radius-md: 14px;
-  --shadow-card: 0 18px 40px -18px rgba(0, 0, 0, 0.65);
-  --shadow-glow: 0 12px 32px -12px rgba(99, 102, 241, 0.55);
-  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --border: #e5e5e5;
+  --border-strong: #d4d4d8;
+  --text-1: #18181b;
+  --text-2: #52525b;
+  --text-3: #a1a1aa;
+  --accent: #4f46e5;
+  --accent-deep: #4338ca;
+  --accent-soft: rgba(79, 70, 229, 0.08);
+  --radius: 8px;
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter',
+    'Segoe UI', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei',
+    system-ui, sans-serif;
 }
 
 * {
@@ -33,17 +33,13 @@ body {
 
 body {
   min-height: 100vh;
+  background: var(--bg);
   color: var(--text-1);
-  font-family:
-    'Segoe UI', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei',
-    system-ui, -apple-system, sans-serif;
+  font-family: var(--font-sans);
+  font-weight: 400;
   -webkit-font-smoothing: antialiased;
-  background-color: var(--bg-base);
-  background-image:
-    radial-gradient(1100px 720px at 12% -12%, rgba(99, 102, 241, 0.2), transparent 60%),
-    radial-gradient(900px 620px at 108% 8%, rgba(34, 211, 238, 0.1), transparent 55%),
-    radial-gradient(1000px 820px at 50% 118%, rgba(139, 92, 246, 0.14), transparent 62%);
-  background-attachment: fixed;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 #app {
@@ -51,49 +47,36 @@ body {
 }
 
 ::selection {
-  background: rgba(99, 102, 241, 0.45);
+  background: var(--accent-soft);
 }
 
-/* 滚动条 */
+/* 滚动条（浅色细条） */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.13);
+  background: #d4d4d8;
   border-radius: 8px;
-  border: 2.5px solid transparent;
-  background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.24);
-  background-clip: content-box;
-  border: 2.5px solid transparent;
+  background: #bfbfc6;
 }
 
-/* ---------- 玻璃拟态工具 ---------- */
-.glass {
-  background: var(--glass);
-  border: 1px solid var(--glass-border);
-  backdrop-filter: blur(22px) saturate(140%);
-  -webkit-backdrop-filter: blur(22px) saturate(140%);
+/* ---------- 页面切换（fade 200ms，App.vue 引用） ---------- */
+.page-enter-active,
+.page-leave-active {
+  transition: opacity 0.2s ease;
+}
+.page-enter-from,
+.page-leave-to {
+  opacity: 0;
 }
 
-/* ---------- 动画 ---------- */
-@keyframes fade-up {
-  from {
-    opacity: 0;
-    transform: translateY(18px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
+/* ---------- 入场 fade（单次 200ms，用于各页根元素） ---------- */
 @keyframes fade-in {
   from {
     opacity: 0;
@@ -103,49 +86,52 @@ body {
   }
 }
 
-@keyframes shimmer {
-  from {
-    background-position: -420px 0;
-  }
-  to {
-    background-position: 420px 0;
-  }
+/* ---------- Element Plus 浅色化 ----------
+   main.ts（与后端契约复用）会向 <html> 添加 dark class 并引入
+   dark css-vars，这里把相关变量重映射回浅色主题 */
+html.dark {
+  --el-color-primary: #4f46e5;
+  --el-bg-color: #ffffff;
+  --el-bg-color-overlay: #ffffff;
+  --el-border-color: #e5e5e5;
+  --el-border-color-light: #e5e5e5;
+  --el-border-color-lighter: #e5e5e5;
+  --el-fill-color-blank: #ffffff;
+  --el-fill-color-light: #f4f4f5;
+  --el-text-color-primary: #18181b;
+  --el-text-color-regular: #52525b;
+  --el-text-color-placeholder: #a1a1aa;
+  --el-message-bg-color: #ffffff;
+  --el-message-text-color: #18181b;
+  --el-message-border-color: #e5e5e5;
 }
 
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.fade-up {
-  opacity: 0;
-  animation: fade-up 0.65s var(--ease-out) forwards;
-}
-
-/* 页面切换 */
-.page-enter-active,
-.page-leave-active {
-  transition: opacity 0.22s ease, transform 0.22s ease;
-}
-.page-enter-from {
-  opacity: 0;
-  transform: translateY(8px);
-}
-.page-leave-to {
-  opacity: 0;
-}
-
-/* ---------- Element Plus 深色微调 ---------- */
+/* 轻提示：白底细边框，极浅阴影 */
 .el-message {
-  border-radius: 12px !important;
-  backdrop-filter: blur(12px);
+  border-radius: 8px !important;
+  border: 1px solid var(--border) !important;
+  background: var(--surface) !important;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.06) !important;
+}
+.el-message .el-message__content {
+  color: var(--text-1) !important;
+  font-size: 13px !important;
+}
+.el-message .el-message-icon--success {
+  color: #529b2e !important;
+}
+.el-message .el-message-icon--warning {
+  color: #c47f17 !important;
+}
+.el-message .el-message-icon--error {
+  color: #cf4444 !important;
+}
+.el-message .el-message-icon--info {
+  color: #737373 !important;
 }
 
-/* ---------- Logo ---------- */
+/* ---------- Logo（细线书形，随 currentColor 着色） ---------- */
 .logo-mark {
-  width: 44px;
-  height: 44px;
   display: block;
-  filter: drop-shadow(0 6px 16px rgba(99, 102, 241, 0.45));
+  color: var(--accent);
 }

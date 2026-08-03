@@ -1,7 +1,7 @@
 # reader-dev 前端规划（Rust 版）
 
 > 决策：**不复用 legacy 前端构建产物**（安全漏洞过多），全新前端。
-> 状态：规划中（后端切片推进时并行开发）。
+> 状态：已启动（脚手架 + 登录页 + 书架页已完成，见文末「已实现进度」）。
 
 ---
 
@@ -61,3 +61,45 @@
 
 - 后端切片 3-7 进行时，前端按 1-5 顺序并行开发
 - API 契约以实际后端为准（联调驱动）
+
+---
+
+## 7. 已实现进度
+
+> 更新于 2026-01（web-ui/ 脚手架阶段，先本地不提交 git）
+
+### ✅ 已完成
+
+| 项 | 说明 |
+|---|---|
+| **脚手架** | `web-ui/`：Vite 7 + Vue 3.5 + TypeScript + Pinia 3 + Vue Router 4 + Element Plus + axios（npm 依赖锁定，`npm audit` 0 漏洞） |
+| **登录页** | `src/views/LoginView.vue`：居中玻璃拟态卡片、渐变 logo、登录/注册切换（isLogin=true/false）、深色主题、光斑动画背景；对接 `POST /reader3/login` |
+| **书架页** | `src/views/BookshelfView.vue`：玻璃拟态顶部导航栏（搜索框/用户名/退出）、书封网格（封面懒加载 v-lazy + 缺失封面渐变占位+书名首字）、骨架屏加载动画、空状态、刷新；对接 `GET /reader3/getBookshelf` |
+| **axios 封装** | `src/api/request.ts`：baseURL `/reader3`、accessToken 自动带 query、业务错误统一 toast、NEED_LOGIN/401 自动跳登录 |
+| **路由** | `/login`、`/`（未登录拦截跳登录，已登录访问 /login 跳书架） |
+| **构建** | `npm run build`（vue-tsc 类型检查 + vite build）通过；dev 代理 `/reader3 → localhost:8080` |
+
+### 目录结构
+
+```
+web-ui/
+├── index.html / vite.config.ts / tsconfig.json / package.json
+└── src/
+    ├── main.ts / App.vue / env.d.ts
+    ├── styles/main.css          # 深色阅读主题（渐变/玻璃拟态/动画）
+    ├── types/index.ts           # ReturnData / UserInfo / Book（与后端 camelCase 契约一致）
+    ├── api/request.ts / auth.ts / bookshelf.ts
+    ├── stores/user.ts           # accessToken/username 持久化（localStorage）
+    ├── router/index.ts          # /login、/ + 登录守卫
+    ├── directives/lazy.ts       # 封面懒加载指令（IntersectionObserver）
+    ├── components/LogoMark.vue  # 渐变书本 logo
+    └── views/LoginView.vue / BookshelfView.vue
+```
+
+### 待办（下一迭代）
+
+- [ ] 阅读页 `/reader/{url}`（翻页/目录/进度）
+- [ ] 搜索页（多源并发）
+- [ ] 书源管理 / 设置 / 用户管理
+- [ ] rust-embed 内嵌 dist + CSP 头
+- [ ] 与后端真实联调（本机 `npm run dev` + `READER_SERVER_PORT` 后端）
