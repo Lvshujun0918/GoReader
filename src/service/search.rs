@@ -118,6 +118,14 @@ pub struct UrlSuffix {
     pub js: Option<String>,
     /// bodyJs：对响应体执行 JS 后作为新响应体（注入 result=原响应体）
     pub body_js: Option<String>,
+    /// 请求方法（POST/GET，默认 GET）
+    pub method: Option<String>,
+    /// POST body（支持 {{key}}/{{page}} 模板替换）
+    pub body: Option<String>,
+    /// 附加请求头（与书源 header 合并）
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    /// 响应字符集（GB2312/GBK/UTF-8 等）
+    pub charset: Option<String>,
 }
 
 /// 切分 `url,{...}` 后缀：从最后一个「逗号后整段为合法 JSON」的位置切分
@@ -264,10 +272,32 @@ pub async fn search_one_source(
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 
-    let resp = crawler::fetch(&url, &headers, 15).await?;
+    // 附加 headers（书源 header + 后缀 headers 合并）
+    let mut req_headers = headers.clone();
+    if let Some(extra) = &suffix.headers {
+        for (k, v) in extra {
+            req_headers.insert(k.clone(), v.clone());
+        }
+    }
+    // POST body 模板替换（{{key}}/{{page}}）
+    let post_body = suffix.body.as_ref().map(|b| {
+        b.replace("{{key}}", key)
+            .replace("{{page}}", &page.to_string())
+            .replace("{key}", key)
+            .replace("{page}", &page.to_string())
+    });
+    let resp = crawler::fetch(
+        &url,
+        &req_headers,
+        15,
+        suffix.method.as_deref().unwrap_or("GET"),
+        post_body.as_deref(),
+        suffix.charset.as_deref(),
+    )
+    .await?;
     let base = resp.url.clone();
     // bodyJs：对响应体执行 JS 后作为新响应体
-    let body = apply_body_js(&resp.body, &suffix, key, page, &source.book_source_url, &headers)?;
+    let body = apply_body_js(&resp.body, &suffix, key, page, &source.book_source_url, &req_headers)?;
     let books = analyze_book_list(&body, &base, source, &rule, &book_list_rule, key);
 
     tracing::info!(
