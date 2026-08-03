@@ -8,6 +8,7 @@ pub mod bookmark;
 pub mod http_tts;
 pub mod replace_rule;
 pub mod rss;
+pub mod source_sub;
 pub mod txt_toc_rule;
 pub mod user;
 
@@ -19,5 +20,6 @@ pub use bookmark::Bookmark;
 pub use http_tts::HttpTts;
 pub use replace_rule::ReplaceRule;
 pub use rss::{RssArticle, RssSource};
+pub use source_sub::SourceSub;
 pub use txt_toc_rule::TxtTocRule;
 pub use user::User;

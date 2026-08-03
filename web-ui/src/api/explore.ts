@@ -1,5 +1,10 @@
 import { get } from './request'
-import type { ExploreCategory, ReturnData, SearchBook } from '@/types'
+import type { ExploreCategory, ExploreSourceInfo, ReturnData, SearchBook } from '@/types'
+
+/** GET /reader3/getExploreSources：探索书源列表（精确分类数） */
+export function getExploreSources(): Promise<ReturnData<ExploreSourceInfo[]>> {
+  return get<ExploreSourceInfo[]>('/getExploreSources')
+}
 
 /** GET /reader3/getExploreUrls：书源 exploreUrl 集合（bookSource=书源 URL 或完整 JSON） */
 export function getExploreUrls(bookSource: string): Promise<ReturnData<ExploreCategory[]>> {

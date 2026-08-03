@@ -112,6 +112,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/deleteBook", post(delete_book))
         .route("/reader3/saveBook", post(save_book))
         .route("/reader3/saveBookProgress", post(save_book_progress))
+        .route("/reader3/getExploreSources", get(get_explore_sources).post(get_explore_sources))
         .route("/reader3/getExploreUrls", get(get_explore_urls).post(get_explore_urls))
         .route("/reader3/exploreBook", get(explore_book).post(explore_book))
         .route("/reader3/searchBookMultiSSE", get(search_book_multi_sse).post(search_book_multi_sse))
@@ -1919,6 +1920,36 @@ async fn save_book_progress(
             Json(ReturnData::err("保存失败"))
         }
     }
+}
+
+/// GET/POST /reader3/getExploreSources：探索书源列表（精确分类数——parse_explore_entries 执行后计数）
+async fn get_explore_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let sources = match state.storage.get_book_sources(&namespace).await {
+        Ok(s) => s,
+        Err(_) => return Json(ReturnData::err("系统错误")),
+    };
+    let list: Vec<serde_json::Value> = sources
+        .iter()
+        .filter(|s| s.enabled_explore && s.explore_url.is_some())
+        .map(|s| {
+            let count = crate::service::explore::parse_explore_entries(s.explore_url.as_deref().unwrap_or("")).len();
+            serde_json::json!({
+                "bookSourceUrl": s.book_source_url,
+                "bookSourceName": s.book_source_name,
+                "categoryCount": count,
+            })
+        })
+        .filter(|v| v.get("categoryCount").and_then(|c| c.as_u64()).unwrap_or(0) > 0)
+        .collect();
+    Json(ReturnData::ok(serde_json::Value::Array(list)))
 }
 
 /// GET/POST /reader3/getExploreUrls：返回书源的 exploreUrl 集合（bookSource 参数：书源 URL 或完整 JSON）

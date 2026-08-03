@@ -16,6 +16,72 @@ pub struct Storage {
     pub config: AppConfig,
 }
 
+/// 缓存统计（getCacheInfo）
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheInfo {
+    /// toc_cache 行数
+    pub toc_cache_count: i64,
+    /// toc_cache 近似大小（sum length(chapters_json)）
+    pub toc_cache_size: i64,
+    /// book_chapters 行数
+    pub chapter_count: i64,
+    /// 章节缓存近似大小（sum length(content)）
+    pub chapter_size: i64,
+    /// 总大小（目录缓存 + 章节缓存）
+    pub total_size: i64,
+}
+
+/// 全书搜索命中（searchBookContent）
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookContentHit {
+    pub chapter_index: i64,
+    pub title: String,
+    /// 命中段落前后截取的摘要
+    pub snippet: String,
+}
+
+/// 命中摘要：定位 key 首次出现位置（大小写不敏感），取所在段落 + 前后各 radius 字符，
+/// 截断处补省略号、换行压平为空格
+fn make_snippet(content: &str, key: &str, radius: usize) -> String {
+    let lower = content.to_lowercase();
+    let key_lower = key.to_lowercase();
+    let Some(pos) = lower.find(&key_lower) else {
+        return String::new();
+    };
+    // 对齐 UTF-8 字符边界（lowercase 极端情形下字节偏移可能漂移）
+    let pos = floor_char_boundary(content, pos);
+    // 段落边界（最近的前后换行）
+    let para_start = content[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let para_end = content[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(content.len());
+    let start = para_start.max(pos.saturating_sub(radius));
+    let end = (pos + key.len() + radius).min(para_end);
+    let start = floor_char_boundary(content, start);
+    let end = floor_char_boundary(content, end);
+    let mut s = String::new();
+    if start > para_start {
+        s.push('…');
+    }
+    s.push_str(&content[start..end]);
+    if end < para_end {
+        s.push('…');
+    }
+    s.replace('\n', " ")
+}
+
+/// 向左对齐到最近的 UTF-8 字符边界（O(3) 步内收敛）
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+
 /// 初始化：建目录 + 打开/建库 + 建表
 pub async fn init(config: &AppConfig) -> Result<Storage> {
     let storage_dir = config.storage_dir();
@@ -298,6 +364,21 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             name TEXT NOT NULL DEFAULT '',
             type INTEGER DEFAULT 0,
             user_namespace TEXT DEFAULT ''
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // 书源订阅（url 主键；raw_json 为抓取到的书源数组 JSON 原文）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS source_subs (
+            url TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            enabled INTEGER DEFAULT 1,
+            user_namespace TEXT DEFAULT '',
+            raw_json TEXT
         );
         "#,
     )
@@ -588,6 +669,175 @@ impl Storage {
         .fetch_optional(&self.pool)
         .await?;
         Ok(r)
+    }
+
+    // ---------------- 缓存管理 ----------------
+
+    /// 缓存统计：toc_cache 行数 / book_chapters 行数 / 章节正文近似大小（sum length(content)）/
+    /// 目录缓存大小（sum length(chapters_json)）/ 总大小（两者之和）
+    pub async fn get_cache_info(&self) -> Result<CacheInfo> {
+        let toc_cache_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM toc_cache")
+            .fetch_one(&self.pool)
+            .await?;
+        let toc_cache_size: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(length(chapters_json)), 0) FROM toc_cache",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let chapter_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters")
+            .fetch_one(&self.pool)
+            .await?;
+        let chapter_size: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(length(content)), 0) FROM book_chapters",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(CacheInfo {
+            toc_cache_count,
+            toc_cache_size,
+            chapter_count,
+            chapter_size,
+            total_size: toc_cache_size + chapter_size,
+        })
+    }
+
+    /// 清空缓存（type: "toc" 清目录缓存 / "chapters" 清章节缓存 / "all" 全清）；
+    /// 返回 (toc 删除行数, 章节删除行数)
+    pub async fn clear_cache(&self, cache_type: &str) -> Result<(u64, u64)> {
+        let mut toc_deleted = 0u64;
+        let mut chapters_deleted = 0u64;
+        if cache_type == "toc" || cache_type == "all" {
+            let r = sqlx::query("DELETE FROM toc_cache")
+                .execute(&self.pool)
+                .await?;
+            toc_deleted = r.rows_affected();
+        }
+        if cache_type == "chapters" || cache_type == "all" {
+            let r = sqlx::query("DELETE FROM book_chapters")
+                .execute(&self.pool)
+                .await?;
+            chapters_deleted = r.rows_affected();
+        }
+        Ok((toc_deleted, chapters_deleted))
+    }
+
+    // ---------------- 全书搜索（本地书） ----------------
+
+    /// 某书在 book_chapters 表中的章节数（本地书判定用）
+    pub async fn count_chapters(&self, book_url: &str) -> Result<i64> {
+        let count = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1")
+            .bind(book_url)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// 全书搜索：book_chapters 正文 LIKE 匹配（key 中 %/_ 转义为字面量），按章节序返回
+    /// 命中章节（chapterIndex/title/snippet——命中段落前后截取），最多 limit 条
+    pub async fn search_book_content(
+        &self,
+        book_url: &str,
+        key: &str,
+        limit: i64,
+    ) -> Result<Vec<BookContentHit>> {
+        let escaped = key
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let rows = sqlx::query_as::<_, (i64, String, String)>(
+            "SELECT chapter_index, title, content FROM book_chapters             WHERE book_url = ?1 AND content LIKE ?2 ESCAPE '\\'             ORDER BY chapter_index LIMIT ?3",
+        )
+        .bind(book_url)
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut hits = Vec::with_capacity(rows.len());
+        for (chapter_index, title, content) in rows {
+            hits.push(BookContentHit {
+                chapter_index,
+                title,
+                snippet: make_snippet(&content, key, 40),
+            });
+        }
+        Ok(hits)
+    }
+
+    // ---------------- 书源订阅 ----------------
+
+    /// 订阅列表（按名称排序；用户无订阅回退 default，同书源语义）
+    pub async fn get_source_subs(&self, ns: &str) -> Result<Vec<crate::model::SourceSub>> {
+        let rows = sqlx::query_as::<_, crate::model::SourceSub>(
+            "SELECT * FROM source_subs WHERE user_namespace = ?1 ORDER BY name, url",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        if !rows.is_empty() || ns == "default" {
+            return Ok(rows);
+        }
+        sqlx::query_as::<_, crate::model::SourceSub>(
+            "SELECT * FROM source_subs WHERE user_namespace = 'default' ORDER BY name, url",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// 按 URL 查订阅（用户命名空间 + default 回退）
+    pub async fn find_source_sub(
+        &self,
+        ns: &str,
+        url: &str,
+    ) -> Result<Option<crate::model::SourceSub>> {
+        let r = sqlx::query_as::<_, crate::model::SourceSub>(
+            "SELECT * FROM source_subs WHERE user_namespace = ?1 AND url = ?2",
+        )
+        .bind(ns)
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await?;
+        if r.is_some() || ns == "default" {
+            return Ok(r);
+        }
+        sqlx::query_as::<_, crate::model::SourceSub>(
+            "SELECT * FROM source_subs WHERE user_namespace = 'default' AND url = ?1",
+        )
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// 保存订阅（INSERT OR REPLACE，按 url 主键覆盖；raw_json 存书源数组 JSON 原文）
+    pub async fn save_source_sub(
+        &self,
+        ns: &str,
+        url: &str,
+        name: &str,
+        raw_json: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO source_subs (url, name, enabled, user_namespace, raw_json)             VALUES (?1, ?2, 1, ?3, ?4)",
+        )
+        .bind(url)
+        .bind(name)
+        .bind(ns)
+        .bind(raw_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 删除订阅（按 url，仅限本命名空间）；返回受影响行数
+    pub async fn delete_source_sub(&self, ns: &str, url: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM source_subs WHERE user_namespace = ?1 AND url = ?2")
+            .bind(ns)
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
     }
 
     /// 保存章节（本地书）

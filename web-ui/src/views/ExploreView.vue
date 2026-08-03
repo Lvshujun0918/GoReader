@@ -26,7 +26,7 @@
       <ul v-else class="source-list">
         <li v-for="s in sources" :key="s.bookSourceUrl" class="source-item" @click="selectSource(s)">
           <span class="source-name">{{ s.bookSourceName }}</span>
-          <span class="source-count">{{ exploreCount(s.exploreUrl) }} 个分类</span>
+          <span class="source-count">{{ exploreCount(s) }} 个分类</span>
           <span class="chevron">›</span>
         </li>
       </ul>
@@ -76,13 +76,12 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { getExploreUrls, exploreBook } from '@/api/explore'
-import { getBookSources } from '@/api/sources'
-import type { BookSource, ExploreCategory, SearchBook } from '@/types'
+import { getExploreSources, getExploreUrls, exploreBook } from '@/api/explore'
+import type { BookSource, ExploreCategory, ExploreSourceInfo, SearchBook } from '@/types'
 
 const router = useRouter()
 
-const sources = ref<BookSource[]>([])
+const sources = ref<ExploreSourceInfo[]>([])
 const sourcesLoading = ref(true)
 const sourcesError = ref('')
 
@@ -112,19 +111,16 @@ function coverGradient(name: string): string {
   return GRADIENTS[h % GRADIENTS.length]
 }
 
-function exploreCount(exploreUrl?: string | null): number {
-  if (!exploreUrl) return 0
-  return exploreUrl.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#')).length
+function exploreCount(s: ExploreSourceInfo): number {
+  return s.categoryCount ?? 0
 }
 
 async function loadSources() {
   sourcesLoading.value = true
   sourcesError.value = ''
   try {
-    const res = await getBookSources()
-    const all = (res.data ?? []) as BookSource[]
-    // legado 语义：启用了探索且有 exploreUrl 的书源都是入口
-    sources.value = all.filter((s) => s.enabledExplore && s.exploreUrl)
+    const res = await getExploreSources()
+    sources.value = (res.data ?? []) as ExploreSourceInfo[]
   } catch {
     sourcesError.value = '书源加载失败'
   } finally {
@@ -132,8 +128,15 @@ async function loadSources() {
   }
 }
 
-function selectSource(s: BookSource) {
-  source.value = s
+function selectSource(s: ExploreSourceInfo) {
+  const full = sources.value.find((x) => x.bookSourceUrl === s.bookSourceUrl)
+  source.value = {
+    bookSourceUrl: s.bookSourceUrl,
+    bookSourceName: s.bookSourceName,
+    enabledExplore: true,
+    exploreUrl: '',
+  } as unknown as BookSource
+  void full
   categories.value = []
   activeUrl.value = ''
   books.value = []

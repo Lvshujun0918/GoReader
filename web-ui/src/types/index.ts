@@ -102,6 +102,12 @@ export interface SearchBook {
 }
 
 /** 探索分类（/reader3/getExploreUrls → string[]；视图层派生：url + 从 URL 尾部路径/参数提取的名称） */
+export interface ExploreSourceInfo {
+  bookSourceUrl: string
+  bookSourceName: string
+  categoryCount: number
+}
+
 export interface ExploreCategory {
   title: string
   url: string
@@ -212,7 +218,7 @@ export interface SystemInfo {
   [key: string]: unknown
 }
 
-/** 全书内容搜索命中（GET /reader3/searchBookContent 契约——当前后端待实现；chapterIndex=章节索引 / title=章节标题 / snippet=匹配片段） */
+/** 全书内容搜索命中（GET /reader3/searchBookContent → data；chapterIndex=章节索引 / title=章节标题 / snippet=匹配片段） */
 export interface ContentSearchHit {
   chapterIndex: number
   title: string
@@ -220,14 +226,18 @@ export interface ContentSearchHit {
   [key: string]: unknown
 }
 
-/** 缓存统计（GET /reader3/getCacheInfo 契约——当前后端待实现；chapterCacheCount=章节缓存数 / chapterCacheSize=章节缓存大小(字节)） */
+/** 清理缓存类型（POST /reader3/clearCache body.type：toc=目录缓存 / chapter=章节缓存 / all=全部） */
+export type CacheClearType = 'toc' | 'chapter' | 'all'
+
+/** 缓存统计（GET /reader3/getCacheInfo → data；tocCount=目录缓存数 / chapterCount=章节缓存数 / totalBytes=总大小(字节)） */
 export interface CacheInfo {
-  chapterCacheCount: number
-  chapterCacheSize: number
+  tocCount: number
+  chapterCount: number
+  totalBytes: number
   [key: string]: unknown
 }
 
-/** 书源订阅（当前 localStorage: reader_source_subs；占位实现，见 api/sourceSubs.ts；enabled=启用订阅，启用时重新拉取并批量导入书源） */
+/** 书源订阅（后端 /reader3/getSourceSubs 为主，localStorage: reader_source_subs 降级，见 api/sourceSubs.ts；enabled=启用订阅，启用/刷新时重新拉取并批量导入书源） */
 export interface SourceSub {
   url: string
   name: string
