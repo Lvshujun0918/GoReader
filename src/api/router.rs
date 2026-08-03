@@ -52,7 +52,12 @@ pub struct AppState {
 pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     let state = AppState { storage };
 
+    // /assets 静态资源（封面等：storage/assets/**，legacy 兼容）
+    let assets_dir = config.storage_dir().join("assets");
+    let assets_service = tower_http::services::ServeDir::new(assets_dir);
+
     axum::Router::new()
+        .nest_service("/assets", assets_service)
         .route("/health", get(health))
         .route("/reader3/getBookshelf", get(get_bookshelf))
         .route("/reader3/getBookSources", get(get_book_sources).post(get_book_sources))
