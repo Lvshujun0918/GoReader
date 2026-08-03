@@ -16,9 +16,14 @@ export function deleteRssSource(rssSourceUrl: string): Promise<ReturnData<null>>
   return post<null>('/deleteRssSource', { rssSourceUrl })
 }
 
-/** GET /reader3/getRssArticles：订阅源文章列表（params rssSourceUrl + page，分页） */
+/** GET /reader3/getRssArticles：订阅源文章列表（params rssSourceUrl + page，分页；hasRead 已读标记） */
 export function getRssArticles(rssSourceUrl: string, page = 1): Promise<ReturnData<RssArticle[]>> {
   return get<RssArticle[]>('/getRssArticles', { rssSourceUrl, page })
+}
+
+/** POST /reader3/markRssArticleRead：标记文章已读/未读（body { articleUrl, read }） */
+export function markRssArticleRead(articleUrl: string, read: boolean): Promise<ReturnData<null>> {
+  return post<null>('/markRssArticleRead', { articleUrl, read })
 }
 
 /** GET /reader3/getRssArticle：文章正文（data: { content }，content 为 HTML） */

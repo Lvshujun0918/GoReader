@@ -24,6 +24,15 @@
 ### 4. 上传
 - 文件名/路径均收敛（见上）；书源导入仅 JSON 白名单字段；本地书导入只做解析不入壳执行（EPUB zip 解包 + TXT 编码检测）。
 
+### 5. 书源 cookie 按用户隔离
+- `book_source_cookies` 表：`user_namespace + source_url` 联合主键——书源登录态（cookie/user_agent）严格按用户命名空间存取，`cookie_for(ns, url)` 只读本命名空间行，跨用户不可见、不可覆盖。
+- 抓取入口（`crawler::fetch_book`）按当前请求命名空间注入 cookie；FlareSolverr 返回的 cookie 与用户原 cookie **按 name 合并**后仍存回该用户命名空间。
+
+### 6. FlareSolverr 转发
+- 仅当环境变量 `FLARESOLVERR_URL` 配置时才启用（默认禁用，零外部依赖）。
+- 仅书源抓取（`fetch_book`）命中 Cloudflare 质询特征（503 + 特征 HTML）时转发；RSS/TTS 等原始抓取（`fetch`/`fetch_get`）不经 FlareSolverr。
+- 转发请求携带当前用户的 cookie（保持书源会话连续性），响应 cookie 按 name 合并后按用户存库，UA 一并记录。
+
 ## 🔧 本轮已修复
 
 ### token 生成（可预测 → 随机）
@@ -39,7 +48,16 @@
 4. **multipart 上传无大小上限**——本地服务可接受；公网建议代理层限制（如 nginx client_max_body_size）。
 5. **EPUB zip 解压无条目大小/数量限制**——zip 炸弹防护缺失；本地导入可接受，公网建议限制上传大小（同 4）。
 
-## OPDS 安全（subagent 实现中，验收时复查）
-- 认证：Basic（系统用户账号 或 独立 opds_username/opds_password 配置）或 accessToken。
-- 独立账号密码存储：sha256(salt+password) 或复用 gen_encrypted_password——验收时核对。
-- 路径/下载：复用白名单路径解析，不越出用户存储目录。
+## OPDS 安全（已实现）
+
+### 认证
+- 非 secure 模式：恒走 `default` 命名空间。
+- secure 模式：Basic（**独立 OPDS 账号优先** → 系统用户账号）或 `accessToken=username:token`（与 /reader3 同套校验）。
+
+### 独立 OPDS 账号（sha256 + salt）
+- 存储于 `system_settings` 键值表（`opds_account`），格式 `{salt}${sha256_hex(salt || password)}`（`util::sha256`：16 字节随机盐，非明文）。
+- 与系统用户（legacy 双 md5 兼容哈希）分离：配置后仅用于 OPDS Basic 认证，不产生系统用户、不占用户配额。
+- 认证顺序：独立账号（sha256 校验）→ 系统用户（`gen_encrypted_password` 双 md5 校验）→ accessToken。
+
+### 路径/下载
+- 复用白名单路径解析，不越出用户存储目录。

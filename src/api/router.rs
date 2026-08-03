@@ -179,6 +179,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/saveRssSource", post(save_rss_source))
         .route("/reader3/deleteRssSource", post(delete_rss_source))
         .route("/reader3/getRssArticles", get(get_rss_articles).post(get_rss_articles))
+        .route("/reader3/markRssArticleRead", post(mark_rss_article_read))
         .route("/reader3/getRssArticle", get(get_rss_article).post(get_rss_article))
         .route("/reader3/searchBook", get(search_book).post(search_book))
         .route("/reader3/searchBookMulti", get(search_book_multi).post(search_book_multi))
@@ -1329,11 +1330,56 @@ async fn get_rss_articles(
             if let Err(e) = state.storage.save_rss_articles(&namespace, &articles).await {
                 tracing::warn!("getRssArticles 入库失败: {e}");
             }
+            // 已读标记合并：入库后按 url 回读 read 列 → 序列化为 hasRead
+            let flags = state
+                .storage
+                .get_rss_article_read_flags(&namespace, &source_url)
+                .await
+                .unwrap_or_default();
+            let articles: Vec<crate::model::RssArticle> = articles
+                .into_iter()
+                .map(|mut a| {
+                    a.read = flags.get(&a.url).copied().unwrap_or(false);
+                    a
+                })
+                .collect();
             Json(ReturnData::ok(serde_json::to_value(&articles).unwrap_or(Value::Null)))
         }
         Err(e) => {
             tracing::error!("getRssArticles 抓取失败 [{}]: {e}", source.source_url);
             Json(ReturnData::err("抓取失败"))
+        }
+    }
+}
+
+/// POST /reader3/markRssArticleRead：标记 RSS 文章已读/未读（body { articleUrl, read }）
+async fn mark_rss_article_read(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = namespace;
+    let body_json: Option<Value> = body
+        .as_ref()
+        .and_then(|b| serde_json::from_slice(b).ok());
+    let url = param_of(&params, body_json.as_ref(), "articleUrl");
+    if url.is_empty() {
+        return Json(ReturnData::err("RSS文章链接不能为空"));
+    }
+    let read = body_json
+        .as_ref()
+        .and_then(|b| b.get("read").and_then(|v| v.as_bool()))
+        .unwrap_or(true);
+    match state.storage.set_rss_article_read(&url, read).await {
+        Ok(_) => Json(ReturnData::ok(Value::Null)),
+        Err(e) => {
+            tracing::error!("markRssArticleRead 失败: {e}");
+            Json(ReturnData::err("标记失败"))
         }
     }
 }
@@ -8692,6 +8738,40 @@ mod tests {
         let body = Bytes::from(r#"[{"sourceUrl":"https://r3.com/feed"}]"#);
         let ret = save_rss_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
         assert_eq!(ret.0.error_msg, "参数错误", "缺 sourceName 应拒绝");
+
+        cleanup(state, dir).await;
+    }
+
+    /// markRssArticleRead：标记已读/未读（body {articleUrl, read}）
+    #[tokio::test]
+    async fn test_mark_rss_article_read_api() {
+        let (mut state, dir) = test_state("mark_read").await;
+        let article = crate::model::RssArticle {
+            url: "https://feed.example.com/x".into(),
+            source_url: "https://feed.example.com/rss".into(),
+            title: "X".into(),
+            ..Default::default()
+        };
+        state.storage.save_rss_articles("default", &[article]).await.unwrap();
+        // 已读
+        let body = Bytes::from(r#"{"articleUrl":"https://feed.example.com/x","read":true}"#);
+        let ret = mark_rss_article_read(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let got = state.storage.get_rss_article("https://feed.example.com/x").await.unwrap().unwrap();
+        assert!(got.read);
+        // 标回未读
+        let body = Bytes::from(r#"{"articleUrl":"https://feed.example.com/x","read":false}"#);
+        let ret = mark_rss_article_read(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success);
+        assert!(!state.storage.get_rss_article("https://feed.example.com/x").await.unwrap().unwrap().read);
+        // 参数校验：缺 articleUrl
+        let ret = mark_rss_article_read(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "RSS文章链接不能为空");
+        // 未登录（secure 模式）拒绝
+        state.storage.config.secure = true;
+        let body = Bytes::from(r#"{"articleUrl":"https://feed.example.com/x","read":true}"#);
+        let ret = mark_rss_article_read(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
 
         cleanup(state, dir).await;
     }

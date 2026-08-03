@@ -330,12 +330,24 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             time INTEGER DEFAULT 0,
             content TEXT,
             cover TEXT,
+            read INTEGER DEFAULT 0,
             user_namespace TEXT DEFAULT ''
         );
         "#,
     )
     .execute(&pool)
     .await?;
+
+    // 兼容旧库：rss_articles 缺 read 列时补列（幂等——已存在则跳过）
+    let rss_cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('rss_articles')")
+        .fetch_all(&pool)
+        .await?;
+    if !rss_cols.iter().any(|c| c == "read") {
+        sqlx::query("ALTER TABLE rss_articles ADD COLUMN read INTEGER DEFAULT 0")
+            .execute(&pool)
+            .await?;
+        tracing::info!("rss_articles 表补充 read 列");
+    }
 
     sqlx::query(
         r#"
@@ -901,12 +913,13 @@ impl Storage {
         Ok(r.rows_affected())
     }
 
-    /// 批量保存 RSS 文章（单事务，INSERT OR REPLACE 按 url 主键去重）
+    /// 批量保存 RSS 文章（单事务，INSERT ... ON CONFLICT 按 url 主键去重更新；
+    /// 更新时不触碰 read 列——feed 刷新重新入库不清除已读标记）
     pub async fn save_rss_articles(&self, ns: &str, articles: &[crate::model::RssArticle]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for a in articles {
             sqlx::query(
-                "INSERT OR REPLACE INTO rss_articles            (url, source_url, title, author, time, content, cover, user_namespace)            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO rss_articles            (url, source_url, title, author, time, content, cover, user_namespace, read)            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)            ON CONFLICT(url) DO UPDATE SET                source_url = excluded.source_url,                title = excluded.title,                author = excluded.author,                time = excluded.time,                content = excluded.content,                cover = excluded.cover,                user_namespace = excluded.user_namespace",
             )
             .bind(&a.url)
             .bind(&a.source_url)
@@ -916,11 +929,38 @@ impl Storage {
             .bind(&a.content)
             .bind(&a.cover)
             .bind(ns)
+            .bind(a.read)
             .execute(&mut *tx)
             .await?;
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// 标记 RSS 文章已读/未读（url 主键；返回受影响行数）
+    pub async fn set_rss_article_read(&self, url: &str, read: bool) -> Result<u64> {
+        let r = sqlx::query("UPDATE rss_articles SET read = ?2 WHERE url = ?1")
+            .bind(url)
+            .bind(read)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 某 RSS 源全部文章的已读标记（url → read），getRssArticles 返回时合并用
+    pub async fn get_rss_article_read_flags(
+        &self,
+        ns: &str,
+        source_url: &str,
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT url, read FROM rss_articles WHERE user_namespace = ?1 AND source_url = ?2",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// 按 URL 查 RSS 文章（getRssArticle 正文/缓存用）
@@ -3293,6 +3333,26 @@ mod tests {
         assert_eq!(again.title, "甲v2");
         assert_eq!(again.time, 3000);
         assert_eq!(storage.get_rss_article("https://feed.example.com/b").await.unwrap().unwrap().title, "乙");
+
+        // 已读标记：标记已读 → 重新入库（feed 刷新）不清除
+        storage.set_rss_article_read("https://feed.example.com/a", true).await.unwrap();
+        storage
+            .save_rss_articles("default", &[article("https://feed.example.com/a", "甲v3", 4000)])
+            .await
+            .unwrap();
+        let marked = storage.get_rss_article("https://feed.example.com/a").await.unwrap().unwrap();
+        assert!(marked.read, "重新入库不应清除已读标记");
+        assert_eq!(marked.title, "甲v3");
+        // 标回未读
+        storage.set_rss_article_read("https://feed.example.com/a", false).await.unwrap();
+        assert!(!storage.get_rss_article("https://feed.example.com/a").await.unwrap().unwrap().read);
+        // 已读标记批量查询（仅本命名空间 + 本源的 url）
+        let flags = storage.get_rss_article_read_flags("default", "https://feed.example.com/rss").await.unwrap();
+        assert_eq!(flags.len(), 2);
+        assert!(!flags["https://feed.example.com/a"]);
+        assert!(!flags["https://feed.example.com/b"]);
+        let other = storage.get_rss_article_read_flags("other", "https://feed.example.com/rss").await.unwrap();
+        assert!(other.is_empty(), "其他命名空间看不到该源的已读标记");
 
         // 不存在的 url
         assert!(storage.get_rss_article("https://feed.example.com/nope").await.unwrap().is_none());

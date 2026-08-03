@@ -112,6 +112,7 @@ fn article_from_entry(entry: &feed_rs::model::Entry, source: &RssSource) -> RssA
         time,
         content,
         cover,
+        read: false,
         user_namespace: String::new(),
     }
 }

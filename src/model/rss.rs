@@ -67,6 +67,9 @@ pub struct RssArticle {
     pub content: Option<String>,
     /// 封面/配图
     pub cover: Option<String>,
+    /// 已读标记（JSON 输出为 hasRead；SQLite 列 read）
+    #[serde(rename = "hasRead")]
+    pub read: bool,
     #[serde(skip)]
     #[sqlx(rename = "user_namespace")]
     pub user_namespace: String,

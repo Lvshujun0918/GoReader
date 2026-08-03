@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { searchBookMulti, searchBookMultiSSE } from '@/api/search'
 import { useUserStore } from '@/stores/user'
+import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
 import type { ReturnData, SearchBook } from '@/types'
 
 const router = useRouter()
@@ -185,36 +186,20 @@ function openBook(book: SearchBook) {
   void router.push(`/book/${encodeURIComponent(book.bookUrl)}`)
 }
 
-/* ================= 搜索历史（localStorage，最近 10 条） ================= */
-const HISTORY_KEY = 'reader_search_history'
+/* ================= 搜索历史（localStorage，最近 10 条——与探索页共用） ================= */
 const history = ref<string[]>([])
 
 function loadHistory() {
-  try {
-    const raw = localStorage.getItem(HISTORY_KEY)
-    history.value = raw ? (JSON.parse(raw) as string[]) : []
-  } catch {
-    history.value = []
-  }
+  history.value = loadSearchHistory()
 }
 
 function pushHistory(word: string) {
-  const next = [word, ...history.value.filter((h) => h !== word)].slice(0, 10)
-  history.value = next
-  try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(next))
-  } catch {
-    // localStorage 不可用时静默降级
-  }
+  history.value = pushSearchHistory(word)
 }
 
 function clearHistory() {
+  clearSearchHistory()
   history.value = []
-  try {
-    localStorage.removeItem(HISTORY_KEY)
-  } catch {
-    // 忽略
-  }
 }
 
 onMounted(() => {

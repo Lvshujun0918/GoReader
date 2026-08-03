@@ -145,6 +145,8 @@ export interface RssArticle {
   time: number
   content?: string | null
   cover?: string | null
+  /** 已读标记（getRssArticles 返回 hasRead；点击文章后置 true） */
+  hasRead?: boolean
   [key: string]: unknown
 }
 

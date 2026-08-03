@@ -7,6 +7,7 @@ import {
   getRssArticle,
   getRssArticles,
   getRssSources,
+  markRssArticleRead,
   saveRssSource,
 } from '@/api/rss'
 import type { RssArticle, RssSource } from '@/types'
@@ -123,6 +124,9 @@ async function loadArticles(page: number) {
   }
 }
 
+/** 未读计数（标题旁展示） */
+const unreadCount = computed(() => articles.value.filter((a) => !a.hasRead).length)
+
 /* ================= 文章阅读 ================= */
 const articleMode = ref(false)
 const readingArticle = ref<RssArticle | null>(null)
@@ -137,6 +141,11 @@ async function openArticle(a: RssArticle) {
   readingArticle.value = a
   articleContent.value = ''
   loadingArticle.value = true
+  // 点击即已读（乐观更新 + 后端落库；失败静默，下次进入再同步）
+  if (!a.hasRead) {
+    a.hasRead = true
+    void markRssArticleRead(a.url, true).catch(() => {})
+  }
   try {
     const res = await getRssArticle(a.url)
     articleContent.value = sanitizeHtml(res.data?.content ?? '')
@@ -360,13 +369,21 @@ onBeforeUnmount(() => {
         <template v-else>
           <div class="col-head">
             <h2 class="col-title">{{ selectedSourceName || '文章' }}</h2>
-            <span class="col-count">{{ articles.length }} 篇</span>
+            <span class="col-count"
+              >共 {{ articles.length }} 篇<span v-if="unreadCount"> · {{ unreadCount }} 未读</span></span
+            >
           </div>
           <div v-if="loadingArticles" class="state-text loading">文章加载中…</div>
           <div v-else-if="!selectedUrl" class="state-text">请选择一个订阅源</div>
           <div v-else-if="articles.length === 0" class="state-text">暂无文章</div>
           <ul v-else ref="listEl" class="article-list">
-            <li v-for="a in articles" :key="a.url" class="article-item" @click="openArticle(a)">
+            <li
+              v-for="a in articles"
+              :key="a.url"
+              class="article-item"
+              :class="{ read: a.hasRead }"
+              @click="openArticle(a)"
+            >
               <p class="article-item-title" :title="a.title">{{ a.title || '无标题' }}</p>
               <p class="article-item-meta">
                 <span>{{ a.author || selectedSourceName }}</span>
@@ -796,6 +813,18 @@ onBeforeUnmount(() => {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+/* 未读加粗 / 已读置灰 */
+.article-item:not(.read) .article-item-title {
+  font-weight: 600;
+}
+.article-item.read .article-item-title {
+  font-weight: 400;
+  color: var(--text-3);
+}
+.article-item.read .article-item-meta {
+  color: var(--text-3);
+  opacity: 0.7;
 }
 .article-item-meta {
   margin: 6px 0 0;

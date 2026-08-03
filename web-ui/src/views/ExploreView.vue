@@ -22,6 +22,61 @@
     <!-- 书源列表（legado 语义：所有 enabledExplore 书源） -->
     <main v-if="!source" class="main" :style="{ maxWidth: contentWidth }">
       <p class="page-hint">书源探索</p>
+      <!-- 搜索框：下拉提示最近搜索（localStorage 最近 10 条，与搜索页共用） -->
+      <div class="search-wrap">
+        <div class="explore-search">
+          <svg
+            class="search-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+          >
+            <circle cx="11" cy="11" r="6.5" />
+            <path d="M20 20l-3.8-3.8" />
+          </svg>
+          <input
+            v-model="searchKey"
+            class="search-input"
+            type="text"
+            placeholder="搜索书籍…"
+            spellcheck="false"
+            @focus="showDropdown = true"
+            @input="showDropdown = true"
+            @keydown.enter="onSearchEnter"
+            @keydown.esc="showDropdown = false"
+          />
+          <button
+            class="search-go"
+            type="button"
+            :disabled="!searchKey.trim()"
+            @click="onSearchEnter"
+          >
+            搜索
+          </button>
+        </div>
+        <!-- 下拉提示（最近搜索；点击回填） -->
+        <div v-if="showDropdown && suggestions.length" class="search-dropdown">
+          <div class="dropdown-head">
+            <span class="dropdown-label">最近搜索</span>
+            <button class="dropdown-clear" type="button" @click="clearHistory">清空</button>
+          </div>
+          <ul class="dropdown-list">
+            <li
+              v-for="h in suggestions"
+              :key="h"
+              class="dropdown-item"
+              @mousedown.prevent="searchKey = h"
+            >
+              <svg class="item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                <path d="M5 12h14M13 6l6 6-6 6" />
+              </svg>
+              <span class="item-text" :title="h">{{ h }}</span>
+            </li>
+          </ul>
+        </div>
+      </div>
       <div v-if="sourcesLoading" class="state">
         <p class="state-text">加载中…</p>
       </div>
@@ -90,13 +145,39 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { applyHan, getHanMode, type HanMode } from '@/utils/chinese'
 import { useRouter } from 'vue-router'
 import { getExploreSources, getExploreUrls, exploreBook } from '@/api/explore'
+import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
 import type { BookSource, ExploreCategory, ExploreSourceInfo, SearchBook } from '@/types'
 
 const router = useRouter()
+
+/* ================= 搜索框（下拉提示最近搜索，与搜索页共用 localStorage 历史） ================= */
+const searchKey = ref('')
+const showDropdown = ref(false)
+const searchHistory = ref<string[]>([])
+
+/** 下拉建议：输入为空 → 全部最近搜索；有输入 → 子串过滤 */
+const suggestions = computed(() => {
+  const kw = searchKey.value.trim()
+  if (!kw) return searchHistory.value
+  return searchHistory.value.filter((h) => h.includes(kw))
+})
+
+function onSearchEnter() {
+  const kw = searchKey.value.trim()
+  if (!kw) return
+  showDropdown.value = false
+  searchHistory.value = pushSearchHistory(kw)
+  void router.push({ path: '/search', query: { key: kw } })
+}
+
+function clearHistory() {
+  clearSearchHistory()
+  searchHistory.value = []
+}
 
 const sources = ref<ExploreSourceInfo[]>([])
 const hanMode = ref<HanMode>(getHanMode())
@@ -268,6 +349,7 @@ function onCatsWheel(e: WheelEvent) {
 
 onMounted(() => {
   loadSources()
+  searchHistory.value = loadSearchHistory()
   const catsEl = document.querySelector('.cats')
   catsEl?.addEventListener('wheel', onCatsWheel as EventListener, { passive: false })
 })
@@ -356,6 +438,140 @@ onBeforeUnmount(() => {
   color: var(--text-3, #999);
   letter-spacing: 2px;
   margin: 0 0 16px;
+}
+
+/* ================= 搜索框 + 下拉提示 ================= */
+.search-wrap {
+  position: relative;
+  margin-bottom: 20px;
+}
+.explore-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 2px 8px;
+  border-bottom: 1px solid var(--border, #ececec);
+  transition: border-color 0.2s ease;
+}
+.explore-search:focus-within {
+  border-bottom-color: var(--accent, #4f46e5);
+}
+.search-icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  color: var(--text-3, #999);
+  transition: color 0.2s ease;
+}
+.explore-search:focus-within .search-icon {
+  color: var(--accent, #4f46e5);
+}
+.search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  color: var(--text-1, #1a1a1a);
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  outline: none;
+}
+.search-input::placeholder {
+  color: var(--text-3, #999);
+  font-weight: 300;
+}
+.search-go {
+  flex-shrink: 0;
+  padding: 4px 14px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--accent, #4f46e5);
+  background: none;
+  border: 1px solid var(--accent, #4f46e5);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.search-go:hover:not(:disabled) {
+  background: var(--accent-soft, #eef2ff);
+}
+.search-go:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.search-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  padding: 8px 4px;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #ececec);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+}
+.dropdown-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 10px 6px;
+}
+.dropdown-label {
+  font-size: 11.5px;
+  font-weight: 300;
+  letter-spacing: 2px;
+  color: var(--text-3, #999);
+}
+.dropdown-clear {
+  border: none;
+  background: none;
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3, #999);
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.dropdown-clear:hover {
+  color: var(--accent, #4f46e5);
+}
+.dropdown-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 300;
+  color: var(--text-2, #666);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.dropdown-item:hover {
+  background: var(--hover, #f5f5f5);
+}
+.item-icon {
+  flex-shrink: 0;
+  width: 11px;
+  height: 11px;
+  color: var(--text-3, #999);
+}
+.item-text {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .state {
   padding: 60px 0;
