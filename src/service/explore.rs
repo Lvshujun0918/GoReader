@@ -63,6 +63,39 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
             }
             continue;
         }
+        // JSON 数组格式：[{"title":"...","url":"..."}, ...]（inline 或跨行）
+        if line.starts_with('[') || line.starts_with('{') {
+            // 收集到匹配的 ]（多行 JSON）
+            let mut json_str = line.to_string();
+            let mut j = i + 1;
+            while !json_str.trim_end().ends_with(']') && j < lines.len() {
+                json_str.push('\n');
+                json_str.push_str(lines[j]);
+                j += 1;
+            }
+            i = j;
+            if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                for item in list {
+                    let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if !url.is_empty() {
+                        entries.push(ExploreEntry { title, url });
+                    }
+                }
+                continue;
+            }
+            continue;
+        }
+        // "标题::URL" 格式（legado 常见）
+        if let Some((title, url)) = line.split_once("::") {
+            let title = title.trim().to_string();
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                entries.push(ExploreEntry { title, url });
+                i += 1;
+                continue;
+            }
+        }
         // 普通 URL 行：title 从尾部提取
         let title = url_title(&line);
         entries.push(ExploreEntry {
@@ -124,6 +157,13 @@ pub async fn explore_url(
 ) -> Result<Vec<SearchBook>> {
     // URL 模板（{{page}}）
     let url = url.replace("{{page}}", "1").replace("{page}", "1");
+    // 相对 URL 拼书源 baseUrl
+    let url = if url.starts_with('/') && !url.starts_with("//") {
+        let base = source.book_source_url.split("##").next().unwrap_or("").trim_end_matches('/');
+        format!("{base}{url}")
+    } else {
+        url
+    };
     let headers = source.header.as_deref().map(crawler::parse_header).unwrap_or_default();
     let resp = crawler::fetch(&url, &headers, 15, "GET", None, None).await?;
 

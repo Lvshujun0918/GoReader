@@ -52,7 +52,7 @@
 
         <div v-if="loadingBooks" class="state"><p class="state-text">加载中…</p></div>
         <p v-else-if="booksError" class="state-error">{{ booksError }} <button class="retry" type="button" @click="loadBooks(1)">重试</button></p>
-        <div v-else-if="books.length === 0" class="state"><p class="state-text">此分类暂无内容</p></div>
+        <div v-else-if="books.length === 0" class="state"><p class="state-text">此分类暂无内容</p><p class="state-hint">可能为外部链接/站点失效，或书源探索规则未配置完整</p></div>
         <div v-else class="book-grid">
           <button v-for="b in books" :key="b.bookUrl" type="button" class="book-card" @click="goBook(b)">
             <span class="book-cover" :style="{ background: coverGradient(b.name) }">
@@ -278,6 +278,13 @@ onMounted(loadSources)
   font-size: 13px;
   font-weight: 300;
   color: var(--text-3, #999);
+}
+.state-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3, #999);
+  opacity: 0.7;
 }
 .state-error {
   padding: 40px 0;
