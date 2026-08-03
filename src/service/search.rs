@@ -309,6 +309,17 @@ pub async fn search_one_source(
     Ok(books)
 }
 
+/// 发现页解析（无 key）
+pub(crate) fn analyze_book_list_for_explore(
+    body: &str,
+    base_url: &str,
+    source: &BookSource,
+    rule: &SearchRule,
+    book_list_rule: &str,
+) -> Vec<SearchBook> {
+    analyze_book_list_impl(body, base_url, source, rule, book_list_rule, "")
+}
+
 /// 解析书单（对齐 legacy BookList.analyzeBookList v1：无 JS/无变量）
 fn analyze_book_list(
     body: &str,
@@ -316,7 +327,18 @@ fn analyze_book_list(
     source: &BookSource,
     rule: &SearchRule,
     book_list_rule: &str,
-    key: &str,
+    _key: &str,
+) -> Vec<SearchBook> {
+    analyze_book_list_impl(body, base_url, source, rule, book_list_rule, _key)
+}
+
+fn analyze_book_list_impl(
+    body: &str,
+    base_url: &str,
+    source: &BookSource,
+    rule: &SearchRule,
+    book_list_rule: &str,
+    _key: &str,
 ) -> Vec<SearchBook> {
     // bookList 规则类型检测
     let parsed = parse_rule(book_list_rule);
