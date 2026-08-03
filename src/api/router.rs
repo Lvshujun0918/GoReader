@@ -56,9 +56,16 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     let assets_dir = config.storage_dir().join("assets");
     let assets_service = tower_http::services::ServeDir::new(assets_dir);
 
+    // 前端静态资源（web-ui/dist，SPA fallback index.html——fallback 不强制 404 状态码）
+    let web_dir = std::path::PathBuf::from(&config.web_root);
+    let web_service = tower_http::services::ServeDir::new(&web_dir)
+        .fallback(tower_http::services::ServeFile::new(web_dir.join("index.html")));
+
     axum::Router::new()
         .nest_service("/assets", assets_service)
         .route("/health", get(health))
+        // SPA fallback：未匹配路由（非 /reader3）→ 前端
+        .fallback_service(web_service)
         .route("/reader3/getBookshelf", get(get_bookshelf))
         .route("/reader3/getBookSources", get(get_book_sources).post(get_book_sources))
         .route("/reader3/getBookSource", get(get_book_source).post(get_book_source))

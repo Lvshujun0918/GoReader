@@ -21,5 +21,6 @@ export default defineConfig({
   },
   build: {
     chunkSizeWarningLimit: 1500,
+    assetsDir: 'static',
   },
 })
