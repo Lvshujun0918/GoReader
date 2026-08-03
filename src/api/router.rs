@@ -70,6 +70,8 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     axum::Router::new()
         .nest_service("/assets", assets_service)
         .route("/health", get(health))
+        // 弱网优化：响应压缩（gzip/brotli）
+        .layer(tower_http::compression::CompressionLayer::new())
         .route("/opds", get(opds_catalog))
         .route("/opds/", get(opds_catalog))
         .route("/opds/search", get(opds_search))

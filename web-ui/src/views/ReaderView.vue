@@ -4,9 +4,10 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getBookshelf, deleteBook } from '@/api/bookshelf'
 import { getBookInfo, getBookToc, getBookContent } from '@/api/books'
+import { get, post } from '@/api/request'
 import { loadReplaceRules } from '@/api/replaceRules'
 import { simplized, traditionalized } from '@/utils/chinese'
-import type { Book, BookChapter, ReplaceRule } from '@/types'
+import type { Book, BookChapter, Bookmark, ReplaceRule } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -51,19 +52,27 @@ const loadError = ref(false)
 const notFound = ref(false)
 const drawerOpen = ref(false)
 
-/* ---------------- 1. 主题（浅色/深色/纸色） ---------------- */
+/* ---------------- 1. 主题（浅色/深色/纸色/跟随系统） ---------------- */
 
-type Theme = 'light' | 'dark' | 'paper'
+type Theme = 'light' | 'dark' | 'paper' | 'system'
 const THEME_KEY = 'reader_theme'
-const THEME_ORDER: Theme[] = ['light', 'dark', 'paper']
-const THEME_LABEL: Record<Theme, string> = { light: '浅', dark: '深', paper: '纸' }
+const THEME_ORDER: Theme[] = ['light', 'dark', 'paper', 'system']
+const THEME_LABEL: Record<Theme, string> = { light: '浅', dark: '深', paper: '纸', system: '系统' }
 const theme = ref<Theme>('light')
 {
   const raw = localStorage.getItem(THEME_KEY)
-  if (raw === 'light' || raw === 'dark' || raw === 'paper') theme.value = raw
+  if (raw === 'light' || raw === 'dark' || raw === 'paper' || raw === 'system') theme.value = raw
 }
+/** 系统深色偏好（theme=system 时生效；matchMedia 监听切换） */
+const systemDark = ref(false)
+let mediaQuery: MediaQueryList | null = null
+const systemTheme = (): Theme => (systemDark.value ? 'dark' : 'light')
 function applyTheme(t: Theme) {
-  document.documentElement.dataset.theme = t
+  document.documentElement.dataset.theme = t === 'system' ? systemTheme() : t
+}
+function onSystemThemeChange(e: MediaQueryListEvent) {
+  systemDark.value = e.matches
+  if (theme.value === 'system') applyTheme(theme.value)
 }
 watch(theme, (t) => {
   applyTheme(t)
@@ -111,12 +120,59 @@ watch(lineHeight, (v) => persist('reader_line_height', v))
 watch(paraSpacing, (v) => persist('reader_para_spacing', v))
 watch(fontWeight, (v) => persist('reader_font_weight', v))
 
+/* ---------------- 2.1 字体（系统/衬线/圆体/黑体） ---------------- */
+
+type FontKind = 'system' | 'serif' | 'round' | 'hei'
+const FONT_OPTIONS: { label: string; value: FontKind }[] = [
+  { label: '系统', value: 'system' },
+  { label: '衬线', value: 'serif' },
+  { label: '圆体', value: 'round' },
+  { label: '黑体', value: 'hei' },
+]
+const FONT_STACK: Record<FontKind, string> = {
+  system: '',
+  serif: "Georgia, 'Songti SC', 'SimSun', 'Noto Serif CJK SC', serif",
+  round: "'Yuanti SC', 'YouYuan', '幼圆', 'PingFang SC', sans-serif",
+  hei: "'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif",
+}
+const fontKind = ref<FontKind>('system')
+{
+  const raw = localStorage.getItem('reader_font_family')
+  if (FONT_OPTIONS.some((o) => o.value === raw)) fontKind.value = raw as FontKind
+}
+watch(fontKind, (v) => persist('reader_font_family', v))
+const fontFamilyStyle = computed(() => FONT_STACK[fontKind.value])
+
+/* ---------------- 2.2 字距 / 首行缩进 / 对齐 ---------------- */
+
+const letterSpacing = ref(0)
+letterSpacing.value = loadSetting('reader_letter_spacing', 0, 2, 0, 0.5)
+watch(letterSpacing, (v) => persist('reader_letter_spacing', v))
+
+const textIndent = ref(true)
+{
+  const raw = localStorage.getItem('reader_text_indent')
+  if (raw === '0') textIndent.value = false
+}
+watch(textIndent, (v) => persist('reader_text_indent', v ? '1' : '0'))
+
+const textAlign = ref<'left' | 'justify'>('left')
+{
+  const raw = localStorage.getItem('reader_text_align')
+  if (raw === 'left' || raw === 'justify') textAlign.value = raw
+}
+watch(textAlign, (v) => persist('reader_text_align', v))
+
 const settingsOpen = ref(false)
 function resetTypography() {
   fontSize.value = 18
   lineHeight.value = 1.9
   paraSpacing.value = 1
   fontWeight.value = 400
+  fontKind.value = 'system'
+  letterSpacing.value = 0
+  textIndent.value = true
+  textAlign.value = 'left'
 }
 
 /* ---------------- 3. 翻页模式（滚动 / 滑动=整页节流） ---------------- */
@@ -144,7 +200,7 @@ function slideFlip(dir: 1 | -1) {
   window.scrollBy({ top: dir * window.innerHeight * SLIDE_PAGE, behavior: 'smooth' })
 }
 function isInsideOverlay(el: EventTarget | null): boolean {
-  return el instanceof HTMLElement && !!el.closest('.drawer-mask, .pop-mask')
+  return el instanceof HTMLElement && !!el.closest('.drawer-mask, .pop-mask, .sel-bar')
 }
 function onWheel(e: WheelEvent) {
   if (pageMode.value !== 'slide' || isInsideOverlay(e.target)) return
@@ -210,6 +266,109 @@ function confirmJump() {
   jumpOpen.value = false
   jumpNum.value = ''
   if (idx >= 0) goToChapter(idx)
+}
+
+/* ---------------- 4.1 书签（服务端 /reader3/bookmarks） ---------------- */
+
+const bookmarksOpen = ref(false)
+const bookmarks = ref<Bookmark[]>([])
+const bookmarkLoading = ref(false)
+/** 书签跳转待恢复的段落序号（跨章时随 loadContent 消费） */
+let restoreParagraphIdx: number | null = null
+
+async function openBookmarks() {
+  bookmarksOpen.value = true
+  bookmarkLoading.value = true
+  try {
+    const res = await get<Bookmark[]>('/getBookmarks', { bookUrl: bookUrl.value })
+    bookmarks.value = res.data ?? []
+  } catch {
+    bookmarks.value = []
+  } finally {
+    bookmarkLoading.value = false
+  }
+}
+
+/** 当前视口顶部附近的段落序号（书签锚点） */
+function topParagraphIndex(): number {
+  const paras = document.querySelectorAll<HTMLElement>('.reader-content .reader-para')
+  let idx = 0
+  paras.forEach((p, i) => {
+    if (p.getBoundingClientRect().top <= 80) idx = i
+  })
+  return idx
+}
+
+async function addBookmark() {
+  const ch = currentChapter.value
+  if (!ch || !bookUrl.value) return
+  const paraIdx = topParagraphIndex()
+  const anchor = paragraphs.value[paraIdx]?.trim() ?? ''
+  const title = anchor.slice(0, 24) || ch.title
+  try {
+    await post('/saveBookmark', {
+      bookUrl: bookUrl.value,
+      title,
+      paragraphIndex: paraIdx,
+      chapterIndex: chapterIndex.value,
+    })
+    ElMessage.success('已添加书签')
+  } catch {
+    /* request.ts 已提示 */
+  }
+}
+
+function chapterTitleAt(idx: number): string {
+  const ch = chapters.value[idx]
+  return ch ? hanConvert(ch.title) : ''
+}
+
+/** 书签跳转：同章直接滚段落；跨章切章后按段落序号恢复 */
+function jumpToBookmark(b: Bookmark) {
+  bookmarksOpen.value = false
+  const ch = chapters.value[b.chapterIndex]
+  if (!ch || ch.isVolume) return
+  restoreParagraphIdx = b.paragraphIndex
+  if (b.chapterIndex === chapterIndex.value) {
+    void applyRestoreParagraph()
+  } else {
+    goToChapter(b.chapterIndex)
+  }
+}
+
+async function deleteBookmarkItem(b: Bookmark) {
+  try {
+    await post('/deleteBookmark', { bookUrl: bookUrl.value, title: b.title })
+    bookmarks.value = bookmarks.value.filter((x) => x.title !== b.title)
+    ElMessage.success('已删除书签')
+  } catch {
+    /* request.ts 已提示 */
+  }
+}
+
+function fmtBookmarkTime(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/** 按段落序号滚动恢复（含图片撑高后的二次校正） */
+async function applyRestoreParagraph() {
+  if (restoreParagraphIdx == null) return
+  await nextTick()
+  await settleFrames()
+  scrollToParagraph(restoreParagraphIdx)
+  await imagesReady()
+  await settleFrames()
+  scrollToParagraph(restoreParagraphIdx)
+  restoreParagraphIdx = null
+  updateScrollFrac()
+}
+function scrollToParagraph(idx: number) {
+  const p = document.querySelectorAll<HTMLElement>('.reader-content .reader-para')[idx]
+  const top = p ? Math.max(0, p.getBoundingClientRect().top + window.scrollY - 64) : 0
+  window.scrollTo(0, top)
 }
 
 /* ---------------- 5. 简繁转换（legacy chinese.js 移植） ---------------- */
@@ -353,6 +512,174 @@ function toggleTts() {
 /** 切换章节 / 离开页面时停止朗读 */
 watch(chapterIndex, () => stopTts())
 
+/* ---------------- 8. 自动阅读（定时滚动，到底自动切章） ---------------- */
+
+const autoPlaying = ref(false)
+const autoSpeed = ref(3)
+autoSpeed.value = loadSetting('reader_auto_speed', 1, 5, 3)
+watch(autoSpeed, (v) => persist('reader_auto_speed', v))
+let autoTimer: number | undefined
+const AUTO_BOTTOM_GAP = 40
+const autoInterval = () => (6 - autoSpeed.value) * 1000
+
+function autoTick() {
+  if (loading.value || loadError.value || !currentChapter.value) return
+  const doc = document.documentElement
+  if (doc.scrollHeight - window.innerHeight <= 0) return
+  const atBottom = window.scrollY + window.innerHeight >= doc.scrollHeight - AUTO_BOTTOM_GAP
+  if (atBottom) {
+    if (hasNext.value) nextChapter()
+    else stopAuto()
+    return
+  }
+  // 每 tick 滚动一行（行高 = 字号 × 行距）
+  window.scrollBy({ top: fontSize.value * lineHeight.value, behavior: 'auto' })
+}
+
+function startAuto() {
+  if (autoTimer != null) return
+  autoPlaying.value = true
+  autoTick()
+  autoTimer = window.setInterval(autoTick, autoInterval())
+}
+function stopAuto() {
+  autoPlaying.value = false
+  if (autoTimer != null) {
+    window.clearInterval(autoTimer)
+    autoTimer = undefined
+  }
+}
+function toggleAuto() {
+  if (autoPlaying.value) stopAuto()
+  else startAuto()
+}
+// 运行中调速：重建定时器
+watch(autoSpeed, () => {
+  if (autoPlaying.value && autoTimer != null) {
+    window.clearInterval(autoTimer)
+    autoTimer = window.setInterval(autoTick, autoInterval())
+  }
+})
+
+/* ---------------- 9. 划词操作（复制 / 搜索） ---------------- */
+
+const selText = ref('')
+const selOpen = ref(false)
+const selX = ref(0)
+const selY = ref(0)
+
+function hideSelBar() {
+  selOpen.value = false
+  selText.value = ''
+}
+
+function clearSelection() {
+  window.getSelection()?.removeAllRanges()
+}
+
+/** mouseup/touchend 后延迟计算：确保选中态已就绪 */
+function onSelectionUp() {
+  window.setTimeout(computeSelection, 0)
+}
+
+function computeSelection() {
+  const sel = window.getSelection()
+  const text = sel?.toString().trim() ?? ''
+  if (!text || !sel || sel.rangeCount === 0) {
+    hideSelBar()
+    return
+  }
+  const node = sel.anchorNode
+  const el =
+    node && node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as HTMLElement | null)
+  if (!el || !el.closest('.reader-content')) {
+    hideSelBar()
+    return
+  }
+  const rect = sel.getRangeAt(0).getBoundingClientRect()
+  if (rect.width === 0 && rect.height === 0) {
+    hideSelBar()
+    return
+  }
+  selText.value = text
+  selX.value = Math.min(Math.max(rect.left + rect.width / 2, 60), window.innerWidth - 60)
+  selY.value = Math.max(10, rect.top - 44)
+  selOpen.value = true
+}
+
+/** 点击正文/他处收起工具条（mousedown 先于 mouseup，避免选中后立即被 click 误关） */
+function onDocMouseDown(e: MouseEvent) {
+  if (e.target instanceof HTMLElement && e.target.closest('.sel-bar')) return
+  hideSelBar()
+}
+
+async function copySelection() {
+  const text = selText.value
+  clearSelection()
+  hideSelBar()
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    try {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    } catch {
+      /* ignore */
+    }
+  }
+  ElMessage.success('已复制')
+}
+
+function searchSelection() {
+  const text = selText.value
+  clearSelection()
+  hideSelBar()
+  if (!text) return
+  void router.push({ path: '/search', query: { key: text } })
+}
+
+/* ---------------- 10. 章节图片预加载（下一章前 5 张） ---------------- */
+
+const preloadedChapters = new Set<string>()
+
+/** 提取正文图片 URL：markdown 图片语法 + 裸图片扩展名 URL */
+function extractImageUrls(text: string): string[] {
+  const urls: string[] = []
+  const mdRe = /!\[[^\]]*]\(\s*([^)\s]+)\s*\)/g
+  let m: RegExpExecArray | null
+  while ((m = mdRe.exec(text))) urls.push(m[1])
+  const bareRe =
+    /https?:\/\/[^\s"'<>，。！？、；：“”‘’（）【】]+\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\?[^\s"'<>]*)?/gi
+  let b: RegExpExecArray | null
+  while ((b = bareRe.exec(text))) urls.push(b[0])
+  return urls
+}
+
+/** 当前章渲染后调用：静默拉取下一章正文并预热前 5 张图片（仅当含图片 URL） */
+function preloadNextChapterImages() {
+  if (!shelfBook.value?.origin) return
+  const fi = flatIndex.value
+  if (fi < 0 || fi >= realChapters.value.length - 1) return
+  const next = realChapters.value[fi + 1]
+  if (preloadedChapters.has(next.url)) return
+  preloadedChapters.add(next.url)
+  void getBookContent(next.url, shelfBook.value.origin)
+    .then((res) => {
+      for (const u of extractImageUrls(res.data?.content ?? '').slice(0, 5)) {
+        const img = new Image()
+        img.src = u
+      }
+    })
+    .catch(() => {
+      /* 静默 */
+    })
+}
+
 /* ---------------- 目录/章节 ---------------- */
 
 /** 有效章节（跳过卷标题分隔行） */
@@ -404,6 +731,21 @@ function saveProgress() {
   } catch {
     /* ignore */
   }
+  syncServerProgress()
+}
+
+/** 进度服务端同步（POST /reader3/saveBookProgress；失败静默，不影响本地阅读） */
+function syncServerProgress() {
+  if (!shelfBook.value || !currentChapter.value) return
+  void post('/saveBookProgress', {
+    bookUrl: bookUrl.value,
+    durChapterIndex: chapterIndex.value,
+    durChapterPos: Math.round(window.scrollY),
+    durChapterTime: Date.now(),
+    durChapterTitle: currentChapter.value.title,
+  }).catch(() => {
+    /* 静默失败 */
+  })
 }
 
 function restoreProgress(): ReaderProgress | null {
@@ -473,13 +815,19 @@ async function loadContent(chapterUrl: string) {
   }
   // 等正文真正渲染（loading 置 false 后）再滚动，避免被加载态高度钳制
   await nextTick()
-  window.scrollTo(0, restoreScrollY ?? 0)
-  if (restoreScrollY != null) {
-    await applyRestoreScroll()
+  if (restoreParagraphIdx != null) {
+    await applyRestoreParagraph()
   } else {
-    restoreScrollY = null
-    updateScrollFrac()
+    window.scrollTo(0, restoreScrollY ?? 0)
+    if (restoreScrollY != null) {
+      await applyRestoreScroll()
+    } else {
+      restoreScrollY = null
+      updateScrollFrac()
+    }
   }
+  // 当前章渲染后：预加载下一章前 5 张图片（仅当下一章含图片 URL）
+  preloadNextChapterImages()
 }
 
 function goToChapter(idx: number) {
@@ -575,17 +923,31 @@ async function init() {
       bookName.value = infoRes.value.data.name || bookName.value
     }
 
-    // 起始章节：恢复进度优先，否则第一章
-    const saved = restoreProgress()
+    // 起始章节：服务端进度优先（getBookshelf 已带 durChapter*；durChapterTime>0 才算存过），
+    // 无服务端进度则回退 localStorage
     let startIndex = realChapters.value.length ? chapters.value.indexOf(realChapters.value[0]) : 0
-    if (
-      saved &&
-      saved.chapterIndex >= 0 &&
-      saved.chapterIndex < chapters.value.length &&
-      !chapters.value[saved.chapterIndex].isVolume
-    ) {
-      startIndex = saved.chapterIndex
-      restoreScrollY = saved.scrollY
+    const srvIdx = found.durChapterIndex ?? -1
+    const serverSaved =
+      typeof srvIdx === 'number' &&
+      srvIdx >= 0 &&
+      srvIdx < chapters.value.length &&
+      !chapters.value[srvIdx].isVolume &&
+      (found.durChapterTime ?? 0) > 0
+    if (serverSaved) {
+      startIndex = srvIdx
+      const srvPos = found.durChapterPos ?? 0
+      restoreScrollY = srvPos > 0 ? srvPos : 0
+    } else {
+      const saved = restoreProgress()
+      if (
+        saved &&
+        saved.chapterIndex >= 0 &&
+        saved.chapterIndex < chapters.value.length &&
+        !chapters.value[saved.chapterIndex].isVolume
+      ) {
+        startIndex = saved.chapterIndex
+        restoreScrollY = saved.scrollY
+      }
     }
     chapterIndex.value = startIndex
     const start = chapters.value[startIndex]
@@ -621,14 +983,22 @@ watch(drawerOpen, async (open) => {
 
 function onScroll() {
   updateScrollFrac()
+  hideSelBar()
   window.clearTimeout(saveTimer)
   saveTimer = window.setTimeout(saveProgress, 300)
 }
 
 onMounted(() => {
+  // 跟随系统：matchMedia 监听系统深色偏好（先于 applyTheme，保证 system 主题首帧正确）
+  mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+  systemDark.value = mediaQuery.matches
+  mediaQuery.addEventListener('change', onSystemThemeChange)
   applyTheme(theme.value)
   window.addEventListener('scroll', onScroll, { passive: true })
   window.addEventListener('resize', updateScrollFrac, { passive: true })
+  window.addEventListener('mouseup', onSelectionUp)
+  window.addEventListener('touchend', onSelectionUp, { passive: true })
+  window.addEventListener('mousedown', onDocMouseDown)
   if (pageMode.value === 'slide') {
     window.addEventListener('wheel', onWheel, { passive: false })
     window.addEventListener('touchstart', onTouchStart, { passive: true })
@@ -639,15 +1009,20 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  mediaQuery?.removeEventListener('change', onSystemThemeChange)
   window.removeEventListener('scroll', onScroll)
   window.removeEventListener('resize', updateScrollFrac)
   window.removeEventListener('wheel', onWheel)
   window.removeEventListener('touchstart', onTouchStart)
   window.removeEventListener('touchmove', onTouchMove)
   window.removeEventListener('touchend', onTouchEnd)
+  window.removeEventListener('mouseup', onSelectionUp)
+  window.removeEventListener('touchend', onSelectionUp)
+  window.removeEventListener('mousedown', onDocMouseDown)
   window.clearTimeout(saveTimer)
   window.clearTimeout(removeTimer)
   stopTts()
+  stopAuto()
   saveProgress()
 })
 </script>
@@ -705,6 +1080,21 @@ onBeforeUnmount(() => {
         >
           {{ ttsPlaying ? '停止' : '听书' }}
         </button>
+        <button class="font-btn" type="button" title="在当前位置添加书签" @click="addBookmark">
+          ＋书签
+        </button>
+        <button class="font-btn" type="button" title="书签列表" @click="openBookmarks">
+          书签
+        </button>
+        <button
+          class="font-btn auto-btn"
+          type="button"
+          :class="{ active: autoPlaying }"
+          :title="autoPlaying ? '停止自动阅读' : '自动阅读（定时滚动，到底自动切章）'"
+          @click="toggleAuto"
+        >
+          {{ autoPlaying ? '停止' : '自动' }}
+        </button>
         <button class="font-btn" type="button" title="排版设置" @click="settingsOpen = true">
           排版
         </button>
@@ -756,13 +1146,16 @@ onBeforeUnmount(() => {
             lineHeight: `${lineHeight}`,
             fontWeight: `${fontWeight}`,
             maxWidth: contentWidth,
+            fontFamily: fontFamilyStyle || undefined,
+            letterSpacing: letterSpacing > 0 ? `${letterSpacing}px` : undefined,
+            textAlign,
           }"
         >
           <p
             v-for="(para, i) in paragraphs"
             :key="i"
             class="reader-para"
-            :style="{ marginBottom: `${paraSpacing}em` }"
+            :style="{ marginBottom: `${paraSpacing}em`, textIndent: textIndent ? '2em' : '0' }"
           >
             {{ para }}
           </p>
@@ -890,6 +1283,89 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="set-row">
+            <span class="set-label">字体</span>
+            <div class="seg-row">
+              <button
+                v-for="opt in FONT_OPTIONS"
+                :key="opt.value"
+                type="button"
+                class="seg-btn"
+                :class="{ active: fontKind === opt.value }"
+                @click="fontKind = opt.value"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <span class="set-label">字距</span>
+            <div class="set-controls">
+              <button
+                class="set-btn"
+                type="button"
+                :disabled="letterSpacing <= 0"
+                @click="letterSpacing = round1(Math.max(0, letterSpacing - 0.5))"
+              >
+                −
+              </button>
+              <span class="set-value">{{ letterSpacing }}</span>
+              <button
+                class="set-btn"
+                type="button"
+                :disabled="letterSpacing >= 2"
+                @click="letterSpacing = round1(Math.min(2, letterSpacing + 0.5))"
+              >
+                ＋
+              </button>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <span class="set-label">缩进</span>
+            <div class="seg">
+              <button
+                class="seg-btn"
+                type="button"
+                :class="{ active: !textIndent }"
+                @click="textIndent = false"
+              >
+                无
+              </button>
+              <button
+                class="seg-btn"
+                type="button"
+                :class="{ active: textIndent }"
+                @click="textIndent = true"
+              >
+                2em
+              </button>
+            </div>
+          </div>
+
+          <div class="set-row">
+            <span class="set-label">对齐</span>
+            <div class="seg">
+              <button
+                class="seg-btn"
+                type="button"
+                :class="{ active: textAlign === 'left' }"
+                @click="textAlign = 'left'"
+              >
+                左
+              </button>
+              <button
+                class="seg-btn"
+                type="button"
+                :class="{ active: textAlign === 'justify' }"
+                @click="textAlign = 'justify'"
+              >
+                两端
+              </button>
+            </div>
+          </div>
+
+          <div class="set-row">
             <span class="set-label">翻页</span>
             <div class="seg">
               <button
@@ -932,6 +1408,23 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="set-row">
+            <span class="set-label">自动速度</span>
+            <div class="seg-row">
+              <button
+                v-for="s in 5"
+                :key="s"
+                type="button"
+                class="seg-btn"
+                :class="{ active: autoSpeed === s }"
+                :title="`${s}：约每 ${6 - s} 秒滚一行`"
+                @click="autoSpeed = s"
+              >
+                {{ s }}
+              </button>
+            </div>
+          </div>
+
+          <div class="set-row">
             <span class="set-label">宽度</span>
             <div class="seg-row">
               <button
@@ -958,6 +1451,44 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </div>
+      </div>
+    </transition>
+
+    <!-- 书签列表弹层 -->
+    <transition name="pop">
+      <div v-if="bookmarksOpen" class="pop-mask" @click="bookmarksOpen = false">
+        <div class="pop-card bookmark-card" @click.stop>
+          <p class="pop-title">书签</p>
+          <p v-if="bookmarkLoading" class="pop-hint">加载中…</p>
+          <p v-else-if="bookmarks.length === 0" class="pop-hint">暂无书签，点顶栏「＋书签」添加</p>
+          <ul v-else class="bm-list">
+            <li v-for="(b, i) in bookmarks" :key="`${b.title}-${b.createdAt}-${i}`" class="bm-item">
+              <button
+                type="button"
+                class="bm-jump"
+                :title="`跳转：${chapterTitleAt(b.chapterIndex)}`"
+                @click="jumpToBookmark(b)"
+              >
+                <span class="bm-chapter">{{ chapterTitleAt(b.chapterIndex) }}</span>
+                <span class="bm-text">{{ b.title }}</span>
+                <span class="bm-time">{{ fmtBookmarkTime(b.createdAt) }}</span>
+              </button>
+              <button type="button" class="bm-del" title="删除书签" @click="deleteBookmarkItem(b)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </transition>
+
+    <!-- 划词工具条（复制 / 搜索） -->
+    <transition name="pop">
+      <div v-if="selOpen" class="sel-bar" :style="{ left: `${selX}px`, top: `${selY}px` }">
+        <button type="button" class="sel-btn" @click="copySelection">复制</button>
+        <button type="button" class="sel-btn" @click="searchSelection">搜索</button>
       </div>
     </transition>
 
@@ -1075,7 +1606,8 @@ onBeforeUnmount(() => {
   color: var(--accent);
   border-color: var(--accent);
 }
-.font-btn.tts-btn.active {
+.font-btn.tts-btn.active,
+.font-btn.auto-btn.active {
   color: var(--accent);
   border-color: var(--accent);
   background: var(--accent-soft);
@@ -1640,6 +2172,118 @@ onBeforeUnmount(() => {
   border-left-color: var(--accent);
   background: var(--accent-soft);
   font-weight: 400;
+}
+
+/* ================= 书签弹层 ================= */
+.bookmark-card {
+  width: min(380px, 92vw);
+}
+.bm-list {
+  list-style: none;
+  margin: 16px 0 0;
+  padding: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.bm-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.bm-item:last-child {
+  border-bottom: none;
+}
+.bm-jump {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.bm-chapter {
+  max-width: 100%;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bm-text {
+  max-width: 100%;
+  font-size: 13px;
+  font-weight: 300;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bm-time {
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.bm-del {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.bm-del:hover {
+  color: #cf4444;
+}
+.bm-del svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* ================= 划词工具条 ================= */
+.sel-bar {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  transform: translateX(-50%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.1);
+}
+.sel-btn {
+  padding: 6px 14px;
+  border: none;
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.sel-btn + .sel-btn {
+  border-left: 1px solid var(--border);
+}
+.sel-btn:hover {
+  color: var(--accent);
 }
 
 /* ================= 响应式 ================= */

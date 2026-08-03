@@ -33,6 +33,21 @@ export interface Book {
   latestChapterTitle?: string | null
   latestChapterTime: number
   lastCheckTime?: number
+  /** 阅读进度（服务端同步，/reader3/saveBookProgress 写入） */
+  durChapterTitle?: string | null
+  durChapterIndex?: number
+  durChapterPos?: number
+  durChapterTime?: number
+  [key: string]: unknown
+}
+
+/** 书签（/reader3/getBookmarks → Bookmark，camelCase；主键 bookUrl+title） */
+export interface Bookmark {
+  bookUrl: string
+  title: string
+  paragraphIndex: number
+  chapterIndex: number
+  createdAt: number
   [key: string]: unknown
 }
 

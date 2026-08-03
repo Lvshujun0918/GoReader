@@ -446,6 +446,29 @@ pub(crate) fn field(context: &str, rule: Option<&str>, default: &str) -> String 
     let Some(rule) = rule else { return default.to_string() };
     // legado 内嵌规则：{{$.xxx}} 从上下文提取替换（v1 支持 JSONPath 内嵌）
     let rule = expand_embedded(rule, context);
+    // @js: 后缀链（legado）：`提取规则@js:code` → 先提取，结果注入 result 执行 JS
+    // （如猫眼章节 URL：$.path@js:java.aesBase64DecodeToString(...)）
+    if let Some((main_part, js_code)) = rule.split_once("@js:") {
+        let main_part = main_part.trim();
+        if !main_part.is_empty() {
+            let extracted = if main_part.starts_with("$.") || main_part.starts_with('{') {
+                crate::parser::rule::apply(main_part, context)
+            } else if main_part.starts_with("//") {
+                crate::parser::xpath::xpath_select(main_part, context)
+            } else {
+                crate::parser::css_chain::css_chain(main_part, context)
+            };
+            let first = extracted.into_iter().next().unwrap_or_default();
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("result".to_string(), first);
+            if let Ok(s) = crate::parser::js::eval_js(js_code.trim(), &vars) {
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+            return default.to_string();
+        }
+    }
     let r = parse_rule(&rule);
     match r.kind {
         RuleKind::Css => {

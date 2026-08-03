@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { searchBookMulti } from '@/api/search'
 import type { SearchBook } from '@/types'
 
 const router = useRouter()
+const route = useRoute()
 
 /* ================= 搜索 ================= */
 const key = ref('')
@@ -73,7 +74,12 @@ function clearHistory() {
   }
 }
 
-onMounted(loadHistory)
+onMounted(() => {
+  loadHistory()
+  // 支持 /search?key=xxx 预填并自动搜索（阅读页划词「搜索」跳转）
+  const kw = typeof route.query.key === 'string' ? route.query.key.trim() : ''
+  if (kw) void doSearch(kw)
+})
 </script>
 
 <template>

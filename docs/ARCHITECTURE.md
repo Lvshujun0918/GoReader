@@ -118,6 +118,31 @@ book_groups(id, group_name, order_num, user_namespace)
 
 **实现切片**：与 WebDAV 同批（协议服务层），前端无关。
 
+## 6.8 HTTP/3 + 弱网优化（设计）
+
+### 书源抓取（客户端）
+- **协议协商**：HTTP/3（QUIC）优先 → HTTP/2 → HTTP/1.1（reqwest `http3` feature + rustls，`reqwest_unstable` cfg）
+- **指纹模拟**：TLS/QUIC 传输参数对齐主流浏览器（Chrome/Safari——分层设计，后续可接 impersonate）
+- **行为层**：完整浏览器头（保序）/ Cookie 会话 / 随机抖动并发 / 重试退避 / 验证码特征检测
+
+### 服务端（对外服务）
+- **双栈监听**（HTTPS 模式启用时）：TCP（HTTP/1.1+HTTP/2）+ UDP（HTTP/3，quinn+h3）——同端口
+  - 需 TLS 证书（`READER_APP_TLS_CERT`/`READER_APP_TLS_KEY`，自签可）——H3 依赖 QUIC-TLS
+  - 未配置 TLS：纯 HTTP 模式（H3 不可用，文档注明）
+- **弱网优化**：
+  - 响应压缩（tower-http CompressionLayer：gzip/brotli/deflate）
+  - 连接复用（pool/keep-alive）/ HTTP/2 多路复用
+  - 书源抓取：超时分级 + 重试退避（5xx/网络错误 2 次重试，指数退避）
+  - 流式响应（SSE 已有）/ 大文件分块
+  - 0-RTT（QUIC 快连——H3 模式自动）
+
+### 实施分步
+1. ✅ 客户端 H3（reqwest http3 编译通过）
+2. 服务端压缩层（tower-http Compression）
+3. 书源抓取行为层（完整头/重试/验证码检测）
+4. 服务端 H3（quinn+h3 监听，TLS 模式）
+5. QUIC/TLS 指纹细化
+
 ## 7. 产物策略
 
 - **scratch 镜像**（musl 静态编译，系统层 CVE=0）+ **裸静态二进制**（Release 附件 + systemd 示例）

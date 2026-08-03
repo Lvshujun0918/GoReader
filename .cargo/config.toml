@@ -1,0 +1,3 @@
+[build]
+# reqwest http3 实验特性（书源抓取 H3 支持）
+rustflags = ["--cfg", "reqwest_unstable"]

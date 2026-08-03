@@ -171,6 +171,7 @@ fn build_bridge_objects(bridge: &JsBridge, context: &mut Context) -> (JsObject, 
     java.function(bind(bridge, java_put), JsString::from("put"), 2)
         .function(bind(bridge, java_get), JsString::from("get"), 1)
         .function(bind(bridge, java_log), JsString::from("log"), 1)
+        .function(unsafe { NativeFunction::from_closure(java_aes_decrypt) }, JsString::from("aesBase64DecodeToString"), 4)
         .property(JsString::from("headerMap"), header_map, Attribute::all());
     let java = java.build();
 
@@ -537,5 +538,42 @@ mod tests {
         assert_eq!(eval_js_with_bridge("key + 'x'", &v, &bridge).unwrap(), "ax");
         assert_eq!(eval_js_with_bridge("1 + 2", &v, &bridge).unwrap(), "3");
         assert!(eval_js_with_bridge("throw new Error('x')", &v, &bridge).is_err());
+    }
+}
+
+/// java.aesBase64DecodeToString(data, key, mode, iv)：AES/CBC/PKCS5 解密（书源加密 URL 常见）
+fn java_aes_decrypt(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let data = args.get(0).map(|v| js_value_to_string(v, context)).unwrap_or_default();
+    let key = args.get(1).map(|v| js_value_to_string(v, context)).unwrap_or_default();
+    let iv = args.get(3).map(|v| js_value_to_string(v, context)).unwrap_or_default();
+    let decrypted = aes_base64_decode_to_string(&data, &key, &iv);
+    Ok(JsValue::from(JsString::from(decrypted)))
+}
+
+/// AES-128-CBC/PKCS7 解密（key/iv 取前 16 字节）
+fn aes_base64_decode_to_string(data: &str, key: &str, iv: &str) -> String {
+    use aes::cipher::{BlockDecryptMut, KeyIvInit};
+    use base64::Engine;
+    let ciphertext = match base64::engine::general_purpose::STANDARD.decode(data.trim()) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    if ciphertext.is_empty() {
+        return String::new();
+    }
+    let key_bytes: Vec<u8> = key.as_bytes().iter().take(16).copied().collect();
+    let iv_bytes: Vec<u8> = iv.as_bytes().iter().take(16).copied().collect();
+    type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+    let Ok(dec) = Aes128CbcDec::new_from_slices(&key_bytes, &iv_bytes) else {
+        return String::new();
+    };
+    let mut buf = ciphertext;
+    match dec.decrypt_padded_vec_mut::<block_padding::Pkcs7>(&mut buf) {
+        Ok(pt) => String::from_utf8_lossy(&pt).into_owned(),
+        Err(_) => String::new(),
     }
 }

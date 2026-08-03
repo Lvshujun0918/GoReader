@@ -114,39 +114,33 @@ pub fn parse_txt(bytes: &[u8]) -> Result<ImportedBook> {
     // 去掉 BOM
     let text = text.trim_start_matches('\u{feff}').to_string();
 
-    // 分章：常见章节标题模式
-    let chapter_re = regex::Regex::new(
-        r"(?m)^\s*(第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节卷回集部篇]\s*[^\n]{0,40}|Chapter\s+\d+[^\n]{0,40}|序章[^\n]{0,40}|楔子[^\n]{0,40})\s*$",
-    )
-    .unwrap();
-
-    let mut chapters = Vec::new();
-    let mut last_pos = 0usize;
-    let mut last_title = "正文".to_string();
-    for cap in chapter_re.captures_iter(&text) {
-        let m = cap.get(0).unwrap();
-        let content = text[last_pos..m.start()].trim().to_string();
-        if !content.is_empty() {
+    // 分章：内置默认 TXT 目录规则（后续可接用户自定义 txtTocRule）
+    let rules: Vec<String> = DEFAULT_TOC_RULES.iter().map(|s| s.to_string()).collect();
+    let mut chapters = split_by_rules(&text, &rules);
+    if chapters.is_empty() && !text.trim().is_empty() {
+        // 无章节标记的长文本：按 10000 字分章（避免单章过大渲染卡顿）
+        const CHUNK: usize = 10_000;
+        let body = text.trim().to_string();
+        if body.chars().count() > CHUNK * 2 {
+            let mut start = 0usize;
+            let chars: Vec<char> = body.chars().collect();
+            let mut part = 1;
+            while start < chars.len() {
+                let end = (start + CHUNK).min(chars.len());
+                let chunk: String = chars[start..end].iter().collect();
+                chapters.push(Chapter {
+                    title: format!("第 {part} 部分"),
+                    content: chunk,
+                });
+                start = end;
+                part += 1;
+            }
+        } else {
             chapters.push(Chapter {
-                title: last_title.clone(),
-                content,
+                title: "正文".into(),
+                content: body,
             });
         }
-        last_title = m.as_str().trim().to_string();
-        last_pos = m.end();
-    }
-    let tail = text[last_pos..].trim().to_string();
-    if !tail.is_empty() {
-        chapters.push(Chapter {
-            title: last_title,
-            content: tail,
-        });
-    }
-    if chapters.is_empty() && !text.trim().is_empty() {
-        chapters.push(Chapter {
-            title: "正文".into(),
-            content: text.trim().to_string(),
-        });
     }
 
     // 元数据（文件名信息由调用方补充——这里取首行做书名猜测）
@@ -163,6 +157,67 @@ pub fn parse_txt(bytes: &[u8]) -> Result<ImportedBook> {
         cover: None,
         format: "txt".into(),
     })
+}
+
+/// 内置默认 TXT 目录规则（对齐 legado 常见章节标题格式）
+pub const DEFAULT_TOC_RULES: &[&str] = &[
+    // 第X章 / 第X节 / 第X卷 第X章 等（常见中文格式）
+    r"^\s*第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节卷回集部篇][^
+]{0,40}\s*$",
+    // 卷标题（"第X卷" 或 "第一卷 标题"）
+    r"^\s*第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*卷[^
+]{0,40}\s*$",
+    // 序章/楔子/番外/后记/尾声/前言/引子/正文 等
+    r"^\s*(序章|楔子|番外|后记|尾声|前言|引子|正文|终章)[^
+]{0,40}\s*$",
+    // 英文 Chapter / CHAPTER
+    r"^\s*[Cc][Hh][Aa][Pp][Tt][Ee][Rr]\s+\d+[^
+]{0,40}\s*$",
+    // 数字+空格+标题（常见"1 标题"格式）
+    r"^\s*\d{1,4}[\s、.．:：][^
+]{0,40}\s*$",
+];
+
+/// 用规则列表分章（txtTocRule 语义——正则匹配行作为章节标题）
+fn split_by_rules(text: &str, rules: &[String]) -> Vec<Chapter> {
+    let mut chapters = Vec::new();
+    let mut last_pos = 0usize;
+    let mut last_title = "正文".to_string();
+    // 收集所有规则匹配
+    let mut matches: Vec<(usize, usize, String)> = Vec::new();
+    for rule in rules {
+        if let Ok(re) = regex::Regex::new(rule) {
+            for cap in re.captures_iter(text) {
+                if let Some(m) = cap.get(0) {
+                    let title = m.as_str().trim().to_string();
+                    if !title.is_empty() {
+                        matches.push((m.start(), m.end(), title));
+                    }
+                }
+            }
+        }
+    }
+    matches.sort_by_key(|m| m.0);
+    matches.dedup_by_key(|m| m.0);
+    for (start, end, title) in matches {
+        let content = text[last_pos..start].trim().to_string();
+        if !content.is_empty() {
+            chapters.push(Chapter {
+                title: last_title.clone(),
+                content,
+            });
+        }
+        last_title = title;
+        last_pos = end;
+    }
+    let tail = text[last_pos..].trim().to_string();
+    if !tail.is_empty() {
+        chapters.push(Chapter {
+            title: last_title,
+            content: tail,
+        });
+    }
+    chapters
 }
 
 /// 读 TXT 文件并分章（legacy 本地书：bookUrl = storage/data/.../xx.txt）
