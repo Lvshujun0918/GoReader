@@ -8,8 +8,12 @@
         </svg>
       </button>
       <span class="brand">夜读<em>.</em></span>
-      <span class="title">{{ source ? source.bookSourceName : '探索' }}</span>
-      <div class="top-actions"></div>
+      <span class="title">{{ source ? applyHan(source.bookSourceName, hanMode) : '探索' }}</span>
+      <div class="top-actions">
+        <button class="han-btn" type="button" :title="'简繁转换（当前：' + hanLabel + '）'" @click="toggleHan(); updateHanLabel()">
+          {{ hanLabel }}
+        </button>
+      </div>
     </header>
 
     <!-- 书源列表（legado 语义：所有 enabledExplore 书源） -->
@@ -25,7 +29,7 @@
       </div>
       <ul v-else class="source-list">
         <li v-for="s in sources" :key="s.bookSourceUrl" class="source-item" @click="selectSource(s)">
-          <span class="source-name">{{ s.bookSourceName }}</span>
+          <span class="source-name">{{ applyHan(s.bookSourceName, hanMode) }}</span>
           <span class="source-count">{{ exploreCount(s) }} 个分类</span>
           <span class="chevron">›</span>
         </li>
@@ -47,7 +51,7 @@
             @click="openCategory(c)"
           >
             <template v-if="c.type === 'link'">↗</template>
-            {{ c.title || '默认' }}
+            {{ c.title ? applyHan(c.title, hanMode.value) : '默认' }}
           </button>
         </div>
 
@@ -65,10 +69,10 @@
                 class="cover-img"
                 @error="failedCovers.add(b.bookUrl)"
               />
-              <template v-else>{{ b.name.charAt(0) }}</template>
+              <template v-else>{{ applyHan(b.name, hanMode.value).charAt(0) }}</template>
             </span>
-            <span class="book-name">{{ b.name }}</span>
-            <span class="book-author">{{ b.author || '未知作者' }}</span>
+            <span class="book-name">{{ applyHan(b.name, hanMode.value) }}</span>
+            <span class="book-author">{{ applyHan(b.author || '未知作者', hanMode.value) }}</span>
           </button>
         </div>
         <div v-if="books.length > 0" class="more-row">
@@ -84,6 +88,7 @@
 
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { applyHan, getHanMode, type HanMode } from '@/utils/chinese'
 import { useRouter } from 'vue-router'
 import { getExploreSources, getExploreUrls, exploreBook } from '@/api/explore'
 import type { BookSource, ExploreCategory, ExploreSourceInfo, SearchBook } from '@/types'
@@ -91,6 +96,19 @@ import type { BookSource, ExploreCategory, ExploreSourceInfo, SearchBook } from 
 const router = useRouter()
 
 const sources = ref<ExploreSourceInfo[]>([])
+const hanMode = ref<HanMode>(getHanMode())
+function toggleHan() {
+  hanMode.value = hanMode.value === 'auto' ? 'simp' : hanMode.value === 'simp' ? 'trad' : 'auto'
+  setHanModeLocal(hanMode.value)
+}
+function setHanModeLocal(m: HanMode) {
+  try { localStorage.setItem('reader_han_mode', m) } catch { /* ignore */ }
+}
+const hanLabel = ref('自动')
+function updateHanLabel() {
+  hanLabel.value = hanMode.value === 'auto' ? '自动' : hanMode.value === 'trad' ? '繁' : '简'
+}
+updateHanLabel()
 const sourcesLoading = ref(true)
 const sourcesError = ref('')
 
@@ -292,7 +310,23 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
 }
 .top-actions {
-  width: 30px;
+  display: flex;
+  gap: 6px;
+}
+.han-btn {
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2, #666);
+  background: none;
+  border: 1px solid var(--border, #ececec);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.han-btn:hover {
+  border-color: var(--accent, #4f46e5);
+  color: var(--accent, #4f46e5);
 }
 .main {
   max-width: 720px;

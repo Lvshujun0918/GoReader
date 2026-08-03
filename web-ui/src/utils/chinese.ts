@@ -124,3 +124,56 @@ export const traditionalized = makeConverter([
   [D_S2T_CHARS, D_S2T_PHRASES],
   [D_TW_VARIANTS],
 ])
+
+/**
+ * 全局简繁模式（阅读页/书海共用同一开关）
+ * 'auto' 自动（检测到繁体转简体，默认）/ 'simp' 强制简体 / 'trad' 强制繁体
+ */
+export type HanMode = 'auto' | 'simp' | 'trad'
+
+const HAN_MODE_KEY = 'reader_han_mode'
+
+export function getHanMode(): HanMode {
+  try {
+    const raw = localStorage.getItem(HAN_MODE_KEY)
+    if (raw === 'simp' || raw === 'trad') return raw
+  } catch {
+    /* ignore */
+  }
+  return 'auto'
+}
+
+export function setHanMode(mode: HanMode) {
+  try {
+    localStorage.setItem(HAN_MODE_KEY, mode)
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 按模式转换文本（auto/simp 均转简体——标题短文本检测不可靠；阅读页正文用 detectTraditional 单独处理） */
+export function applyHan(text: string, mode: HanMode = getHanMode()): string {
+  return mode === 'trad' ? traditionalized(text) : simplized(text)
+}
+
+/** 检测文本是否繁体（采样统计——用于阅读页正文 auto 模式） */
+export function detectTraditional(text: string): boolean {
+  let t = 0
+  let s = 0
+  let n = 0
+  for (const ch of text) {
+    if (n >= 1500) break
+    const conv = simplized(ch)
+    if (conv !== ch) {
+      t++
+      n++
+    } else {
+      const back = traditionalized(ch)
+      if (back !== ch) {
+        s++
+        n++
+      }
+    }
+  }
+  return n > 0 && t > s
+}

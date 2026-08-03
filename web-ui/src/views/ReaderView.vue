@@ -8,7 +8,7 @@ import { getHttpTtsList } from '@/api/httpTts'
 import { get, post } from '@/api/request'
 import { loadReplaceRules } from '@/api/replaceRules'
 import { getTtsVoices, synthesizeTts, type TtsVoice } from '@/api/tts'
-import { simplized, traditionalized } from '@/utils/chinese'
+import { applyHan, getHanMode, setHanMode, type HanMode } from '@/utils/chinese'
 import type { Book, BookChapter, Bookmark, HttpTts, ReplaceRule } from '@/types'
 
 const route = useRoute()
@@ -480,50 +480,28 @@ function jumpToSearchResult(idx: number) {
 
 /* ---------------- 5. 简繁转换（legacy chinese.js 移植） ---------------- */
 
-const HAN_KEY = 'reader_han_trad'
-const SIMP_MARKS = '们这个发现时说话书电视经过间题长门开关动华红绿线纸级结给变边还进种'
-const TRAD_MARKS = '們這這個發現時說話書電視經過間題長門開關動華紅綠線紙級結給變邊還進種'
-/** 未手动选择时按正文自动判定简/繁 */
-const hanTrad = ref(false)
-const hanAuto = ref(true)
-{
-  const raw = localStorage.getItem(HAN_KEY)
-  if (raw === '1') {
-    hanTrad.value = true
-    hanAuto.value = false
-  } else if (raw === '0') {
-    hanAuto.value = false
-  }
-}
-watch(hanTrad, (v) => {
-  if (!hanAuto.value) persist(HAN_KEY, v ? '1' : '0')
+/** 简繁模式（全局：reader_han_mode——auto 默认，检测繁体自动转简体） */
+const hanMode = ref<HanMode>(getHanMode())
+const hanTrad = ref(hanMode.value === 'trad')
+watch(hanMode, (v) => {
+  hanTrad.value = v === 'trad'
+  setHanMode(v)
 })
-function detectTraditional(text: string): boolean {
-  let s = 0
-  let t = 0
-  let n = 0
-  for (const ch of text) {
-    if (n >= 1500) break
-    if (SIMP_MARKS.includes(ch)) {
-      s++
-      n++
-    } else if (TRAD_MARKS.includes(ch)) {
-      t++
-      n++
-    }
-  }
-  return t > 0 && t > s
-}
+const detectTraditional = (text: string): boolean => detectTraditionalFn(text)
+// chinese.ts 的完整转换表检测（更准）
+import { detectTraditional as detectTraditionalFn } from '@/utils/chinese'
 watch(content, (c) => {
-  if (hanAuto.value) hanTrad.value = detectTraditional(c)
+  if (hanMode.value === 'auto') hanTrad.value = detectTraditional(c)
 })
 function toggleHan() {
-  hanTrad.value = !hanTrad.value
-  hanAuto.value = false
-  persist(HAN_KEY, hanTrad.value ? '1' : '0')
+  // 三态循环：自动 → 简 → 繁 → 自动
+  hanMode.value = hanMode.value === 'auto' ? 'simp' : hanMode.value === 'simp' ? 'trad' : 'auto'
+  if (hanMode.value === 'auto') hanTrad.value = detectTraditional(content.value)
 }
-const hanConvert = (text: string) => (hanTrad.value ? traditionalized(text) : simplized(text))
-const hanTargetLabel = computed(() => (hanTrad.value ? '简' : '繁'))
+const hanConvert = (text: string) => applyHan(text, hanMode.value)
+const hanTargetLabel = computed(() =>
+  hanMode.value === 'auto' ? '自动' : hanMode.value === 'trad' ? '简' : '繁'
+)
 
 /* ---------------- 6. 替换规则（localStorage: reader_replace_rules，见 api/replaceRules.ts 契约注释） ---------------- */
 
@@ -1364,7 +1342,7 @@ onBeforeUnmount(() => {
         <button
           class="font-btn"
           type="button"
-          :title="hanTrad ? '当前繁体，点击转为简体' : '当前简体，点击转为繁体'"
+          :title="hanMode === 'auto' ? '自动检测（当前：' + (hanTrad ? '繁体→简体' : '简体') + '），点击切换' : hanMode === 'trad' ? '当前繁体，点击切换' : '当前简体，点击切换'"
           @click="toggleHan"
         >
           {{ hanTargetLabel }}
