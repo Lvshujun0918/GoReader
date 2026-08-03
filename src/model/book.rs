@@ -143,6 +143,14 @@ pub struct Book {
     #[serde(rename = "splitLongChapter")]
     #[sqlx(rename = "split_long_chapter")]
     pub split_long_chapter: bool,
+    /// 语言（本地书/EPUB 元数据）
+    pub language: Option<String>,
+    /// 出版社
+    pub publisher: Option<String>,
+    /// 出版时间
+    #[serde(rename = "publishedAt")]
+    #[sqlx(rename = "published_at")]
+    pub published_at: Option<String>,
     /// 用户命名空间（secure 模式用户名 / default）
     #[serde(skip)]
     #[sqlx(rename = "user_namespace")]

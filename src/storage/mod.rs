@@ -177,7 +177,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
                 "toc_url", "custom_tag", "custom_intro", "latest_chapter_title", "latest_chapter_time",
                 "last_check_time", "last_check_count", "total_chapter_num", "word_count",
                 "order_num", "origin_order", "use_replace_rule", "variable", "read_config",
-                "is_in_shelf", "cbz", "display_cover", "display_intro", "local_epub", "local_pdf", "pdf", "split_long_chapter", "info_html", "toc_html", "raw_json",
+                "is_in_shelf", "cbz", "display_cover", "display_intro", "local_epub", "local_pdf", "pdf", "split_long_chapter", "info_html", "toc_html", "language", "publisher", "published_at", "raw_json",
             ][..],
         ),
     ];

@@ -2,5 +2,6 @@
 
 pub mod book;
 pub mod crawler;
+pub mod epub;
 pub mod explore;
 pub mod search;

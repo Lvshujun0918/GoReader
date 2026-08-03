@@ -16,7 +16,7 @@ pub async fn catalog(storage: &Storage, ns: &str) -> Result<String> {
     let updated = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:opds=\"http://opds-spec.org/2010/catalog\">\n",
+         <feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:opds=\"http://opds-spec.org/2010/catalog xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\"\">\n",
     );
     xml.push_str(&format!(
         "  <id>urn:uuid:reader-dev-bookshelf-{ns}</id>\n  <title>书架（{ns}）</title>\n  <updated>{updated}</updated>\n"
@@ -45,7 +45,7 @@ pub async fn search(storage: &Storage, ns: &str, q: &str) -> Result<String> {
     let updated = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:opds=\"http://opds-spec.org/2010/catalog\">\n",
+         <feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:opds=\"http://opds-spec.org/2010/catalog xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\"\">\n",
     );
     xml.push_str(&format!(
         "  <id>urn:uuid:reader-dev-search-{ns}</id>\n  <title>搜索：{q}</title>\n  <updated>{updated}</updated>\n  <author><name>reader-dev</name></author>\n"
@@ -84,6 +84,25 @@ fn book_entry(book: &crate::model::Book, ns: &str) -> String {
                 "    <link rel=\"http://opds-spec.org/cover\" href=\"{}\" type=\"image/jpeg\"/>\n",
                 xml_escape(cover)
             ));
+        }
+    }
+    // OPDS 1.2 元数据：语言/出版时间/出版社（本地书元数据，有则输出）
+    if let Some(lang) = &book.language {
+        if !lang.is_empty() {
+            entry.push_str(&format!("    <dc:language>{}</dc:language>
+", xml_escape(lang)));
+        }
+    }
+    if let Some(pub_at) = &book.published_at {
+        if !pub_at.is_empty() {
+            entry.push_str(&format!("    <dcterms:published>{}</dcterms:published>
+", xml_escape(pub_at)));
+        }
+    }
+    if let Some(publisher) = &book.publisher {
+        if !publisher.is_empty() {
+            entry.push_str(&format!("    <dcterms:publisher>{}</dcterms:publisher>
+", xml_escape(publisher)));
         }
     }
     if let Some(kind) = &book.kind {
