@@ -396,7 +396,7 @@ fn field_url(context: &str, rule: Option<&str>, default: &str, base: &str) -> St
 }
 
 /// 展开 {{$.xxx}} 内嵌规则（legado：{{}} 内为 JSONPath/JS，v1 支持 JSONPath）
-fn expand_embedded(rule: &str, context: &str) -> String {
+pub(crate) fn expand_embedded(rule: &str, context: &str) -> String {
     if !rule.contains("{{") {
         return rule.to_string();
     }
@@ -420,7 +420,7 @@ fn expand_embedded(rule: &str, context: &str) -> String {
 }
 
 /// 字段规则应用（上下文为单本书元素 html）
-fn field(context: &str, rule: Option<&str>, default: &str) -> String {
+pub(crate) fn field(context: &str, rule: Option<&str>, default: &str) -> String {
     let Some(rule) = rule else { return default.to_string() };
     // legado 内嵌规则：{{$.xxx}} 从上下文提取替换（v1 支持 JSONPath 内嵌）
     let rule = expand_embedded(rule, context);
@@ -454,7 +454,7 @@ fn field(context: &str, rule: Option<&str>, default: &str) -> String {
     }
 }
 
-fn opt_field(context: &str, rule: Option<&str>) -> Option<String> {
+pub(crate) fn opt_field(context: &str, rule: Option<&str>) -> Option<String> {
     let v = field(context, rule, "");
     if v.is_empty() {
         None

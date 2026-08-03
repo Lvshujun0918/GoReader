@@ -258,6 +258,70 @@ impl Storage {
         .map_err(Into::into)
     }
 
+    /// 保存书源（INSERT OR REPLACE；raw_json 按 camelCase 重新序列化，与 bookSource.json 字段名一致）
+    pub async fn save_book_source(&self, ns: &str, source: &crate::model::BookSource) -> Result<()> {
+        upsert_book_source(&self.pool, ns, source).await
+    }
+
+    /// 批量保存书源（单事务：全部成功或全部回滚）
+    pub async fn save_book_sources(&self, ns: &str, sources: &[crate::model::BookSource]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for source in sources {
+            upsert_book_source(&mut *tx, ns, source).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 删除书源（按 URL 精确匹配，仅限本命名空间）；返回受影响行数
+    pub async fn delete_book_source(&self, ns: &str, url: &str) -> Result<u64> {
+        let r = sqlx::query(
+            "DELETE FROM book_sources WHERE user_namespace = ?1 AND book_source_url = ?2",
+        )
+        .bind(ns)
+        .bind(url)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 按 URL 查单个书源（管理 API 用；复用 find_book_source 的精确/前缀匹配 + default 回退语义）
+    pub async fn get_book_source(
+        &self,
+        ns: &str,
+        url: &str,
+    ) -> Result<Option<crate::model::BookSource>> {
+        self.find_book_source(ns, url).await
+    }
+
+    /// 去重分组列表（兼容 legacy getBookSourceGroups：bookSourceGroup 空格分隔，保序去重；无书源回退 default）
+    pub async fn list_book_source_groups(&self, ns: &str) -> Result<Vec<String>> {
+        let sources = self.get_book_sources(ns).await?;
+        let mut groups: Vec<String> = Vec::new();
+        for s in sources {
+            let Some(group) = s.book_source_group else { continue };
+            for part in group.split_whitespace() {
+                if !groups.iter().any(|g| g == part) {
+                    groups.push(part.to_string());
+                }
+            }
+        }
+        Ok(groups)
+    }
+
+    /// 启停书源（按 URL 精确匹配，仅限本命名空间）；返回受影响行数
+    pub async fn update_book_source_enabled(&self, ns: &str, url: &str, enabled: bool) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE book_sources SET enabled = ?1 WHERE user_namespace = ?2 AND book_source_url = ?3",
+        )
+        .bind(enabled)
+        .bind(ns)
+        .bind(url)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
     /// 用户总数（注册上限校验）
     pub async fn count_users(&self) -> Result<i64> {
         let count = sqlx::query_scalar("SELECT COUNT(*) FROM users")
@@ -337,4 +401,289 @@ async fn ensure_column(pool: &SqlitePool, table: &str, column: &str) -> anyhow::
         tracing::info!("ALTER TABLE {table} ADD COLUMN {column}");
     }
     Ok(())
+}
+
+/// INSERT OR REPLACE 单条书源（save_book_source / save_book_sources 共用；
+/// raw_json 由 serde 按 camelCase 重新序列化，序列化时跳过 user_namespace / raw_json 内部字段）
+async fn upsert_book_source<'e, E>(executor: E, ns: &str, source: &crate::model::BookSource) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let raw_json = serde_json::to_string(source)?;
+    sqlx::query(
+        r#"
+        INSERT OR REPLACE INTO book_sources
+            (book_source_url, book_source_name, book_source_group, book_source_type,
+             book_url_pattern, custom_order, enabled, enabled_explore, enabled_cookie_jar,
+             concurrent_rate, header, login_url, login_ui, login_check_js, login_js,
+             book_source_comment, variable_comment, last_update_time, respond_time,
+             weight, explore_url, search_url, rule_explore, rule_search, rule_book_info,
+             rule_toc, rule_content, search_rule, explore_rule, book_info_rule, toc_rule,
+             content_rule, key, tag, logger, variable, user_namespace, raw_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)
+        "#,
+    )
+    .bind(&source.book_source_url)
+    .bind(&source.book_source_name)
+    .bind(&source.book_source_group)
+    .bind(source.book_source_type)
+    .bind(&source.book_url_pattern)
+    .bind(source.custom_order)
+    .bind(source.enabled)
+    .bind(source.enabled_explore)
+    .bind(source.enabled_cookie_jar)
+    .bind(&source.concurrent_rate)
+    .bind(&source.header)
+    .bind(&source.login_url)
+    .bind(&source.login_ui)
+    .bind(&source.login_check_js)
+    .bind(&source.login_js)
+    .bind(&source.book_source_comment)
+    .bind(&source.variable_comment)
+    .bind(source.last_update_time)
+    .bind(source.respond_time)
+    .bind(source.weight)
+    .bind(&source.explore_url)
+    .bind(&source.search_url)
+    .bind(&source.rule_explore)
+    .bind(&source.rule_search)
+    .bind(&source.rule_book_info)
+    .bind(&source.rule_toc)
+    .bind(&source.rule_content)
+    .bind(&source.search_rule)
+    .bind(&source.explore_rule)
+    .bind(&source.book_info_rule)
+    .bind(&source.toc_rule)
+    .bind(&source.content_rule)
+    .bind(&source.key)
+    .bind(&source.tag)
+    .bind(&source.logger)
+    .bind(&source.variable)
+    .bind(ns)
+    .bind(raw_json)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::BookSource;
+
+    /// 独立临时目录初始化存储（避免污染真实 storage/reader.db）
+    async fn test_storage(tag: &str) -> Storage {
+        let dir = std::env::temp_dir().join(format!(
+            "reader-storage-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = AppConfig::from_env();
+        config.work_dir = dir.to_string_lossy().into_owned();
+        init(&config).await.expect("测试存储初始化失败")
+    }
+
+    /// 释放连接池并清理临时目录
+    async fn cleanup(storage: Storage, tag: &str) {
+        storage.pool.close().await;
+        let dir = std::env::temp_dir().join(format!(
+            "reader-storage-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn source(url: &str, name: &str, group: Option<&str>) -> BookSource {
+        BookSource {
+            book_source_url: url.into(),
+            book_source_name: name.into(),
+            book_source_group: group.map(|g| g.to_string()),
+            search_url: Some(format!("{url}/search?q={{{{key}}}}")),
+            rule_search: Some(serde_json::json!({ "bookList": "$.data" })),
+            enabled: true,
+            enabled_explore: true,
+            custom_order: 1,
+            ..Default::default()
+        }
+    }
+
+    /// 保存 → 查询 → 覆盖保存 → 删除 往返；raw_json camelCase 与 bookSource.json 一致
+    #[tokio::test]
+    async fn test_save_get_delete_roundtrip() {
+        let storage = test_storage("roundtrip").await;
+        let mut s = source("https://a.com", "A源", Some("小说 玄幻"));
+        storage.save_book_source("default", &s).await.unwrap();
+
+        let got = storage
+            .get_book_source("default", "https://a.com")
+            .await
+            .unwrap()
+            .expect("保存后应能查到");
+        assert_eq!(got.book_source_name, "A源");
+        assert_eq!(got.book_source_group.as_deref(), Some("小说 玄幻"));
+        assert_eq!(got.user_namespace, "default");
+        assert_eq!(got.rule_search, Some(serde_json::json!({ "bookList": "$.data" })));
+
+        // raw_json：camelCase、含规则字段、可反序列化回 BookSource
+        let raw = got.raw_json.as_deref().expect("raw_json 应已写入");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert!(v.get("bookSourceUrl").is_some(), "raw_json 应为 camelCase: {raw}");
+        assert!(v.get("book_source_url").is_none(), "raw_json 不应含 snake_case: {raw}");
+        assert!(v.get("bookSourceName").is_some());
+        assert_eq!(v["enabled"], serde_json::Value::Bool(true));
+        let roundtrip: BookSource = serde_json::from_str(raw).unwrap();
+        assert_eq!(roundtrip.book_source_url, "https://a.com");
+
+        // 覆盖保存（改名 + 禁用）→ INSERT OR REPLACE 生效
+        s.book_source_name = "A源v2".into();
+        s.enabled = false;
+        storage.save_book_source("default", &s).await.unwrap();
+        let got2 = storage
+            .get_book_source("default", "https://a.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got2.book_source_name, "A源v2");
+        assert!(!got2.enabled);
+
+        // 删除 → 查不到
+        let affected = storage.delete_book_source("default", "https://a.com").await.unwrap();
+        assert_eq!(affected, 1);
+        assert!(storage
+            .get_book_source("default", "https://a.com")
+            .await
+            .unwrap()
+            .is_none());
+
+        cleanup(storage, "roundtrip").await;
+    }
+
+    /// update_book_source_enabled：单条切换 + 不存在返回 0 行
+    #[tokio::test]
+    async fn test_update_enabled() {
+        let storage = test_storage("enabled").await;
+        storage
+            .save_book_source("default", &source("https://a.com", "A", None))
+            .await
+            .unwrap();
+        storage
+            .save_book_source("default", &source("https://b.com", "B", None))
+            .await
+            .unwrap();
+
+        let affected = storage
+            .update_book_source_enabled("default", "https://a.com", false)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+        let a = storage
+            .get_book_source("default", "https://a.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!a.enabled, "A 应被禁用");
+        let b = storage
+            .get_book_source("default", "https://b.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(b.enabled, "B 应保持启用");
+
+        // 不存在的 URL → 0 行
+        let none = storage
+            .update_book_source_enabled("default", "https://nope.com", true)
+            .await
+            .unwrap();
+        assert_eq!(none, 0);
+
+        cleanup(storage, "enabled").await;
+    }
+
+    /// 批量事务保存 + 分组去重列表（含 default 回退）
+    #[tokio::test]
+    async fn test_batch_save_and_groups() {
+        let storage = test_storage("batch").await;
+        let sources = vec![
+            source("https://a.com", "A", Some("小说 玄幻")),
+            source("https://b.com", "B", Some("玄幻")),
+            source("https://c.com", "C", None),
+            source("https://d.com", "D", Some("")),
+        ];
+        storage.save_book_sources("default", &sources).await.unwrap();
+
+        let all = storage.get_book_sources("default").await.unwrap();
+        assert_eq!(all.len(), 4);
+        assert!(all.iter().all(|s| s.raw_json.is_some()), "批量保存应写入 raw_json");
+
+        // 保序去重；空串/None 分组不产生条目
+        let groups = storage.list_book_source_groups("default").await.unwrap();
+        assert_eq!(groups, vec!["小说", "玄幻"]);
+        // 无书源命名空间回退 default 的分组
+        let groups_fb = storage.list_book_source_groups("ghost").await.unwrap();
+        assert_eq!(groups_fb, vec!["小说", "玄幻"]);
+
+        cleanup(storage, "batch").await;
+    }
+
+    /// 命名空间隔离：列表/删除/启停互不串；空命名空间回退 default
+    #[tokio::test]
+    async fn test_namespace_isolation() {
+        let storage = test_storage("ns").await;
+        storage
+            .save_book_source("default", &source("https://a.com", "默认源", None))
+            .await
+            .unwrap();
+        storage
+            .save_book_source("alice", &source("https://b.com", "爱丽丝源", None))
+            .await
+            .unwrap();
+
+        let alice = storage.get_book_sources("alice").await.unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].book_source_name, "爱丽丝源");
+        // 无书源命名空间回退 default
+        let bob = storage.get_book_sources("bob").await.unwrap();
+        assert_eq!(bob.len(), 1);
+        assert_eq!(bob[0].book_source_name, "默认源");
+        // 删除只影响本命名空间
+        assert_eq!(
+            storage.delete_book_source("alice", "https://b.com").await.unwrap(),
+            1
+        );
+        assert!(storage
+            .get_book_source("alice", "https://b.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .get_book_source("default", "https://a.com")
+            .await
+            .unwrap()
+            .is_some());
+        // 启停同样按命名空间隔离：跨命名空间 URL 影响 0 行
+        assert_eq!(
+            storage
+                .update_book_source_enabled("alice", "https://a.com", false)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .update_book_source_enabled("default", "https://a.com", false)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!storage
+            .get_book_source("default", "https://a.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled);
+
+        cleanup(storage, "ns").await;
+    }
 }

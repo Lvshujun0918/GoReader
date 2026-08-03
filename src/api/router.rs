@@ -58,6 +58,9 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/getBookSources", get(get_book_sources))
         .route("/reader3/searchBook", get(search_book).post(search_book))
         .route("/reader3/searchBookMulti", get(search_book_multi).post(search_book_multi))
+        .route("/reader3/getBookInfo", get(get_book_info).post(get_book_info))
+        .route("/reader3/getBookToc", get(get_book_toc).post(get_book_toc))
+        .route("/reader3/getBookContent", get(get_book_content).post(get_book_content))
         .route("/reader3/login", post(login))
         .with_state(state)
         // TODO: 挂载 legacy 前端静态资源（rust-embed，兼容阶段复用 legacy dist）
@@ -366,6 +369,129 @@ async fn search_book_multi(
         }
     }
     Json(ReturnData::ok(serde_json::to_value(all).unwrap_or(serde_json::Value::Null)))
+}
+
+/// 解析书源参数（完整 JSON 或 URL 查库）
+async fn resolve_book_source(
+    state: &AppState,
+    ns: &str,
+    param: &str,
+) -> Option<crate::model::BookSource> {
+    if param.trim_start().starts_with('{') {
+        serde_json::from_str(param).ok()
+    } else {
+        state.storage.find_book_source(ns, param).await.ok().flatten()
+    }
+}
+
+/// 从 query/body 取参
+fn param_of(params: &HashMap<String, String>, body: Option<&serde_json::Value>, key: &str) -> String {
+    if let Some(b) = body {
+        if let Some(v) = b.get(key).and_then(|v| v.as_str()) {
+            return v.to_string();
+        }
+    }
+    params.get(key).cloned().unwrap_or_default()
+}
+
+/// POST/GET /reader3/getBookInfo：书籍详情（ruleBookInfo）
+async fn get_book_info(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("请输入书籍链接"));
+    }
+    let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
+    let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
+        return Json(ReturnData::err("书源不存在"));
+    };
+    match crate::service::book::fetch_url(&url, &source).await {
+        Ok(resp) => {
+            let info = crate::service::book::analyze_book_info(&resp.body, &resp.url, &source, &url);
+            Json(ReturnData::ok(serde_json::to_value(info).unwrap_or(serde_json::Value::Null)))
+        }
+        Err(e) => {
+            tracing::error!("getBookInfo 失败 [{url}]: {e}");
+            Json(ReturnData::err("获取详情失败"))
+        }
+    }
+}
+
+/// POST/GET /reader3/getBookToc：章节目录（ruleToc）
+async fn get_book_toc(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let toc_url = param_of(&params, body_json.as_ref(), "tocUrl");
+    let toc_url = if toc_url.is_empty() {
+        param_of(&params, body_json.as_ref(), "url")
+    } else {
+        toc_url
+    };
+    if toc_url.is_empty() {
+        return Json(ReturnData::err("请输入目录链接"));
+    }
+    let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
+    let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
+        return Json(ReturnData::err("书源不存在"));
+    };
+    match crate::service::book::analyze_toc(&toc_url, &source, 20).await {
+        Ok(chapters) => Json(ReturnData::ok(serde_json::to_value(chapters).unwrap_or(serde_json::Value::Null))),
+        Err(e) => {
+            tracing::error!("getBookToc 失败 [{toc_url}]: {e}");
+            Json(ReturnData::err("获取目录失败"))
+        }
+    }
+}
+
+/// POST/GET /reader3/getBookContent：章节正文（ruleContent）
+async fn get_book_content(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let chapter_url = param_of(&params, body_json.as_ref(), "chapterUrl");
+    let chapter_url = if chapter_url.is_empty() {
+        param_of(&params, body_json.as_ref(), "url")
+    } else {
+        chapter_url
+    };
+    if chapter_url.is_empty() {
+        return Json(ReturnData::err("请输入章节链接"));
+    }
+    let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
+    let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
+        return Json(ReturnData::err("书源不存在"));
+    };
+    match crate::service::book::analyze_content(&chapter_url, &source, 5).await {
+        Ok(content) => Json(ReturnData::ok(serde_json::json!({ "content": content }))),
+        Err(e) => {
+            tracing::error!("getBookContent 失败 [{chapter_url}]: {e}");
+            Json(ReturnData::err("获取正文失败"))
+        }
+    }
 }
 
 /// GET /reader3/getBookshelf：按命名空间返回书架（user_namespace 取自 accessToken；非 secure 用 default）
