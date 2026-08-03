@@ -30,6 +30,7 @@ src/
 - 路由路径：`/reader3/*` 与 legacy 完全一致
 - 返回结构：`{"isSuccess": bool, "errorMsg": string, "data": ...}`（camelCase）
 - 认证：`accessToken`（`username:token` query/header），`secure` 模式行为一致
+- legacy 已知 bug 清单（重写时修复）：见 `docs/LEGACY-BUGS.md`（导入订阅源报错 / WebDAV 默认目录）
 - 参数名/语义与 legacy 一致（书源规则格式、搜索参数、分页等）
 - 前端：兼容阶段复用 legacy 构建产物（rust-embed 内嵌 dist），后续再演进
 
