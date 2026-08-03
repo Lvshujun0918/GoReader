@@ -44,6 +44,19 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
                 }
             }
         }
+        // 补迁 RSS 源：rss_sources 空且 data 目录有 rssSource.json 时导入
+        let rss_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_sources")
+            .fetch_one(&storage.pool)
+            .await?;
+        if rss_count == 0 {
+            let namespaces = scan_rss_namespaces(&data_dir);
+            if !namespaces.is_empty() {
+                match migrate_rss_sources(&storage.pool, &data_dir, &namespaces).await {
+                    Ok(n) => tracing::info!("补迁 RSS 源：{} 个（命名空间 {:?}）", n, namespaces),
+                    Err(e) => tracing::warn!("补迁 RSS 源失败：{e}"),
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -66,11 +79,15 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
     // 4. 各命名空间 bookSource.json → book_sources 表（ns = default + 各用户名）
     let source_count = migrate_book_sources(&storage.pool, &data_dir, &namespaces).await?;
 
+    // 5. 各命名空间 rssSource.json → rss_sources 表（ns = default + 各用户名）
+    let rss_count = migrate_rss_sources(&storage.pool, &data_dir, &namespaces).await?;
+
     tracing::info!(
-        "JSON→SQLite 迁移完成：{} 个用户，{} 本书，{} 个书源（备份：{}）",
+        "JSON→SQLite 迁移完成：{} 个用户，{} 本书，{} 个书源，{} 个 RSS 源（备份：{}）",
         usernames.len(),
         book_count,
         source_count,
+        rss_count,
         backup_dir.display()
     );
     Ok(())
@@ -384,4 +401,92 @@ fn scan_source_namespaces(data_dir: &Path) -> Vec<String> {
         }
     }
     namespaces
+}
+
+/// 扫描 data 目录中含 rssSource.json 的命名空间
+fn scan_rss_namespaces(data_dir: &Path) -> Vec<String> {
+    let mut namespaces = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for e in entries.flatten() {
+            if !e.path().is_dir() {
+                continue;
+            }
+            if e.path().join("rssSource.json").exists() {
+                if let Some(name) = e.file_name().to_str() {
+                    namespaces.push(name.to_string());
+                }
+            }
+        }
+    }
+    namespaces
+}
+
+/// 各命名空间 rssSource.json → rss_sources 表（raw_json 原文保底）；返回迁移的 RSS 源总数
+async fn migrate_rss_sources(
+    pool: &SqlitePool,
+    data_dir: &Path,
+    namespaces: &[String],
+) -> Result<usize> {
+    let mut total = 0usize;
+    for ns in namespaces {
+        let path = data_dir.join(ns).join("rssSource.json");
+        if !path.exists() {
+            tracing::debug!("{ns} 无 rssSource.json，跳过");
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("读取 {} 失败（{}），跳过该命名空间", path.display(), e);
+                continue;
+            }
+        };
+        let sources: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("解析 {} 失败（{}），跳过该命名空间", path.display(), e);
+                continue;
+            }
+        };
+        let mut count = 0usize;
+        let mut tx = pool.begin().await?;
+        for value in sources {
+            let mut src: crate::model::RssSource = match serde_json::from_value(value.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("解析 RSS 源失败（{}），跳过", e);
+                    continue;
+                }
+            };
+            if src.source_url.trim().is_empty() {
+                continue; // 无主键的脏数据跳过
+            }
+            if src.source_name.is_empty() {
+                src.source_name = src.source_url.clone();
+            }
+            src.raw_json = Some(value.to_string());
+            src.user_namespace = ns.clone();
+            sqlx::query(
+                r#"
+                INSERT OR REPLACE INTO rss_sources
+                    (rss_source_url, rss_source_name, rss_source_group, enabled,
+                     user_namespace, raw_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+            )
+            .bind(&src.source_url)
+            .bind(&src.source_name)
+            .bind(&src.source_group)
+            .bind(src.enabled)
+            .bind(&src.user_namespace)
+            .bind(&src.raw_json)
+            .execute(&mut *tx)
+            .await?;
+            count += 1;
+        }
+        tx.commit().await?;
+        tracing::info!("迁移 RSS 源 [{ns}]：{} 个", count);
+        total += count;
+    }
+    Ok(total)
 }

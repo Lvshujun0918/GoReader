@@ -1,11 +1,18 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
-import { getBookshelf } from '@/api/bookshelf'
+import {
+  deleteBook,
+  getBookGroups,
+  getBookshelf,
+  saveBookGroup,
+  updateBookGroupId,
+} from '@/api/bookshelf'
 import { uploadLocalBook } from '@/api/upload'
 import { useUserStore } from '@/stores/user'
-import type { Book } from '@/types'
+import type { Book, BookGroup } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
@@ -15,6 +22,24 @@ const loading = ref(true)
 const refreshing = ref(false)
 const keyword = ref('')
 const failedCovers = ref<Set<string>>(new Set())
+
+/* ================= 书架分组 ================= */
+const groups = ref<BookGroup[]>([])
+const activeGroup = ref<number | null>(null) // null=全部
+const groupOpen = ref(false)
+const groupDialogRef = ref<HTMLElement | null>(null)
+const newGroupName = ref('')
+const groupSaving = ref(false)
+
+/* ================= 书卡菜单（右键 / 长按 / hover ⋯） ================= */
+const menuBook = ref<Book | null>(null)
+const menuPos = ref({ x: 0, y: 0 })
+const menuOpen = ref(false)
+const movePanel = ref(false)
+const menuBusy = ref(false)
+let longPressTimer: number | undefined
+let longPressFired = false
+let suppressClick = false
 
 /* ================= 导入本地书 ================= */
 interface ImportItem {
@@ -152,6 +177,7 @@ async function startUpload() {
 }
 
 onBeforeUnmount(() => {
+  if (longPressTimer) clearTimeout(longPressTimer)
   document.body.style.overflow = ''
 })
 
@@ -197,18 +223,34 @@ function coverInitial(name: string): string {
 
 const filtered = computed(() => {
   const kw = keyword.value.trim().toLowerCase()
-  if (!kw) return books.value
-  return books.value.filter(
-    (b) => b.name.toLowerCase().includes(kw) || b.author.toLowerCase().includes(kw),
-  )
+  const gid = activeGroup.value
+  return books.value.filter((b) => {
+    if (gid !== null && b.group !== gid) return false
+    if (!kw) return true
+    return b.name.toLowerCase().includes(kw) || b.author.toLowerCase().includes(kw)
+  })
+})
+
+const emptyText = computed(() => {
+  if (keyword.value) return '没有找到匹配的书籍'
+  if (activeGroup.value !== null) return '该分组下暂无书籍'
+  return '书架空空如也，去搜索添加第一本书吧'
 })
 
 async function load(silent = false) {
   if (!silent) loading.value = true
   else refreshing.value = true
   try {
-    const res = await getBookshelf()
+    const [res, gRes] = await Promise.all([
+      getBookshelf(),
+      getBookGroups().catch(() => ({ isSuccess: false, errorMsg: '', data: [] as BookGroup[] })),
+    ])
     books.value = res.data ?? []
+    groups.value = gRes.data ?? []
+    // 分组被删/失效时回退到「全部」
+    if (activeGroup.value !== null && !groups.value.some((g) => g.id === activeGroup.value)) {
+      activeGroup.value = null
+    }
   } catch {
     // 错误提示已由拦截器统一处理
   } finally {
@@ -224,6 +266,158 @@ function logout() {
 
 function openBook(book: Book) {
   void router.push(`/book/${encodeURIComponent(book.bookUrl)}`)
+}
+
+/* ================= 分组管理 ================= */
+function groupName(id: number): string {
+  return groups.value.find((g) => g.id === id)?.name ?? (id === 0 ? '未分组' : `分组 ${id}`)
+}
+
+function groupCount(id: number): number {
+  return books.value.filter((b) => b.group === id).length
+}
+
+function openGroups() {
+  groupOpen.value = true
+  newGroupName.value = ''
+  document.body.style.overflow = 'hidden'
+  void nextTick(() => groupDialogRef.value?.focus())
+}
+
+function closeGroups() {
+  if (groupSaving.value) return
+  groupOpen.value = false
+  document.body.style.overflow = ''
+}
+
+async function createGroup() {
+  const name = newGroupName.value.trim()
+  if (!name) return
+  groupSaving.value = true
+  try {
+    const res = await saveBookGroup(name)
+    groups.value.push(res.data)
+    newGroupName.value = ''
+    ElMessage.success('已新建分组')
+  } catch {
+    // 错误提示已由拦截器统一处理
+  } finally {
+    groupSaving.value = false
+  }
+}
+
+/** 删除分组：后端暂无删除 API（TODO）。有书先提示移动，无书提示待实现 */
+function deleteGroupHint(g: BookGroup) {
+  const n = groupCount(g.id)
+  if (n > 0) ElMessage.warning(`分组「${g.name}」内有 ${n} 本书，请先移动或移出后再删除`)
+  else ElMessage.info('删除分组接口后端暂未提供（TODO）')
+}
+
+/* ================= 书卡菜单 ================= */
+function openMenuAt(book: Book, x: number, y: number) {
+  menuBook.value = book
+  menuPos.value = {
+    x: Math.min(Math.max(8, x), window.innerWidth - 190),
+    y: Math.min(Math.max(8, y), window.innerHeight - 220),
+  }
+  movePanel.value = false
+  menuOpen.value = true
+}
+
+function openCardMenu(book: Book, e: MouseEvent) {
+  e.preventDefault()
+  e.stopPropagation()
+  openMenuAt(book, e.clientX, e.clientY)
+}
+
+function openMenuAtEl(book: Book, e: MouseEvent) {
+  e.preventDefault()
+  e.stopPropagation()
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  openMenuAt(book, rect.left, rect.bottom + 6)
+}
+
+/** 触屏长按 500ms 唤出菜单（与点击进详情互斥） */
+function onCardTouchStart(book: Book, e: TouchEvent) {
+  longPressFired = false
+  suppressClick = false
+  const t = e.touches[0]
+  longPressTimer = window.setTimeout(() => {
+    longPressFired = true
+    suppressClick = true
+    openMenuAt(book, t.clientX, t.clientY)
+  }, 500)
+}
+
+function onCardTouchEnd() {
+  if (longPressTimer) {
+    clearTimeout(longPressTimer)
+    longPressTimer = undefined
+  }
+}
+
+function onCardClick(book: Book) {
+  if (longPressFired) {
+    longPressFired = false
+    return // 长按已触发菜单，忽略本次点击
+  }
+  openBook(book)
+}
+
+function closeMenu() {
+  menuOpen.value = false
+  menuBook.value = null
+  movePanel.value = false
+}
+
+/** 长按后手指抬起产生的合成 click 会落在遮罩上，吞掉一次防止菜单秒关 */
+function onOverlayClick() {
+  if (suppressClick) {
+    suppressClick = false
+    return
+  }
+  closeMenu()
+}
+
+async function moveToGroup(groupId: number) {
+  const book = menuBook.value
+  if (!book || menuBusy.value) return
+  menuBusy.value = true
+  try {
+    await updateBookGroupId(book.bookUrl, groupId)
+    book.group = groupId
+    ElMessage.success(groupId === 0 ? '已移出分组' : `已移动到「${groupName(groupId)}」`)
+    closeMenu()
+  } catch {
+    // 错误提示已由拦截器统一处理
+  } finally {
+    menuBusy.value = false
+  }
+}
+
+async function removeFromShelf() {
+  const book = menuBook.value
+  if (!book || menuBusy.value) return
+  try {
+    await ElMessageBox.confirm(`确定将《${book.name}》移出书架吗？`, '移出书架', {
+      confirmButtonText: '移出',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return // 用户取消
+  }
+  menuBusy.value = true
+  try {
+    await deleteBook(book.bookUrl)
+    books.value = books.value.filter((b) => b.bookUrl !== book.bookUrl)
+    ElMessage.success('已移出书架')
+    closeMenu()
+  } catch {
+    // 错误提示已由拦截器统一处理
+  } finally {
+    menuBusy.value = false
+  }
 }
 
 onMounted(() => load())
@@ -273,6 +467,7 @@ onMounted(() => load())
       <div class="user-area">
         <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
         <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
+        <button class="nav-link" type="button" @click="router.push('/rss')">RSS</button>
         <span class="user-chip">{{ store.username || '未登录' }}</span>
         <button class="logout-btn" type="button" @click="logout">退出</button>
       </div>
@@ -305,6 +500,41 @@ onMounted(() => load())
         </button>
       </div>
 
+      <!-- 分组栏：全部 / 分组名 胶囊筛选（细字，active 强调色下划线） -->
+      <div class="group-bar">
+        <div class="group-tabs" role="tablist" aria-label="书架分组筛选">
+          <button
+            type="button"
+            class="group-tab"
+            :class="{ active: activeGroup === null }"
+            @click="activeGroup = null"
+          >
+            全部
+          </button>
+          <button
+            v-for="g in groups"
+            :key="g.id"
+            type="button"
+            class="group-tab"
+            :class="{ active: activeGroup === g.id }"
+            @click="activeGroup = g.id"
+          >
+            {{ g.name }}
+          </button>
+        </div>
+        <button class="group-manage" type="button" @click="openGroups">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 7h10" />
+            <path d="M18 7h2" />
+            <circle cx="16" cy="7" r="2" />
+            <path d="M4 17h2" />
+            <path d="M10 17h10" />
+            <circle cx="8" cy="17" r="2" />
+          </svg>
+          <span>管理</span>
+        </button>
+      </div>
+
       <!-- 加载骨架（浅灰静置块） -->
       <div v-if="loading" class="book-grid" aria-label="加载中">
         <div v-for="i in 12" :key="i" class="skeleton-card">
@@ -316,14 +546,33 @@ onMounted(() => load())
 
       <!-- 空状态 -->
       <div v-else-if="filtered.length === 0" class="empty-state">
-        <p class="empty-text">
-          {{ keyword ? '没有找到匹配的书籍' : '书架空空如也，去搜索添加第一本书吧' }}
-        </p>
+        <p class="empty-text">{{ emptyText }}</p>
       </div>
 
       <!-- 书封网格（大间距） -->
       <div v-else class="book-grid">
-        <div v-for="book in filtered" :key="book.bookUrl" class="book-card" @click="openBook(book)">
+        <div
+          v-for="book in filtered"
+          :key="book.bookUrl"
+          class="book-card"
+          @click="onCardClick(book)"
+          @contextmenu="openCardMenu(book, $event)"
+          @touchstart.passive="onCardTouchStart(book, $event)"
+          @touchend="onCardTouchEnd"
+          @touchcancel="onCardTouchEnd"
+        >
+          <button
+            class="card-menu-btn"
+            type="button"
+            title="更多操作"
+            @click="openMenuAtEl(book, $event)"
+          >
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <circle cx="5" cy="12" r="1.6" />
+              <circle cx="12" cy="12" r="1.6" />
+              <circle cx="19" cy="12" r="1.6" />
+            </svg>
+          </button>
           <div class="cover-wrap">
             <img
               v-if="hasCover(book)"
@@ -452,6 +701,122 @@ onMounted(() => load())
                 >
                   {{ uploadBusy ? '导入中…' : hasPending ? `开始导入（${hasPendingCount}）` : '开始导入' }}
                 </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 书卡菜单（右键 / 长按 / hover ⋯） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="menuOpen && menuBook" class="ctx-overlay" @click="onOverlayClick" @contextmenu.prevent="closeMenu">
+          <div class="ctx-menu" :style="{ left: menuPos.x + 'px', top: menuPos.y + 'px' }" @click.stop>
+            <template v-if="!movePanel">
+              <button class="ctx-item" type="button" @click="movePanel = true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h4L12 6.5h6.5A1.5 1.5 0 0 1 20 8v10.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5z" />
+                </svg>
+                移动到分组
+              </button>
+              <button class="ctx-item danger" type="button" :disabled="menuBusy" @click="removeFromShelf">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 7h16" />
+                  <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                  <path d="M6.5 7l.8 12a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12" />
+                </svg>
+                移出书架
+              </button>
+            </template>
+            <template v-else>
+              <button class="ctx-item" type="button" @click="movePanel = false">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M15 6l-6 6 6 6" />
+                </svg>
+                返回
+              </button>
+              <div class="ctx-title">移动到分组</div>
+              <button class="ctx-item" type="button" :disabled="menuBusy" @click="moveToGroup(0)">未分组</button>
+              <button
+                v-for="g in groups"
+                :key="g.id"
+                class="ctx-item"
+                type="button"
+                :disabled="menuBusy"
+                @click="moveToGroup(g.id)"
+              >
+                {{ g.name }}
+              </button>
+            </template>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 分组管理弹窗（极简：新建 + 列表 + 删除提示） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="groupOpen" class="dlg-overlay" @click.self="closeGroups">
+          <div
+            ref="groupDialogRef"
+            class="dlg"
+            role="dialog"
+            aria-modal="true"
+            aria-label="分组管理"
+            tabindex="-1"
+            @keydown.esc="closeGroups"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">分组管理</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="groupSaving" @click="closeGroups">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+
+            <!-- 新建分组 -->
+            <div class="group-create">
+              <input
+                v-model="newGroupName"
+                class="group-input"
+                type="text"
+                placeholder="新分组名称"
+                maxlength="20"
+                spellcheck="false"
+                @keydown.enter="createGroup"
+              />
+              <button
+                class="accent-btn"
+                type="button"
+                :disabled="groupSaving || !newGroupName.trim()"
+                @click="createGroup"
+              >
+                {{ groupSaving ? '创建中…' : '新建' }}
+              </button>
+            </div>
+
+            <!-- 分组列表：名称 + 本书数 + 删除 -->
+            <ul v-if="groups.length" class="group-list">
+              <li v-for="g in groups" :key="g.id" class="group-row">
+                <span class="group-row-name" :title="g.name">{{ g.name }}</span>
+                <span class="group-row-count">{{ groupCount(g.id) }} 本</span>
+                <button class="group-del" type="button" title="删除分组" @click="deleteGroupHint(g)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 7h16" />
+                    <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                    <path d="M6.5 7l.8 12a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12" />
+                  </svg>
+                </button>
+              </li>
+            </ul>
+            <p v-else class="group-empty">还没有分组，输入名称新建一个吧</p>
+
+            <div class="dlg-foot">
+              <span class="overall">删除分组接口后端暂未提供（TODO）</span>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="groupSaving" @click="closeGroups">关闭</button>
               </div>
             </div>
           </div>
@@ -710,6 +1075,7 @@ onMounted(() => load())
 }
 
 .book-card {
+  position: relative;
   cursor: pointer;
   transition: transform 0.2s ease;
 }
@@ -1129,6 +1495,281 @@ onMounted(() => load())
 .dlg-leave-to .dlg {
   opacity: 0;
   transform: translateY(6px);
+}
+
+/* ================= 分组栏（胶囊筛选：细字 + 强调色下划线） ================= */
+.group-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: -22px 0 32px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.group-bar::-webkit-scrollbar {
+  display: none;
+}
+.group-tabs {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  flex: 1;
+  min-width: 0;
+}
+.group-tab {
+  position: relative;
+  flex-shrink: 0;
+  padding: 4px 2px 8px;
+  border: none;
+  background: none;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.group-tab:hover {
+  color: var(--text-2);
+}
+.group-tab.active {
+  color: var(--accent);
+  font-weight: 400;
+}
+.group-tab.active::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.group-manage {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
+.group-manage:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.group-manage svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* 书卡右上角 ⋯（hover 显现） */
+.card-menu-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  color: var(--text-2);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 0.2s ease,
+    color 0.2s ease;
+}
+.book-card:hover .card-menu-btn,
+.card-menu-btn:focus-visible {
+  opacity: 1;
+}
+.card-menu-btn:hover {
+  color: var(--accent);
+}
+.card-menu-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* ================= 书卡菜单（右键 / 长按 / ⋯） ================= */
+.ctx-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+}
+.ctx-menu {
+  position: fixed;
+  z-index: 121;
+  min-width: 168px;
+  max-width: 220px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.1);
+}
+.ctx-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+.ctx-item:hover:not(:disabled) {
+  color: var(--text-1);
+  background: var(--hover);
+}
+.ctx-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.ctx-item.danger {
+  color: #cf4444;
+}
+.ctx-item.danger:hover:not(:disabled) {
+  color: #b33535;
+  background: rgba(207, 68, 68, 0.07);
+}
+.ctx-item svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+}
+.ctx-title {
+  padding: 4px 10px 8px;
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+
+/* ================= 分组管理弹窗 ================= */
+.group-create {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.group-input {
+  flex: 1;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+.group-input::placeholder {
+  color: var(--text-3);
+  font-weight: 300;
+}
+.group-input:focus {
+  border-color: var(--accent);
+}
+.group-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.group-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.group-row-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.group-row-count {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.group-del {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.group-del:hover {
+  color: #cf4444;
+  background: rgba(207, 68, 68, 0.08);
+}
+.group-del svg {
+  width: 12px;
+  height: 12px;
+}
+.group-empty {
+  margin: 0;
+  padding: 28px 0;
+  text-align: center;
+  font-size: 12.5px;
+  font-weight: 300;
+  color: var(--text-3);
 }
 
 /* ================= 响应式 ================= */

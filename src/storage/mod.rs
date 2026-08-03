@@ -183,6 +183,39 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS rss_sources (
+            rss_source_url TEXT PRIMARY KEY,
+            rss_source_name TEXT DEFAULT '',
+            rss_source_group TEXT,
+            enabled INTEGER DEFAULT 1,
+            user_namespace TEXT DEFAULT '',
+            raw_json TEXT
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // RSS 文章缓存（url 主键；content 为 feed 正文/摘要或抓取网页提取的正文）
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS rss_articles (
+            url TEXT PRIMARY KEY,
+            source_url TEXT DEFAULT '',
+            title TEXT DEFAULT '',
+            author TEXT DEFAULT '',
+            time INTEGER DEFAULT 0,
+            content TEXT,
+            cover TEXT,
+            user_namespace TEXT DEFAULT ''
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS book_chapters (
             book_url TEXT NOT NULL,
             chapter_index INTEGER NOT NULL,
@@ -401,6 +434,113 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected())
+    }
+
+    // ---------------- RSS ----------------
+
+    /// RSS 源列表（按命名空间；无则回退 default，同 get_book_sources 语义）
+    pub async fn get_rss_sources(&self, ns: &str) -> Result<Vec<crate::model::RssSource>> {
+        let rows = sqlx::query_as::<_, crate::model::RssSource>(
+            "SELECT * FROM rss_sources WHERE user_namespace = ?1 ORDER BY rss_source_name",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        if !rows.is_empty() || ns == "default" {
+            return Ok(rows);
+        }
+        sqlx::query_as::<_, crate::model::RssSource>(
+            "SELECT * FROM rss_sources WHERE user_namespace = 'default' ORDER BY rss_source_name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// 按 URL 查 RSS 源（用户命名空间 + default 回退）
+    pub async fn find_rss_source(
+        &self,
+        ns: &str,
+        source_url: &str,
+    ) -> Result<Option<crate::model::RssSource>> {
+        let r = sqlx::query_as::<_, crate::model::RssSource>(
+            "SELECT * FROM rss_sources WHERE user_namespace = ?1 AND rss_source_url = ?2",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .fetch_optional(&self.pool)
+        .await?;
+        if r.is_some() || ns == "default" {
+            return Ok(r);
+        }
+        sqlx::query_as::<_, crate::model::RssSource>(
+            "SELECT * FROM rss_sources WHERE user_namespace = 'default' AND rss_source_url = ?1",
+        )
+        .bind(source_url)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// 保存 RSS 源（INSERT OR REPLACE；raw_json 存完整 JSON 原文）
+    pub async fn save_rss_source(&self, ns: &str, source: &crate::model::RssSource) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO rss_sources            (rss_source_url, rss_source_name, rss_source_group, enabled, user_namespace, raw_json)            VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&source.source_url)
+        .bind(&source.source_name)
+        .bind(&source.source_group)
+        .bind(source.enabled)
+        .bind(ns)
+        .bind(&source.raw_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 删除 RSS 源（按 URL，仅限本命名空间）；返回受影响行数
+    pub async fn delete_rss_source(&self, ns: &str, source_url: &str) -> Result<u64> {
+        let r = sqlx::query(
+            "DELETE FROM rss_sources WHERE user_namespace = ?1 AND rss_source_url = ?2",
+        )
+        .bind(ns)
+        .bind(source_url)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 批量保存 RSS 文章（单事务，INSERT OR REPLACE 按 url 主键去重）
+    pub async fn save_rss_articles(&self, ns: &str, articles: &[crate::model::RssArticle]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for a in articles {
+            sqlx::query(
+                "INSERT OR REPLACE INTO rss_articles            (url, source_url, title, author, time, content, cover, user_namespace)            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .bind(&a.url)
+            .bind(&a.source_url)
+            .bind(&a.title)
+            .bind(&a.author)
+            .bind(a.time)
+            .bind(&a.content)
+            .bind(&a.cover)
+            .bind(ns)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 按 URL 查 RSS 文章（getRssArticle 正文/缓存用）
+    pub async fn get_rss_article(&self, url: &str) -> Result<Option<crate::model::RssArticle>> {
+        let r = sqlx::query_as::<_, crate::model::RssArticle>(
+            "SELECT * FROM rss_articles WHERE url = ?1",
+        )
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(r)
     }
 
     /// 保存章节（本地书）
@@ -1630,5 +1770,116 @@ mod tests {
         assert_eq!(storage.update_book_group_id("default", "https://nope.com", g1.id).await.unwrap(), 0);
 
         cleanup(storage, "bookgroup").await;
+    }
+
+    /// RSS 源：保存（含 raw_json 原文）→ 查询 → 覆盖保存 → 删除；命名空间回退 default
+    #[tokio::test]
+    async fn test_rss_source_roundtrip() {
+        let storage = test_storage("rsssrc").await;
+        let s = crate::model::RssSource {
+            source_url: "https://feed.example.com/rss".into(),
+            source_name: "示例源".into(),
+            source_group: Some("科技".into()),
+            enabled: true,
+            raw_json: Some(
+                r#"{"sourceUrl":"https://feed.example.com/rss","sourceName":"示例源","sourceGroup":"科技","enabled":true,"sortUrl":null,"ruleContent":"css.article"}"#
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        storage.save_rss_source("default", &s).await.unwrap();
+
+        let got = storage
+            .find_rss_source("default", "https://feed.example.com/rss")
+            .await
+            .unwrap()
+            .expect("保存后应能查到");
+        assert_eq!(got.source_name, "示例源");
+        assert_eq!(got.source_group.as_deref(), Some("科技"));
+        assert!(got.enabled);
+        assert_eq!(got.user_namespace, "default");
+        let raw: serde_json::Value =
+            serde_json::from_str(got.raw_json.as_deref().expect("raw_json 应已写入")).unwrap();
+        assert_eq!(raw["sourceUrl"], "https://feed.example.com/rss");
+        assert_eq!(raw["ruleContent"], "css.article", "raw_json 应保留完整字段");
+
+        // 覆盖保存（改名 + 禁用）→ INSERT OR REPLACE 生效
+        let mut s2 = s.clone();
+        s2.source_name = "示例源v2".into();
+        s2.enabled = false;
+        storage.save_rss_source("default", &s2).await.unwrap();
+        let got2 = storage
+            .find_rss_source("default", "https://feed.example.com/rss")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got2.source_name, "示例源v2");
+        assert!(!got2.enabled);
+
+        // 列表（default 直接返回；其他命名空间回退 default）
+        let list = storage.get_rss_sources("default").await.unwrap();
+        assert_eq!(list.len(), 1);
+        let fb = storage.get_rss_sources("ghost").await.unwrap();
+        assert_eq!(fb.len(), 1);
+        assert_eq!(fb[0].source_name, "示例源v2", "无源命名空间回退 default");
+
+        // 删除 → 查不到
+        assert_eq!(
+            storage.delete_rss_source("default", "https://feed.example.com/rss").await.unwrap(),
+            1
+        );
+        assert!(storage
+            .find_rss_source("default", "https://feed.example.com/rss")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage.delete_rss_source("default", "https://feed.example.com/rss").await.unwrap(),
+            0,
+            "重复删除影响 0 行"
+        );
+
+        cleanup(storage, "rsssrc").await;
+    }
+
+    /// RSS 文章：批量保存（按 url 去重）→ 按 url 查询；命名空间隔离
+    #[tokio::test]
+    async fn test_rss_articles_roundtrip() {
+        let storage = test_storage("rssart").await;
+        let article = |url: &str, title: &str, time: i64| crate::model::RssArticle {
+            url: url.into(),
+            source_url: "https://feed.example.com/rss".into(),
+            title: title.into(),
+            author: "作者".into(),
+            time,
+            content: Some("正文".into()),
+            cover: Some("https://img.example.com/1.jpg".into()),
+            ..Default::default()
+        };
+        let articles = vec![article("https://feed.example.com/a", "甲", 1000), article("https://feed.example.com/b", "乙", 2000)];
+        storage.save_rss_articles("default", &articles).await.unwrap();
+
+        let got = storage.get_rss_article("https://feed.example.com/a").await.unwrap().unwrap();
+        assert_eq!(got.title, "甲");
+        assert_eq!(got.source_url, "https://feed.example.com/rss");
+        assert_eq!(got.time, 1000);
+        assert_eq!(got.content.as_deref(), Some("正文"));
+        assert_eq!(got.cover.as_deref(), Some("https://img.example.com/1.jpg"));
+        assert_eq!(got.user_namespace, "default");
+
+        // 同 url 覆盖（刷新 feed 时去重更新）
+        storage
+            .save_rss_articles("default", &[article("https://feed.example.com/a", "甲v2", 3000)])
+            .await
+            .unwrap();
+        let again = storage.get_rss_article("https://feed.example.com/a").await.unwrap().unwrap();
+        assert_eq!(again.title, "甲v2");
+        assert_eq!(again.time, 3000);
+        assert_eq!(storage.get_rss_article("https://feed.example.com/b").await.unwrap().unwrap().title, "乙");
+
+        // 不存在的 url
+        assert!(storage.get_rss_article("https://feed.example.com/nope").await.unwrap().is_none());
+
+        cleanup(storage, "rssart").await;
     }
 }

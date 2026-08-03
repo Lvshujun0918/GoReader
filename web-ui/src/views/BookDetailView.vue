@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { getBookshelf } from '@/api/bookshelf'
+import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { getBookInfo } from '@/api/books'
 import type { Book, BookInfo } from '@/types'
 
@@ -11,11 +11,17 @@ const router = useRouter()
 /** /book/:url —— vue-router 已自动解码 */
 const bookUrl = computed(() => String(route.params.url ?? ''))
 
+/** 非书架书的书源信息：入口（搜索结果等）通过 query 传入 */
+const queryOrigin = computed(() => String(route.query.origin ?? ''))
+const queryOriginName = computed(() => String(route.query.originName ?? ''))
+
 const shelfBook = ref<Book | null>(null)
 const info = ref<BookInfo | null>(null)
 const loading = ref(true)
 const loadFailed = ref(false)
+const errorMsg = ref('')
 const coverFailed = ref(false)
+const saving = ref(false)
 
 /** 展示数据：实时详情优先，书架数据兜底 */
 const display = computed(() => ({
@@ -32,27 +38,93 @@ function coverInitial(name: string): string {
   return ch ? ch.toUpperCase() : '书'
 }
 
+/** 本地书（local:// 或文件型 .txt）：后端 local 分支直查书架，不依赖书源 */
+function isLocalBookUrl(url: string): boolean {
+  return url.startsWith('local://') || url.endsWith('.txt')
+}
+
 async function load() {
   loading.value = true
   loadFailed.value = false
+  errorMsg.value = ''
+  info.value = null
   try {
-    // 详情接口需要 bookSource=book.origin，先从书架定位本书
+    // ① 先查书架定位本书
     const res = await getBookshelf()
     const found = (res.data ?? []).find((b) => b.bookUrl === bookUrl.value) ?? null
     shelfBook.value = found
+
     if (found?.origin) {
+      // ② 书架书：详情接口 bookSource=book.origin，实时详情优先，失败用书架数据兜底
       try {
         const infoRes = await getBookInfo(bookUrl.value, found.origin)
         if (infoRes.isSuccess) info.value = infoRes.data
       } catch {
         // 实时详情失败：用书架数据兜底展示
       }
+    } else if (isLocalBookUrl(bookUrl.value)) {
+      // ③ 本地书：后端 local 分支直查书架返回（无需 bookSource；不在书架则报错）
+      try {
+        const infoRes = await getBookInfo(bookUrl.value, '')
+        if (infoRes.isSuccess) info.value = infoRes.data
+      } catch (err) {
+        loadFailed.value = true
+        errorMsg.value = err instanceof Error ? err.message : '未找到这本书（可能不在书架中）'
+      }
+    } else if (queryOrigin.value) {
+      // ④ 非书架书：直接调详情接口（后端已支持非书架书，bookSource=入口传入的 origin）
+      try {
+        const infoRes = await getBookInfo(bookUrl.value, queryOrigin.value)
+        if (infoRes.isSuccess) info.value = infoRes.data
+      } catch (err) {
+        loadFailed.value = true
+        errorMsg.value = err instanceof Error ? err.message : '获取详情失败'
+      }
+    } else {
+      // ⑤ 非书架书且无书源信息：无法获取详情
+      loadFailed.value = true
+      errorMsg.value = '未找到这本书（可能不在书架中）'
     }
-    if (!found) loadFailed.value = true
   } catch {
     loadFailed.value = true
+    errorMsg.value = '书架拉取失败，请稍后重试'
   } finally {
     loading.value = false
+  }
+}
+
+/** 由详情信息组装完整 Book JSON（saveBook 入架 body：type/group 用默认值 0） */
+function buildShelfBook(): Book {
+  const i = info.value
+  return {
+    bookUrl: i?.bookUrl || bookUrl.value,
+    tocUrl: i?.tocUrl || '',
+    origin: i?.origin || queryOrigin.value,
+    originName: i?.originName || queryOriginName.value,
+    name: i?.name || '',
+    author: i?.author || '',
+    kind: i?.kind ?? null,
+    coverUrl: i?.coverUrl ?? null,
+    intro: i?.intro ?? null,
+    charset: null,
+    type: 0,
+    group: 0,
+    latestChapterTitle: i?.latestChapterTitle ?? null,
+    latestChapterTime: 0,
+  }
+}
+
+/** 加入书架（非书架书）：POST /reader3/saveBook，成功即视为书架书 */
+async function addToShelf() {
+  if (saving.value || !info.value) return
+  saving.value = true
+  try {
+    await saveBook(buildShelfBook())
+    shelfBook.value = buildShelfBook()
+  } catch {
+    // 失败提示由 request.ts 统一 toast，按钮保持「加入书架」
+  } finally {
+    saving.value = false
   }
 }
 
@@ -90,10 +162,13 @@ onMounted(load)
         </div>
       </div>
 
-      <!-- 错误态：不在书架 / 书架拉取失败 -->
+      <!-- 错误态：不在书架 / 书源获取失败 / 书架拉取失败 -->
       <div v-else-if="loadFailed" class="empty-state">
-        <p class="empty-text">未找到这本书（可能不在书架中）</p>
-        <button class="ghost-btn" type="button" @click="router.push('/')">返回书架</button>
+        <p class="empty-text">{{ errorMsg || '未找到这本书（可能不在书架中）' }}</p>
+        <div class="empty-actions">
+          <button class="ghost-btn" type="button" @click="load">重试</button>
+          <button class="ghost-btn" type="button" @click="router.push('/')">返回书架</button>
+        </div>
       </div>
 
       <!-- 详情 -->
@@ -123,7 +198,11 @@ onMounted(load)
           <p v-if="display.intro" class="book-intro">{{ display.intro }}</p>
 
           <div class="actions">
-            <button class="read-btn" type="button" @click="startReading">开始阅读</button>
+            <!-- 书架书 → 开始阅读；非书架书 → 加入书架（入架成功后变开始阅读） -->
+            <button v-if="shelfBook" class="read-btn" type="button" @click="startReading">开始阅读</button>
+            <button v-else class="add-btn" type="button" :disabled="saving" @click="addToShelf">
+              加入书架
+            </button>
           </div>
         </div>
       </div>
@@ -316,6 +395,31 @@ onMounted(load)
   background: var(--accent-deep);
 }
 
+/* 加入书架：细字描边 → hover 强调色 */
+.add-btn {
+  padding: 13px 44px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 14.5px;
+  font-weight: 300;
+  letter-spacing: 4px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
+.add-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.add-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 /* ================= 骨架 / 空态 ================= */
 .skeleton-cover {
   width: 220px;
@@ -354,6 +458,11 @@ onMounted(load)
   font-weight: 300;
   letter-spacing: 1px;
   color: var(--text-3);
+}
+.empty-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
 }
 .ghost-btn {
   padding: 9px 28px;

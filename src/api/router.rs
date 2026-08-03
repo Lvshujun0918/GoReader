@@ -100,6 +100,12 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/deleteBookSource", post(delete_book_source))
         .route("/reader3/deleteBookSources", post(delete_book_sources))
         .route("/reader3/deleteAllBookSources", post(delete_all_book_sources))
+        // RSS 模块（兼容 legacy rss 路由）
+        .route("/reader3/getRssSources", get(get_rss_sources).post(get_rss_sources))
+        .route("/reader3/saveRssSource", post(save_rss_source))
+        .route("/reader3/deleteRssSource", post(delete_rss_source))
+        .route("/reader3/getRssArticles", get(get_rss_articles).post(get_rss_articles))
+        .route("/reader3/getRssArticle", get(get_rss_article).post(get_rss_article))
         .route("/reader3/searchBook", get(search_book).post(search_book))
         .route("/reader3/searchBookMulti", get(search_book_multi).post(search_book_multi))
         .route("/reader3/getBookInfo", get(get_book_info).post(get_book_info))
@@ -435,6 +441,206 @@ async fn delete_all_book_sources(
             Json(ReturnData::err("删除失败"))
         }
     }
+}
+
+// ---------------- RSS ----------------
+
+/// GET/POST /reader3/getRssSources：RSS 源列表（用户命名空间，无则回退 default）
+async fn get_rss_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = body;
+    match state.storage.get_rss_sources(&namespace).await {
+        Ok(list) => {
+            let arr: Vec<Value> = list.iter().map(rss_source_json).collect();
+            Json(ReturnData::ok(Value::Array(arr)))
+        }
+        Err(e) => {
+            tracing::error!("getRssSources [{namespace}] 失败: {e}");
+            Json(ReturnData::err("系统错误"))
+        }
+    }
+}
+
+/// POST /reader3/saveRssSource：保存 RSS 源（body = 完整 RSS 源 JSON，sourceUrl/sourceName 必填）
+async fn save_rss_source(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let Some(body) = body else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    let body_str = String::from_utf8_lossy(&body).to_string();
+    let mut source: crate::model::RssSource = match serde_json::from_slice(&body) {
+        Ok(s) => s,
+        Err(_) => return Json(ReturnData::err("参数错误")),
+    };
+    if source.source_url.trim().is_empty() {
+        return Json(ReturnData::err("RSS链接不能为空"));
+    }
+    if source.source_name.trim().is_empty() {
+        return Json(ReturnData::err("RSS名称不能为空"));
+    }
+    // raw_json：完整 JSON 原文保底（未知字段不丢，列表接口原样回吐）
+    source.raw_json = Some(body_str);
+    match state.storage.save_rss_source(&namespace, &source).await {
+        Ok(()) => Json(ReturnData::ok(Value::String(String::new()))),
+        Err(e) => {
+            tracing::error!("saveRssSource 失败: {e}");
+            Json(ReturnData::err("保存失败"))
+        }
+    }
+}
+
+/// POST /reader3/deleteRssSource：删除 RSS 源（rssSourceUrl 参数）
+async fn delete_rss_source(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json: Option<Value> = body
+        .as_ref()
+        .and_then(|b| serde_json::from_slice(b).ok());
+    let url = param_of(&params, body_json.as_ref(), "rssSourceUrl");
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    match state.storage.delete_rss_source(&namespace, &url).await {
+        Ok(_) => Json(ReturnData::ok(Value::String(String::new()))),
+        Err(e) => {
+            tracing::error!("deleteRssSource 失败: {e}");
+            Json(ReturnData::err("删除失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/getRssArticles：抓取 feed → 解析文章列表 → 入库 → 返回
+async fn get_rss_articles(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json: Option<Value> = body
+        .as_ref()
+        .and_then(|b| serde_json::from_slice(b).ok());
+    // rssSourceUrl 为主参数（兼容 legacy sourceUrl）
+    let mut source_url = param_of(&params, body_json.as_ref(), "rssSourceUrl");
+    if source_url.is_empty() {
+        source_url = param_of(&params, body_json.as_ref(), "sourceUrl");
+    }
+    let page = body_json
+        .as_ref()
+        .and_then(|b| b.get("page").and_then(|v| v.as_i64()))
+        .or_else(|| params.get("page").and_then(|v| v.parse().ok()))
+        .unwrap_or(1);
+    if source_url.is_empty() {
+        return Json(ReturnData::err("RSS源链接不能为空"));
+    }
+    let Some(source) = state.storage.find_rss_source(&namespace, &source_url).await.ok().flatten() else {
+        return Json(ReturnData::err("RSS源不存在"));
+    };
+    match crate::service::rss::fetch_articles(&source, page).await {
+        Ok(articles) => {
+            if let Err(e) = state.storage.save_rss_articles(&namespace, &articles).await {
+                tracing::warn!("getRssArticles 入库失败: {e}");
+            }
+            Json(ReturnData::ok(serde_json::to_value(&articles).unwrap_or(Value::Null)))
+        }
+        Err(e) => {
+            tracing::error!("getRssArticles 抓取失败 [{}]: {e}", source.source_url);
+            Json(ReturnData::err("抓取失败"))
+        }
+    }
+}
+
+/// GET/POST /reader3/getRssArticle：文章正文（url 参数；feed 已带 content 直接返回，
+/// 否则抓取文章网页用 CSS 选择器提取正文）
+async fn get_rss_article(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let _ = namespace;
+    let body_json: Option<Value> = body
+        .as_ref()
+        .and_then(|b| serde_json::from_slice(b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    if url.is_empty() {
+        return Json(ReturnData::err("RSS文章链接不能为空"));
+    }
+    // 已入库且带 content → 直接返回（content 字段随序列化输出）
+    if let Ok(Some(article)) = state.storage.get_rss_article(&url).await {
+        if article.content.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+            return Json(ReturnData::ok(serde_json::to_value(&article).unwrap_or(Value::Null)));
+        }
+    }
+    // 未带正文 → 抓取网页提取正文
+    match crate::service::rss::fetch_web_content(&url).await {
+        Ok(content) => {
+            let article = crate::model::RssArticle {
+                url: url.clone(),
+                title: String::new(),
+                content: Some(content),
+                ..Default::default()
+            };
+            Json(ReturnData::ok(serde_json::to_value(&article).unwrap_or(Value::Null)))
+        }
+        Err(e) => {
+            tracing::error!("getRssArticle 正文提取失败 [{url}]: {e}");
+            Json(ReturnData::err("正文提取失败"))
+        }
+    }
+}
+
+/// RSS 源 JSON 输出：raw_json（完整 legacy 字段）为基底，表列字段覆盖（名称/分组/启用状态）
+fn rss_source_json(source: &crate::model::RssSource) -> Value {
+    let mut v = source
+        .raw_json
+        .as_deref()
+        .and_then(|r| serde_json::from_str::<Value>(r).ok())
+        .unwrap_or_else(|| serde_json::to_value(source).unwrap_or(Value::Null));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("sourceUrl".into(), Value::String(source.source_url.clone()));
+        obj.insert("sourceName".into(), Value::String(source.source_name.clone()));
+        obj.insert(
+            "sourceGroup".into(),
+            source
+                .source_group
+                .as_ref()
+                .map(|g| Value::String(g.clone()))
+                .unwrap_or(Value::Null),
+        );
+        obj.insert("enabled".into(), Value::Bool(source.enabled));
+    }
+    v
 }
 
 /// POST/GET /reader3/searchBook：单书源搜索（bookSource 参数：书源 URL 或完整 JSON）

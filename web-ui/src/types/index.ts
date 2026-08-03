@@ -86,6 +86,34 @@ export interface SearchBook {
   [key: string]: unknown
 }
 
+/** 书架分组（/reader3/getBookGroups → BookGroup，camelCase；books.group 存分组 id，0=未分组） */
+export interface BookGroup {
+  id: number
+  name: string
+  order: number
+  [key: string]: unknown
+}
+
+/** RSS 订阅源（/reader3/getRssSources → RssSource，legacy 兼容 camelCase） */
+export interface RssSource {
+  rssSourceUrl: string
+  rssSourceName: string
+  rssSourceGroup?: string | null
+  enabled: boolean
+  [key: string]: unknown
+}
+
+/** RSS 文章（/reader3/getRssArticles → data 数组；content 为正文 HTML，getRssArticle 单独拉取） */
+export interface RssArticle {
+  url: string
+  title: string
+  author?: string | null
+  time: number
+  content?: string | null
+  cover?: string | null
+  [key: string]: unknown
+}
+
 /** 书源（/reader3/getBookSources → BookSource，legado 兼容 camelCase） */
 export interface BookSource {
   bookSourceUrl: string

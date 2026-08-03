@@ -5,4 +5,5 @@ pub mod crawler;
 pub mod epub;
 pub mod explore;
 pub mod local_book;
+pub mod rss;
 pub mod search;
