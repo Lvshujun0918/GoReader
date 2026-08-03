@@ -1,0 +1,151 @@
+/* ============================================================
+   夜读 · 全局主题（现代深色阅读主题 / 渐变 + 玻璃拟态）
+   ============================================================ */
+
+:root {
+  --bg-base: #0a0d14;
+  --glass: rgba(255, 255, 255, 0.055);
+  --glass-strong: rgba(255, 255, 255, 0.08);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --text-1: #eef1f8;
+  --text-2: rgba(238, 241, 248, 0.64);
+  --text-3: rgba(238, 241, 248, 0.38);
+  --brand-1: #6366f1;
+  --brand-2: #8b5cf6;
+  --brand-3: #22d3ee;
+  --grad-brand: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #22d3ee 120%);
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --shadow-card: 0 18px 40px -18px rgba(0, 0, 0, 0.65);
+  --shadow-glow: 0 12px 32px -12px rgba(99, 102, 241, 0.55);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+  color: var(--text-1);
+  font-family:
+    'Segoe UI', 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei',
+    system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background-color: var(--bg-base);
+  background-image:
+    radial-gradient(1100px 720px at 12% -12%, rgba(99, 102, 241, 0.2), transparent 60%),
+    radial-gradient(900px 620px at 108% 8%, rgba(34, 211, 238, 0.1), transparent 55%),
+    radial-gradient(1000px 820px at 50% 118%, rgba(139, 92, 246, 0.14), transparent 62%);
+  background-attachment: fixed;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+::selection {
+  background: rgba(99, 102, 241, 0.45);
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.13);
+  border-radius: 8px;
+  border: 2.5px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.24);
+  background-clip: content-box;
+  border: 2.5px solid transparent;
+}
+
+/* ---------- 玻璃拟态工具 ---------- */
+.glass {
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+}
+
+/* ---------- 动画 ---------- */
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: -420px 0;
+  }
+  to {
+    background-position: 420px 0;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.fade-up {
+  opacity: 0;
+  animation: fade-up 0.65s var(--ease-out) forwards;
+}
+
+/* 页面切换 */
+.page-enter-active,
+.page-leave-active {
+  transition: opacity 0.22s ease, transform 0.22s ease;
+}
+.page-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.page-leave-to {
+  opacity: 0;
+}
+
+/* ---------- Element Plus 深色微调 ---------- */
+.el-message {
+  border-radius: 12px !important;
+  backdrop-filter: blur(12px);
+}
+
+/* ---------- Logo ---------- */
+.logo-mark {
+  width: 44px;
+  height: 44px;
+  display: block;
+  filter: drop-shadow(0 6px 16px rgba(99, 102, 241, 0.45));
+}
