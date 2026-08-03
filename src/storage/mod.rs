@@ -383,10 +383,7 @@ impl Storage {
     pub async fn list_books(&self, namespace: &str) -> Result<Vec<Book>> {
         let books = sqlx::query_as::<_, Book>(
             r#"
-            SELECT book_url, name, author, origin, origin_name, kind, cover_url, intro,
-                   toc_url, charset, custom_cover_url, can_update, dur_chapter_index,
-                   dur_chapter_pos, dur_chapter_time, dur_chapter_title, group_name,
-                   type, last_check_error
+            SELECT *
             FROM books
             WHERE user_namespace = ?1
             ORDER BY rowid ASC
