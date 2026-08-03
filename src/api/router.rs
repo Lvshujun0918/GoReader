@@ -75,8 +75,8 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         // 弱网优化：响应压缩（gzip/brotli）
         .layer(tower_http::compression::CompressionLayer::new())
         .route("/opds", get(opds_dispatch))
+        .route("/opds-save", post(opds_save_post).get(opds_save_post))
         .route("/opds/*rest", get(opds_dispatch))
-        .route("/opds/save/*id", post(opds_save_post))
         // OPDS 独立账号设置（secure 模式外亦可配置，作用于 OPDS Basic 认证）
         .route("/reader3/getOpdsSettings", get(get_opds_settings).post(get_opds_settings))
         .route("/reader3/saveOpdsSettings", post(save_opds_settings))
@@ -3787,7 +3787,6 @@ fn opds_404() -> Response {
 /// POST /opds/save/{bookId}：OPDS-PSE 保存进度（body/query：progress/position/total/chapterIndex/chapterTitle/timestamp）
 async fn opds_save_post(
     State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
@@ -3797,6 +3796,7 @@ async fn opds_save_post(
         Err(resp) => return resp,
     };
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let id = param_of(&params, body_json.as_ref(), "bookId");
     let f64_of = |keys: &[&str]| -> Option<f64> {
         for k in keys {
             if let Some(v) = params.get(*k).and_then(|v| v.parse::<f64>().ok()) {

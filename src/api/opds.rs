@@ -801,7 +801,7 @@ fn publication_json(storage: &Storage, ns: &str, book: &Book) -> serde_json::Val
     let mut links = vec![
         link_obj(&format!("/opds/acquire/{id}"), "text/plain", Some("获取正文"), Some("http://opds-spec.org/acquisition")),
         link_obj(&format!("/opds/download/{id}?format=txt"), "text/plain", Some("下载 TXT"), Some("http://opds-spec.org/acquisition")),
-        link_obj(&format!("/opds/save/{id}"), "application/atom+xml;type=entry;profile=opds-save", Some("保存进度"), Some("partial-save")),
+        link_obj(&format!("/opds-save?bookId={id}"), "application/atom+xml;type=entry;profile=opds-save", Some("保存进度"), Some("partial-save")),
     ];
     let mut images: Vec<serde_json::Value> = Vec::new();
     if let Some(cover) = display_cover(book) {
