@@ -2201,7 +2201,8 @@ async fn save_book_progress(
         book_url
     };
     if book_url.is_empty() {
-        return Json(ReturnData::err("请输入书籍链接"));
+        // 进度保存静默：无 bookUrl 时不弹错（前端组件卸载竞态等场景）
+        return Json(ReturnData::ok(serde_json::Value::Null));
     }
     let int_of = |keys: &[&str]| -> Option<i64> {
         for k in keys {

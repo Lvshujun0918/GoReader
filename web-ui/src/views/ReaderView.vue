@@ -1182,7 +1182,7 @@ async function init() {
     // 目录 + 详情并行拉取
     const [tocRes, infoRes] = await Promise.allSettled([
       getBookToc(found.tocUrl, found.origin),
-      getBookInfo(found.bookUrl, found.origin),
+      getBookInfo(found.bookUrl, found.origin, { silent: true }),
     ])
     if (tocRes.status === 'fulfilled' && tocRes.value.isSuccess) {
       chapters.value = tocRes.value.data ?? []

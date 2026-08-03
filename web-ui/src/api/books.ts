@@ -2,8 +2,8 @@ import { get } from './request'
 import type { BookChapter, BookContent, BookInfo, ReturnData, SearchBook } from '@/types'
 
 /** GET /reader3/getBookInfo：书籍详情（参数 url + bookSource=book.origin） */
-export function getBookInfo(url: string, bookSource: string): Promise<ReturnData<BookInfo>> {
-  return get<BookInfo>('/getBookInfo', { url, bookSource })
+export function getBookInfo(url: string, bookSource: string, opts?: { silent?: boolean }): Promise<ReturnData<BookInfo>> {
+  return get<BookInfo>('/getBookInfo', { url, bookSource }, opts)
 }
 
 /**
