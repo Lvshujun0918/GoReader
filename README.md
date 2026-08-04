@@ -173,6 +173,10 @@ docs/             # SECURITY.md / ROADMAP.md / ARCHITECTURE.md / legado-ref/
 
 ---
 
+## 💬 交流
+
+Telegram 群：[t.me/readerdev](https://t.me/readerdev)（使用反馈 / 书源交流）
+
 ## 📚 文档
 
 - [`docs/SECURITY.md`](docs/SECURITY.md) —— 安全设计审查
