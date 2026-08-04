@@ -193,4 +193,4 @@ docs/             # SECURITY.md / ROADMAP.md / ARCHITECTURE.md / legado-ref/
 
 ## 📄 License
 
-Apache-2.0
+[GNU General Public License v3.0](LICENSE) (GPL-3.0)

@@ -751,6 +751,17 @@ async function startTts() {
   audio.pause()
   audio.src = url
   ttsState.value = 'playing'
+  // 后台标签页被浏览器暂停时，切回自动恢复（防"听书几分钟后中断"）
+  document.addEventListener(
+    'visibilitychange',
+    () => {
+      const a = ttsAudioRef.value
+      if (document.visibilityState === 'visible' && ttsState.value === 'playing' && a && a.paused && a.src) {
+        void a.play().catch(() => {})
+      }
+    },
+    { once: true },
+  )
   try {
     await audio.play()
     startTtsParaTracking()
@@ -832,10 +843,30 @@ function onTtsEnded() {
   }
 }
 
+let ttsErrorRetries = 0
 function onTtsError() {
   if (ttsState.value === 'idle') return
   const audio = ttsAudioRef.value
   if (audio && !audio.getAttribute('src')) return
+  // 自动重试一次（网络/解码抖动），仍失败才停止
+  if (ttsErrorRetries < 1 && audio && audio.src) {
+    ttsErrorRetries++
+    const src = audio.src
+    audio.pause()
+    audio.load()
+    audio.src = src
+    audio
+      .play()
+      .then(() => {
+        ttsErrorRetries = 0
+      })
+      .catch(() => {
+        stopTts()
+        ElMessage.error('语音播放失败（已重试）')
+      })
+    return
+  }
+  ttsErrorRetries = 0
   stopTts()
   ElMessage.error('语音播放失败')
 }
