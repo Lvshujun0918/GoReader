@@ -42,6 +42,8 @@ pub struct AppConfig {
     pub default_user_enable_rss_source: bool,
     pub default_user_book_source_limit: i64,
     pub default_user_book_limit: i64,
+    /// GAP 62 上传大小上限（MB，env READER_UPLOAD_MAX_MB，默认 100）
+    pub upload_max_mb: i64,
 }
 
 impl AppConfig {
@@ -72,7 +74,13 @@ impl AppConfig {
                 .unwrap_or(true),
             default_user_book_source_limit: env_i64("READER_APP_DEFAULTUSERBOOKSOURCELIMIT", 100),
             default_user_book_limit: env_i64("READER_APP_DEFAULTUSERBOOKLIMIT", 200),
+            upload_max_mb: env_i64("READER_UPLOAD_MAX_MB", 100),
         }
+    }
+
+    /// GAP 62：上传大小上限字节数（multipart DefaultBodyLimit 用）
+    pub fn upload_max_bytes(&self) -> usize {
+        (self.upload_max_mb.max(1) * 1024 * 1024) as usize
     }
 
     /// storage 根目录（workDir 下的 storage）
@@ -104,6 +112,8 @@ impl AppConfig {
         // 路由未覆盖（axum Router::layer 只包装调用时已注册的路由）。此处外层再挂一层兜底：
         // 已带 Content-Encoding 的响应自动跳过，SSE（text/event-stream）/音视频默认排除，无副作用。
         let app = app.layer(tower_http::compression::CompressionLayer::new());
+        // GAP 62：multipart 超限（DefaultBodyLimit 413）→ 替换为明确的 JSON 错误（最外层兜底）
+        let app = app.layer(crate::middleware::upload_limit::UploadLimitLayer { max_mb: self.upload_max_mb });
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         tracing::info!("reader-dev (Rust) listening on {addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;

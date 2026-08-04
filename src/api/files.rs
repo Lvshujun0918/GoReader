@@ -406,25 +406,40 @@ pub async fn upload(
     let mut home = params.get("home").cloned().unwrap_or_default();
     let mut path = params.get("path").cloned().unwrap_or_default();
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
-        match field.name() {
-            Some("home") => {
-                if let Ok(v) = field.text().await {
-                    home = v;
+    let max_bytes = state.storage.config.upload_max_bytes();
+    let max_mb = state.storage.config.upload_max_mb;
+    // GAP 62：Content-Length 预检（超限 → 明确错误）
+    if let Some(msg) = crate::api::router::check_upload_content_length(&headers, max_bytes, max_mb) {
+        return Json(ReturnData::err(msg));
+    }
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(mut field)) => match field.name() {
+                Some("home") => {
+                    if let Ok(v) = field.text().await {
+                        home = v;
+                    }
                 }
-            }
-            Some("path") => {
-                if let Ok(v) = field.text().await {
-                    path = v;
+                Some("path") => {
+                    if let Ok(v) = field.text().await {
+                        path = v;
+                    }
                 }
-            }
-            Some("file") => {
-                let name = field.file_name().unwrap_or("file").to_string();
-                if let Ok(bytes) = field.bytes().await {
-                    files.push((name, bytes.to_vec()));
+                Some("file") => {
+                    let name = field.file_name().unwrap_or("file").to_string();
+                    // GAP 62：显式字段大小上限（超限 → 明确错误）
+                    match crate::api::router::read_multipart_field_limited(&mut field, max_bytes, max_mb).await {
+                        Ok(bytes) => files.push((name, bytes)),
+                        Err(msg) => return Json(ReturnData::err(msg)),
+                    }
                 }
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!("files upload multipart 读取失败: {e}");
+                break;
             }
-            _ => {}
         }
     }
     if files.is_empty() {

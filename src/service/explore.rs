@@ -242,6 +242,109 @@ pub async fn explore_url(
     Ok(books)
 }
 
+/// GAP 141：内置探索源清单（JSON 原文，与 bookSource.json 同构——可直接 saveBookSources 导入）
+///
+/// 验证状态（2026-08 网络实测）：
+/// - 新笔趣阁 biquge365.net：探索分类 /sort/{n}_1/、书籍详情、章节目录 ul.info、正文 div.txt 单页全流程可用
+/// - 看泡书屋 kpshu.cc：探索分类 /list{n}/、搜索 /search.php、书籍详情、目录 div.book_list、正文 article.font_max
+///   （章节正文分页时仅取首页——nextContentUrl 缺失避免串章；站点结构变更时用户可自行修正规则）
+pub const BUILTIN_EXPLORE_SOURCES: &[&str] = &[
+    // 新笔趣阁（biquge365.net）
+    r#"{
+  "bookSourceUrl": "https://www.biquge365.net",
+  "bookSourceName": "新笔趣阁（内置）",
+  "bookSourceGroup": "内置探索",
+  "enabled": true,
+  "enabledExplore": true,
+  "customOrder": 900,
+  "exploreUrl": "玄幻魔法::https://www.biquge365.net/sort/1_1/\n仙侠修真::https://www.biquge365.net/sort/2_1/\n都市言情::https://www.biquge365.net/sort/3_1/\n网游动漫::https://www.biquge365.net/sort/4_1/\n科幻小说::https://www.biquge365.net/sort/5_1/\n恐怖灵异::https://www.biquge365.net/sort/6_1/\n历史军事::https://www.biquge365.net/sort/7_1/\n其他小说::https://www.biquge365.net/sort/8_1/",
+  "searchUrl": "https://www.biquge365.net/s.php,{method:POST,body:type=articlename&s={{key}}}",
+  "ruleExplore": {
+    "bookList": "ul.gengxin@li",
+    "name": "span.name a@text",
+    "author": "span.zuo@text",
+    "bookUrl": "span.name a@href"
+  },
+  "ruleSearch": {
+    "bookList": "ul.search li:not(.fen)@li",
+    "name": "span.name a@text",
+    "author": "span.zuo@text",
+    "bookUrl": "span.name a@href"
+  },
+  "ruleBookInfo": {
+    "name": "h1@text",
+    "author": "div.xinxi span.x1 a@text",
+    "kind": "div.xinxi span.x1.1@text",
+    "intro": "div.x3@text",
+    "coverUrl": "div.zhutu img@src",
+    "tocUrl": "div.gongneng a@href"
+  },
+  "ruleToc": {
+    "chapterList": "ul.info@li",
+    "chapterName": "a@text",
+    "chapterUrl": "a@href"
+  },
+  "ruleContent": {
+    "content": "div.txt@html",
+    "replaceRegex": "一秒记住【笔趣阁】.*?！|（请记住看台湾小说认准台湾小说网.*?）##"
+  }
+}"#,
+    // 看泡书屋（kpshu.cc）
+    r#"{
+  "bookSourceUrl": "http://www.kpshu.cc",
+  "bookSourceName": "看泡书屋（内置）",
+  "bookSourceGroup": "内置探索",
+  "enabled": true,
+  "enabledExplore": true,
+  "customOrder": 901,
+  "exploreUrl": "玄幻小说::http://www.kpshu.cc/list1/\n武侠小说::http://www.kpshu.cc/list2/\n都市小说::http://www.kpshu.cc/list3/\n历史小说::http://www.kpshu.cc/list4/\n网游小说::http://www.kpshu.cc/list5/\n科幻小说::http://www.kpshu.cc/list6/\n言情小说::http://www.kpshu.cc/list7/\n其他小说::http://www.kpshu.cc/list8/",
+  "searchUrl": "http://www.kpshu.cc/search.php?q={{key}}&p=1",
+  "ruleExplore": {
+    "bookList": "div.row dl@dl",
+    "name": "dd h3 a@text",
+    "author": "dd.book_other span a@text",
+    "bookUrl": "dd h3 a@href",
+    "coverUrl": "dt a img@src"
+  },
+  "ruleSearch": {
+    "bookList": "div.row dl@dl",
+    "name": "dd h3 a@text",
+    "author": "dd.book_other span a@text",
+    "bookUrl": "dd h3 a@href",
+    "coverUrl": "dt a img@src"
+  },
+  "ruleBookInfo": {
+    "name": "h1@text",
+    "author": "div.options li a@text",
+    "intro": "div.intro@text",
+    "coverUrl": "div.book_info img@src"
+  },
+  "ruleToc": {
+    "chapterList": "div.book_list ul.row@li",
+    "chapterName": "a@text",
+    "chapterUrl": "a@href"
+  },
+  "ruleContent": {
+    "content": "article.font_max@html"
+  }
+}"#,
+];
+
+/// GAP 141：解析内置探索源 → BookSource 列表（JSON 非法项跳过并告警）
+pub fn builtin_explore_sources() -> Vec<crate::model::BookSource> {
+    let mut out = Vec::with_capacity(BUILTIN_EXPLORE_SOURCES.len());
+    for raw in BUILTIN_EXPLORE_SOURCES {
+        match serde_json::from_str::<crate::model::BookSource>(raw) {
+            Ok(mut s) => {
+                s.raw_json = Some((*raw).to_string());
+                out.push(s);
+            }
+            Err(e) => tracing::warn!("内置探索源解析失败（跳过）: {e}"),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +404,34 @@ mod tests {
         assert!(!has_more(&(0..10).map(book).collect::<Vec<_>>()), "不足阈值无更多");
         assert!(has_more(&(0..EXPLORE_PAGE_SIZE).map(book).collect::<Vec<_>>()), "满页可能有更多");
         assert!(has_more(&(0..30).map(book).collect::<Vec<_>>()));
+    }
+
+    /// GAP 141：内置探索源——JSON 合法、探索入口可解析且非空、ruleExplore/ruleToc/
+    /// ruleContent 规则完整（bookList 定位 + 字段规则），可直接导入书源库使用
+    #[test]
+    fn test_builtin_explore_sources_parse() {
+        let sources = builtin_explore_sources();
+        assert!(sources.len() >= 2, "内置探索源应 >= 2 个（当前 {}）", sources.len());
+        for s in &sources {
+            assert!(!s.book_source_url.is_empty(), "书源 URL 必填");
+            assert!(!s.book_source_name.is_empty());
+            assert!(s.enabled);
+            assert!(s.enabled_explore, "探索源应启用 enabledExplore");
+            // 探索入口：解析出条目且非空
+            let entries = parse_explore_entries(s.explore_url.as_deref().unwrap_or(""));
+            assert!(entries.len() >= 4, "{} 探索分类应 >= 4（当前 {}）", s.book_source_name, entries.len());
+            assert!(entries.iter().all(|e| e.r#type == "book"), "分类应为书单型");
+            // 规则完整性：ruleExplore bookList + 字段规则；ruleToc/ruleContent 齐备
+            let explore: crate::service::search::SearchRule =
+                serde_json::from_value(s.rule_explore.clone().unwrap()).unwrap();
+            assert!(explore.book_list.is_some(), "ruleExplore.bookList 必填");
+            assert!(explore.name.is_some() && explore.book_url.is_some(), "name/bookUrl 字段规则必填");
+            let toc: crate::service::book::TocRule =
+                serde_json::from_value(s.rule_toc.clone().unwrap()).unwrap();
+            assert!(toc.chapter_list.is_some() && toc.chapter_name.is_some() && toc.chapter_url.is_some());
+            let content: crate::service::book::ContentRule =
+                serde_json::from_value(s.rule_content.clone().unwrap()).unwrap();
+            assert!(content.content.is_some(), "ruleContent.content 必填");
+        }
     }
 }

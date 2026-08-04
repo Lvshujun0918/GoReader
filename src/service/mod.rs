@@ -9,6 +9,7 @@ pub mod epub;
 pub mod explore;
 pub mod export_book;
 pub mod health;
+pub mod imaging;
 pub mod local_book;
 pub mod local_sync;
 pub mod login;

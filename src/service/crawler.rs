@@ -230,7 +230,14 @@ async fn http_fetch(
     }
 
     // ② 直连
-    let resp = fetch(url, &req_headers, timeout_secs, method, body, charset).await?;
+    tracing::debug!("http_fetch 直连 {method} {url}");
+    let resp = match fetch(url, &req_headers, timeout_secs, method, body, charset).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("http_fetch 直连失败 {url}: {e:?} source={:?}", e.source().map(|s| s.to_string()));
+            return Err(e.into());
+        }
+    };
 
     // ③ CF 质询检测（503/403 + 特征 HTML）→ 解质询降级链：FlareSolverr（配置了 URL）→
     //    内置浏览器（进程内 CDP，含 Turnstile 分支）→ 求解成功 cookie 合并存库后
@@ -238,6 +245,7 @@ async fn http_fetch(
     //    只会 GET 首页，重试才能让 POST（如 69shuba search.php 搜索）拿到真实结果）；
     //    重试仍质询/失败 → 用求解结果（浏览器 HTML）兜底返回
     if is_cloudflare_challenge(resp.status, &resp.body) {
+        tracing::debug!("http_fetch 命中 CF 质询 status={} url={url}", resp.status);
         // 求解：返回兜底响应 + 合并后 cookie 串（内存直传重试——不依赖 storage 注册状态/
         // 并发覆盖）+ 浏览器 UA
         let (fallback, merged_cookie, solved_ua) =
@@ -635,13 +643,38 @@ pub fn merge_turnstile_token(cookie_str: &str, token: &str) -> String {
         .join("; ")
 }
 
-/// 解析书源 header 字段（legacy：JSON 字符串或 key=value 行）
+/// 解析书源 header 字段（legacy：`<js>` 模板先执行（返回 JSON）→ JSON 字符串或 key=value 行）
 pub fn parse_header(header: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    let header = header.trim();
+    let mut header = header.trim().to_string();
     if header.is_empty() {
         return map;
     }
+    // `<js>...</js>` 模板：执行 JS（注入 key/page/baseUrl/result 空串/headerMap）→ 返回 JSON 字符串
+    if header.starts_with("<js>") || header.starts_with("js:") || header.starts_with("@js:") {
+        let code = header
+            .trim_start_matches("<js>")
+            .trim_end_matches("</js>")
+            .trim_start_matches("js:")
+            .trim_start_matches("@js:")
+            .trim()
+            .to_string();
+        let vars = std::collections::HashMap::from([
+            ("key".to_string(), String::new()),
+            ("page".to_string(), "1".to_string()),
+            ("baseUrl".to_string(), String::new()),
+            ("result".to_string(), String::new()),
+            ("headerMap".to_string(), "{}".to_string()),
+        ]);
+        match crate::parser::js::eval_js(&code, &vars) {
+            Ok(json) => header = json,
+            Err(e) => {
+                tracing::warn!("书源 header JS 执行失败: {e}");
+                return map;
+            }
+        }
+    }
+    let header = header.as_str();
     // 尝试 JSON（兼容单引号 JSON：'key': 'value' → 标准 JSON）
     if header.starts_with('{') {
         let normalized = if header.contains('\'') && !header.contains('"') {
@@ -678,6 +711,22 @@ pub fn parse_header(header: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 69shuba 搜索 POST（真实链路复现 builder error——网络不可达时跳过）
+    #[tokio::test]
+    async fn fetch_69shuba_post() {
+        use std::collections::HashMap;
+        let mut h = HashMap::new();
+        h.insert("User-Agent".to_string(), "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/125.0 Mobile Safari/537.36".to_string());
+        h.insert("Referer".to_string(), "https://www.69shuba.com/".to_string());
+        h.insert("Content-Type".to_string(), "application/x-www-form-urlencoded; charset=gbk".to_string());
+        let url = "https://www.69shuba.com/modules/article/search.php";
+        let body = "searchkey=%E8%AF%A1%E7%A7%98%E4%B9%8B%E4%B8%BB&searchtype=all&page=1";
+        match fetch(url, &h, 30, "POST", Some(body), Some("gbk")).await {
+            Ok(r) => println!("OK status={} len={}", r.status, r.body.len()),
+            Err(e) => println!("ERR: {e:?} source={:?}", e.source().map(|s| s.to_string())),
+        }
+    }
 
     #[test]
     fn test_base_url_of() {
@@ -863,3 +912,4 @@ mod tests {
         assert_eq!(bytes, body);
     }
 }
+

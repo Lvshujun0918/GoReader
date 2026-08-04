@@ -299,6 +299,7 @@ pub async fn search_one_source(
     });
     // 书源抓取（自动带书源 cookie——按用户命名空间）
     let method = suffix.method.as_deref().unwrap_or("GET");
+    tracing::debug!("搜索请求 [{}] {} {} body={}", source.book_source_name, method, url, post_body.as_deref().unwrap_or(""));
     let resp = if method.eq_ignore_ascii_case("POST") {
         crawler::http_post(ns, &url, &req_headers, 15, post_body.as_deref(), suffix.charset.as_deref()).await?
     } else {

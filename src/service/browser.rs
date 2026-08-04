@@ -629,14 +629,16 @@ pub const TURNSTILE_DETECT_JS: &str = r#"
 (function(){
   try {
     var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-    var iframeIsTurnstile = !!(iframe && /turnstile/.test(iframe.src || ''));
+    // 只有 src 明确含 turnstile 的 iframe 才算 Turnstile widget——
+    // CF JS 质询页同样内嵌 challenges.cloudflare.com iframe（challenge-platform），误判会走错分支
+    var iframeIsTurnstile = !!(iframe && /turnstile/i.test(iframe.src || ''));
     var container = document.querySelector('.cf-turnstile');
     var input = document.querySelector('[name="cf-turnstile-response"]');
     var script = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"], script[src*="turnstile/api.js"]');
     var t = (document.title || '').toLowerCase();
     var hasTitle = t.indexOf('turnstile') >= 0 || t.indexOf('verifying') >= 0;
     return {
-      turnstile: !!(iframe || container || input || script || hasTitle),
+      turnstile: !!(iframeIsTurnstile || container || input || script || hasTitle),
       hasContainer: !!container,
       hasInput: !!input,
       hasTitle: hasTitle,

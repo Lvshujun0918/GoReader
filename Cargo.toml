@@ -64,6 +64,8 @@ lopdf = "0.44.0"
 quick-xml = "0.41.0"
 notify = "6"           # GAP 170 本地书双轨同步：书仓目录文件监听
 fancy-regex = "0.19.0"
+# GAP 130 正文图片代理 webp 转换（仅 jpeg/png/gif/webp 编解码，避免完整 image 依赖面）
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 [profile.release]
 lto = true

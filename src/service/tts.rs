@@ -24,6 +24,33 @@ pub struct EdgeVoice {
     pub gender: &'static str,
 }
 
+/// GAP 113：getTTSVoices 10 分钟内存缓存（Mutex<Option<(时间戳, 语音列表)>>）
+/// 语音列表为静态预置（不含网络请求），缓存主要避免每次请求重复构造/序列化；
+/// 10 分钟过期后重建（为未来动态语音源预留结构）
+static VOICE_CACHE: std::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<Vec<EdgeVoice>>)>> =
+    std::sync::Mutex::new(None);
+
+/// 语音列表缓存 TTL（10 分钟）
+const VOICE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// 带 10 分钟内存缓存的语音列表读取（GAP 113）
+pub fn edge_voices_cached() -> std::sync::Arc<Vec<EdgeVoice>> {
+    let now = std::time::Instant::now();
+    if let Ok(mut guard) = VOICE_CACHE.lock() {
+        if let Some((ts, voices)) = guard.as_ref() {
+            if now.duration_since(*ts) < VOICE_CACHE_TTL {
+                return voices.clone();
+            }
+        }
+        let voices = std::sync::Arc::new(edge_voices().to_vec());
+        *guard = Some((now, voices.clone()));
+        voices
+    } else {
+        // 锁中毒兜底：直接返回（不缓存）
+        std::sync::Arc::new(edge_voices().to_vec())
+    }
+}
+
 /// 预置 Edge 语音列表（zh-CN 常见 + en-US 若干；完整列表可后续扩充）
 pub fn edge_voices() -> &'static [EdgeVoice] {
     &[
@@ -584,5 +611,24 @@ mod tests {
         assert_eq!(voice_locale("zh-CN-XiaoxiaoNeural"), "zh-CN");
         assert_eq!(voice_locale("en-US-JennyNeural"), "en-US");
         assert_eq!(voice_locale("weird"), "zh-CN");
+    }
+
+    /// GAP 113：语音列表 10 分钟内存缓存——TTL 内两次读取命中同一 Arc（同一实例），
+    /// 内容与静态列表一致
+    #[test]
+    fn test_edge_voices_cached() {
+        // 清空缓存（测试隔离）
+        *VOICE_CACHE.lock().unwrap() = None;
+        let a = edge_voices_cached();
+        let b = edge_voices_cached();
+        assert!(!a.is_empty());
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "TTL 内应命中同一缓存实例");
+        assert_eq!(a.len(), edge_voices().len());
+        assert_eq!(a[0].value, "zh-CN-XiaoxiaoNeural");
+        // 与静态列表一致（逐项对比）
+        for (cached, static_v) in a.iter().zip(edge_voices().iter()) {
+            assert_eq!(cached.value, static_v.value);
+        }
+        *VOICE_CACHE.lock().unwrap() = None;
     }
 }

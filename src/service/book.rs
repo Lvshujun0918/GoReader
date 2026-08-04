@@ -319,6 +319,11 @@ pub async fn analyze_content(
 }
 
 /// 单页正文解析（纯函数，可测）
+///
+/// GAP 97：规则提取结果原样返回——书源正文含 HTML 标签（@html 提取或 JSON 正文源
+/// 直接携带 <p>/<br> 等）时不做剥离/转义，前端已有纯文本渲染负责展示。
+/// GAP 109：contentReplace（legacy 命名）即 ruleContent.replaceRegex（`模式##替换`），
+/// 与 sourceRegex（删除型）均在解析期应用——正文净化在 getBookContent 返回前完成。
 pub fn analyze_content_from(html: &str, source: &BookSource) -> String {
     let rule: ContentRule = source
         .rule_content
@@ -508,5 +513,72 @@ mod tests {
         let content = analyze_content_from(html, &src);
         // sourceRegex（lookbehind）移除 "烦人"；replaceRegex（lookbehind+lookahead）把 "一章 " 替换为 X
         assert_eq!(content, "正文：第X章 测试内容 广告：");
+    }
+
+    /// GAP 97：书源正文含 HTML 标签（<p>/<br> 等）时保留标签原样返回。
+    /// 行为确认：ruleContent.content 用 @html 提取（或 JSON 正文源直接含标签）时，
+    /// 后端不做任何剥离/转义——原样透传；前端已有纯文本渲染（HTML → 文本），
+    /// 段落分隔依赖 <br>/<p> 标签，因此此处必须保留。
+    #[test]
+    fn test_analyze_content_preserves_html_tags() {
+        let mut src = test_source();
+        // @html 提取：保留 <p>/<br> 标签原样（含匹配元素外层标签）
+        src.rule_content = Some(serde_json::json!({ "content": "div.content@html" }));
+        let html = r#"<div class="content"><p>第一段</p><br><p>第二段</p></div>"#;
+        let content = analyze_content_from(html, &src);
+        assert!(
+            content.contains("<p>第一段</p><br><p>第二段</p>"),
+            "HTML 标签应原样保留: {content}"
+        );
+        assert!(content.contains("<p>") && content.contains("<br>"), "<p>/<br> 不应被剥离: {content}");
+        assert!(content.contains("<div"), "@html 含匹配元素外层标签（前端纯文本渲染无影响）: {content}");
+
+        // 无 @ 的裸选择器（legacy 兼容）→ 取纯文本（仅此处剥离，规则显式 @html 时保留）
+        src.rule_content = Some(serde_json::json!({ "content": "div.content" }));
+        let content = analyze_content_from(html, &src);
+        assert!(!content.contains("<p>"), "裸选择器取文本: {content}");
+        assert!(content.contains("第一段") && content.contains("第二段"));
+
+        // 清洗（sourceRegex/replaceRegex）作用于原样内容——HTML 标签不受影响
+        src.rule_content = Some(serde_json::json!({
+            "content": "div.content@html",
+            "replaceRegex": "第一段##甲段"
+        }));
+        let content = analyze_content_from(html, &src);
+        assert!(content.contains("<p>甲段</p><br><p>第二段</p>"), "{content}");
+    }
+
+    /// GAP 109：contentReplace/replaceRegex 在 ruleContent 解析已应用——
+    /// 构造含广告行的正文，断言净化（广告行移除、正文保留）。
+    /// （legacy 的 contentReplace 对应 ruleContent.replaceRegex：`模式##替换`，
+    /// 逐条 replace_all；sourceRegex 为删除型清洗，同样在解析期应用）
+    #[test]
+    fn test_analyze_content_replace_regex_cleans_ad_lines() {
+        let mut src = test_source();
+        src.rule_content = Some(serde_json::json!({
+            "content": "div.content@html",
+            // 广告行 + 推广行 → 替换为空（净化）
+            "replaceRegex": "【广告】.*?。|（推广）.*?。##"
+        }));
+        let html = concat!(
+            r#"<div class="content"><p>正文第一段。</p>"#,
+            r#"<p>【广告】本书由某某网首发，请支持正版。</p>"#,
+            r#"<p>（推广）加群领福利。</p>"#,
+            r#"<p>正文第二段。</p></div>"#
+        );
+        let content = analyze_content_from(html, &src);
+        assert!(!content.contains("【广告】"), "广告行应被 replaceRegex 清除: {content}");
+        assert!(!content.contains("（推广）"), "推广行应被清除: {content}");
+        assert!(content.contains("正文第一段。") && content.contains("正文第二段。"), "正文应保留: {content}");
+
+        // sourceRegex（删除型）同样应用于正文
+        src.rule_content = Some(serde_json::json!({
+            "content": "div.content@text",
+            "sourceRegex": "【广告】[^】]*"
+        }));
+        let html = r#"<div class="content">正文甲。【广告】这是一条广告】正文乙。</div>"#;
+        let content = analyze_content_from(html, &src);
+        assert!(!content.contains("广告"), "sourceRegex 应删除广告片段: {content}");
+        assert!(content.contains("正文甲。") && content.contains("正文乙。"));
     }
 }

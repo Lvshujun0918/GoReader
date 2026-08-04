@@ -519,6 +519,8 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     let columns = [
         ("users", &["token_map", "raw_json"][..]),
         ("book_sources", &["rule_related"][..]),
+        // GAP 44：旧库缺 rss_source_group 列时补上（新库 CREATE TABLE 已含）
+        ("rss_sources", &["rss_source_group"][..]),
         (
             "books",
             &[
@@ -1276,7 +1278,16 @@ impl Storage {
     }
 
     /// 删除书（书源书或本地书——本地书含章节）
+    /// GAP 117：删除后清理 assets/{ns}/covers 下对应封面文件（未被其他书引用时）
     pub async fn delete_book(&self, ns: &str, book_url: &str) -> Result<u64> {
+        let cover_url = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT cover_url FROM books WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
             .bind(book_url)
@@ -1288,7 +1299,49 @@ impl Storage {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        if r.rows_affected() > 0 {
+            self.cleanup_orphan_cover(ns, cover_url.as_deref()).await;
+        }
         Ok(r.rows_affected())
+    }
+
+    /// GAP 117：封面文件残留清理——cover_url 形如 /assets/{ns}/covers/{file}，
+    /// 且删除后无其他书引用同一路径时删除文件（最佳努力，失败仅告警）
+    async fn cleanup_orphan_cover(&self, ns: &str, cover_url: Option<&str>) {
+        let Some(cover_url) = cover_url else { return };
+        let Some(file) = cover_file_name(ns, cover_url) else { return };
+        // 其他书（本命名空间内）是否仍引用同一封面
+        let refs: i64 = match sqlx::query_scalar(
+            "SELECT COUNT(*) FROM books WHERE user_namespace = ?1 AND cover_url = ?2",
+        )
+        .bind(ns)
+        .bind(cover_url)
+        .fetch_one(&self.pool)
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("cleanup_orphan_cover 查询失败: {e}");
+                return;
+            }
+        };
+        if refs > 0 {
+            return;
+        }
+        let path = self
+            .config
+            .storage_dir()
+            .join("assets")
+            .join(ns)
+            .join("covers")
+            .join(&file);
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("封面清理失败 {}: {e}", path.display());
+            }
+        } else {
+            tracing::info!("GAP 117 已清理无引用封面 {}", path.display());
+        }
     }
 
     /// 更新书字段（编辑：name/author/coverUrl/group）
@@ -1651,7 +1704,21 @@ impl Storage {
     // ---------------- 批量接口（deleteBooks / 分组批量 / 书签批量 / RSS 批量） ----------------
 
     /// 批量删除书（事务：每本连带删章节）；返回删除的书行数
+    /// 批量删除（GAP 117：删除后清理无引用封面文件）
     pub async fn delete_books(&self, ns: &str, book_urls: &[String]) -> Result<u64> {
+        let mut covers: Vec<String> = Vec::new();
+        for url in book_urls {
+            if let Ok(Some(c)) = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT cover_url FROM books WHERE user_namespace = ?1 AND book_url = ?2",
+            )
+            .bind(ns)
+            .bind(url)
+            .fetch_one(&self.pool)
+            .await
+            {
+                covers.push(c);
+            }
+        }
         let mut tx = self.pool.begin().await?;
         let mut deleted = 0u64;
         for url in book_urls {
@@ -1667,6 +1734,9 @@ impl Storage {
             deleted += r.rows_affected();
         }
         tx.commit().await?;
+        for c in covers {
+            self.cleanup_orphan_cover(ns, Some(&c)).await;
+        }
         Ok(deleted)
     }
 
@@ -2154,6 +2224,92 @@ impl Storage {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    // ---------------- GAP 171：loc_book → DB 迁移 ----------------
+
+    /// legacy loc_book 文件书迁移：文件解析结果写入 book_chapters（键 = 原 book_url），
+    /// books.local_file 记录关联路径（保留原记录 origin 不动，local_file 非空即迁移标记）
+    /// 返回是否写入（书不存在返回 false）
+    pub async fn migrate_loc_book(
+        &self,
+        ns: &str,
+        book_url: &str,
+        local_file: Option<&str>,
+        mtime: i64,
+        size: i64,
+        chapters: &[(String, String)],
+        cover: Option<&[u8]>,
+    ) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM books WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .fetch_one(&self.pool)
+        .await?
+            > 0;
+        if !exists {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        // 覆盖式重建章节（重复迁移幂等）
+        sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
+            .bind(book_url)
+            .execute(&mut *tx)
+            .await?;
+        for (i, (title, content)) in chapters.iter().enumerate() {
+            sqlx::query(
+                "INSERT OR REPLACE INTO book_chapters (book_url, chapter_index, title, content) VALUES (?1,?2,?3,?4)",
+            )
+            .bind(book_url)
+            .bind(i as i64)
+            .bind(title)
+            .bind(content)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE books SET local_file = ?3, local_file_mtime = ?4, local_file_size = ?5, local_file_deleted = 0              WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .bind(local_file)
+        .bind(mtime)
+        .bind(size)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        // 封面落盘（与上传导入一致）
+        if let Some(cover) = cover {
+            if !cover.is_empty() {
+                let cover_dir = self
+                    .config
+                    .storage_dir()
+                    .join("assets")
+                    .join(ns)
+                    .join("covers");
+                let _ = std::fs::create_dir_all(&cover_dir);
+                let file_id = format!("{}.jpg", uuid::Uuid::new_v4());
+                if std::fs::write(cover_dir.join(&file_id), cover).is_ok() {
+                    let _ = self
+                        .update_book_cover(ns, book_url, &format!("/assets/{ns}/covers/{file_id}"))
+                        .await;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// GAP 171：查全部 legacy loc_book 文件书（migrateLocBook all 用）
+    pub async fn list_loc_book_books(&self, ns: &str) -> Result<Vec<crate::model::Book>> {
+        sqlx::query_as::<_, crate::model::Book>(
+            "SELECT * FROM books WHERE user_namespace = ?1 AND origin = 'loc_book' ORDER BY name",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     // ---------------- GAP 170 本地书双轨同步 ----------------
@@ -3212,6 +3368,21 @@ pub(crate) fn normalize_base(url: &str) -> Option<String> {
 
 async fn ensure_column(pool: &SqlitePool, table: &str, column: &str) -> anyhow::Result<()> {
     ensure_column_typed(pool, table, column, "TEXT").await
+}
+
+/// GAP 117：从 cover_url（/assets/{ns}/covers/{file}）提取文件名；
+/// 仅接受纯文件名（无路径分隔符，防穿越）且命名空间匹配时返回
+fn cover_file_name(ns: &str, cover_url: &str) -> Option<String> {
+    let prefix = format!("/assets/{ns}/covers/");
+    let file = cover_url.strip_prefix(&prefix)?;
+    if file.is_empty()
+        || file.contains('/')
+        || file.contains('\\')
+        || file.contains("..")
+    {
+        return None;
+    }
+    Some(file.to_string())
 }
 
 /// 幂等补列（带列类型；GAP 170：local_file 等双轨同步列按类型补充）
@@ -5726,5 +5897,109 @@ mod tests {
         assert_eq!(normalize_base("http://a.com").as_deref(), Some("http://a.com"));
         assert_eq!(normalize_base("a.com").as_deref(), Some("https://a.com"));
         assert_eq!(normalize_base("").is_none(), true);
+    }
+
+    // ---------------- GAP 44：RSS 分组 ----------------
+
+    /// RSS 源 group 往返：保存（含 sourceGroup）→ 列表/查找返回 group；覆盖保存更新 group；
+    /// 删除后无残留
+    #[tokio::test]
+    async fn test_rss_source_group_roundtrip() {
+        let storage = test_storage("rssgroup").await;
+        let mut s = crate::model::RssSource {
+            source_url: "https://r.com/feed.xml".into(),
+            source_name: "科技资讯".into(),
+            source_group: Some("科技".into()),
+            enabled: true,
+            ..Default::default()
+        };
+        storage.save_rss_source("default", &s).await.unwrap();
+        let got = storage
+            .get_rss_sources("default")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|x| x.source_url == "https://r.com/feed.xml")
+            .expect("保存后应能查到");
+        assert_eq!(got.source_group.as_deref(), Some("科技"), "group 应落库并读回");
+        assert_eq!(got.source_name, "科技资讯");
+
+        // 覆盖保存：改 group
+        s.source_group = Some("新闻 综合".into());
+        storage.save_rss_source("default", &s).await.unwrap();
+        let got = storage
+            .find_rss_source("default", "https://r.com/feed.xml")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.source_group.as_deref(), Some("新闻 综合"));
+
+        // 删除
+        storage.delete_rss_source("default", "https://r.com/feed.xml").await.unwrap();
+        assert!(storage
+            .get_rss_sources("default")
+            .await
+            .unwrap()
+            .iter()
+            .all(|x| x.source_url != "https://r.com/feed.xml"));
+
+        cleanup(storage, "rssgroup").await;
+    }
+
+    // ---------------- GAP 117：删除书清理封面文件 ----------------
+
+    /// 封面残留清理：删除唯一引用书的封面文件被移除；多书共享封面时保留；
+    /// 无封面/路径不匹配不报错
+    #[tokio::test]
+    async fn test_delete_book_cleans_orphan_cover() {
+        let storage = test_storage("coverclean").await;
+        let cover_dir = storage.config.storage_dir().join("assets/default/covers");
+        std::fs::create_dir_all(&cover_dir).unwrap();
+        std::fs::write(cover_dir.join("a1.jpg"), b"cover-a").unwrap();
+        std::fs::write(cover_dir.join("a2.jpg"), b"cover-b").unwrap();
+        let cover_a = "/assets/default/covers/a1.jpg";
+        let cover_b = "/assets/default/covers/a2.jpg";
+
+        // 两本书共享 cover_a；一本书独享 cover_b
+        for (url, cover) in [
+            ("https://b1.com", cover_a),
+            ("https://b2.com", cover_a),
+            ("https://b3.com", cover_b),
+        ] {
+            storage
+                .upsert_book("default", &crate::model::Book { book_url: url.into(), name: url.into(), cover_url: Some(cover.into()), ..Default::default() })
+                .await
+                .unwrap();
+        }
+
+        // 删 b1（cover_a 仍被 b2 引用 → 文件保留）
+        storage.delete_book("default", "https://b1.com").await.unwrap();
+        assert!(cover_dir.join("a1.jpg").exists(), "共享封面不应删除");
+        // 删 b2 → cover_a 无引用 → 文件清理
+        storage.delete_book("default", "https://b2.com").await.unwrap();
+        assert!(!cover_dir.join("a1.jpg").exists(), "无引用封面应清理");
+        // 删 b3 → cover_b 清理
+        storage.delete_book("default", "https://b3.com").await.unwrap();
+        assert!(!cover_dir.join("a2.jpg").exists());
+
+        // 批量删除也清理
+        std::fs::write(cover_dir.join("a3.jpg"), b"cover-c").unwrap();
+        for url in ["https://c1.com", "https://c2.com"] {
+            storage
+                .upsert_book("default", &crate::model::Book { book_url: url.into(), name: url.into(), cover_url: Some("/assets/default/covers/a3.jpg".into()), ..Default::default() })
+                .await
+                .unwrap();
+        }
+        storage.delete_books("default", &["https://c1.com".into(), "https://c2.com".into()]).await.unwrap();
+        assert!(!cover_dir.join("a3.jpg").exists(), "批量删除后封面应清理");
+
+        // 封面路径穿越样式（.. / 反斜杠）→ 不删除任何文件
+        storage
+            .upsert_book("default", &crate::model::Book { book_url: "https://d1.com".into(), name: "d".into(), cover_url: Some("/assets/default/covers/../a1.jpg".into()), ..Default::default() })
+            .await
+            .unwrap();
+        storage.delete_book("default", "https://d1.com").await.unwrap();
+
+        cleanup(storage, "coverclean").await;
     }
 }

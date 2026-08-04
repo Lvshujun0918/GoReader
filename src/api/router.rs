@@ -69,6 +69,10 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     let web_service = tower_http::services::ServeDir::new(&web_dir)
         .fallback(tower_http::services::ServeFile::new(web_dir.join("index.html")));
 
+    // GAP 62：multipart 上传上限（env READER_UPLOAD_MAX_MB，默认 100MB；超限 → 413 →
+    // 最外层 UploadLimitLayer 替换为明确 JSON 错误）。所有上传路由统一走此配置。
+    let upload_limit = config.upload_max_bytes();
+
     axum::Router::new()
         .nest_service("/assets", assets_service)
         // GAP #88/125：封面/正文图片防盗链代理（精确路由优先于 /assets 静态目录）
@@ -84,7 +88,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/saveOpdsSettings", post(save_opds_settings))
         .route(
             "/reader3/uploadLocalBook",
-            post(upload_local_book).layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+            post(upload_local_book).layer(axum::extract::DefaultBodyLimit::max(upload_limit)),
         )
         // F-4 远程书源订阅导入
         .route("/reader3/saveFromRemoteSource", post(save_from_remote_source))
@@ -108,7 +112,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route(
             "/reader3/restoreFromZip",
             post(restore_from_zip)
-                .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(upload_limit)),
         )
         .route("/reader3/restoreFromWebdav", post(restore_from_webdav))
         // F-38 文件管理（home 语义对齐 legacy FileController）
@@ -119,7 +123,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/file/download", get(crate::api::files::download))
         .route(
             "/reader3/file/upload",
-            post(crate::api::files::upload).layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+            post(crate::api::files::upload).layer(axum::extract::DefaultBodyLimit::max(upload_limit)),
         )
         .route("/reader3/file/delete", post(crate::api::files::delete))
         .route("/reader3/deleteBook", post(delete_book))
@@ -215,6 +219,10 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/saveBookGroupOrder", post(save_book_group_order))
         .route("/reader3/getAvailableBookSource", get(get_available_book_source).post(get_available_book_source))
         .route("/reader3/getInvalidBookSources", get(get_invalid_book_sources).post(get_invalid_book_sources))
+        // GAP 140：一键禁用失效书源（复用失效检测 → 批量 enabled=0）
+        .route("/reader3/disableInvalidBookSources", post(disable_invalid_book_sources))
+        // GAP 171：legacy loc_book 文件书 → DB 迁移（local_file 关联，保留原记录）
+        .route("/reader3/migrateLocBook", post(migrate_loc_book))
         .route("/reader3/setAsDefaultBookSources", post(set_as_default_book_sources))
         .route("/reader3/searchBookSourceSSE", get(search_book_source_sse).post(search_book_source_sse))
         .route("/reader3/getReadingStats", get(get_reading_stats).post(get_reading_stats))
@@ -228,7 +236,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route(
             "/reader3/importBookPreview",
             post(import_book_preview)
-                .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(upload_limit)),
         )
         .route("/reader3/readSourceFile", post(read_source_file))
         .route("/reader3/saveBookContent", post(save_book_content))
@@ -244,7 +252,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route(
             "/reader3/uploadFile",
             post(crate::api::files::upload)
-                .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(upload_limit)),
         )
         .route("/reader3/login", post(login))
         .with_state(state)
@@ -259,6 +267,7 @@ async fn health() -> &'static str {
 ///
 /// 服务端拉取图片：自动附加书源 header（书源登录 cookie/UA 按用户命名空间 + Referer）；
 /// 超时 10s；大小上限 5MB（Content-Length 预检 + 流式累计兜底）；Content-Type 透传。
+/// GAP 130：?fmt=webp&q=80 → 转码 webp 输出（image 编解码，失败回退原图透传）。
 /// secure 模式下按 accessToken 解析用户命名空间（与 /reader3 一致）。
 async fn assets_proxy(
     State(state): State<AppState>,
@@ -279,6 +288,15 @@ async fn assets_proxy(
         Err(ret) => return (StatusCode::UNAUTHORIZED, Json(ret)).into_response(),
     };
     let referer = params.get("referer").cloned();
+    // GAP 130：webp 转换参数（fmt=webp 且 q=质量 1-100，默认 80）
+    let to_webp = params
+        .get("fmt")
+        .map(|v| v.eq_ignore_ascii_case("webp"))
+        .unwrap_or(false);
+    let quality: u8 = params
+        .get("q")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80);
     match crate::service::crawler::fetch_image(
         &namespace,
         parsed.as_str(),
@@ -288,15 +306,34 @@ async fn assets_proxy(
     )
     .await
     {
-        Ok((bytes, content_type, status)) => Response::builder()
-            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
-            .header(
-                "Content-Type",
-                content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-            )
-            .header("Cache-Control", "public, max-age=3600")
-            .body(Body::from(bytes))
-            .unwrap(),
+        Ok((bytes, content_type, status)) => {
+            let is_raster = content_type
+                .as_deref()
+                .map(|ct| ct.starts_with("image/"))
+                .unwrap_or(false);
+            let converted = if to_webp && is_raster {
+                crate::service::imaging::to_webp(&bytes, quality)
+            } else {
+                None
+            };
+            match converted {
+                Some(webp) => Response::builder()
+                    .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+                    .header("Content-Type", "image/webp")
+                    .header("Cache-Control", "public, max-age=3600")
+                    .body(Body::from(webp))
+                    .unwrap(),
+                None => Response::builder()
+                    .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+                    .header(
+                        "Content-Type",
+                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                    )
+                    .header("Cache-Control", "public, max-age=3600")
+                    .body(Body::from(bytes))
+                    .unwrap(),
+            }
+        }
         Err(e) => {
             tracing::warn!("图片代理失败 [{url}]: {e}");
             Json(ReturnData::err(format!("图片加载失败：{e}"))).into_response()
@@ -524,6 +561,65 @@ async fn get_book_source(
         Ok(Some(s)) => Json(ReturnData::ok(serde_json::to_value(s).unwrap_or(serde_json::Value::Null))),
         Ok(None) => Json(ReturnData::err("书源不存在")),
         Err(_) => Json(ReturnData::err("系统错误")),
+    }
+}
+
+/// GAP 62：multipart 字段读取（带上传上限）——超过上限返回明确错误文案。
+/// 说明：axum 的 DefaultBodyLimit 对 Multipart 提取器只表现为流错误（不产生 413），
+/// 因此 handler 层必须显式累计字段字节数并给出可读错误；DefaultBodyLimit 仍保留
+/// 作为框架级内存保护（配合 UploadLimitLayer 改写 413 响应）。
+pub(crate) async fn read_multipart_field_limited(
+    field: &mut axum::extract::multipart::Field<'_>,
+    max_bytes: usize,
+    max_mb: i64,
+) -> Result<Vec<u8>, String> {
+    let limit_msg = || {
+        format!(
+            "文件过大：超过上传大小上限（{} MB，可用环境变量 READER_UPLOAD_MAX_MB 调整）",
+            max_mb
+        )
+    };
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        match field.chunk().await {
+            Ok(Some(chunk)) => {
+                out.extend_from_slice(&chunk);
+                if out.len() > max_bytes {
+                    return Err(limit_msg());
+                }
+            }
+            Ok(None) => break,
+            // 流错误（如底层 limited body 超限中断）——用累计长度判定是否超限
+            Err(_) => break,
+        }
+    }
+    if out.len() > max_bytes {
+        return Err(limit_msg());
+    }
+    Ok(out)
+}
+
+/// GAP 62：上传 Content-Length 预检——超限直接返回明确错误。
+/// 说明：DefaultBodyLimit 的 Limited 流在 Content-Length 超限时于首次读取即报错，
+/// Multipart 提取器表现为泛化流错误（"failed to read stream"，无超限信息）——
+/// 因此 handler 层在解析前先按 Content-Length 预检；无 Content-Length 的分块上传
+/// 由 read_multipart_field_limited 累计字节数兜底。
+pub(crate) fn check_upload_content_length(
+    headers: &HeaderMap,
+    max_bytes: usize,
+    max_mb: i64,
+) -> Option<String> {
+    let cl = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())?;
+    if cl > max_bytes {
+        Some(format!(
+            "文件过大：超过上传大小上限（{} MB，可用环境变量 READER_UPLOAD_MAX_MB 调整）",
+            max_mb
+        ))
+    } else {
+        None
     }
 }
 
@@ -1622,7 +1718,7 @@ async fn search_book(
     match crate::service::search::search_one_source(&namespace, &source, &key, page).await {
         Ok(books) => Json(ReturnData::ok(serde_json::to_value(books).unwrap_or(serde_json::Value::Null))),
         Err(e) => {
-            tracing::error!("搜索失败 [{}]: {e}", source.book_source_name);
+            tracing::error!("搜索失败 [{}]: {e:?}", source.book_source_name);
             Json(ReturnData::err("搜索失败"))
         }
     }
@@ -2128,11 +2224,26 @@ async fn export_book(
         })
         .collect();
     let (bytes, mime, ext) = match format {
-        "epub" => (
-            crate::service::export_book::build_epub(&title, &author, &export_chapters),
-            "application/epub+zip".to_string(),
-            "epub",
-        ),
+        // GAP 111：epub 导出携带封面（OPF manifest properties="cover-image" +
+        // <meta name="cover"> + OEBPS/cover.{jpg,png} 图片条目）；本地封面直读，
+        // 远程封面短超时抓取，失败静默降级为无封面
+        "epub" => {
+            let cover = book_cover_bytes(&state, &namespace, &url).await;
+            let epub = if let Some(cover) = cover {
+                crate::service::export_book::build_epub_full(
+                    &title,
+                    &author,
+                    &crate::service::export_book::EpubMeta {
+                        cover: Some(cover),
+                        ..Default::default()
+                    },
+                    &export_chapters,
+                )
+            } else {
+                crate::service::export_book::build_epub(&title, &author, &export_chapters)
+            };
+            (epub, "application/epub+zip".to_string(), "epub")
+        }
         "html" => (
             crate::service::export_book::build_html(&title, &export_chapters).into_bytes(),
             "text/html; charset=utf-8".to_string(),
@@ -2178,6 +2289,37 @@ fn percent_encode_filename(name: &str) -> String {
         }
     }
     out
+}
+
+/// GAP 111：导出 epub 用封面字节——书架书 cover_url 本地文件（/assets/...）直读；
+/// 远程 URL 短超时抓取（5s / 2MB）；任何失败返回 None（导出降级为无封面，不阻塞）
+async fn book_cover_bytes(state: &AppState, ns: &str, book_url: &str) -> Option<Vec<u8>> {
+    let book = state.storage.find_book(ns, book_url).await.ok().flatten()?;
+    let cover_url = book.cover_url.clone()?;
+    if cover_url.is_empty() {
+        return None;
+    }
+    if let Some(rel) = cover_url.strip_prefix("/assets/") {
+        // 本地封面文件（防穿越：仅接受 assets/{ns}/covers/ 纯文件名）
+        let prefix = format!("{ns}/covers/");
+        let file = rel.strip_prefix(&prefix)?;
+        if file.is_empty()
+            || file.contains('/')
+            || file.contains('\\')
+            || file.contains("..")
+        {
+            return None;
+        }
+        let path = state.storage.config.storage_dir().join("assets").join(ns).join("covers").join(file);
+        return std::fs::read(&path).ok();
+    }
+    if cover_url.starts_with("http://") || cover_url.starts_with("https://") {
+        // 远程封面：短超时 + 2MB 上限（失败静默）
+        if let Ok((bytes, _, _)) = crate::service::crawler::fetch_image(ns, &cover_url, None, 5, 2 * 1024 * 1024).await {
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 /// 收集导出章节：(书名, 作者, [(章节标题, 正文)])——本地书/文件书/书源书统一入口
@@ -3067,6 +3209,169 @@ async fn get_invalid_book_sources(
     Json(ReturnData::ok(serde_json::Value::Array(arr)))
 }
 
+/// POST /reader3/disableInvalidBookSources：失效书源一键禁用（GAP 140）
+///
+/// 复用 getInvalidBookSources 的并发检测（HEAD/首页轻量探测，超时 8s），
+/// 对判定失效的启用中书源批量 enabled=0；返回 {count, disabled:[bookSourceUrl]}。
+async fn disable_invalid_book_sources(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    _body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let sources = match state.storage.get_book_sources(&namespace).await {
+        Ok(s) => s.into_iter().filter(|s| s.enabled).collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::error!("disableInvalidBookSources [{namespace}] 失败: {e}");
+            return Json(ReturnData::err("系统错误"));
+        }
+    };
+    if sources.is_empty() {
+        return Json(ReturnData::ok(json!({ "count": 0, "disabled": [] })));
+    }
+    let invalid = crate::service::health::find_invalid(&namespace, &sources).await;
+    let mut disabled: Vec<String> = Vec::new();
+    for (s, reason) in &invalid {
+        match state
+            .storage
+            .update_book_source_enabled(&namespace, &s.book_source_url, false)
+            .await
+        {
+            Ok(_) => {
+                disabled.push(s.book_source_url.clone());
+                tracing::info!(
+                    "GAP 140 禁用失效书源 [{}] {}（{reason}）",
+                    namespace,
+                    s.book_source_url
+                );
+            }
+            Err(e) => tracing::warn!("禁用书源 {} 失败: {e}", s.book_source_url),
+        }
+    }
+    Json(ReturnData::ok(json!({ "count": disabled.len(), "disabled": disabled })))
+}
+
+/// POST /reader3/migrateLocBook：legacy loc_book 文件书 → DB 迁移（GAP 171）
+///
+/// body：{bookUrl} 单本，或 {all:true} 批量（书架全部 origin=loc_book 文件书）。
+/// 行为：文件解析入 book_chapters（键 = 原 book_url）→ books.local_file 关联路径
+/// （保留原记录：origin/阅读进度等不动，local_file 非空即迁移标记）→ 目录/正文
+/// 改由 DB 直读（getBookToc/getBookContent 命中章节表即不再解析文件）。
+/// 封面（文件内嵌）落盘 assets/{ns}/covers 并关联。返回 {migrated, skipped:[{bookUrl,error}]}。
+async fn migrate_loc_book(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json: Option<serde_json::Value> = body
+        .as_ref()
+        .and_then(|b| serde_json::from_slice(b).ok());
+    let all = body_json
+        .as_ref()
+        .and_then(|b| b.get("all").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let book_url = param_of(&params, body_json.as_ref(), "bookUrl");
+    if !all && book_url.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    // 收集目标书
+    let books = if all {
+        match state.storage.list_loc_book_books(&namespace).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("migrateLocBook 查询失败: {e}");
+                return Json(ReturnData::err("系统错误"));
+            }
+        }
+    } else {
+        match state.storage.find_book(&namespace, &book_url).await {
+            Ok(Some(b)) => vec![b],
+            Ok(None) => return Json(ReturnData::err("书籍不存在（请先加入书架）")),
+            Err(e) => {
+                tracing::error!("migrateLocBook 查询失败: {e}");
+                return Json(ReturnData::err("系统错误"));
+            }
+        }
+    };
+    let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
+    let mut migrated = 0usize;
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    for book in books {
+        // 文件定位（storage 路径或白名单扩展名；legacy 目录式 index.epub 兜底）
+        let Some(path) = resolve_loc_book_file(&state.storage.config.storage_dir(), &book.book_url)
+            .or_else(|| resolve_storage_path(&state.storage.config.storage_dir(), &book.book_url))
+        else {
+            skipped.push(json!({ "bookUrl": book.book_url, "error": "文件不存在" }));
+            continue;
+        };
+        let imported = match crate::service::local_book::parse_loc_book_path(&path, &user_rules) {
+            Ok(i) => i,
+            Err(e) => {
+                skipped.push(json!({ "bookUrl": book.book_url, "error": format!("解析失败：{e}") }));
+                continue;
+            }
+        };
+        if imported.chapters.is_empty() {
+            skipped.push(json!({ "bookUrl": book.book_url, "error": "未解析到章节内容" }));
+            continue;
+        }
+        let meta = std::fs::metadata(&path).ok();
+        let mtime = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let size = meta.map(|m| m.len() as i64).unwrap_or(0);
+        let chapters: Vec<(String, String)> = imported
+            .chapters
+            .iter()
+            .map(|c| (c.title.clone(), c.content.clone()))
+            .collect();
+        // local_file 存规范化绝对路径（与本地书双轨同步一致）
+        let local_file = path.to_string_lossy().replace('\\', "/");
+        match state
+            .storage
+            .migrate_loc_book(
+                &namespace,
+                &book.book_url,
+                Some(&local_file),
+                mtime,
+                size,
+                &chapters,
+                imported.cover.as_deref(),
+            )
+            .await
+        {
+            Ok(true) => {
+                migrated += 1;
+                tracing::info!(
+                    "GAP 171 迁移 loc_book [{}] {}（{} 章）← {}",
+                    namespace,
+                    book.book_url,
+                    chapters.len(),
+                    path.display()
+                );
+            }
+            Ok(false) => skipped.push(json!({ "bookUrl": book.book_url, "error": "书籍不存在" })),
+            Err(e) => {
+                tracing::error!("migrateLocBook 写库失败 [{}]: {e}", book.book_url);
+                skipped.push(json!({ "bookUrl": book.book_url, "error": format!("写库失败：{e}") }));
+            }
+        }
+    }
+    Json(ReturnData::ok(json!({ "migrated": migrated, "skipped": skipped })))
+}
+
 /// POST /reader3/setAsDefaultBookSources：默认书源标记（body：{bookSources:[url...] 或 [对象...]}）
 async fn set_as_default_book_sources(
     State(state): State<AppState>,
@@ -3638,6 +3943,7 @@ async fn require_rss_permission(state: &AppState, ns: &str) -> Result<(), Return
 // ---------------- F-25 TTS ----------------
 
 /// GET/POST /reader3/getTTSVoices：Edge TTS 可用语音列表（预置 zh-CN/en-US）
+/// GAP 113：10 分钟内存缓存（Mutex<Option<(ts, voices)>>——edge_voices_cached）
 async fn get_tts_voices(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -3645,7 +3951,8 @@ async fn get_tts_voices(
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
     let _ = (&state, &params, &headers, &body);
-    let arr: Vec<Value> = crate::service::tts::edge_voices()
+    let voices = crate::service::tts::edge_voices_cached();
+    let arr: Vec<Value> = voices
         .iter()
         .map(|v| {
             json!({
@@ -3764,21 +4071,36 @@ async fn restore_from_zip(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    let max_bytes = state.storage.config.upload_max_bytes();
+    let max_mb = state.storage.config.upload_max_mb;
+    // GAP 62：Content-Length 预检（超限 → 明确错误）
+    if let Some(msg) = check_upload_content_length(&headers, max_bytes, max_mb) {
+        return Json(ReturnData::err(msg));
+    }
     let mut bytes: Vec<u8> = Vec::new();
     let mut overwrite = params.get("overwrite").map(|v| v == "true" || v == "1").unwrap_or(false);
-    while let Ok(Some(field)) = multipart.next_field().await {
-        match field.name() {
-            Some("file") => {
-                if let Ok(b) = field.bytes().await {
-                    bytes = b.to_vec();
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(mut field)) => match field.name() {
+                Some("file") => {
+                    // GAP 62：显式字段大小上限（超限 → 明确错误）
+                    match read_multipart_field_limited(&mut field, max_bytes, max_mb).await {
+                        Ok(b) => bytes = b,
+                        Err(msg) => return Json(ReturnData::err(msg)),
+                    }
                 }
-            }
-            Some("overwrite") => {
-                if let Ok(v) = field.text().await {
-                    overwrite = v == "true" || v == "1";
+                Some("overwrite") => {
+                    if let Ok(v) = field.text().await {
+                        overwrite = v == "true" || v == "1";
+                    }
                 }
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!("restoreFromZip multipart 读取失败: {e}");
+                break;
             }
-            _ => {}
         }
     }
     if bytes.is_empty() {
@@ -5093,16 +5415,33 @@ async fn import_book_preview(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    let max_bytes = state.storage.config.upload_max_bytes();
+    let max_mb = state.storage.config.upload_max_mb;
+    // GAP 62：Content-Length 预检（超限 → 明确错误）
+    if let Some(msg) = check_upload_content_length(&headers, max_bytes, max_mb) {
+        return Json(ReturnData::err(msg));
+    }
     // 取 file 字段（首块）
     let mut file_name = String::new();
     let mut bytes: Vec<u8> = Vec::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("file") {
-            file_name = field.file_name().unwrap_or("file").to_string();
-            if let Ok(b) = field.bytes().await {
-                bytes = b.to_vec();
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(mut field)) => {
+                if field.name() == Some("file") {
+                    file_name = field.file_name().unwrap_or("file").to_string();
+                    // GAP 62：显式字段大小上限（超限 → 明确错误）
+                    match read_multipart_field_limited(&mut field, max_bytes, max_mb).await {
+                        Ok(b) => bytes = b,
+                        Err(msg) => return Json(ReturnData::err(msg)),
+                    }
+                    break;
+                }
             }
-            break;
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!("importBookPreview multipart 读取失败: {e}");
+                break;
+            }
         }
     }
     if bytes.is_empty() {
@@ -5774,13 +6113,30 @@ async fn upload_local_book(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    let max_bytes = state.storage.config.upload_max_bytes();
+    let max_mb = state.storage.config.upload_max_mb;
+    // GAP 62：Content-Length 预检（超限 → 明确错误）
+    if let Some(msg) = check_upload_content_length(&headers, max_bytes, max_mb) {
+        return Json(ReturnData::err(msg));
+    }
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut file_name = String::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("file") {
-            file_name = field.file_name().unwrap_or("book").to_string();
-            if let Ok(bytes) = field.bytes().await {
-                file_bytes = Some(bytes.to_vec());
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(mut field)) => {
+                if field.name() == Some("file") {
+                    file_name = field.file_name().unwrap_or("book").to_string();
+                    // GAP 62：显式字段大小上限（超限 → 明确错误）
+                    match read_multipart_field_limited(&mut field, max_bytes, max_mb).await {
+                        Ok(b) => file_bytes = Some(b),
+                        Err(msg) => return Json(ReturnData::err(msg)),
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!("uploadLocalBook multipart 读取失败: {e}");
+                break;
             }
         }
     }
@@ -5977,6 +6333,12 @@ async fn get_book_toc_loc_book(
         .or_else(|| books.iter().find(|b| b.origin == "loc_book"))?;
     let book_url = &book.book_url;
     tracing::debug!("loc_book toc: req={req_url} matched={book_url}");
+    // GAP 171：已迁移（migrateLocBook）的书——章节表命中即 DB 直读
+    if let Ok(chapters) = state.storage.list_chapters(book_url).await {
+        if !chapters.is_empty() {
+            return toc_json_from_chapters(book_url, &chapters);
+        }
+    }
     if !book_url.starts_with("storage/") {
         tracing::debug!("loc_book toc: book_url 非 storage 路径");
         return None;
@@ -6012,6 +6374,12 @@ async fn get_book_toc_loc_book(
 
 /// 文件型本地书目录：按扩展名解析（TXT 用用户规则）→ 章节列表（chapterUrl = bookUrl#index）
 async fn get_book_toc_file(state: &AppState, ns: &str, book_url: &str) -> Option<Json<ReturnData>> {
+    // GAP 171：已迁移（migrateLocBook）的书——章节表命中即 DB 直读（不再解析文件）
+    if let Ok(chapters) = state.storage.list_chapters(book_url).await {
+        if !chapters.is_empty() {
+            return toc_json_from_chapters(book_url, &chapters);
+        }
+    }
     // 优先严格路径（防穿越），失败回退 legacy 目录式 index.epub 定位
     let path = resolve_storage_path(&state.storage.config.storage_dir(), book_url)
         .or_else(|| resolve_loc_book_file(&state.storage.config.storage_dir(), book_url))?;
@@ -6033,15 +6401,40 @@ async fn get_book_toc_file(state: &AppState, ns: &str, book_url: &str) -> Option
     Some(Json(ReturnData::ok(serde_json::Value::Array(list))))
 }
 
+/// 章节表 → 目录 JSON（文件书 url 格式 {book_url}#{index}）
+fn toc_json_from_chapters(
+    book_url: &str,
+    chapters: &[(i64, String)],
+) -> Option<Json<ReturnData>> {
+    let list: Vec<serde_json::Value> = chapters
+        .iter()
+        .map(|(idx, title)| {
+            serde_json::json!({
+                "title": title,
+                "url": format!("{book_url}#{idx}"),
+                "isVolume": false,
+                "index": idx,
+            })
+        })
+        .collect();
+    Some(Json(ReturnData::ok(serde_json::Value::Array(list))))
+}
+
 /// 文件型本地书正文：bookUrl#index → 定位文件（白名单扩展名）→ 提取章节
 async fn get_book_content_file(state: &AppState, ns: &str, chapter_url: &str) -> Option<Json<ReturnData>> {
     let (book_part, idx_part) = chapter_url.rsplit_once('#')?;
-    let index: usize = idx_part.parse().ok()?;
+    let index: i64 = idx_part.parse().ok()?;
+    // GAP 171：已迁移的书——章节表直读（索引命中即返回，不再解析文件）
+    if let Ok(Some(content)) = state.storage.get_chapter_content(book_part, index).await {
+        if !content.trim().is_empty() {
+            return Some(Json(ReturnData::ok(serde_json::json!({ "content": content }))));
+        }
+    }
     let path = resolve_loc_book_file(&state.storage.config.storage_dir(), book_part)?;
     // 按扩展名分派（TXT 用用户规则，其余格式用各自解析器）
     let user_rules = txt_toc_rule_regexes(state, ns).await;
     let imported = crate::service::local_book::parse_loc_book_path(&path, &user_rules).ok()?;
-    let content = imported.chapters.get(index)?.content.clone();
+    let content = imported.chapters.get(index as usize)?.content.clone();
     Some(Json(ReturnData::ok(serde_json::json!({ "content": content }))))
 }
 
@@ -10544,6 +10937,310 @@ mod tests {
         let resp = assets_proxy(AxumState(state.clone()), Query(params), HeaderMap::new()).await;
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("参数错误"));
+        cleanup(state, dir).await;
+    }
+
+    // ==================== 收尾批（P3）：上传限制 / EPUB 封面 / 失效禁用 / 迁移 / 内置探索 ====================
+
+    /// GAP 62：READER_UPLOAD_MAX_MB 配置解析——默认 100MB，env 覆盖，上传字节数换算正确
+    #[test]
+    fn test_upload_max_mb_config() {
+        let old = std::env::var("READER_UPLOAD_MAX_MB").ok();
+        std::env::remove_var("READER_UPLOAD_MAX_MB");
+        let cfg = crate::AppConfig::from_env();
+        assert_eq!(cfg.upload_max_mb, 100, "默认 100MB");
+        assert_eq!(cfg.upload_max_bytes(), 100 * 1024 * 1024);
+        std::env::set_var("READER_UPLOAD_MAX_MB", "50");
+        let cfg = crate::AppConfig::from_env();
+        assert_eq!(cfg.upload_max_mb, 50);
+        assert_eq!(cfg.upload_max_bytes(), 50 * 1024 * 1024);
+        // 非法值回退默认
+        std::env::set_var("READER_UPLOAD_MAX_MB", "abc");
+        let cfg = crate::AppConfig::from_env();
+        assert_eq!(cfg.upload_max_mb, 100);
+        match old {
+            Some(v) => std::env::set_var("READER_UPLOAD_MAX_MB", v),
+            None => std::env::remove_var("READER_UPLOAD_MAX_MB"),
+        }
+    }
+
+    /// GAP 62：端到端——multipart 超限（上限 1MB）→ 明确 JSON 错误（Content-Length 预检）
+    #[tokio::test]
+    async fn test_upload_limit_413_end_to_end() {
+        use tower::ServiceExt as _;
+        let (mut state, dir) = test_state("uplimit").await;
+        state.storage.config.upload_max_mb = 1; // 1MB 上限
+        // 小上限路由（1MB）：直接构造路由片段验证 DefaultBodyLimit + 明确错误 + 413 改写层
+        let app = axum::Router::new()
+            .route(
+                "/reader3/uploadLocalBook",
+                post(upload_local_book).layer(axum::extract::DefaultBodyLimit::max(state.storage.config.upload_max_bytes())),
+            )
+            .with_state(state.clone())
+            .layer(crate::middleware::upload_limit::UploadLimitLayer { max_mb: 1 });
+        let boundary = "----reader-uplimit-boundary";
+        // 构造 2MB multipart 体（超过 1MB 上限）
+        let mut mp: Vec<u8> = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.txt\"\r\nContent-Type: text/plain\r\n\r\n"
+        )
+        .into_bytes();
+        mp.extend(std::iter::repeat(b'x').take(2 * 1024 * 1024));
+        mp.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/reader3/uploadLocalBook")
+                    .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+                    .header("content-length", mp.len().to_string())
+                    .body(axum::body::Body::from(mp))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // axum Multipart 对 DefaultBodyLimit 超限表现为流错误（非 413）——handler 层
+        // 显式字段上限给出明确错误（GAP 62 主路径）；413 改写由 UploadLimitLayer 覆盖
+        // Bytes/Json 类提取器（middleware::upload_limit 单测已覆盖）
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap(), "超限应失败: {json}");
+        assert!(
+            json["errorMsg"].as_str().unwrap().contains("超过上传大小上限"),
+            "应为明确错误: {json}"
+        );
+        cleanup(state, dir).await;
+    }
+
+    /// GAP 111：exportBook epub 含封面——OPF manifest properties=cover-image +
+    /// <meta name="cover"> + OEBPS/cover.jpg 图片条目（本地封面文件直读）
+    #[tokio::test]
+    async fn test_export_book_epub_cover_api() {
+        use std::io::Read as _;
+        let (state, dir) = test_state("epubcover").await;
+        // 本地书（local://）入架 + 章节 + 本地封面文件
+        let book_url = "local://epub-cover-test";
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.into(),
+                    name: "封面书".into(),
+                    author: "作者X".into(),
+                    origin: "local".into(),
+                    cover_url: Some("/assets/default/covers/c1.jpg".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .cache_chapter_content(book_url, 0, "第一章", "正文内容。")
+            .await
+            .unwrap();
+        let cover_dir = state.storage.config.storage_dir().join("assets/default/covers");
+        std::fs::create_dir_all(&cover_dir).unwrap();
+        // 最小合法 JPEG 头（封面检测：非 PNG 前缀即按 jpg 处理）
+        std::fs::write(cover_dir.join("c1.jpg"), [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46]).unwrap();
+
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), book_url.into());
+        params.insert("format".into(), "epub".into());
+        let resp = export_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap().to_vec();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("epub 应合法");
+        let mut opf = String::new();
+        zip.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(opf.contains("properties=\"cover-image\""), "manifest 封面声明: {opf}");
+        assert!(opf.contains("<meta name=\"cover\" content=\"cover-image\"/>"));
+        assert!(opf.contains("href=\"cover.jpg\""), "manifest 条目应指向 OEBPS/cover.jpg: {opf}");
+        let mut cover = Vec::new();
+        zip.by_name("OEBPS/cover.jpg").unwrap().read_to_end(&mut cover).unwrap();
+        assert_eq!(&cover[..4], &[0xFF, 0xD8, 0xFF, 0xE0], "封面图片条目内容一致");
+        // 章节仍在
+        let mut ch = String::new();
+        zip.by_name("OEBPS/chap_0000.xhtml").unwrap().read_to_string(&mut ch).unwrap();
+        assert!(ch.contains("正文内容。"));
+        cleanup(state, dir).await;
+    }
+
+    /// GAP 140：disableInvalidBookSources——坏源批量禁用、好源保留、返回 count/disabled
+    #[tokio::test]
+    async fn test_disable_invalid_book_sources_api() {
+        let (state, dir) = test_state("disinv").await;
+        let good_url = serve_head_get().await;
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: good_url.clone(),
+                    book_source_name: "好源".into(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "http://127.0.0.1:1".into(),
+                    book_source_name: "坏源".into(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // 已禁用的不参与（也不重复禁用）
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "http://127.0.0.1:2".into(),
+                    book_source_name: "停用源".into(),
+                    enabled: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let ret = disable_invalid_book_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["count"], 1, "仅坏源被禁用: {}", ret.0.data);
+        assert_eq!(ret.0.data["disabled"][0], "http://127.0.0.1:1");
+        let sources = state.storage.get_book_sources("default").await.unwrap();
+        let bad = sources.iter().find(|s| s.book_source_url == "http://127.0.0.1:1").unwrap();
+        assert!(!bad.enabled, "坏源应被禁用");
+        let good = sources.iter().find(|s| s.book_source_url == good_url).unwrap();
+        assert!(good.enabled, "好源应保留启用");
+
+        // 再次执行：已禁用的不再重复计数
+        let ret = disable_invalid_book_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.data["count"], 0);
+        cleanup(state, dir).await;
+    }
+
+    /// GAP 141：内置探索源导入测试库 → getExploreSources 返回（categoryCount>0，可探索）
+    #[tokio::test]
+    async fn test_builtin_explore_sources_import_api() {
+        let (state, dir) = test_state("builtexplore").await;
+        let builtin = crate::service::explore::builtin_explore_sources();
+        assert!(builtin.len() >= 2);
+        for s in &builtin {
+            state.storage.save_book_source("default", s).await.unwrap();
+        }
+        let ret = get_explore_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new()).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), builtin.len(), "内置探索源应全部进入探索列表: {arr:?}");
+        for item in arr {
+            let count = item["categoryCount"].as_u64().unwrap_or(0);
+            assert!(count >= 4, "探索分类数应 >= 4: {item}");
+        }
+        // 已导入书源可被 saveBookSources 幂等覆盖（raw_json 完整回吐）
+        let ret = get_book_sources(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new()).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data.as_array().unwrap().len(), builtin.len());
+        cleanup(state, dir).await;
+    }
+
+    /// GAP 171：migrateLocBook——单本 + 批量；文件解析入章节表、local_file 关联、
+    /// 原记录保留；迁移后 getBookToc/getBookContent 走 DB 直读（不再解析文件）
+    #[tokio::test]
+    async fn test_migrate_loc_book_api() {
+        let (state, dir) = test_state("migloc").await;
+        // 构造 legacy loc_book 文件书：storage/data/default/示例.txt（书架记录 origin=loc_book）
+        let file_dir = state.storage.config.storage_dir().join("data/default");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        let txt_path = file_dir.join("示例.txt");
+        std::fs::write(&txt_path, "第一章 起点\n内容一。\n第二章 发展\n内容二。\n").unwrap();
+        let book_url = format!("storage/data/default/{}", txt_path.file_name().unwrap().to_string_lossy());
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.clone(),
+                    name: "示例".into(),
+                    origin: "loc_book".into(),
+                    origin_name: "本地书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // 单本迁移
+        let body = Bytes::from(json!({ "bookUrl": book_url }).to_string());
+        let ret = migrate_loc_book(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["migrated"], 1, "{}", ret.0.data);
+        assert_eq!(ret.0.data["skipped"].as_array().unwrap().len(), 0);
+        // 章节入库 + local_file 关联 + 原记录保留（origin 不变）
+        let chapters = state.storage.list_chapters(&book_url).await.unwrap();
+        assert_eq!(chapters.len(), 2, "章节应写入 DB");
+        assert_eq!(chapters[0].1, "第一章 起点");
+        let book = state.storage.find_book("default", &book_url).await.unwrap().unwrap();
+        assert_eq!(book.origin, "loc_book", "原记录 origin 保留");
+        assert!(book.local_file.as_deref().unwrap_or("").contains("示例.txt"), "local_file 应关联: {:?}", book.local_file);
+        assert!(!book.local_file_deleted);
+        // 正文内容可读（DB 直读——通过 get_book_content_file 路径）
+        let content = state.storage.get_chapter_content(&book_url, 1).await.unwrap().unwrap();
+        assert_eq!(content, "内容二。");
+        // getBookToc：storage/ 路径命中 DB 直读（不再解析文件）
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("tocUrl".into(), book_url.clone());
+        let ret = get_book_toc(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let arr = ret.0.data.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["title"], "第一章 起点");
+        assert_eq!(arr[0]["url"], format!("{book_url}#0"));
+
+        // 重复迁移幂等（migrated=1，章节不翻倍）
+        let body = Bytes::from(json!({ "bookUrl": book_url }).to_string());
+        let ret = migrate_loc_book(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.data["migrated"], 1);
+        assert_eq!(state.storage.list_chapters(&book_url).await.unwrap().len(), 2);
+
+        // 参数错误
+        let ret = migrate_loc_book(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "参数错误");
+        // 不存在的书
+        let body = Bytes::from(r#"{"bookUrl":"storage/data/default/ghost.txt"}"#);
+        let ret = migrate_loc_book(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "书籍不存在（请先加入书架）");
+
+        // 批量（all）：第二本 loc_book 一并迁移；非 loc_book 不受影响
+        let txt2 = file_dir.join("示例2.txt");
+        std::fs::write(&txt2, "甲章\n甲内容。\n").unwrap();
+        let book_url2 = format!("storage/data/default/{}", txt2.file_name().unwrap().to_string_lossy());
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url2.clone(),
+                    name: "示例2".into(),
+                    origin: "loc_book".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let body = Bytes::from(r#"{"all":true}"#);
+        let ret = migrate_loc_book(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["migrated"], 2, "两本 loc_book 均迁移（第一本幂等重迁成功）: {}", ret.0.data);
+        assert_eq!(state.storage.list_chapters(&book_url2).await.unwrap().len(), 1);
         cleanup(state, dir).await;
     }
 
