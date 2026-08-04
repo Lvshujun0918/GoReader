@@ -71,6 +71,8 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
 
     axum::Router::new()
         .nest_service("/assets", assets_service)
+        // GAP #88/125：封面/正文图片防盗链代理（精确路由优先于 /assets 静态目录）
+        .route("/assets/proxy", get(assets_proxy))
         .route("/health", get(health))
         // 弱网优化：响应压缩（gzip/brotli）
         .layer(tower_http::compression::CompressionLayer::new())
@@ -251,6 +253,55 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
 
 async fn health() -> &'static str {
     "ok!"
+}
+
+/// GAP #88/125：GET /assets/proxy?url=&referer=（封面/正文图片防盗链代理）
+///
+/// 服务端拉取图片：自动附加书源 header（书源登录 cookie/UA 按用户命名空间 + Referer）；
+/// 超时 10s；大小上限 5MB（Content-Length 预检 + 流式累计兜底）；Content-Type 透传。
+/// secure 模式下按 accessToken 解析用户命名空间（与 /reader3 一致）。
+async fn assets_proxy(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let url = params.get("url").cloned().unwrap_or_default();
+    if url.is_empty() {
+        return Json(ReturnData::err("参数错误")).into_response();
+    }
+    // 仅允许 http/https（控制 SSRF 面）
+    let parsed = match url::Url::parse(&url) {
+        Ok(p) if matches!(p.scheme(), "http" | "https") => p,
+        _ => return Json(ReturnData::err("参数错误")).into_response(),
+    };
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return (StatusCode::UNAUTHORIZED, Json(ret)).into_response(),
+    };
+    let referer = params.get("referer").cloned();
+    match crate::service::crawler::fetch_image(
+        &namespace,
+        parsed.as_str(),
+        referer.as_deref(),
+        10,
+        5 * 1024 * 1024,
+    )
+    .await
+    {
+        Ok((bytes, content_type, status)) => Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+            .header(
+                "Content-Type",
+                content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+            )
+            .header("Cache-Control", "public, max-age=3600")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(e) => {
+            tracing::warn!("图片代理失败 [{url}]: {e}");
+            Json(ReturnData::err(format!("图片加载失败：{e}"))).into_response()
+        }
+    }
 }
 
 /// POST /reader3/login 请求体（兼容 legacy：username/password/isLogin/code）
@@ -1131,72 +1182,17 @@ async fn get_source_subs(
 }
 
 /// 抓取订阅 URL → 校验书源数组 → 订阅入库（raw_json 存原文）+ 批量导入书源（已存在覆盖）
-/// （saveSourceSub / refreshSourceSub 共用）；返回导入书源数
+/// （saveSourceSub / refreshSourceSub 共用；核心逻辑在 service::schedule，定时刷新复用）；
+/// 返回导入书源数
 async fn fetch_and_store_source_sub(
     state: &AppState,
     ns: &str,
     url: &str,
     name: &str,
 ) -> Result<usize, ReturnData> {
-    let headers_map: HashMap<String, String> = HashMap::new();
-    let resp = match crate::service::crawler::fetch(url, &headers_map, 15, "GET", None, None).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("订阅抓取失败 [{url}]: {e}");
-            return Err(ReturnData::err("远程书源链接错误"));
-        }
-    };
-    // 校验：必须是书源数组（每项含非空 bookSourceUrl）
-    let json: serde_json::Value = match serde_json::from_str(&resp.body) {
-        Ok(v) => v,
-        Err(_) => return Err(ReturnData::err("书源数据格式错误")),
-    };
-    let sources: Vec<crate::model::BookSource> = match serde_json::from_value(json) {
-        Ok(s) => s,
-        Err(_) => return Err(ReturnData::err("书源数据格式错误")),
-    };
-    if sources.is_empty() || sources.iter().any(|s| s.book_source_url.trim().is_empty()) {
-        return Err(ReturnData::err("书源数据格式错误"));
-    }
-    // F-7 书源数上限（同 saveFromRemoteSource：已存在覆盖不计名额，超限整批拒绝）
-    if let Some(limit) = state.storage.book_source_limit_for(ns).await.ok().flatten() {
-        if limit > 0 {
-            let mut new_count = 0i64;
-            for s in &sources {
-                let exists = state
-                    .storage
-                    .find_book_source(ns, &s.book_source_url)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if !exists {
-                    new_count += 1;
-                }
-            }
-            match state.storage.count_book_sources(ns).await {
-                Ok(count) if count + new_count > limit => {
-                    return Err(ReturnData::err("超过书源数上限"));
-                }
-                Ok(_) => {}
-                Err(_) => return Err(ReturnData::err("系统错误")),
-            }
-        }
-    }
-    // 订阅入库 + 批量导入书源
-    if let Err(e) = state
-        .storage
-        .save_source_sub(ns, url, name, &resp.body)
+    crate::service::schedule::refresh_source_sub_core(&state.storage, ns, url, name)
         .await
-    {
-        tracing::error!("保存订阅失败 [{url}]: {e}");
-        return Err(ReturnData::err("保存失败"));
-    }
-    if let Err(e) = state.storage.save_book_sources(ns, &sources).await {
-        tracing::error!("订阅书源入库失败 [{url}]: {e}");
-        return Err(ReturnData::err("保存失败"));
-    }
-    Ok(sources.len())
+        .map_err(|e| ReturnData::err(e.to_string()))
 }
 
 /// POST /reader3/saveSourceSub：订阅书源集合（body {url, name}）——抓取校验后入库 + 批量导入书源
@@ -1290,6 +1286,10 @@ async fn get_rss_sources(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下 RSS 功能未开启 → 拒绝
+    if let Err(ret) = require_rss_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let _ = body;
     match state.storage.get_rss_sources(&namespace).await {
         Ok(list) => {
@@ -1314,6 +1314,10 @@ async fn save_rss_source(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下 RSS 功能未开启 → 拒绝
+    if let Err(ret) = require_rss_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let Some(body) = body else {
         return Json(ReturnData::err("参数错误"));
     };
@@ -1350,6 +1354,10 @@ async fn delete_rss_source(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下 RSS 功能未开启 → 拒绝
+    if let Err(ret) = require_rss_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let body_json: Option<Value> = body
         .as_ref()
         .and_then(|b| serde_json::from_slice(b).ok());
@@ -1377,6 +1385,10 @@ async fn get_rss_articles(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下 RSS 功能未开启 → 拒绝
+    if let Err(ret) = require_rss_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let body_json: Option<Value> = body
         .as_ref()
         .and_then(|b| serde_json::from_slice(b).ok());
@@ -1434,6 +1446,10 @@ async fn mark_rss_article_read(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下 RSS 功能未开启 → 拒绝
+    if let Err(ret) = require_rss_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let _ = namespace;
     let body_json: Option<Value> = body
         .as_ref()
@@ -1467,6 +1483,10 @@ async fn get_rss_article(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下 RSS 功能未开启 → 拒绝
+    if let Err(ret) = require_rss_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let _ = namespace;
     let body_json: Option<Value> = body
         .as_ref()
@@ -1533,6 +1553,10 @@ async fn search_book(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下书源功能未开启 → 拒绝
+    if let Err(ret) = require_book_source_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     // 参数解析（POST body JSON 优先，GET query 兜底）
     let mut key = params.get("key").cloned().unwrap_or_default();
     let mut page = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1i64);
@@ -1587,6 +1611,10 @@ async fn search_book_multi(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下书源功能未开启 → 拒绝
+    if let Err(ret) = require_book_source_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let mut key = params.get("key").cloned().unwrap_or_default();
     let mut page = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1i64);
     let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
@@ -1673,6 +1701,10 @@ async fn search_book_source(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：换源同样受书源权限开关约束
+    if let Err(ret) = require_book_source_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let url = param_of(&params, body_json.as_ref(), "url");
     let book_source_param = param_of(&params, body_json.as_ref(), "bookSource");
@@ -2690,6 +2722,10 @@ async fn save_rss_sources(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下 RSS 功能未开启 → 拒绝
+    if let Err(ret) = require_rss_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let _ = params;
     let Some(body) = body else {
         return Json(ReturnData::err("参数错误"));
@@ -3019,6 +3055,10 @@ async fn search_book_source_sse(
         Ok(ns) => ns,
         Err(ret) => return sse_error(ret),
     };
+    // GAP #58：换源同样受书源权限开关约束
+    if let Err(ret) = require_book_source_permission(&state, &namespace).await {
+        return sse_error(ret);
+    }
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let url = param_of(&params, body_json.as_ref(), "url");
     let book_source_param = param_of(&params, body_json.as_ref(), "bookSource");
@@ -3489,6 +3529,32 @@ fn check_manager_auth(
         });
     }
     Ok(())
+}
+
+// ---------------- GAP #58 权限开关实际执行 ----------------
+
+/// secure 模式书源功能检查：用户 enable_book_source=0（或用户不存在）→ 拒绝
+async fn require_book_source_permission(state: &AppState, ns: &str) -> Result<(), ReturnData> {
+    if !state.storage.config.secure {
+        return Ok(());
+    }
+    match state.storage.find_user(ns).await {
+        Ok(Some(u)) if u.enable_book_source => Ok(()),
+        Ok(Some(_)) => Err(ReturnData::err("书源功能未开启")),
+        _ => Err(login_required()),
+    }
+}
+
+/// secure 模式 RSS 功能检查：用户 enable_rss_source=0（或用户不存在）→ 拒绝
+async fn require_rss_permission(state: &AppState, ns: &str) -> Result<(), ReturnData> {
+    if !state.storage.config.secure {
+        return Ok(());
+    }
+    match state.storage.find_user(ns).await {
+        Ok(Some(u)) if u.enable_rss_source => Ok(()),
+        Ok(Some(_)) => Err(ReturnData::err("RSS功能未开启")),
+        _ => Err(login_required()),
+    }
 }
 
 // ---------------- F-25 TTS ----------------
@@ -4370,6 +4436,10 @@ async fn get_explore_sources(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下书源功能未开启 → 拒绝
+    if let Err(ret) = require_book_source_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let sources = match state.storage.get_book_sources(&namespace).await {
         Ok(s) => s,
         Err(_) => return Json(ReturnData::err("系统错误")),
@@ -4401,6 +4471,10 @@ async fn get_explore_urls(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下书源功能未开启 → 拒绝
+    if let Err(ret) = require_book_source_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
@@ -4413,6 +4487,9 @@ async fn get_explore_urls(
 }
 
 /// GET/POST /reader3/exploreBook：探索/书海（url=ruleFindUrl + bookSource + page）
+///
+/// GAP #51：分页——page 参数由服务端替换书源分页变量（{{page}}/{page}）；
+/// 返回 `{books: SearchBook[], hasMore: bool}`（hasMore：本页达到阈值且非空）。
 async fn explore_book(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -4423,6 +4500,10 @@ async fn explore_book(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP #58：secure 模式下书源功能未开启 → 拒绝
+    if let Err(ret) = require_book_source_permission(&state, &namespace).await {
+        return Json(ret);
+    }
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let url = param_of(&params, body_json.as_ref(), "url");
     let url = if url.is_empty() {
@@ -4442,16 +4523,16 @@ async fn explore_book(
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
     };
-    // 分页占位（{{page}}/{page}）
-    let target = url
-        .replace("{{page}}", &page.to_string())
-        .replace("{page}", &page.to_string());
-    match crate::service::explore::explore_url(&namespace, &target, &source).await {
-        Ok(books) => Json(ReturnData::ok(
-            serde_json::to_value(books).unwrap_or(serde_json::Value::Null),
-        )),
+    match crate::service::explore::explore_url(&namespace, &url, page, &source).await {
+        Ok(books) => {
+            let has_more = crate::service::explore::has_more(&books);
+            Json(ReturnData::ok(serde_json::json!({
+                "books": books,
+                "hasMore": has_more,
+            })))
+        }
         Err(e) => {
-            tracing::error!("exploreBook 失败 [{target}]: {e}");
+            tracing::error!("exploreBook 失败 [{url}]: {e}");
             Json(ReturnData::err(format!("探索失败：{e}")))
         }
     }
@@ -4507,6 +4588,10 @@ async fn search_book_multi_sse(
         Ok(ns) => ns,
         Err(ret) => return sse_error(ret),
     };
+    // GAP #58：secure 模式下书源功能未开启 → 拒绝
+    if let Err(ret) = require_book_source_permission(&state, &namespace).await {
+        return sse_error(ret);
+    }
     if key.is_empty() {
         return sse_error(ReturnData::err("请输入搜索关键字"));
     }
@@ -9681,6 +9766,305 @@ mod tests {
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "未开启webdav功能");
 
+        cleanup(state, dir).await;
+    }
+
+    /// GAP #58：secure 模式下 enable_book_source=0 → 搜索/探索/换源拒绝（书源功能未开启）
+    #[tokio::test]
+    async fn test_permission_book_source_gate() {
+        let (state, dir) = test_state("permbook").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.secure_key = "sk".into();
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t1".into(),
+                enable_book_source: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let params: HashMap<String, String> =
+            [("accessToken".into(), "alice:t1".into())].into_iter().collect();
+
+        // 搜索（单源/多源/SSE）→ 拒绝
+        let mut p = params.clone();
+        p.insert("key".into(), "测试".into());
+        let ret = search_book(AxumState(state.clone()), Query(p.clone()), HeaderMap::new(), None).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "书源功能未开启");
+        let ret = search_book_multi(AxumState(state.clone()), Query(p.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "书源功能未开启");
+        let resp = search_book_multi_sse(AxumState(state.clone()), Query(p.clone()), HeaderMap::new(), None).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let sse = String::from_utf8_lossy(&bytes).to_string();
+        assert!(sse.contains("书源功能未开启"), "SSE 应输出 error 事件: {sse}");
+
+        // 换源 → 拒绝
+        let mut p2 = params.clone();
+        p2.insert("url".into(), "https://a.com/b".into());
+        p2.insert("bookSource".into(), "https://s.com".into());
+        let ret = search_book_source(AxumState(state.clone()), Query(p2.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "书源功能未开启");
+        let resp = search_book_source_sse(AxumState(state.clone()), Query(p2.clone()), HeaderMap::new(), None).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("书源功能未开启"));
+
+        // 探索 → 拒绝
+        let mut p3 = params.clone();
+        p3.insert("url".into(), "https://a.com/list".into());
+        p3.insert("bookSource".into(), "https://s.com".into());
+        let ret = explore_book(AxumState(state.clone()), Query(p3.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "书源功能未开启");
+        let ret = get_explore_sources(AxumState(state.clone()), Query(params.clone()), HeaderMap::new()).await;
+        assert_eq!(ret.0.error_msg, "书源功能未开启");
+        let ret = get_explore_urls(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "书源功能未开启");
+
+        // 开启后放行（无书源 → 走正常业务错误，说明权限已过）
+        state
+            .storage
+            .update_user_permissions("alice", None, None, Some(true), None, None, None)
+            .await
+            .unwrap();
+        let ret = search_book(AxumState(state.clone()), Query(p.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "未配置书源");
+
+        // 非 secure 模式不拦截
+        state.storage.config.secure = false;
+        let ret = search_book(AxumState(state.clone()), Query(p.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "未配置书源");
+        cleanup(state, dir).await;
+    }
+
+    /// GAP #58：secure 模式下 enable_rss_source=0 → RSS 接口拒绝（RSS功能未开启）
+    #[tokio::test]
+    async fn test_permission_rss_gate() {
+        let (state, dir) = test_state("permrss").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.secure_key = "sk".into();
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t1".into(),
+                enable_rss_source: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let params: HashMap<String, String> =
+            [("accessToken".into(), "alice:t1".into())].into_iter().collect();
+
+        // 列表/保存/删除/文章/已读 → 全部拒绝
+        let ret = get_rss_sources(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "RSS功能未开启");
+        let body = Bytes::from(r#"{"sourceUrl":"https://r.com/f.xml","sourceName":"R"}"#);
+        let ret = save_rss_source(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "RSS功能未开启");
+        let mut p = params.clone();
+        p.insert("rssSourceUrl".into(), "https://r.com/f.xml".into());
+        let ret = delete_rss_source(AxumState(state.clone()), Query(p.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "RSS功能未开启");
+        let ret = get_rss_articles(AxumState(state.clone()), Query(p.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "RSS功能未开启");
+        let mut p2 = params.clone();
+        p2.insert("articleUrl".into(), "https://r.com/a1".into());
+        let ret = mark_rss_article_read(AxumState(state.clone()), Query(p2.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "RSS功能未开启");
+        let mut p3 = params.clone();
+        p3.insert("url".into(), "https://r.com/a1".into());
+        let ret = get_rss_article(AxumState(state.clone()), Query(p3.clone()), HeaderMap::new(), None).await;
+        assert_eq!(ret.0.error_msg, "RSS功能未开启");
+        let body = Bytes::from(r#"[{"sourceUrl":"https://r.com/f.xml","sourceName":"R"}]"#);
+        let ret = save_rss_sources(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), Some(body)).await;
+        assert_eq!(ret.0.error_msg, "RSS功能未开启");
+
+        // 开启后放行
+        state
+            .storage
+            .update_user_permissions("alice", None, None, None, Some(true), None, None)
+            .await
+            .unwrap();
+        let ret = get_rss_sources(AxumState(state.clone()), Query(params.clone()), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "开启后应放行: {}", ret.0.error_msg);
+        cleanup(state, dir).await;
+    }
+
+    /// GAP #51：exploreBook 分页——page 服务端替换 {{page}}；返回 {books, hasMore}
+    #[tokio::test]
+    async fn test_explore_book_pagination_response() {
+        let (state, dir) = test_state("explorepg").await;
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        // 25 本书的 JSON 列表（满页 → hasMore=true）
+        let mut books: Vec<serde_json::Value> = Vec::new();
+        for i in 0..25 {
+            books.push(serde_json::json!({
+                "name": format!("书{i}"), "author": "作者", "url": format!("https://a.com/b{i}")
+            }));
+        }
+        let body = serde_json::json!({ "data": books }).to_string();
+        let body_for_server = body.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..5 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                cap.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_for_server.len(),
+                    body_for_server
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let base = format!("http://{addr}");
+        let explore_url = format!("{base}/list/{{{{page}}}}");
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base.clone(),
+                    book_source_name: "探索源".into(),
+                    enabled_explore: true,
+                    explore_url: Some(explore_url.clone()),
+                    rule_explore: Some(serde_json::json!({
+                        "bookList": "$.data[*]",
+                        "name": "$.name",
+                        "author": "$.author",
+                        "bookUrl": "$.url",
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // page=3 → 请求路径应含 /list/3（服务端分页变量替换）
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), explore_url.clone());
+        params.insert("bookSource".into(), base.clone());
+        params.insert("page".into(), "3".into());
+        let ret = explore_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let data = ret.0.data;
+        assert_eq!(data["books"].as_array().unwrap().len(), 25);
+        assert_eq!(data["hasMore"], serde_json::json!(true), "满页应有更多");
+        assert_eq!(data["books"][0]["name"], "书0");
+        assert_eq!(data["books"][0]["origin"], base);
+        let req = captured.lock().unwrap()[0].clone();
+        assert!(req.contains("GET /list/3 "), "page 应由服务端替换进 URL: {req}");
+
+        // 空页（返回空数组）→ hasMore=false
+        let body2 = "{\"data\":[]}";
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener2.accept().await else { return };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body2.len(),
+                body2
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+        let base2 = format!("http://{addr2}");
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base2.clone(),
+                    book_source_name: "空源".into(),
+                    enabled_explore: true,
+                    explore_url: Some(format!("{base2}/list/{{{{page}}}}")),
+                    rule_explore: Some(serde_json::json!({
+                        "bookList": "$.data[*]",
+                        "name": "$.name",
+                        "bookUrl": "$.url",
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), format!("{base2}/list/{{{{page}}}}"));
+        params.insert("bookSource".into(), base2);
+        params.insert("page".into(), "2".into());
+        let ret = explore_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["books"].as_array().unwrap().len(), 0);
+        assert_eq!(ret.0.data["hasMore"], serde_json::json!(false));
+        cleanup(state, dir).await;
+    }
+
+    /// GAP #88/125：/assets/proxy 图片代理端点
+    #[tokio::test]
+    async fn test_assets_proxy_endpoint() {
+        let (state, dir) = test_state("proxy").await;
+        // mock 图片服务器（记录请求头）
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 9, 9, 9];
+        let png_for_server = png.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            cap.lock().unwrap().push(String::from_utf8_lossy(&buf).to_string());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png_for_server.len()
+            );
+            let mut resp = head.into_bytes();
+            resp.extend_from_slice(&png_for_server);
+            let _ = sock.write_all(&resp).await;
+        });
+        let img_url = format!("http://{addr}/cover/1.png");
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), img_url.clone());
+        params.insert("referer".into(), "https://src.com/book".into());
+        let resp = assets_proxy(AxumState(state.clone()), Query(params), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+            Some("image/png"),
+            "Content-Type 透传"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        assert_eq!(bytes.to_vec(), png, "图片字节透传");
+        let req = captured.lock().unwrap()[0].clone();
+        assert!(req.contains("GET /cover/1.png"), "{req}");
+        assert!(
+            req.to_lowercase().contains("referer: https://src.com/book"),
+            "Referer 应透传给上游: {req}"
+        );
+
+        // 参数错误（缺 url / 非法 scheme）
+        let resp = assets_proxy(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new()).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("参数错误"));
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), "file:///etc/passwd".into());
+        let resp = assets_proxy(AxumState(state.clone()), Query(params), HeaderMap::new()).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("参数错误"));
         cleanup(state, dir).await;
     }
 

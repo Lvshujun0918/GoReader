@@ -174,14 +174,32 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 探索分页 hasMore 阈值：单页书数达到该值认为可能还有下一页（无总数信号的
+/// 分页站点通用启发式——与 RSS 列表分页同策略；小于阈值说明已到底）
+pub const EXPLORE_PAGE_SIZE: usize = 20;
+
+/// 判断是否还有下一页：本页非空且达到阈值
+pub fn has_more(books: &[SearchBook]) -> bool {
+    !books.is_empty() && books.len() >= EXPLORE_PAGE_SIZE
+}
+
+/// 构造分页探索 URL（GAP #51：服务端解析书源规则分页变量 {{page}}/{page}）
+pub fn build_explore_url(url: &str, page: i64) -> String {
+    url.replace("{{page}}", &page.to_string())
+        .replace("{page}", &page.to_string())
+}
+
 /// 单页发现：抓取 + 解析（复用搜索的 SearchRule 语义）
+///
+/// GAP #51：page 参数由服务端替换书源分页变量（{{page}}/{page}，URL 与 POST body）
 pub async fn explore_url(
     ns: &str,
     url: &str,
+    page: i64,
     source: &BookSource,
 ) -> Result<Vec<SearchBook>> {
-    // URL 模板（{{page}}）
-    let url = url.replace("{{page}}", "1").replace("{page}", "1");
+    // URL 模板（{{page}}/{page}）→ 页码
+    let url = build_explore_url(url, page);
     // 相对 URL 拼书源 baseUrl
     let raw_url = if url.starts_with('/') && !url.starts_with("//") {
         let base = source.book_source_url.split("##").next().unwrap_or("").trim_end_matches('/');
@@ -197,7 +215,7 @@ pub async fn explore_url(
             headers.insert(k.clone(), v.clone());
         }
     }
-    let post_body = suffix.body.as_ref().map(|b| b.replace("{{page}}", "1").replace("{page}", "1"));
+    let post_body = suffix.body.as_ref().map(|b| build_explore_url(b, page));
     // 书源抓取（自动带书源 cookie——按用户命名空间）
     let method = suffix.method.as_deref().unwrap_or("GET");
     let resp = if method.eq_ignore_ascii_case("POST") {
@@ -251,6 +269,7 @@ mod tests {
         assert_eq!(parsed[0].title, "分类X");
         assert_eq!(parsed[0].url, "https://a.com/x");
         assert_eq!(parsed[1].title, "分类Y");
+        assert_eq!(parsed[1].url, "https://a.com/y");
         // JSON.parse 数组出口
         let js = "@js:JSON.parse('[{\"title\":\"类P\",\"url\":\"https://a.com/p\"}]')";
         let parsed = parse_explore_entries(js);
@@ -259,5 +278,28 @@ mod tests {
         // 无 url 条目丢弃
         let js = "@js:[{title:'空',url:''}]";
         assert!(parse_explore_entries(js).is_empty());
+    }
+
+    /// GAP #51：分页变量替换（{{page}}/{page} 双格式，URL 与 POST body 一致）
+    #[test]
+    fn test_build_explore_url_page() {
+        assert_eq!(build_explore_url("https://a.com/list/{{page}}", 3), "https://a.com/list/3");
+        assert_eq!(build_explore_url("https://a.com/list/{page}", 2), "https://a.com/list/2");
+        assert_eq!(build_explore_url("https://a.com/list?p={{page}}", 7), "https://a.com/list?p=7");
+        // 无占位符：原样返回
+        assert_eq!(build_explore_url("https://a.com/list", 5), "https://a.com/list");
+    }
+
+    /// GAP #51：hasMore 启发式（本页达到阈值且非空 → 可能有下一页）
+    #[test]
+    fn test_has_more() {
+        assert!(!has_more(&[]), "空页无更多");
+        let book = |i: usize| SearchBook {
+            book_url: format!("https://a.com/b{i}"),
+            ..Default::default()
+        };
+        assert!(!has_more(&(0..10).map(book).collect::<Vec<_>>()), "不足阈值无更多");
+        assert!(has_more(&(0..EXPLORE_PAGE_SIZE).map(book).collect::<Vec<_>>()), "满页可能有更多");
+        assert!(has_more(&(0..30).map(book).collect::<Vec<_>>()));
     }
 }

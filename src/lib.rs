@@ -3,6 +3,7 @@
 //! API 兼容 legacy 分支（Kotlin）的 `/reader3/*` 接口，数据兼容（JSON storage → SQLite 迁移）。
 
 pub mod api;
+pub mod middleware;
 pub mod model;
 pub mod parser;
 pub mod service;
@@ -84,9 +85,20 @@ impl AppConfig {
     /// 启动服务（axum）
     pub async fn serve(self) -> anyhow::Result<()> {
         let storage = storage::init(&self).await?;
-        // F-35：定时书架更新检查（每 10 分钟扫描 can_update=1 的书）
-        storage::spawn_shelf_update_job(storage.clone());
+        // F-35 定时书架更新检查（每 10 分钟）+ GAP #101 订阅/RSS 自动刷新
+        service::schedule::spawn_schedule_jobs(storage.clone());
+        // GAP #57 自动备份（每天 READER_AUTO_BACKUP_HOUR 03:00 默认）
+        service::schedule::spawn_auto_backup_job(storage.clone());
         let app = api::router(self.clone(), storage);
+        // GAP 60：静态资源 Cache-Control（hash 文件名 30 天 / index.html no-cache）。
+        // 挂载点说明：router.rs 被并行修改（git status 未提交改动）——避免冲突，
+        // 在 app 构造处（lib.rs serve()，main.rs 无 app 构造代码）挂载，效果等同 router 内层。
+        let app = app.layer(crate::middleware::cache_control::CacheControlLayer);
+        // GAP 60 备注（实测确认）：router.rs 内的 CompressionLayer 只覆盖其调用前注册的路由
+        // （/assets、/health 等）——fallback 静态资源（web-ui/dist）与后注册的 /reader3、/opds
+        // 路由未覆盖（axum Router::layer 只包装调用时已注册的路由）。此处外层再挂一层兜底：
+        // 已带 Content-Encoding 的响应自动跳过，SSE（text/event-stream）/音视频默认排除，无副作用。
+        let app = app.layer(tower_http::compression::CompressionLayer::new());
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         tracing::info!("reader-dev (Rust) listening on {addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;

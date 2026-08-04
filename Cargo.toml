@@ -10,13 +10,14 @@ license = "GPL-3.0"
 axum = { version = "0.7", features = ["macros", "json", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "fs", "compression-gzip"] }
+tower = "0.5"            # 中间件（Layer/Service trait——GAP 60 Cache-Control）
 http = "1"
 
 # 数据库（SQLite，兼容迁移自 JSON storage）
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
 
 # HTTP 客户端（书源抓取）
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http3", "json", "gzip", "brotli", "deflate", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http3", "json", "gzip", "brotli", "deflate", "cookies", "stream"] }
 
 # 序列化/配置
 serde = { version = "1", features = ["derive"] }
@@ -39,7 +40,7 @@ tokio-tungstenite = "0.24"
 
 # 工具
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 anyhow = "1"
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }

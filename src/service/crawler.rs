@@ -76,6 +76,61 @@ pub async fn fetch_get(url: &str, headers: &HashMap<String, String>, timeout_sec
     fetch(url, headers, timeout_secs, "GET", None, None).await
 }
 
+/// 图片代理抓取（GAP #88/125）：二进制安全 + 限流下载
+///
+/// - 自动附加书源登录态（cookie + 记录的 UA，按用户命名空间）与 Referer（防盗链绕过）
+/// - 超时 timeout_secs；Content-Length 超限直接拒绝，流式读取累计超 max_bytes 截断报错
+/// - 返回 (图片字节, Content-Type, HTTP 状态码)
+pub async fn fetch_image(
+    ns: &str,
+    url: &str,
+    referer: Option<&str>,
+    timeout_secs: u64,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, Option<String>, u16)> {
+    use futures::StreamExt;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
+        .build()?;
+    let mut req = client.get(url);
+    if let Some(r) = referer.filter(|r| !r.trim().is_empty()) {
+        req = req.header("Referer", r);
+    }
+    // 书源登录态（cookie + UA）按用户命名空间附加
+    let (cookie, stored_ua) = session_for(ns, url).await.unwrap_or_default();
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
+    }
+    if !stored_ua.is_empty() {
+        req = req.header("User-Agent", stored_ua);
+    }
+    let resp = req.send().await?;
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    // Content-Length 预检（超限拒绝，避免无谓下载）
+    if resp.content_length().is_some_and(|cl| cl > max_bytes) {
+        anyhow::bail!("图片超过大小上限");
+    }
+    // 流式读取 + 累计上限（服务端不守 Content-Length 时兜底）
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > max_bytes as usize {
+            anyhow::bail!("图片超过大小上限");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, content_type, status))
+}
+
 // ==================== 书源 cookie（按用户隔离） ====================
 
 /// 书源 cookie 存取：由 router 启动时注册（底层 Storage；None = 未注册，不附加 cookie）。
@@ -624,5 +679,78 @@ mod tests {
             err.to_string().contains("FLARESOLVERR_URL"),
             "错误应提示可配置 FLARESOLVERR_URL: {err}"
         );
+    }
+
+    /// 微型 HTTP 服务器：返回固定状态/Content-Type/二进制体；可记录收到的请求头
+    async fn serve_image(
+        status: u16,
+        content_type: &'static str,
+        body: Vec<u8>,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..10 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                captured.lock().unwrap().push(req);
+                let reason = if status == 200 { "OK" } else { "ERR" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let mut resp = head.into_bytes();
+                resp.extend_from_slice(&body);
+                let _ = sock.write_all(&resp).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// GAP #88/125：fetch_image——二进制透传 + Content-Type + Referer/书源 cookie 附加
+    #[tokio::test]
+    async fn test_fetch_image_binary_and_headers() {
+        clear_cookie_storage();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let png = vec![0x89u8, b'P', b'N', b'G', 1, 2, 3, 4];
+        let url = serve_image(200, "image/png", png.clone(), captured.clone()).await;
+
+        let (bytes, content_type, status) =
+            fetch_image("default", &url, Some("https://src.com/book/1"), 10, 5 * 1024 * 1024)
+                .await
+                .unwrap();
+        assert_eq!(bytes, png, "图片字节应原样透传");
+        assert_eq!(content_type.as_deref(), Some("image/png"), "Content-Type 透传");
+        assert_eq!(status, 200);
+        let req = captured.lock().unwrap()[0].clone();
+        assert!(
+            req.to_lowercase().contains("referer: https://src.com/book/1"),
+            "应携带 Referer（防盗链绕过）: {req}"
+        );
+
+        // 非 200 状态透传
+        let url = serve_image(404, "text/plain", b"nf".to_vec(), captured.clone()).await;
+        let (bytes, _, status) = fetch_image("default", &url, None, 10, 5 * 1024 * 1024).await.unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(bytes, b"nf");
+    }
+
+    /// GAP #88/125：大小上限——Content-Length 预检与流式累计双重拦截
+    #[tokio::test]
+    async fn test_fetch_image_size_cap() {
+        clear_cookie_storage();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let body = vec![b'x'; 2048];
+        let url = serve_image(200, "application/octet-stream", body.clone(), captured.clone()).await;
+        // Content-Length 预检：声明 2048 > 上限 100 → 拒绝
+        let err = fetch_image("default", &url, None, 10, 100).await.unwrap_err();
+        assert!(err.to_string().contains("图片超过大小上限"), "{err}");
+        // 正常上限内通过
+        let (bytes, _, _) = fetch_image("default", &url, None, 10, 4096).await.unwrap();
+        assert_eq!(bytes, body);
     }
 }

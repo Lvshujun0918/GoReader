@@ -12,5 +12,6 @@ pub mod health;
 pub mod local_book;
 pub mod login;
 pub mod rss;
+pub mod schedule;
 pub mod search;
 pub mod tts;

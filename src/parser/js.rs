@@ -107,18 +107,56 @@ pub fn eval_js(code: &str, vars: &HashMap<String, String>) -> Result<String> {
     eval_js_with_bridge(code, vars, &JsBridge::default())
 }
 
+/// JS 循环迭代上限（GAP #94：boa 死循环防卡死）。
+/// boa 0.19 的 RuntimeLimits 无独立“指令数”上限，循环迭代计数（loop_iteration_limit）
+/// 是其等价物：每次循环迭代 +1，超限抛 RangeError。10M 足够正常书源规则（一般 <1K 次）
+/// 循环，而 `while(true){}` 这类死循环会在毫秒级内触发。
+pub const JS_LOOP_ITERATION_LIMIT: u64 = 10_000_000;
+
+/// 构造受限 Context（runtime limits：循环迭代上限，防死循环）
+pub fn new_limited_context() -> Context {
+    context_with_limit(JS_LOOP_ITERATION_LIMIT)
+}
+
+/// 以指定循环迭代上限构造 Context（测试用小上限快速触发）
+fn context_with_limit(loop_limit: u64) -> Context {
+    let mut context = Context::default();
+    context.runtime_limits_mut().set_loop_iteration_limit(loop_limit);
+    context
+}
+
+/// 将 boa 错误映射为友好文案：超限 → "JS 执行超限"
+fn map_js_error(e: boa_engine::JsError) -> anyhow::Error {
+    let msg = e.to_string();
+    if msg.to_lowercase().contains("loop iteration limit") {
+        anyhow!("JS 执行超限")
+    } else {
+        anyhow!("JS 执行失败: {msg}")
+    }
+}
+
 /// 执行 JS 代码并注入书源桥接（java.* / source.*，对齐 legado jsHelp）
 pub fn eval_js_with_bridge(
     code: &str,
     vars: &HashMap<String, String>,
     bridge: &JsBridge,
 ) -> Result<String> {
-    let mut context = Context::default();
+    eval_js_with_bridge_limited(code, vars, bridge, JS_LOOP_ITERATION_LIMIT)
+}
+
+/// 指定循环迭代上限的桥接执行（核心；测试用小上限验证超限路径）
+fn eval_js_with_bridge_limited(
+    code: &str,
+    vars: &HashMap<String, String>,
+    bridge: &JsBridge,
+    loop_limit: u64,
+) -> Result<String> {
+    let mut context = context_with_limit(loop_limit);
     inject_vars(&mut context, vars)?;
     install_bridge(&mut context, bridge)?;
     let result = context
         .eval(Source::from_bytes(code.as_bytes()))
-        .map_err(|e| anyhow!("JS 执行失败: {e}"))?;
+        .map_err(map_js_error)?;
     Ok(js_result_to_string(&result, &mut context))
 }
 
@@ -137,12 +175,12 @@ pub fn eval_js_json_with_bridge(
     vars: &HashMap<String, String>,
     bridge: &JsBridge,
 ) -> Result<JsonValue> {
-    let mut context = Context::default();
+    let mut context = context_with_limit(JS_LOOP_ITERATION_LIMIT);
     inject_vars(&mut context, vars)?;
     install_bridge(&mut context, bridge)?;
     let result = context
         .eval(Source::from_bytes(code.as_bytes()))
-        .map_err(|e| anyhow!("JS 执行失败: {e}"))?;
+        .map_err(map_js_error)?;
     let json = js_value_to_json(&result, &mut context)
         .map_err(|e| anyhow!("JS 结果 JSON 转换失败: {e}"))?;
     // 字符串结果：若为 JSON 文本则解析为结构（兼容 JSON.stringify 出口）
@@ -154,13 +192,29 @@ pub fn eval_js_json_with_bridge(
     Ok(json)
 }
 
+/// 指定循环迭代上限的 JSON 桥接执行（测试用小上限验证超限路径）
+fn eval_js_json_with_bridge_limited(
+    code: &str,
+    vars: &HashMap<String, String>,
+    bridge: &JsBridge,
+    loop_limit: u64,
+) -> Result<JsonValue> {
+    let mut context = context_with_limit(loop_limit);
+    inject_vars(&mut context, vars)?;
+    install_bridge(&mut context, bridge)?;
+    let result = context
+        .eval(Source::from_bytes(code.as_bytes()))
+        .map_err(map_js_error)?;
+    js_value_to_json(&result, &mut context).map_err(|e| anyhow!("JS 结果 JSON 转换失败: {e}"))
+}
+
 /// 执行 JS 表达式并返回 JsValue（供内部使用）
 pub fn eval_js_value(code: &str, vars: &HashMap<String, String>) -> Result<JsValue> {
-    let mut context = Context::default();
+    let mut context = context_with_limit(JS_LOOP_ITERATION_LIMIT);
     inject_vars(&mut context, vars)?;
     context
         .eval(Source::from_bytes(code.as_bytes()))
-        .map_err(|e| anyhow!("JS 执行失败: {e}"))
+        .map_err(map_js_error)
 }
 
 /// 注入变量为全局属性（boa 0.19：key/value 需经 JsString 转换）
@@ -694,6 +748,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(json.as_array().unwrap()[0]["n"], 1);
+    }
+
+    /// GAP #94：死循环 JS 触发循环迭代上限 → 报“JS 执行超限”（而非卡死）
+    #[test]
+    fn eval_js_infinite_loop_hits_limit() {
+        let v = vars(&[]);
+        // 小上限快速触发（1K 次迭代）；正式入口用 10M 上限，同一映射路径
+        for code in ["while(true){}", "for(;;){}"] {
+            let err = eval_js_with_bridge_limited(code, &v, &JsBridge::default(), 1_000).unwrap_err();
+            assert!(
+                err.to_string().contains("JS 执行超限"),
+                "死循环应报超限: {}（实际: {err}）",
+                code
+            );
+        }
+        // 正常循环不受影响
+        assert_eq!(eval_js("let s=0; for(let i=0;i<100;i++){s+=i} s", &v).unwrap(), "4950");
+        // 超限同样作用于 JSON 出口
+        let err = eval_js_json_with_bridge_limited("while(true){}", &v, &JsBridge::default(), 1_000)
+            .unwrap_err();
+        assert!(err.to_string().contains("JS 执行超限"));
+    }
+
+    /// 受限 Context：单独设置小上限可快速触发（10M 上限下死循环也能在合理时间内触发）
+    #[test]
+    fn limited_context_small_limit_quickly_triggers() {
+        let mut ctx = context_with_limit(1_000);
+        let err = ctx
+            .eval(boa_engine::Source::from_bytes(b"while(true){}".as_slice()))
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("loop iteration limit"));
     }
 }
 

@@ -2220,6 +2220,7 @@ impl Storage {
 
     /// F-34 清理不活跃用户：删除 last_login_at < before_ms 的 users 行（简化：仅删用户行，
     /// 用户数据目录/命名空间数据保留；except 用户受保护不删）。返回被删用户名列表
+    /// GAP #95：清理不活跃用户（users 行 + 用户级数据行 + 数据目录；except 用户除外）
     pub async fn clear_inactive_users(&self, before_ms: i64, except: Option<&str>) -> Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
         let rows: Vec<String> =
@@ -2236,9 +2237,13 @@ impl Storage {
                 .bind(&username)
                 .execute(&mut *tx)
                 .await?;
+            delete_user_rows(&mut tx, &username).await?;
             deleted.push(username);
         }
         tx.commit().await?;
+        for username in &deleted {
+            self.remove_user_data_dir(username);
+        }
         Ok(deleted)
     }
 
@@ -2288,13 +2293,47 @@ impl Storage {
         Ok(r.rows_affected())
     }
 
-    /// 删除用户（仅 users 行；用户数据保留——与 clearInactiveUsers 一致）
+    /// GAP #95：删除用户并清理全部用户数据（用户级表行 + storage/data/{username} 目录）。
+    ///
+    /// 表：books/book_sources/book_source_cookies/reading_stats/user_config/rss_sources/
+    /// rss_articles/bookmarks/book_groups/replace_rules/http_tts_list/source_subs/txt_toc_rules；
+    /// 章节/目录缓存仅当该书 URL 不再被其他用户拥有时删除（book_url 为全局主键）；
+    /// 目录递归删除（含 webdav/opds_files 等）。用户不存在返回 0。
     pub async fn delete_user(&self, username: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
         let r = sqlx::query("DELETE FROM users WHERE username = ?1")
             .bind(username)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(r.rows_affected())
+        if r.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(0);
+        }
+        delete_user_rows(&mut tx, username).await?;
+        tx.commit().await?;
+        self.remove_user_data_dir(username);
+        Ok(1)
+    }
+
+    /// 删除 storage/data/{username} 目录（递归——含 webdav/opds_files 等）；失败仅告警
+    fn remove_user_data_dir(&self, username: &str) {
+        // 防御：注册已限 ^[a-zA-Z0-9]+$，再挡一层路径穿越
+        if username.is_empty()
+            || username.contains(['/', '\\'])
+            || username.contains("..")
+            || !username.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            tracing::warn!("跳过用户数据目录清理（非法用户名）: {username}");
+            return;
+        }
+        let dir = self.config.storage_dir().join("data").join(username);
+        if !dir.exists() {
+            return;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(_) => tracing::info!("已删除用户数据目录: {}", dir.display()),
+            Err(e) => tracing::warn!("删除用户数据目录失败（文件占用？）{}: {e}", dir.display()),
+        }
     }
 
     /// 重置用户密码（新 salt + 加密密码；清空 token 使旧会话立即失效）
@@ -2351,6 +2390,13 @@ impl Storage {
     /// F-39 书架数据打包 zip（bookshelf/bookSource/bookmark/bookGroup/rssSources）写入
     /// storage/data/{ns}/webdav/legado/backup-{ts}.zip；返回 zip 文件路径
     pub async fn create_backup_zip(&self, ns: &str) -> Result<String> {
+        let ts = chrono::Utc::now().format("%Y-%m-%d-%H%M%S");
+        self.write_backup_zip(ns, &format!("backup-{ts}")).await
+    }
+
+    /// 打包 zip 写入 storage/data/{ns}/webdav/legado/{stem}.zip（
+    /// GAP #57 自动备份与手动备份共用核心）；返回 zip 文件路径
+    pub(crate) async fn write_backup_zip(&self, ns: &str, stem: &str) -> Result<String> {
         let legado = self
             .config
             .storage_dir()
@@ -2359,8 +2405,7 @@ impl Storage {
             .join("webdav")
             .join("legado");
         std::fs::create_dir_all(&legado)?;
-        let ts = chrono::Utc::now().format("%Y-%m-%d-%H%M%S");
-        let zip_path = legado.join(format!("backup-{ts}.zip"));
+        let zip_path = legado.join(format!("{stem}.zip"));
 
         // 收集数据（legacy backupFileNames 子集：Rust 有对应表/模型的部分）
         let books = self.list_books(ns).await?;
@@ -2385,6 +2430,60 @@ impl Storage {
 
         tracing::info!("备份完成 [{ns}]: {}", zip_path.display());
         Ok(zip_path.to_string_lossy().into_owned())
+    }
+
+    // ---------------- GAP #57 自动备份 ----------------
+
+    /// GAP #57：清理自动备份 zip（webdav/legado/auto-*.zip），仅保留最近 keep 份；
+    /// 返回删除数（文件名按日期字典序即时间序）
+    pub fn prune_auto_backups(&self, ns: &str, keep: usize) -> usize {
+        let legado = self
+            .config
+            .storage_dir()
+            .join("data")
+            .join(ns)
+            .join("webdav")
+            .join("legado");
+        let Ok(entries) = std::fs::read_dir(&legado) else {
+            return 0;
+        };
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("auto-") && n.ends_with(".zip"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        files.sort();
+        let mut removed = 0usize;
+        while files.len() > keep {
+            let oldest = files.remove(0);
+            match std::fs::remove_file(&oldest) {
+                Ok(_) => removed += 1,
+                Err(e) => tracing::warn!("删除旧自动备份失败 {}: {e}", oldest.display()),
+            }
+        }
+        removed
+    }
+
+    /// 定时任务命名空间集合：非 secure → [default]；secure → 全部用户 + 残留 default 目录
+    pub async fn schedule_namespaces(&self) -> Vec<String> {
+        if !self.config.secure {
+            return vec!["default".to_string()];
+        }
+        let mut nss: Vec<String> = Vec::new();
+        if let Ok(users) = self.list_users().await {
+            nss.extend(users.iter().map(|u| u.username.clone()));
+        }
+        // secure 化之前遗留的 default 数据目录也纳入（存在才处理）
+        let default_dir = self.config.storage_dir().join("data").join("default");
+        if default_dir.is_dir() && !nss.iter().any(|n| n == "default") {
+            nss.push("default".to_string());
+        }
+        nss
     }
 
     // ---------------- F-55 备份恢复（restoreFromZip / restoreFromWebdav 共用核心） ----------------
@@ -2825,21 +2924,6 @@ fn write_zip_entry(
     Ok(())
 }
 
-/// F-35：启动定时书架更新检查（tokio interval，每 10 分钟一轮）
-pub fn spawn_shelf_update_job(storage: Storage) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            match run_shelf_update(&storage).await {
-                Ok(n) => tracing::info!("书架更新检查完成：更新 {n} 本"),
-                Err(e) => tracing::warn!("书架更新检查失败: {e:#}"),
-            }
-        }
-    });
-}
-
 /// F-35：扫描 books 表 can_update=1 的书 → analyze_toc → 回写
 /// latest_chapter_title / total_chapter_num（单本失败跳过，不影响其余）
 pub async fn run_shelf_update(storage: &Storage) -> Result<usize> {
@@ -2894,6 +2978,54 @@ pub async fn run_shelf_update(storage: &Storage) -> Result<usize> {
 /// 幂等补列：列不存在则 ALTER TABLE ADD COLUMN（旧库升级用）
 /// 规范化 baseUrl（scheme://host[:port]，去尾斜杠/路径/查询）——
 /// 书源 cookie 按 base 匹配：请求 https://a.com/book/1 命中 source_url https://a.com
+/// GAP #95：删除用户命名空间下的全部用户级数据行（事务内调用）
+///
+/// 覆盖全部含 user_namespace 列的表；章节/目录缓存（全局 book_url 主键）仅当
+/// 该书 URL 不再被其他用户拥有时才删除，避免误删他用户章节。
+async fn delete_user_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    username: &str,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM book_chapters WHERE book_url IN (
+            SELECT book_url FROM books WHERE user_namespace = ?1
+              AND book_url NOT IN (SELECT book_url FROM books WHERE user_namespace != ?1))",
+    )
+    .bind(username)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM toc_cache WHERE book_url IN (
+            SELECT book_url FROM books WHERE user_namespace = ?1
+              AND book_url NOT IN (SELECT book_url FROM books WHERE user_namespace != ?1))",
+    )
+    .bind(username)
+    .execute(&mut **tx)
+    .await?;
+    // 表名单为内部硬编码常量，无注入面
+    for table in [
+        "books",
+        "book_sources",
+        "book_source_cookies",
+        "reading_stats",
+        "user_config",
+        "rss_sources",
+        "rss_articles",
+        "bookmarks",
+        "book_groups",
+        "replace_rules",
+        "http_tts_list",
+        "source_subs",
+        "txt_toc_rules",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_namespace = ?1"))
+            .bind(username)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn normalize_base(url: &str) -> Option<String> {
     let url = url.trim();
     if url.is_empty() {
@@ -3828,7 +3960,7 @@ mod tests {
         cleanup(storage, "logout").await;
     }
 
-    /// F-34：不活跃用户清理（简化：仅删 users 行；except 保护）
+    /// F-34：不活跃用户清理（GAP #95：users 行 + 用户级数据行 + 数据目录；except 保护）
     #[tokio::test]
     async fn test_clear_inactive_users() {
         let storage = test_storage("inactive").await;
@@ -3840,18 +3972,271 @@ mod tests {
         storage.insert_user(&mk("old", 1000)).await.unwrap();
         storage.insert_user(&mk("mid", 5000)).await.unwrap();
         storage.insert_user(&mk("new", 9999)).await.unwrap();
+        // old 用户残留数据（书 + 数据目录文件）——应一并清理
+        storage
+            .upsert_book(
+                "old",
+                &crate::model::Book {
+                    book_url: "https://old.com/b".into(),
+                    name: "旧书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let dir = storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join("old")
+            .join("webdav");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.txt"), "x").unwrap();
 
         let deleted = storage.clear_inactive_users(6000, None).await.unwrap();
         assert_eq!(deleted, vec!["old", "mid"]);
         assert!(storage.find_user("old").await.unwrap().is_none());
         assert!(storage.find_user("mid").await.unwrap().is_none());
         assert!(storage.find_user("new").await.unwrap().is_some());
+        // 用户级数据行 + 目录已清理
+        assert!(storage.list_books("old").await.unwrap().is_empty());
+        assert!(!storage.config.storage_dir().join("data").join("old").exists());
 
         // except 用户受保护
         let deleted = storage.clear_inactive_users(99999, Some("new")).await.unwrap();
         assert!(deleted.is_empty());
         assert!(storage.find_user("new").await.unwrap().is_some());
         cleanup(storage, "inactive").await;
+    }
+
+    /// GAP #95：deleteUser 全量清理——用户级表行 + 数据目录；共享书章节保留
+    #[tokio::test]
+    async fn test_delete_user_cleans_all_data() {
+        let storage = test_storage("deluser2").await;
+        // alice（被删）与 bob（保留）
+        storage
+            .insert_user(&User {
+                username: "alice".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .insert_user(&User {
+                username: "bob".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 共享书（双方都有）+ alice 独有书
+        let shared = crate::model::Book {
+            book_url: "https://s.com/shared".into(),
+            name: "共享".into(),
+            ..Default::default()
+        };
+        let alice_only = crate::model::Book {
+            book_url: "https://a.com/only".into(),
+            name: "独有".into(),
+            ..Default::default()
+        };
+        storage.upsert_book("alice", &shared).await.unwrap();
+        storage.upsert_book("bob", &shared).await.unwrap();
+        storage.upsert_book("alice", &alice_only).await.unwrap();
+        // 章节（共享书章节两用户共用；独有书章节仅 alice）
+        for (url, idx) in [("https://s.com/shared", 0), ("https://a.com/only", 0)] {
+            sqlx::query("INSERT INTO book_chapters (book_url, chapter_index, title, content) VALUES (?1, ?2, '章', '文')")
+                .bind(url)
+                .bind(idx)
+                .execute(&storage.pool)
+                .await
+                .unwrap();
+        }
+        // 用户级数据铺满各表
+        storage
+            .save_book_source(
+                "alice",
+                &crate::model::BookSource {
+                    book_source_url: "https://a.com/src".into(),
+                    book_source_name: "源".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage.set_cookie("alice", "https://a.com/src", "sid=1").await.unwrap();
+        storage.save_user_config("alice", "reader", "{}").await.unwrap();
+        storage
+            .record_reading_stats("alice", "https://a.com/only", "2025-01-01", 60, 1000)
+            .await
+            .unwrap();
+        storage
+            .save_bookmark(
+                "alice",
+                &crate::model::Bookmark {
+                    book_url: "https://a.com/only".into(),
+                    title: "书签".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_source_sub("alice", "https://a.com/sub", "订阅", "[]")
+            .await
+            .unwrap();
+        storage
+            .save_rss_source(
+                "alice",
+                &crate::model::RssSource {
+                    source_url: "https://a.com/rss".into(),
+                    source_name: "RSS".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_rss_articles(
+                "alice",
+                &[crate::model::RssArticle {
+                    url: "https://a.com/rss/1".into(),
+                    title: "文".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        // 数据目录（含 webdav 子目录）
+        let alice_dir = storage.config.storage_dir().join("data").join("alice");
+        std::fs::create_dir_all(alice_dir.join("webdav").join("legado")).unwrap();
+        std::fs::write(alice_dir.join("webdav").join("legado").join("backup-1.zip"), "zip").unwrap();
+        std::fs::create_dir_all(alice_dir.join("opds_files")).unwrap();
+        std::fs::write(alice_dir.join("opds_files").join("f.txt"), "f").unwrap();
+
+        // 删除
+        assert_eq!(storage.delete_user("alice").await.unwrap(), 1);
+        // users 行
+        assert!(storage.find_user("alice").await.unwrap().is_none());
+        // 用户级表行清空
+        assert!(storage.list_books("alice").await.unwrap().is_empty());
+        assert!(storage.get_book_sources("alice").await.unwrap().is_empty());
+        assert!(storage.get_cookie("alice", "https://a.com/src").await.unwrap().is_none());
+        let cfg: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_config WHERE user_namespace = 'alice'")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(cfg, 0);
+        let stats: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reading_stats WHERE user_namespace = 'alice'")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(stats, 0);
+        let bm: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks WHERE user_namespace = 'alice'")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(bm, 0);
+        let subs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_subs WHERE user_namespace = 'alice'")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(subs, 0);
+        let rss_src: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_sources WHERE user_namespace = 'alice'")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(rss_src, 0);
+        let rss_art: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_articles WHERE user_namespace = 'alice'")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(rss_art, 0);
+        // 章节：独有书章节删除；共享书章节保留（bob 仍拥有）
+        let shared_ch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = 'https://s.com/shared'")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(shared_ch, 1, "共享书章节应保留");
+        let only_ch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = 'https://a.com/only'")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(only_ch, 0, "独有书章节应删除");
+        // bob 数据不受影响
+        assert!(storage.find_book("bob", "https://s.com/shared").await.unwrap().is_some());
+        // 目录递归删除（含 webdav/opds_files）
+        assert!(!alice_dir.exists(), "数据目录应被递归删除");
+
+        // 不存在用户 → 0；非法用户名 → 不 panic、不删目录
+        assert_eq!(storage.delete_user("ghost").await.unwrap(), 0);
+        assert_eq!(storage.delete_user("../evil").await.unwrap(), 0);
+        cleanup(storage, "deluser2").await;
+    }
+
+    /// GAP #57：自动备份（auto-YYYYMMDD.zip 写入 + 同日幂等 + 保留最近 7 份）
+    #[tokio::test]
+    async fn test_auto_backup_and_prune() {
+        let storage = test_storage("autobk").await;
+        storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://a.com/b".into(),
+                    name: "书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let legado = storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join("default")
+            .join("webdav")
+            .join("legado");
+
+        // 首次：生成 auto-YYYYMMDD.zip
+        assert_eq!(crate::service::schedule::run_auto_backup(&storage).await.unwrap(), 1);
+        let today = chrono::Local::now().format("%Y%m%d").to_string();
+        let auto_file = legado.join(format!("auto-{today}.zip"));
+        assert!(auto_file.exists(), "自动备份文件应生成: {}", auto_file.display());
+
+        // 同日再跑：幂等跳过（不重复生成）
+        let files_after_first: Vec<_> = std::fs::read_dir(&legado)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(crate::service::schedule::run_auto_backup(&storage).await.unwrap(), 0);
+        let files_after_second: Vec<_> = std::fs::read_dir(&legado)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(files_after_first.len(), files_after_second.len(), "同日不应重复备份");
+
+        // 保留最近 7 份：伪造 12 个历史 auto-*.zip → prune 后剩 7（今天的保留）
+        for i in 1..=12 {
+            std::fs::write(legado.join(format!("auto-202501{i:02}.zip")), "old").unwrap();
+        }
+        let removed = storage.prune_auto_backups("default", 7);
+        assert_eq!(removed, 6);
+        let remaining: Vec<String> = std::fs::read_dir(&legado)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.starts_with("auto-") && n.ends_with(".zip"))
+            .collect();
+        assert_eq!(remaining.len(), 7);
+        assert!(remaining.iter().any(|n| *n == format!("auto-{today}.zip")), "今天的备份应保留");
+        assert!(remaining.iter().all(|n| n.as_str() >= "auto-20250107.zip"), "只保留最新的 7 份: {remaining:?}");
+
+        // 手动备份不受影响（backup-*.zip 不参与 auto 清理）
+        storage.create_backup_zip("default").await.unwrap();
+        let removed = storage.prune_auto_backups("default", 7);
+        assert_eq!(removed, 0);
+        cleanup(storage, "autobk").await;
     }
 
     /// F-32：用户管理——列表/权限更新/删除/重置密码
