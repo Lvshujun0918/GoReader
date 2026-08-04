@@ -1456,7 +1456,7 @@ onMounted(() => {
     <!-- 极简导航：字标 + 搜索 + 用户 -->
     <header class="topbar">
       <div class="brand">
-        <LogoMark class="brand-logo" />
+        <img class="brand-logo" src="/logo.svg" alt="夜读" />
         <span class="brand-name">夜读<span class="brand-dot">.</span></span>
       </div>
 
@@ -2391,8 +2391,9 @@ onMounted(() => {
   flex-shrink: 0;
 }
 .brand-logo {
-  width: 26px;
-  height: 26px;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
 }
 .brand-name {
   font-size: 17px;

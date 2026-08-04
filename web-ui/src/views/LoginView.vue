@@ -56,8 +56,9 @@ async function submit() {
 <template>
   <div class="login-page">
     <main class="login-panel">
-      <!-- 字标：细体「夜读」+ 小点 -->
+      <!-- 徽标 + 字标 -->
       <div class="wordmark">
+        <img class="login-logo" src="/logo.svg" alt="夜读" />
         <h1 class="wordmark-text">夜读<span class="wordmark-dot">.</span></h1>
         <p class="wordmark-sub">READER</p>
       </div>
@@ -345,5 +346,12 @@ async function submit() {
 }
 .tg-foot:hover {
   color: var(--accent, #4f46e5);
+}
+.login-logo {
+  width: 76px;
+  height: 76px;
+  border-radius: 20px;
+  margin-bottom: 16px;
+  box-shadow: 0 2px 14px rgba(30, 27, 75, 0.2);
 }
 </style>
