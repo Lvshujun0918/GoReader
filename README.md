@@ -1,99 +1,191 @@
-# reader-dev (Rust) ｜ Rust 重构开发分支（进行中，未发布）。稳定版见 legacy 分支（Kotlin，ghcr.io/warpdotsys/reader-dev）
+<div align="center">
 
-Rust 实现的 Web 阅读服务，API 兼容 legacy 分支 `/reader3/*` 接口，数据兼容（JSON storage → SQLite 迁移）。
-前端为 Vue 3（`web-ui/`），构建产物由后端统一托管（SPA fallback）。
+# Reader Dev
 
-## 功能清单
+**自托管 Web 阅读服务 —— 书源搜索 · 本地书仓 · OPDS · WebDAV · 多用户**
 
-**书源**
-- 多书源搜索 / 书籍详情 / 目录 / 正文（legacy 规则引擎：`ruleSearch` / `ruleBookInfo` / `ruleToc` / `ruleContent` / `ruleExplore`，兼容 legado 命名别名 `searchRule` / `bookInfoRule` / `tocRule` / `contentRule` / `exploreRule`）
-- 书源管理：新增 / 编辑（基本信息 + 规则字段 textarea JSON）/ 启停 / 删除 / 分组筛选 / 失效检测（`getInvalidBookSources` 红色标记）/ 本地导入 / 远程导入 / 导出 `bookSource.json` / 订阅源（服务端入库优先，localStorage 降级）
-- 书源调试：搜索 / 目录 / 正文逐步日志（SSE `bookSourceDebugSSE`）
-- 书源登录：HTTP 登录流（`loginUrl` 占位符 / POST 表单 / `loginCheckJs` / Set-Cookie 按用户合并存库）、图片验证码截图回填（`getCaptcha` / `submitCaptcha`）、浏览器自动登录（CDP 轻量实现——表单填写 / 滑块验证码贝塞尔拖拽 / cookie 提取，依赖本机 Chrome/Edge）、手动 Cookie 粘贴降级
-- FlareSolverr：Cloudflare 质询自动检测并转发解（可选，`FLARESOLVERR_URL` 环境变量；解出 cookie 与书源原 cookie 按 name 合并）
-- 换源：`searchBookSource` 并发多源搜索 + 书名过滤去重
+Rust + Vue 3 实现的现代化阅读服务器，API 与数据兼容 legacy 分支（Kotlin），支持多书源规则引擎、7 种本地书格式、OPDS 1.2/2.0 与 PSE、书源登录与反爬（内嵌浏览器 + FlareSolverr 能力）、多用户隔离。
 
-**阅读**
-- 阅读器：进度服务端同步（`saveBookProgress`）、书签、替换规则、TXT 目录规则、HttpTTS 听书源
-- 全局简繁转换（简体 / 繁体）、主题（浅色 / 深色 / 纸色 / 跟随系统）、排版偏好（12 项阅读偏好云端同步 `getUserConfig` / `saveUserConfig`）
-- 阅读统计（`getReadingStats`：时长 / 字数累计）
-- 整书缓存（`cacheBookOnServer` / `cacheBookSSE`：后台缓存 + SSE 进度 + 取消）、缓存管理（`clearCache` / `getCacheInfo`）、全书内容搜索（`searchBookContent`）
+</div>
 
-**本地书（7 格式）**
-- EPUB / TXT / MOBI / AZW3 / PDF / FB2 / DOCX：上传导入 / 目录 / 正文 / OPDS 下载统一分派
-- 文件管理（`/reader3/file/*`）、本地书重扫（`refreshLocalBook`）
+---
 
-**导出**
-- 书籍导出多格式：TXT / EPUB / HTML（`exportBook`）；书源导出 `bookSource.json`
+## ✨ 功能特性
 
-**OPDS**
-- OPDS 1.2（Atom 导航 / 分组 / 分页 / OpenSearch / 获取正文 / 下载 / 封面缩略图）+ OPDS 2.0（JSON catalog：facets / groups / publications / images）+ OPDS-PSE 进度保存（`/opds/save/{id}`）
-- 独立 OPDS 账号（secure 模式 Basic 认证：独立账号优先 → 系统用户账号 → accessToken）
+### 📚 书源与抓取
+- **规则引擎**：legacy/legado 双命名规则（`ruleSearch`/`searchRule`、`ruleToc`/`tocRule` 等）——CSS 链式选择器、JSONPath、XPath、Regex、JS（boa 沙箱，含 `java.*`/`source.*` shim 与 AES 解密）
+- **书源管理**：增删改（规则字段 JSON 编辑）、启停、分组、失效检测、本地/远程导入、导出、订阅源
+- **书源调试**：搜索/目录/正文逐规则逐步日志（SSE 流式）
+- **书源登录**：`loginUrl` 登录流 + `loginCheckJs` 校验 + Set-Cookie 按用户合并；图片验证码截图回填；**CDP 浏览器自动登录**（表单/滑块贝塞尔轨迹/cookie 提取——本机 Chrome/Edge 自动发现）
+- **反爬**：Cloudflare 质询检测 → **进程内浏览器求解**（内嵌 FlareSolverr 能力——无需外部容器）或可选外部 `FLARESOLVERR_URL`；cookie 按 name 合并 + UA 记录
+- **换源**：并发多源搜索 + 书名过滤去重，一键切换
 
-**服务**
-- 多用户账号体系：每用户独立书源 / 书架 / 进度 / 书签 / 订阅 / WebDAV 命名空间，权限与限额可配（`updateUser`）
-- RSS 订阅、WebDAV、用户管理（secureKey 保护）、书源健康（`getAvailableBookSource`）、批量接口（删除 / 书签 / 分组 / RSS / 换源）
-- 数据存储：SQLite（`storage/` 目录），legacy JSON 数据自动迁移（users.json / bookSource.json / books 等）
+### 📖 阅读体验
+- 阅读器：字体（12 档 + 离线网络字体）、行距/段距/字重/宽度/字距/缩进/对齐、主题（浅色/深色/纸色 + 界面深色独立）、翻页、自动阅读、进度服务端同步、书签、划词（复制/搜索）、预加载、TTS（Edge TTS + HttpTTS 音色/倍速）、**亮度滑条、键盘翻页、目录当前章高亮**
+- **全局简繁转换**（自动检测/简/繁三态）、阅读偏好 12 项云端同步（多端一致）
+- 整书缓存（后台并发 + SSE 进度 + 取消）、正文缓存、缓存管理、**全书内容搜索**（含文件型本地书）
+- 阅读统计（时长/字数累计）、书架排序/分组折叠/网格密度/进度角标
 
-## 构建与部署
+### 📁 本地书（7 格式）
+EPUB · TXT · MOBI · AZW3 · PDF · FB2 · DOCX —— 上传导入（含预览）、目录、正文、重扫、全书搜索、OPDS 下载统一分派（PDF 8MB 解压上限防炸弹、DOCX 标题样式分章、TXT 编码自动检测）
 
-### 后端（Rust）
+### 📤 导出与备份
+- 书籍导出：TXT / EPUB / HTML；书源导出；**备份恢复闭环**（`backupToWebdav` + `restoreFromZip`/`restoreFromWebdav`——9 类目幂等恢复，兼容 legacy 备份布局）
 
-需要 Rust 工具链（stable；Windows 建议 MSYS2 gcc，见 `build-dev.ps1`）。
+### 🌐 OPDS & WebDAV
+- **OPDS 1.2**（Atom 导航/分组/分页/OpenSearch/获取/下载/封面）+ **OPDS 2.0**（JSON catalog：facets/groups/publications）+ **OPDS-PSE**（进度保存/读取）
+- **独立 OPDS 账号**（sha256+salt）或系统账号 Basic / token 三路认证
+- **WebDAV 服务器**（OPTIONS/PROPFIND/GET/PUT/MKCOL/DELETE/MOVE/COPY/LOCK/UNLOCK——路径穿越防护）——可作为 Calibre/坚果云客户端存储
+
+### 👥 多用户与安全
+- 多用户注册/登录（token 随机化）、用户权限开关（WebDAV/本地书仓/书源/RSS）、用户管理
+- 命名空间隔离（书架/书源 cookie/配置/文件全部按用户）、路径穿越防护（白名单 + 组件级归一化）、SQL 全参数化、OPDS/WebDAV 独立认证
+- 安全设计详见 [`docs/SECURITY.md`](docs/SECURITY.md)
+
+### 🎨 前端（web-ui）
+Vue 3 + Vite + Element Plus，A 版极简风格（近白底/细字重/强调色/圆角），响应式移动端适配、深色主题、虚拟滚动书架、SSE 流式搜索/调试/缓存进度
+
+---
+
+## 🚀 快速开始
+
+### 本地运行（Windows/Linux/macOS）
 
 ```bash
+# 1. 构建后端（Rust 1.75+）
 cargo build --release
-./target/release/reader-dev            # 默认端口 8080，前端静态资源 web-ui/dist
+
+# 2. 构建前端
+cd web-ui && npm install && npm run build && cd ..
+
+# 3. 运行
+export READER_APP_WORKDIR="$PWD/data"     # 数据目录（可选）
+export READER_APP_SECURE=true             # 开启多用户安全模式（可选）
+./target/release/reader-dev
 ```
 
-环境变量（`READER_APP_*` 兼容 legacy 前缀，实现见 `src/lib.rs` `AppConfig`）：
+浏览器打开 `http://localhost:8080`（前端/API/封面/OPDS/WebDAV 同端口）。
+
+> 非 secure 模式单用户（default）；secure 模式注册/登录后使用。
+
+### Docker（可选）
+
+```dockerfile
+# 示例：构建镜像（arm64/amd64 多架构）
+docker build -f Dockerfile.source -t reader-dev .
+```
+
+---
+
+## ⚙️ 环境变量
 
 | 变量 | 默认 | 说明 |
-| --- | --- | --- |
+|---|---|---|
 | `READER_SERVER_PORT` | `8080` | 服务端口 |
 | `READER_APP_WORKDIR` | 当前目录 | 工作目录（数据在 `{workdir}/storage`） |
-| `READER_APP_WEB_ROOT` | `web-ui/dist` | 前端静态资源根（SPA fallback → index.html） |
-| `READER_APP_SECURE` / `READER_APP_SECUREKEY` | 关 | 安全模式（secureKey 保护用户管理 / OPDS 独立账号） |
-| `FLARESOLVERR_URL` | 空（禁用） | FlareSolverr 服务地址，如 `http://127.0.0.1:8191` |
-| `READER_CHROME_PATH` | 自动发现 | Chrome/Edge 可执行文件路径（书源浏览器登录流） |
+| `READER_APP_WEB_ROOT` | `web-ui/dist` | 前端静态资源根（SPA fallback） |
+| `READER_APP_SECURE` / `READER_APP_SECUREKEY` | 关 | 多用户安全模式（secureKey 保护管理接口） |
+| `READER_APP_MINUSERPASSWORDLENGTH` | `8` | 注册密码最小长度 |
+| `READER_APP_USERLIMIT` | `500000` | 用户数上限 |
+| `READER_APP_INVITECODE` | 空 | 注册邀请码（配置后注册必须） |
+| `READER_LOG_DIR` | 空（仅控制台） | 日志目录（控制台 + 文件，按大小轮转 10MB×7） |
+| `READER_LOG_MAX_SIZE_MB` / `READER_LOG_MAX_FILES` | `10` / `7` | 日志轮转参数 |
+| `READER_CHROME_PATH` | 自动发现 | Chrome/Edge 路径（书源登录浏览器流） |
+| `FLARESOLVERR_URL` | 空（内嵌求解） | 可选外部 FlareSolverr 服务地址 |
 
-### 前端（Vue 3）
+---
 
-```bash
-cd web-ui
-npm install
-npm run build      # 产物 web-ui/dist（vue-tsc 类型检查 + vite build），由后端托管
+## 📦 部署说明
+
+### 书源浏览器流依赖
+- **Windows**：自动发现系统 Edge/Chrome，无需安装
+- **Linux/容器**：`apt install chromium`（或 `chromium-browser`/`google-chrome`），或用 `READER_CHROME_PATH` 显式指定
+- 无浏览器时：登录/CF 质询降级为明确报错 + 手动 Cookie 粘贴
+
+### 反爬（Cloudflare）
+- **默认内嵌求解**：检测到 CF 质询自动用本机浏览器执行 JS 质询并提取 `cf_clearance`（无需外部服务）
+- 可选：部署 FlareSolverr（Docker）并通过 `FLARESOLVERR_URL` 指定
+
+### 反向代理（HTTPS）
+服务端为 HTTP；公网部署建议前置 nginx/Caddy 终止 TLS：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name reader.example.com;
+    client_max_body_size 200m;              # 上传大文件
+    location / { proxy_pass http://127.0.0.1:8080; proxy_buffering off; }  # SSE
+}
 ```
 
-### 可选依赖
+---
 
-**FlareSolverr（反 Cloudflare 质询）** —— 可选。书源抓取命中 Cloudflare 质询（503 + 特征 HTML）时自动转发解，解出的 cookie 与书源原 cookie 按 name 合并存库（按用户）并记录 UA。不配置则直连降级（部分站点会失败）。
+## 📖 使用指南
 
-Docker 部署：
+- **书源导入**：书源管理 → 本地导入 / 远程导入 / 订阅源；调试器逐规则排查
+- **OPDS 接入**：外部阅读器（Legado/静读天下）添加 `http://host:port/opds`（可配独立账号，设置页查看并复制）
+- **WebDAV**：`http://host:port/reader3/webdav/`（系统用户 Basic 认证，需开启 WebDAV 权限）
+- **备份/恢复**：设置页 → 备份到 WebDAV / 下载备份；恢复通过 `POST /reader3/restoreFromZip`
+- **全书搜索**：详情页 → 全书搜索（本地书，含文件型）；书架搜索可切「全书」范围
+
+---
+
+## 🧑‍💻 开发
 
 ```bash
-docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
-# 启动 reader-dev 时设置环境变量：
-# FLARESOLVERR_URL=http://127.0.0.1:8191
+cargo test        # 后端测试（255+，含 CF 求解/OPDS/本地格式集成测试）
+cd web-ui && npm run build   # 前端（vue-tsc 类型检查 + vite）
 ```
 
-**Chrome / Edge（书源登录浏览器流）** —— 可选。书源登录的「浏览器自动登录」通过 CDP 驱动本机 headless 浏览器：登录表单自动填写、滑块验证码自动拖拽（人类轨迹：贝塞尔曲线 + 随机噪声）、图片验证码截图回填、`Storage.getCookies` 提取 cookie 存库。
+### 项目结构
 
-- Windows：自动检测 Edge / Chrome 常见安装路径（无需配置）
-- Linux：需安装 `chromium` / `chromium-browser` / `google-chrome`，或用 `READER_CHROME_PATH` 显式指定
-- 未安装浏览器时登录自动回退手动 Cookie 流程（接口返回「未安装浏览器」提示）
+```
+src/
+├── api/          # axum 路由（/reader3/*、/opds、/opds-save）
+├── model/        # 数据模型（book/book_source/rss/user/...）
+├── parser/       # 规则引擎（css_chain / js / rule / xpath）
+├── service/      # 业务（search/crawler/explore/local_book/epub/opds/rss/
+│                 #   browser(CDP)/login(书源登录)/export_book/debug/cache_job/health）
+├── storage/      # SQLite（迁移/CRUD/书源 cookie/正文缓存/阅读统计）
+└── util/         # md5/sha256 等
+web-ui/src/
+├── views/        # 12 个视图（书架/阅读/搜索/详情/探索/书源/文件/用户/规则/RSS/设置/登录）
+├── components/   # LogoMark / ErrorBoundary
+├── api/          # 后端接口封装（24 个模块）
+└── utils/        # chinese(简繁)/uiTheme/readerConfig/download/...
+scripts/          # api-scan.py（API 扫描）/ mock-cf-site.py（CF 质询 mock）
+tests/            # 集成测试（cf_solve 等）
+docs/             # SECURITY.md / ROADMAP.md / ARCHITECTURE.md / legado-ref/
+```
 
-### 本地书格式依赖说明
+---
 
-- **EPUB / FB2 / DOCX**：纯 Rust 解析（zip / XML 解包），无外部依赖；DOCX 按标题样式分章
-- **MOBI / AZW3**：内置解析（PalmDOC / AZW 头），无外部依赖
-- **PDF**：内置 PDF 解析（lopdf）逐页提取文本，8MB 解压上限（超大 / 加密 PDF 可能失败）
-- **TXT**：自动编码检测 + 目录规则分章（TXT 目录规则可在设置中配置）
-- 上传仅接受上述 7 种扩展名，其余返回「仅支持 EPUB/TXT/MOBI/AZW3/PDF/FB2/DOCX」
+## 🧪 测试
 
-## 文档
+- 后端 259+ 单测与集成测试（规则引擎/存储迁移/OPDS XML/本地书 7 格式解析/CF 质询端到端/WebDAV 全方法）
+- `scripts/api-scan.py`：API 全接口扫描（正常/空参/错参/边界）
+- 前端 `vue-tsc --noEmit` 严格类型检查 + vite 构建
 
-- `docs/ARCHITECTURE.md` —— 架构说明（模块 / 数据流 / 契约）
-- `docs/FRONTEND.md` —— 前端说明（页面 / 状态 / API 契约）
-- `docs/SECURITY.md` —— 安全审查报告
-- `docs/legado-ref/` —— legado 参考（规则命名对照）
+---
+
+## 📚 文档
+
+- [`docs/SECURITY.md`](docs/SECURITY.md) —— 安全设计审查
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) —— 架构设计
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) —— 路线图
+- [`docs/legado-ref/ruleHelp.md`](docs/legado-ref/ruleHelp.md) —— 书源规则参考（legado）
+
+---
+
+## 📌 分支说明
+
+| 分支 | 说明 |
+|---|---|
+| `master` | **Rust 重构版（当前）**——本文档 |
+| `legacy` | Kotlin 稳定版（ghcr.io/warpdotsys/reader-dev:latest / v4.x 双平台镜像） |
+
+---
+
+## 📄 License
+
+Apache-2.0
