@@ -1863,12 +1863,22 @@ async fn get_book_toc(
         Err(ret) => return Json(ret),
     };
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-    let toc_url = param_of(&params, body_json.as_ref(), "tocUrl");
-    let toc_url = if toc_url.is_empty() {
-        param_of(&params, body_json.as_ref(), "url")
-    } else {
-        toc_url
-    };
+    let mut toc_url = param_of(&params, body_json.as_ref(), "tocUrl");
+    if toc_url.is_empty() {
+        toc_url = param_of(&params, body_json.as_ref(), "url");
+    }
+    // 换源后 tocUrl 常为空：从书架书 DB 取 toc_url（书源书/本地书均可）兜底
+    if toc_url.is_empty() {
+        let req_url = param_of(&params, body_json.as_ref(), "url");
+        let book_url_param = if !req_url.is_empty() { req_url } else { String::new() };
+        if !book_url_param.is_empty() {
+            if let Ok(Some(b)) = state.storage.find_book(&namespace, &book_url_param).await {
+                if !b.toc_url.is_empty() {
+                    toc_url = b.toc_url.clone();
+                }
+            }
+        }
+    }
     if toc_url.is_empty() {
         return Json(ReturnData::err("请输入目录链接"));
     }
