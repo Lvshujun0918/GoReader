@@ -176,9 +176,24 @@ fn context_with_limit(loop_limit: u64) -> Context {
     context
 }
 
-/// 将 boa 错误映射为友好文案：超限 → "JS 执行超限"
+// 最近一次 JS eval 失败的原始错误消息（线程局部——GAP 156：debug SSE 步骤输出用）。
+// 每次 `map_js_error`（eval 失败统一出口）记录；debug 流程在步骤结束后
+// `take_last_js_error` 取走并附加到步骤输出（错误消息 + JS 片段前 100 字符）。
+// 注意：同步代码内取用（debug 步骤的 eval 与读取之间无 await，同线程安全）；
+// 其他并发请求的 eval 在线程局部隔离，互不污染。
+thread_local! {
+    static LAST_JS_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 取走（并清空）最近一次 JS eval 失败消息；无则 None。
+pub fn take_last_js_error() -> Option<String> {
+    LAST_JS_ERROR.with(|c| c.borrow_mut().take())
+}
+
+/// 将 boa 错误映射为友好文案：超限 → "JS 执行超限"；同时记录原始消息（debug 输出用）
 fn map_js_error(e: boa_engine::JsError) -> anyhow::Error {
     let msg = e.to_string();
+    LAST_JS_ERROR.with(|c| *c.borrow_mut() = Some(msg.clone()));
     if msg.to_lowercase().contains("loop iteration limit") {
         anyhow!("JS 执行超限")
     } else {
@@ -442,7 +457,9 @@ fn block_on_task<T: Send + 'static>(
     }
 }
 
-/// 内置浏览器可用性（`java.startBrowserAwait` 前置检查；测试钩子可强制覆盖）
+/// 内置浏览器可用性（`java.startBrowserAwait` 前置检查；测试钩子可强制覆盖）。
+/// GAP 175：camoufox 后端启用（默认）时视为可用——求解链会在 CDP 失败/不可用时
+/// 自动走 camoufox（HTTP 后端），前置检查不再因缺浏览器直接拦截。
 fn js_browser_available() -> bool {
     #[cfg(test)]
     {
@@ -453,7 +470,7 @@ fn js_browser_available() -> bool {
             _ => {}
         }
     }
-    crate::service::browser::is_browser_available()
+    crate::service::browser::is_browser_available() || crate::service::camoufox::enabled()
 }
 
 /// 测试钩子：强制浏览器可用性（Some(true)/Some(false) 强制；None 恢复自动探测）
@@ -493,6 +510,7 @@ fn register_js_solve_hook(hook: Option<Arc<SolveHook>>) {
 /// 接入 `browser::solve_captcha`（统一验证码求解入口：CF JS 质询 / Turnstile / 滑块
 /// 自动处理；进程内 CDP，会话级浏览器实例惰性启动/复用/异常自动重启）。
 async fn solve_page(
+    ns: String,
     url: String,
     cookies: Vec<(String, String)>,
     _title: String,
@@ -508,7 +526,7 @@ async fn solve_page(
     }
     #[cfg(not(test))]
     {
-        let sol = crate::service::browser::solve_captcha(&url, &cookies, 60_000)
+        let sol = crate::service::browser::solve_captcha(&ns, &url, &cookies, 60_000)
             .await
             .map_err(|e| anyhow!("浏览器加载失败（{url}）: {e:#}"))?;
         return Ok((sol.html, sol.cookies, sol.user_agent));
@@ -544,7 +562,7 @@ fn java_start_browser_await(
         let cookie_str =
             crate::service::crawler::cookie_for(&ns, &fut_url).await.unwrap_or_default();
         let cookies = crate::service::crawler::parse_cookie_string(&cookie_str);
-        solve_page(fut_url, cookies, title).await
+        solve_page(ns, fut_url, cookies, title).await
     };
     let (html, cookies, _user_agent) =
         match block_on_task(fut, Duration::from_secs(60), "java.startBrowserAwait") {

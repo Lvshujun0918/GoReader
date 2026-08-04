@@ -142,6 +142,7 @@ async fn turnstile_challenge_solve_end_to_end() {
     // 用户既有 cookie（会话连续性：求解后仍保留并合并）
     let user_cookies = vec![("sid".to_string(), "abc123".to_string())];
     let result = reader_dev::service::browser::solve_cf_challenge(
+        "default",
         &format!("http://127.0.0.1:{port}/"),
         &user_cookies,
         30_000,

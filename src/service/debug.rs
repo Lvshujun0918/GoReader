@@ -47,6 +47,49 @@ impl DebugStep {
     }
 }
 
+/// 提取规则字符串中的 JS 代码（`<js>…</js>` / `@js:` 前缀 / `规则@js:` 后缀链）——
+/// debug 步骤输出 JS 片段用（与生产解析的提取规则同源）
+fn extract_js_code(rule: &str) -> Option<String> {
+    let r = rule.trim();
+    if let Some(rest) = r.strip_prefix("@js:") {
+        return Some(rest.trim().to_string());
+    }
+    if let Some(start) = r.find("<js>") {
+        let rest = &r[start + 4..];
+        let end = rest.find("</js>").unwrap_or(rest.len());
+        return Some(rest[..end].to_string());
+    }
+    if let Some((_, js)) = r.split_once("@js:") {
+        return Some(js.trim().to_string());
+    }
+    None
+}
+
+/// JS 片段前 100 字符（Unicode 字符计数）
+fn js_snippet(code: &str) -> String {
+    code.chars().take(100).collect()
+}
+
+/// GAP 156：把本步骤内发生的 JS eval 错误附加到步骤输出——
+/// `error` = 错误消息；`detail.jsError` = 原始错误；`detail.jsSnippet` = JS 片段前 100 字符；
+/// `detail.jsRule` = 来源规则。取走线程局部记录（无则不改动步骤）。
+fn attach_js_error(step: &mut DebugStep, rule: Option<&str>) {
+    let Some(err) = crate::parser::js::take_last_js_error() else {
+        return;
+    };
+    step.error = Some(format!("JS 执行失败: {err}"));
+    let mut detail = step.detail.clone();
+    if !detail.is_object() {
+        detail = json!({});
+    }
+    detail["jsError"] = json!(err);
+    if let Some(code) = rule.and_then(extract_js_code) {
+        detail["jsSnippet"] = json!(js_snippet(&code));
+        detail["jsRule"] = json!(rule.unwrap_or(""));
+    }
+    step.detail = detail;
+}
+
 /// 执行调试：逐步骤回调 on_step，返回最终结果 JSON
 pub async fn run_debug(
     ns: &str,
@@ -179,14 +222,19 @@ async fn debug_search(
     ) {
         Ok(v) => v,
         Err(e) => {
-            on_step(&DebugStep {
+            let mut step = DebugStep {
                 rule_name: "URL 构造".into(),
                 url: search_url.clone(),
                 elapsed_ms: started.elapsed().as_millis() as i64,
                 result_len: 0,
                 error: Some(e.to_string()),
                 detail: Value::Null,
-            });
+            };
+            // GAP 156：URL 构造 JS（@js: 前缀）失败时附加 JS 片段前 100 字符
+            if let Some(code) = extract_js_code(&search_url) {
+                step.detail = json!({"jsSnippet": js_snippet(&code), "jsRule": search_url});
+            }
+            on_step(&step);
             return Err(e);
         }
     };
@@ -218,6 +266,8 @@ async fn debug_search(
             "name": b.name, "author": b.author, "bookUrl": b.book_url,
         })),
     });
+    // GAP 156：bookList JS 规则 eval 失败 → 错误消息 + JS 片段前 100 字符
+    attach_js_error(&mut step, Some(&book_list_rule));
     on_step(&step);
     Ok(json!(books))
 }
@@ -319,6 +369,8 @@ async fn debug_toc(
     let mut all: Vec<Value> = Vec::new();
     let mut current_url = toc_url.to_string();
     for page in 0..5usize {
+        // 清掉上一页 nextTocUrl 字段求值可能留下的 JS 错误记录（避免错挂到本页步骤）
+        let _ = crate::parser::js::take_last_js_error();
         // 抓取目录页
         let resp = match debug_fetch(ns, &current_url, &UrlSuffix::default(), source, "", on_step).await {
             Ok(r) => r,
@@ -343,6 +395,8 @@ async fn debug_toc(
         step.elapsed_ms = started.elapsed().as_millis() as i64;
         step.result_len = items.len();
         step.detail = json!({ "count": items.len() });
+        // GAP 156：chapterList JS 规则（<js>/@js:）eval 失败 → 错误消息 + JS 片段前 100 字符
+        attach_js_error(&mut step, Some(&list_rule));
         on_step(&step);
 
         // 字段规则（前 20 条示例）
@@ -372,6 +426,12 @@ async fn debug_toc(
         step.elapsed_ms = started.elapsed().as_millis() as i64;
         step.result_len = page_chapters.len();
         step.detail = json!({ "sample": page_chapters.first() });
+        // GAP 156：chapterName/chapterUrl 的 @js: 后缀链 eval 失败 → 错误消息 + JS 片段前 100 字符
+        let js_field_rule = [rule.chapter_name.as_deref(), rule.chapter_url.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|r| extract_js_code(r).is_some());
+        attach_js_error(&mut step, js_field_rule);
         on_step(&step);
         all.extend(page_chapters);
 
@@ -416,6 +476,8 @@ async fn debug_content(
     let mut parts: Vec<String> = Vec::new();
     let mut current_url = chapter_url.to_string();
     for page in 0..5usize {
+        // 清掉上一页 nextContentUrl 字段求值可能留下的 JS 错误记录（避免错挂到本页步骤）
+        let _ = crate::parser::js::take_last_js_error();
         let resp = match debug_fetch(ns, &current_url, &UrlSuffix::default(), source, "", on_step).await {
             Ok(r) => r,
             Err(e) => return Err(e),
@@ -429,6 +491,8 @@ async fn debug_content(
         step.result_len = content.len();
         step.error = if content.is_empty() { Some("未提取到正文".into()) } else { None };
         step.detail = json!({ "chars": content.chars().count() });
+        // GAP 156：content 规则 JS（<js>/@js: 后缀链）eval 失败 → 错误消息 + JS 片段前 100 字符
+        attach_js_error(&mut step, rule.content.as_deref());
         on_step(&step);
         if !content.is_empty() {
             parts.push(content);
@@ -474,5 +538,83 @@ mod tests {
         assert_eq!(v["ruleName"], "规则解析（ruleSearch）");
         assert_eq!(v["elapsedMs"], 12);
         assert_eq!(v["detail"]["kind"], "Css");
+    }
+
+    // ==================== GAP 156：JS 规则执行步骤错误详情 ====================
+
+    #[test]
+    fn test_extract_js_code_variants() {
+        // <js>…</js> 包裹
+        assert_eq!(
+            extract_js_code("<js>return 1</js>"),
+            Some("return 1".to_string())
+        );
+        // @js: 前缀
+        assert_eq!(extract_js_code("@js:JSON.parse(result)"), Some("JSON.parse(result)".to_string()));
+        // 提取规则 @js: 后缀链（legado）
+        assert_eq!(
+            extract_js_code("$.path@js:java.aesBase64DecodeToString(v)"),
+            Some("java.aesBase64DecodeToString(v)".to_string())
+        );
+        // 非 JS 规则 → None
+        assert_eq!(extract_js_code("div.book@text"), None);
+        assert_eq!(extract_js_code(""), None);
+    }
+
+    #[test]
+    fn test_js_snippet_100_chars() {
+        // ASCII
+        let s = "a".repeat(250);
+        assert_eq!(js_snippet(&s).len(), 100);
+        // 中文（Unicode 字符计数——100 个汉字）
+        let cn = "汉".repeat(120);
+        assert_eq!(js_snippet(&cn).chars().count(), 100);
+        // 短代码原样
+        assert_eq!(js_snippet("var x = 1;"), "var x = 1;");
+    }
+
+    #[test]
+    fn test_attach_js_error_records_error_and_snippet() {
+        // eval 失败（运行期 throw）——map_js_error 记录线程局部
+        let mut vars = std::collections::HashMap::new();
+        let r = crate::parser::js::eval_js_json("throw new Error('书单解析爆炸')", &vars);
+        assert!(r.is_err(), "throw 应失败");
+        let raw = crate::parser::js::take_last_js_error().expect("eval 失败应留下错误记录");
+        assert!(raw.contains("书单解析爆炸"), "原始错误消息: {raw}");
+
+        // 再次失败，随后 attach 到步骤——错误消息 + JS 片段前 100 字符
+        let r = crate::parser::js::eval_js_json("throw new Error('书单解析爆炸')", &vars);
+        assert!(r.is_err());
+        let mut step = DebugStep::new("规则应用（bookList 字段）");
+        attach_js_error(&mut step, Some("<js>throw new Error('书单解析爆炸')</js>"));
+        let err = step.error.expect("步骤应带错误");
+        assert!(err.contains("JS 执行失败"), "错误消息含 JS 执行失败前缀: {err}");
+        assert!(err.contains("书单解析爆炸"), "错误消息含原始错误: {err}");
+        assert!(
+            step.detail["jsError"].as_str().unwrap_or("").contains("书单解析爆炸"),
+            "detail.jsError 含原始错误"
+        );
+        assert_eq!(
+            step.detail["jsSnippet"],
+            "throw new Error('书单解析爆炸')",
+            "JS 片段为规则代码前 100 字符"
+        );
+        assert_eq!(step.detail["jsRule"], "<js>throw new Error('书单解析爆炸')</js>");
+        // 记录已被取走——再次 attach 不再重复
+        let mut step2 = DebugStep::new("x");
+        attach_js_error(&mut step2, None);
+        assert!(step2.error.is_none());
+    }
+
+    #[test]
+    fn test_attach_js_error_ignores_successful_eval() {
+        // eval 成功 → 无错误记录 → attach 不改动步骤
+        let mut vars = std::collections::HashMap::new();
+        let r = crate::parser::js::eval_js_json("JSON.stringify([{a:1}])", &vars);
+        assert!(r.is_ok());
+        assert!(crate::parser::js::take_last_js_error().is_none());
+        let mut step = DebugStep::new("规则应用");
+        attach_js_error(&mut step, Some("@js:JSON.stringify([{a:1}])"));
+        assert!(step.error.is_none(), "成功 eval 不应挂错误");
     }
 }

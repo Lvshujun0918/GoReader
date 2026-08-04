@@ -192,7 +192,7 @@ async fn turnstile_real_widget_local_page() {
     let url = format!("http://{addr}/");
 
     let start = Instant::now();
-    let result = reader_dev::service::browser::solve_captcha(&url, &[], 45_000).await;
+    let result = reader_dev::service::browser::solve_captcha("default", &url, &[], 45_000).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     match result {
         Ok(sol) => match sol.turnstile_token {
@@ -234,7 +234,7 @@ async fn turnstile_real_site_demo() {
 
     // ① 带 stealth 注入（默认）
     let start = Instant::now();
-    let r1 = reader_dev::service::browser::solve_captcha(url, &[], 60_000).await;
+    let r1 = reader_dev::service::browser::solve_captcha("default", url, &[], 60_000).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     let (ok1, tok1) = match &r1 {
         Ok(sol) => match &sol.turnstile_token {
@@ -266,7 +266,7 @@ async fn turnstile_real_site_demo() {
     // ② 关 stealth 重测（过率对比——仅报告，不阻塞）
     std::env::set_var("READER_CDP_NO_STEALTH", "1");
     let start2 = Instant::now();
-    let r2 = reader_dev::service::browser::solve_captcha(url, &[], 60_000).await;
+    let r2 = reader_dev::service::browser::solve_captcha("default", url, &[], 60_000).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     std::env::remove_var("READER_CDP_NO_STEALTH");
     match r2 {
@@ -302,7 +302,7 @@ async fn real_cf_js_challenge(url: &str, name: &str, max_wait_ms: u64) {
         return;
     }
     let start = Instant::now();
-    let result = reader_dev::service::browser::solve_cf_challenge(url, &[], max_wait_ms).await;
+    let result = reader_dev::service::browser::solve_cf_challenge("default", url, &[], max_wait_ms).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     match result {
         Ok(sol) => {
@@ -375,6 +375,7 @@ async fn cf_403_strong_challenge_69shuba_search() {
     // ① 首页质询（GET——403 强质询可能更慢，45s 上限）→ cf_clearance
     let start = Instant::now();
     let sol = match reader_dev::service::browser::solve_cf_challenge(
+        "default",
         "https://www.69shuba.com/",
         &[],
         45_000,
@@ -400,7 +401,7 @@ async fn cf_403_strong_challenge_69shuba_search() {
     // ② 页内 fetch POST 搜索（同源自动带 cookie——浏览器会话保持）
     let fetch_js = "fetch('modules/article/search.php', {method:'POST', body:'searchkey=诡秘', \
                     headers:{'Content-Type':'application/x-www-form-urlencoded'}}).then(function(r){ return r.text(); })";
-    let resp = reader_dev::service::browser::evaluate_in_session(fetch_js).await;
+    let resp = reader_dev::service::browser::evaluate_in_session("default", fetch_js).await;
     let mut text = match resp {
         Ok(v) => v.as_str().unwrap_or("").to_string(),
         Err(e) => {
@@ -416,6 +417,7 @@ async fn cf_403_strong_challenge_69shuba_search() {
         eprintln!("69shuba 搜索首次 fetch 命中质询（{}B）——导航 search.php 清除后重试", text.len());
         let start2 = Instant::now();
         match reader_dev::service::browser::solve_cf_challenge(
+            "default",
             "https://www.69shuba.com/modules/article/search.php",
             &[],
             45_000,
@@ -436,7 +438,7 @@ async fn cf_403_strong_challenge_69shuba_search() {
                 return;
             }
         }
-        match reader_dev::service::browser::evaluate_in_session(fetch_js).await {
+        match reader_dev::service::browser::evaluate_in_session("default", fetch_js).await {
             Ok(v) => text = v.as_str().unwrap_or("").to_string(),
             Err(e) => {
                 eprintln!("SKIP: 69shuba 重试页内 fetch 失败: {e:#}");
@@ -494,7 +496,7 @@ async fn slider_mock_solve_via_solve_captcha() {
     }
     let url = format!("http://127.0.0.1:{port}/");
 
-    let result = reader_dev::service::browser::solve_captcha(&url, &[], 30_000).await;
+    let result = reader_dev::service::browser::solve_captcha("default", &url, &[], 30_000).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     kill_mock(&mut child);
 

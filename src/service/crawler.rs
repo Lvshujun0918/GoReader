@@ -499,13 +499,20 @@ async fn solve_cf_builtin(
     url: &str,
     user_cookie: &str,
 ) -> Result<(FetchResponse, Option<String>, String)> {
-    if !cf_browser_available() {
-        return Err(anyhow!("CF 质询需浏览器环境：安装 Edge/Chrome 或配置 FLARESOLVERR_URL"));
-    }
     let cookies = parse_cookie_string(user_cookie);
-    let solution = crate::service::browser::solve_cf_challenge(url, &cookies, CF_SOLVE_MAX_WAIT_MS)
-        .await
-        .map_err(|e| anyhow!("内置浏览器解 CF 质询失败（{url}）: {e:#}"))?;
+    let solution = if !cf_browser_available() {
+        // GAP 175：无内置浏览器（未安装 Edge/Chrome）→ camoufox 后端兜底
+        // （HTTP 调 scripts/camoufox_solver.py；默认启用，仍失败才报错）
+        let cdp_err = anyhow!("CF 质询需浏览器环境：安装 Edge/Chrome 或配置 FLARESOLVERR_URL");
+        crate::service::camoufox::fallback(url, &cookies, CF_SOLVE_MAX_WAIT_MS, &cdp_err)
+            .await
+            .map_err(|e| anyhow!("解 CF 质询失败（{url}）: {e:#}"))?
+    } else {
+        let solution = crate::service::browser::solve_cf_challenge(ns, url, &cookies, CF_SOLVE_MAX_WAIT_MS)
+            .await
+            .map_err(|e| anyhow!("内置浏览器解 CF 质询失败（{url}）: {e:#}"))?;
+        solution
+    };
     let merged = store_solution_session(
         ns,
         url,
@@ -821,13 +828,16 @@ mod tests {
         assert!(r.unwrap().is_none());
     }
 
-    /// 浏览器不可用分支单测：solve_cf_builtin 返回明确错误（不启动浏览器、不发请求）
+    /// 浏览器不可用分支单测：solve_cf_builtin 返回明确错误（不启动浏览器、不发请求）；
+    /// GAP 175：禁用 camoufox 兜底后纯 CDP 错误路径（不发起 HTTP 调用）
     #[test]
     fn test_cf_builtin_browser_unavailable_returns_clear_error() {
+        std::env::set_var("READER_CAMOUFOX_DISABLE", "1");
         force_cf_browser_available(Some(false));
         let rt = tokio::runtime::Runtime::new().unwrap();
         let r = rt.block_on(solve_cf_builtin("default", "https://cf.example.com/book/1", "sid=abc"));
         force_cf_browser_available(None);
+        std::env::remove_var("READER_CAMOUFOX_DISABLE");
         let err = r.err().expect("浏览器不可用应返回错误");
         assert!(
             err.to_string().contains("CF 质询需浏览器环境"),

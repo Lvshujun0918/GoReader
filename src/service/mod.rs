@@ -3,6 +3,7 @@
 pub mod book;
 pub mod browser;
 pub mod cache_job;
+pub mod camoufox;
 pub mod crawler;
 pub mod debug;
 pub mod epub;

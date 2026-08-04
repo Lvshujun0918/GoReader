@@ -717,8 +717,12 @@ struct CfSession {
     last_used: std::time::Instant,
 }
 
-static CF_SESSION: LazyLock<tokio::sync::Mutex<Option<CfSession>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(None));
+/// 按用户命名空间隔离的浏览器会话池（安全：同一实例多用户共享一个浏览器实例会
+/// 泄漏登录态 cookie——A 用户的 cf_clearance/登录 cookie 残留在浏览器，B 用户的
+/// 质询求解会带着 A 的 cookie 请求。每 ns 独立实例（独立 user-data-dir），
+/// 求解前还清空浏览器 cookie 再注入本用户 cookie（双保险）。
+static CF_SESSION: LazyLock<tokio::sync::Mutex<std::collections::HashMap<String, CfSession>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// 闲置回收：每次求解成功后挂一个定时任务——TTL 内无新使用则弃用会话（Drop 杀进程+清目录）。
 /// 并发触发多个无害（幂等：last_used 刷新后条件不满足即跳过）
@@ -726,20 +730,14 @@ fn spawn_cf_session_reaper() {
     tokio::spawn(async {
         tokio::time::sleep(CF_SESSION_IDLE_TTL).await;
         let mut guard = CF_SESSION.lock().await;
-        if let Some(s) = guard.as_ref() {
-            if s.last_used.elapsed() >= CF_SESSION_IDLE_TTL {
-                *guard = None; // Drop → 杀浏览器进程 + 清理 user-data-dir
-            }
-        }
+        guard.retain(|_ns, s| s.last_used.elapsed() < CF_SESSION_IDLE_TTL); // Drop 过期 → 杀进程+清目录
     });
 }
 
 /// 显式关闭 CF 求解会话（集成测试/优雅停机用；幂等）
 pub async fn shutdown_cf_session() {
     let mut guard = CF_SESSION.lock().await;
-    if guard.is_some() {
-        *guard = None;
-    }
+    guard.clear();
 }
 
 /// 解 CF 质询（进程内浏览器 CDP；会话级浏览器实例——惰性启动/互斥/异常自动重启）。
@@ -755,11 +753,12 @@ pub async fn shutdown_cf_session() {
 /// 服务端静默语义：全程 headless（--headless=new），不弹任何窗口/不等待用户——
 /// 求解失败返回明确错误，由调用方（书源 JS 等）自行兜底。
 pub async fn solve_cf_challenge(
+    ns: &str,
     url: &str,
     cookies: &[(String, String)],
     max_wait_ms: u64,
 ) -> Result<CfSolution> {
-    solve_captcha_inner(url, cookies, max_wait_ms, false).await
+    solve_captcha_inner(ns, url, cookies, max_wait_ms, false).await
 }
 
 /// 统一验证码求解入口（服务端静默 headless——不弹浏览器给用户）：一个函数覆盖全部验证码
@@ -772,33 +771,59 @@ pub async fn solve_cf_challenge(
 /// 会话管理/超时语义与 solve_cf_challenge 一致。书源 JS 的 java.startBrowserAwait shim
 /// 应路由到此入口（成功返回 body/cookies，失败返回明确错误）。
 pub async fn solve_captcha(
+    ns: &str,
     url: &str,
     cookies: &[(String, String)],
     max_wait_ms: u64,
 ) -> Result<CfSolution> {
-    solve_captcha_inner(url, cookies, max_wait_ms, true).await
+    solve_captcha_inner(ns, url, cookies, max_wait_ms, true).await
 }
 
-/// 统一求解内部实现（include_slider：solve_captcha 启用滑块分派，CF 专用入口不启用）
+/// 统一求解内部实现（include_slider：solve_captcha 启用滑块分派，CF 专用入口不启用）。
+/// 求解链（GAP 175）：内置浏览器 CDP → camoufox（HTTP 后端 scripts/camoufox_solver.py）
+/// → 仍失败才报错（合并错误）；`READER_CAMOUFOX_FIRST=1` 时 camoufox 优先。
 async fn solve_captcha_inner(
+    ns: &str,
     url: &str,
     cookies: &[(String, String)],
     max_wait_ms: u64,
     include_slider: bool,
 ) -> Result<CfSolution> {
+    // ① camoufox 优先模式（READER_CAMOUFOX_FIRST=1）：先试 HTTP 后端，失败转 CDP
+    let camo_err = if crate::service::camoufox::first_mode() {
+        match crate::service::camoufox::solve(url, cookies, max_wait_ms).await {
+            Ok(sol) => return Ok(sol),
+            Err(e) => {
+                tracing::warn!("camoufox 优先求解失败（转内置浏览器 CDP）: {e:#}");
+                Some(e)
+            }
+        }
+    } else {
+        None
+    };
+
     let mut guard = CF_SESSION.lock().await;
-    // 惰性启动 / 复用（前次异常已在出错时弃用实例，这里自然重新 launch）
-    if guard.is_none() {
-        let browser = Browser::launch()
-            .await
-            .map_err(|e| anyhow!("CF 质询需浏览器环境：{e}"))?;
-        *guard = Some(CfSession {
-            browser,
-            last_used: std::time::Instant::now(),
-        });
+    // 惰性启动 / 复用（每用户命名空间独立浏览器实例——防跨用户 cookie 泄漏）
+    if !guard.contains_key(ns) {
+        let browser = match Browser::launch().await {
+            Ok(b) => b,
+            Err(launch_err) => {
+                let cdp_err = anyhow!("CF 质询需浏览器环境：{launch_err:#}");
+                drop(guard);
+                // 无内置浏览器 → camoufox 兜底（默认启用；仍失败合并错误）
+                return finish_with_fallback(url, cookies, max_wait_ms, &cdp_err, camo_err).await;
+            }
+        };
+        guard.insert(
+            ns.to_string(),
+            CfSession {
+                browser,
+                last_used: std::time::Instant::now(),
+            },
+        );
     }
     let result = {
-        let session = guard.as_mut().expect("just initialized");
+        let session = guard.get_mut(ns).expect("just initialized");
         session.last_used = std::time::Instant::now();
         solve_with(&mut session.browser, url, cookies, max_wait_ms, include_slider).await
     };
@@ -808,18 +833,37 @@ async fn solve_captcha_inner(
             Ok(sol)
         }
         Err(e) => {
-            // 超时/异常 → 弃用实例（Drop 杀进程 + 清 user-data-dir），下次调用自动重启
-            *guard = None;
-            Err(e)
+            // 超时/异常 → 弃用该用户实例（Drop 杀进程 + 清 user-data-dir），下次自动重启
+            guard.remove(ns);
+            drop(guard);
+            // ② CDP 失败 → camoufox 兜底（仍失败才报错）
+            finish_with_fallback(url, cookies, max_wait_ms, &e, camo_err).await
         }
     }
 }
 
+/// CDP 失败后的统一收尾：camoufox 兜底；已优先尝试过 camoufox（并失败）则不再重复调用，
+/// 直接合并错误返回。
+async fn finish_with_fallback(
+    url: &str,
+    cookies: &[(String, String)],
+    max_wait_ms: u64,
+    cdp_err: &anyhow::Error,
+    camo_err: Option<anyhow::Error>,
+) -> Result<CfSolution> {
+    if let Some(prev) = camo_err {
+        return Err(anyhow!(
+            "内置浏览器求解失败: {cdp_err:#}；camoufox 优先尝试失败: {prev:#}"
+        ));
+    }
+    crate::service::camoufox::fallback(url, cookies, max_wait_ms, cdp_err).await
+}
+
 /// 在会话浏览器当前页面执行 JS（求解完成后继续操作页面——如提交表单/页内 fetch，
 /// 69shuba 搜索场景：同源自动携带 cf_clearance）。无会话（未求解过）→ 错误。
-pub async fn evaluate_in_session(expression: &str) -> Result<Value> {
+pub async fn evaluate_in_session(ns: &str, expression: &str) -> Result<Value> {
     let mut guard = CF_SESSION.lock().await;
-    let Some(session) = guard.as_mut() else {
+    let Some(session) = guard.get_mut(ns) else {
         return Err(anyhow!("无浏览器会话——请先调用 solve_cf_challenge/solve_captcha"));
     };
     session.last_used = std::time::Instant::now();
