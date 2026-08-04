@@ -6,6 +6,14 @@ import { deleteBookSource, getBookSources, getInvalidBookSources, saveBookSource
 import { deleteSourceSub, getSourceSubs, refreshSourceSub, saveSourceSub } from '@/api/sourceSubs'
 import { exportBookSources } from '@/api/system'
 import { bookSourceDebugSSE, type DebugAction } from '@/api/sourceDebug'
+import {
+  getCaptcha,
+  loginBookSource,
+  setBookSourceCookie,
+  submitCaptcha,
+  type BookSourceLoginResult,
+  type CaptchaProbe,
+} from '@/api/sourceLogin'
 import { downloadBlob } from '@/utils/download'
 import type { BookSource, SourceSub } from '@/types'
 
@@ -453,6 +461,260 @@ function closeEdit() {
 }
 
 /** 校验 + 保存：JSON 字段逐个 parse（失败定位到具体字段），合并进原书源后 saveBookSource 整源覆盖，刷新列表 */
+/* ================= 书源登录（POST /reader3/loginBookSource 等；登录态 localStorage 持久 reader_src_login_{url}） ================= */
+
+const LOGIN_KEY_PREFIX = 'reader_src_login_'
+const LOGIN_KEY = (url: string) => `${LOGIN_KEY_PREFIX}${url}`
+
+/** 已登录书源 URL 集合（localStorage 缓存 reader_src_login_{url}，刷新页面后仍显示「已登录」） */
+const loggedUrls = ref<Set<string>>(new Set())
+
+function syncLoggedUrls() {
+  const set = new Set<string>()
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i)
+    if (k && k.startsWith(LOGIN_KEY_PREFIX) && localStorage.getItem(k) === '1') {
+      set.add(k.slice(LOGIN_KEY_PREFIX.length))
+    }
+  }
+  loggedUrls.value = set
+}
+
+function markLoggedIn(url: string) {
+  localStorage.setItem(LOGIN_KEY(url), '1')
+  syncLoggedUrls()
+}
+
+function markLoggedOut(url: string) {
+  localStorage.removeItem(LOGIN_KEY(url))
+  syncLoggedUrls()
+}
+
+const loginOpen = ref(false)
+const loginSource = ref<BookSource | null>(null)
+const loginBusy = ref(false)
+const loginForm = ref({ username: '', password: '' })
+/** 登录态：unknown=登录态未知（探测中/未探测） logged=已登录 not=登录失败 */
+const loginState = ref<'unknown' | 'logged' | 'not'>('unknown')
+const loginProbe = ref('') // 状态区探测提示（getCaptcha 结果）
+const loginMsg = ref('') // 操作结果提示
+const loginMsgError = ref(false)
+const cookieSummary = ref('') // 登录成功后的 cookie 摘要（前 20 字符）
+const captcha = ref<{ captchaId: string; captchaUrl: string; message: string } | null>(null)
+const captchaFrom = ref<'probe' | 'login'>('probe') // 验证码来源（登录返回的验证码不被探测覆盖）
+const captchaText = ref('')
+const showManual = ref(false) // 手动 Cookie 区（needManualCaptcha / 探测到点选验证码）
+const manualCookie = ref('')
+const probing = ref(false)
+
+function openLogin(s: BookSource) {
+  loginSource.value = s
+  loginForm.value = { username: '', password: '' }
+  loginState.value = 'unknown'
+  loginProbe.value = ''
+  loginMsg.value = ''
+  loginMsgError.value = false
+  cookieSummary.value = ''
+  captcha.value = null
+  captchaFrom.value = 'probe'
+  captchaText.value = ''
+  showManual.value = false
+  manualCookie.value = ''
+  loginOpen.value = true
+  document.body.style.overflow = 'hidden'
+  if (loggedUrls.value.has(s.bookSourceUrl)) {
+    loginState.value = 'logged'
+    loginProbe.value = '本地缓存：该书源已登录（Cookie 存于服务端）'
+  } else {
+    void probeCaptcha() // 登录态未知 → getCaptcha 探测
+  }
+}
+
+function closeLogin() {
+  if (loginBusy.value) return
+  loginOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 探测验证码（POST /reader3/getCaptcha）：结果仅更新状态区与验证码区；失败不影响直接登录。force=true 时强制刷新验证码图 */
+async function probeCaptcha(force = false) {
+  const s = loginSource.value
+  if (!s || probing.value) return
+  probing.value = true
+  if (!loginProbe.value) loginProbe.value = '探测中…'
+  try {
+    const res = await getCaptcha(s.bookSourceUrl, { silent: true })
+    const d = res.data as CaptchaProbe | null | undefined
+    const kind = d?.captchaType
+    if (kind === 'image' && d?.captchaUrl && d?.captchaId) {
+      if (force || captchaFrom.value !== 'login') {
+        captcha.value = {
+          captchaId: d.captchaId,
+          captchaUrl: d.captchaUrl,
+          message: d.message || '需要图片验证码',
+        }
+        captchaFrom.value = 'probe'
+        captchaText.value = ''
+      }
+      loginProbe.value = '检测到图片验证码——填写用户名/密码后可提交'
+    } else if (kind === 'slider') {
+      loginProbe.value = d?.message || '检测到滑块验证码——点击「登录」由浏览器自动处理'
+    } else if (kind === 'click') {
+      showManual.value = true
+      loginProbe.value = d?.message || '检测到点选类验证码——请在浏览器登录后粘贴 Cookie'
+    } else {
+      loginProbe.value = d?.message || '未检测到验证码，可直接登录'
+    }
+  } catch (err) {
+    loginProbe.value =
+      err instanceof Error && err.message
+        ? `探测失败：${err.message}（可直接登录或粘贴 Cookie）`
+        : '探测失败（可直接登录或粘贴 Cookie）'
+  } finally {
+    probing.value = false
+  }
+}
+
+/** 登录结果统一处理（loginBookSource 的 success / submitCaptcha 的 isLogin 两套标记） */
+function applyLoginResult(d: BookSourceLoginResult | null | undefined) {
+  const url = loginSource.value?.bookSourceUrl
+  if (!d || !url) return
+  if (d.isLogin === true || d.success === true) {
+    markLoggedIn(url)
+    loginState.value = 'logged'
+    cookieSummary.value = d.cookie ? d.cookie.slice(0, 20) : ''
+    loginMsg.value = '登录成功'
+    loginMsgError.value = false
+    captcha.value = null
+    captchaFrom.value = 'probe'
+    captchaText.value = ''
+    showManual.value = false
+    loginProbe.value = ''
+    return
+  }
+  if (d.needCaptcha) {
+    captcha.value = {
+      captchaId: d.captchaId ?? '',
+      captchaUrl: d.captchaUrl ?? '',
+      message: d.message || '需要图片验证码',
+    }
+    captchaFrom.value = 'login'
+    captchaText.value = ''
+    loginMsg.value = d.message || '需要图片验证码，请输入后提交'
+    loginMsgError.value = false
+    return
+  }
+  if (d.needManualCaptcha) {
+    showManual.value = true
+    manualCookie.value = ''
+    loginMsg.value = d.message || '需手动验证码：请在浏览器登录该书源后，在下方粘贴 Cookie'
+    loginMsgError.value = false
+    return
+  }
+  // 登录失败（无验证码）
+  loginState.value = 'not'
+  loginMsg.value = d.message || '登录失败'
+  loginMsgError.value = true
+}
+
+/** 「登录」按钮：POST /reader3/loginBookSource（username/password） */
+async function doLogin() {
+  const s = loginSource.value
+  if (!s || loginBusy.value) return
+  loginBusy.value = true
+  loginMsg.value = ''
+  try {
+    const res = await loginBookSource({
+      bookSource: s.bookSourceUrl,
+      username: loginForm.value.username,
+      password: loginForm.value.password,
+    })
+    applyLoginResult(res.data)
+  } catch {
+    // 硬错误（ReturnData::err / 网络）已由拦截器提示
+  } finally {
+    loginBusy.value = false
+  }
+}
+
+/** 「提交验证码」：POST /reader3/submitCaptcha（带 username/password 覆盖会话值）→ isLogin 显示结果 */
+async function doSubmitCaptcha() {
+  const s = loginSource.value
+  const c = captcha.value
+  if (!s || !c || loginBusy.value) return
+  const text = captchaText.value.trim()
+  if (!c.captchaId || !text) return
+  loginBusy.value = true
+  loginMsg.value = ''
+  try {
+    const res = await submitCaptcha({
+      bookSource: s.bookSourceUrl,
+      captchaId: c.captchaId,
+      captchaText: text,
+      username: loginForm.value.username,
+      password: loginForm.value.password,
+    })
+    applyLoginResult(res.data)
+  } catch {
+    // 拦截器已提示
+  } finally {
+    loginBusy.value = false
+  }
+}
+
+/** 「保存 Cookie」：POST /reader3/setBookSourceCookie（手动 Cookie 落库） */
+async function saveManualCookie() {
+  const s = loginSource.value
+  if (!s || loginBusy.value) return
+  const cookie = manualCookie.value.trim()
+  if (!cookie) return
+  loginBusy.value = true
+  loginMsg.value = ''
+  try {
+    const res = await setBookSourceCookie(s.bookSourceUrl, cookie)
+    if (res.data?.success) {
+      markLoggedIn(s.bookSourceUrl)
+      loginState.value = 'logged'
+      cookieSummary.value = cookie.slice(0, 20)
+      showManual.value = false
+      manualCookie.value = ''
+      loginMsg.value = 'Cookie 已保存'
+      loginMsgError.value = false
+    }
+  } catch {
+    // 拦截器已提示
+  } finally {
+    loginBusy.value = false
+  }
+}
+
+/** 「清除 Cookie」：POST /reader3/setBookSourceCookie（空 cookie = 清除） */
+async function clearLoginCookie() {
+  const s = loginSource.value
+  if (!s || loginBusy.value) return
+  loginBusy.value = true
+  loginMsg.value = ''
+  try {
+    const res = await setBookSourceCookie(s.bookSourceUrl, '')
+    if (res.data?.success) {
+      markLoggedOut(s.bookSourceUrl)
+      loginState.value = 'unknown'
+      cookieSummary.value = ''
+      captcha.value = null
+      captchaFrom.value = 'probe'
+      captchaText.value = ''
+      showManual.value = false
+      manualCookie.value = ''
+      loginMsg.value = '已清除 Cookie（登录态失效）'
+      loginMsgError.value = false
+    }
+  } catch {
+    // 拦截器已提示
+  } finally {
+    loginBusy.value = false
+  }
+}
+
 async function confirmEdit() {
   if (editBusy.value) return
   const base = editSource.value
@@ -817,6 +1079,7 @@ async function loadSubs() {
 }
 
 onMounted(() => {
+  syncLoggedUrls()
   load()
   void loadSubs()
 })
@@ -946,6 +1209,7 @@ onMounted(() => {
             {{ s.bookSourceGroup }}
           </span>
           <span v-if="invalidSources.has(s.bookSourceUrl)" class="source-badge invalid">失效</span>
+          <span v-if="loggedUrls.has(s.bookSourceUrl)" class="source-badge logged" title="已登录（Cookie 存于服务端，本地缓存）">已登录</span>
           <button
             v-if="defaultField"
             class="default-btn"
@@ -966,6 +1230,9 @@ onMounted(() => {
             @click="openDebug(s)"
           >
             测试
+          </button>
+          <button class="test-btn" type="button" title="登录书源（用户名/密码 · 验证码 · 手动 Cookie）" @click="openLogin(s)">
+            登录
           </button>
           <button class="test-btn" type="button" title="编辑书源（基本信息 + 规则字段）" @click="openEdit(s)">
             编辑
@@ -1298,6 +1565,135 @@ onMounted(() => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+    <!-- 书源登录弹窗（POST /reader3/loginBookSource：状态区 + 用户名/密码表单 + 图片验证码 + 手动 Cookie；登录态 localStorage 持久） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="loginOpen" class="dlg-overlay" @click.self="closeLogin">
+          <div
+            class="dlg dlg-login"
+            role="dialog"
+            aria-modal="true"
+            aria-label="书源登录"
+            tabindex="-1"
+            @keydown.esc="closeLogin"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">登录 · {{ loginSource?.bookSourceName }}</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="loginBusy" @click="closeLogin">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+
+            <!-- 状态区：已登录（本地缓存） / 未登录 / 登录态未知（getCaptcha 探测） -->
+            <div class="login-status" :class="{ logged: loginState === 'logged', not: loginState === 'not' }">
+              <span class="login-state-dot"></span>
+              <span class="login-state-text">
+                {{ loginState === 'logged' ? '已登录' : loginState === 'not' ? '未登录' : '登录态未知' }}
+              </span>
+              <span v-if="loginState === 'logged' && cookieSummary" class="login-cookie-sum" :title="cookieSummary + '…'">
+                Cookie {{ cookieSummary }}…
+              </span>
+              <span v-else-if="loginState === 'unknown' && loginProbe" class="login-probe">{{ loginProbe }}</span>
+            </div>
+
+            <!-- 表单：用户名/密码 → 登录 -->
+            <form class="dlg-form" @submit.prevent="doLogin">
+              <label class="field">
+                <span class="field-label">用户名</span>
+                <input
+                  v-model="loginForm.username"
+                  class="field-input"
+                  type="text"
+                  autocomplete="username"
+                  placeholder="书源登录账号"
+                  spellcheck="false"
+                  :disabled="loginBusy"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">密码</span>
+                <input
+                  v-model="loginForm.password"
+                  class="field-input"
+                  type="password"
+                  autocomplete="current-password"
+                  placeholder="书源登录密码"
+                  :disabled="loginBusy"
+                />
+              </label>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="loginBusy" @click="closeLogin">关闭</button>
+                <button class="accent-btn" type="submit" :disabled="loginBusy">
+                  {{ loginBusy ? '登录中…' : '登录' }}
+                </button>
+              </div>
+            </form>
+
+            <!-- 图片验证码区：needCaptcha=true（或探测命中）→ 显示 captchaUrl 图片 + 输入 → submitCaptcha -->
+            <div v-if="captcha" class="captcha-box">
+              <div class="captcha-head">
+                <span class="field-label">图片验证码</span>
+                <button class="captcha-refresh" type="button" :disabled="loginBusy || probing" @click="probeCaptcha(true)">
+                  {{ probing ? '刷新中…' : '刷新验证码' }}
+                </button>
+              </div>
+              <img v-if="captcha.captchaUrl" class="captcha-img" :src="captcha.captchaUrl" alt="验证码图片" />
+              <p class="field-tip">{{ captcha.message }}</p>
+              <div class="captcha-row">
+                <input
+                  v-model="captchaText"
+                  class="field-input"
+                  type="text"
+                  placeholder="输入验证码"
+                  spellcheck="false"
+                  :disabled="loginBusy"
+                  @keydown.enter="doSubmitCaptcha"
+                />
+                <button
+                  class="accent-outline-btn"
+                  type="button"
+                  :disabled="loginBusy || !captchaText.trim()"
+                  @click="doSubmitCaptcha"
+                >
+                  {{ loginBusy ? '提交中…' : '提交验证码' }}
+                </button>
+              </div>
+            </div>
+
+            <!-- 手动 Cookie 区：needManualCaptcha=true → 提示 + 明文粘贴框 + 保存 -->
+            <div v-if="showManual" class="manual-box">
+              <p class="field-tip">需手动验证码：请在浏览器登录该书源后，在下方粘贴 Cookie（明文显示，便于核对）</p>
+              <textarea
+                v-model="manualCookie"
+                class="cookie-textarea"
+                placeholder="粘贴 Cookie，如 a=1; b=2"
+                spellcheck="false"
+                :disabled="loginBusy"
+              ></textarea>
+              <div class="dlg-actions">
+                <button
+                  class="accent-btn"
+                  type="button"
+                  :disabled="loginBusy || !manualCookie.trim()"
+                  @click="saveManualCookie"
+                >
+                  {{ loginBusy ? '保存中…' : '保存 Cookie' }}
+                </button>
+              </div>
+            </div>
+
+            <p v-if="loginMsg" class="login-msg" :class="{ error: loginMsgError }">{{ loginMsg }}</p>
+
+            <!-- 底部：清除 Cookie（空 cookie = 清除） -->
+            <div class="dlg-actions dlg-foot">
+              <button class="danger-btn" type="button" :disabled="loginBusy" @click="clearLoginCookie">清除 Cookie</button>
+            </div>
           </div>
         </div>
       </Transition>
@@ -1794,6 +2190,12 @@ onMounted(() => {
   background: rgba(207, 68, 68, 0.06);
 }
 
+.source-badge.logged {
+  color: var(--accent);
+  border: 1px solid rgba(64, 158, 120, 0.5);
+  background: rgba(64, 158, 120, 0.06);
+}
+
 /* 测试按钮（细字描边） */
 .test-btn {
   flex-shrink: 0;
@@ -2225,6 +2627,158 @@ onMounted(() => {
 .dlg-leave-to .dlg {
   opacity: 0;
   transform: translateY(6px);
+}
+
+/* ================= 书源登录弹窗 ================= */
+.dlg-login {
+  width: min(440px, 100%);
+}
+/* 状态区 */
+.login-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.login-status.logged {
+  border-color: rgba(64, 158, 120, 0.45);
+  background: rgba(64, 158, 120, 0.06);
+}
+.login-status.not {
+  border-color: rgba(207, 68, 68, 0.45);
+  background: rgba(207, 68, 68, 0.05);
+}
+.login-state-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+.login-status.logged .login-state-dot {
+  background: var(--accent);
+}
+.login-status.not .login-state-dot {
+  background: #cf4444;
+}
+.login-state-text {
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-1);
+}
+.login-cookie-sum {
+  min-width: 0;
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.login-probe {
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+/* 图片验证码区 */
+.captcha-box {
+  margin-top: 14px;
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px dashed var(--border-strong);
+  background: var(--bg);
+}
+.captcha-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.captcha-refresh {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.captcha-refresh:hover:not(:disabled) {
+  color: var(--accent-deep);
+}
+.captcha-refresh:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.captcha-img {
+  display: block;
+  max-width: 100%;
+  max-height: 120px;
+  margin-bottom: 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: #fff;
+}
+.captcha-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.captcha-row .field-input {
+  flex: 1;
+  min-width: 0;
+}
+/* 手动 Cookie 区（明文显示，便于核对） */
+.manual-box {
+  margin-top: 14px;
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px dashed rgba(207, 68, 68, 0.4);
+  background: var(--bg);
+}
+.cookie-textarea {
+  width: 100%;
+  min-height: 72px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-1);
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  outline: none;
+  resize: vertical;
+  transition: border-color 0.2s ease;
+}
+.cookie-textarea:focus {
+  border-color: var(--accent);
+}
+.cookie-textarea:disabled {
+  opacity: 0.55;
+}
+.login-msg {
+  margin: 12px 0 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+}
+.login-msg.error {
+  color: #cf4444;
+}
+.dlg-foot {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 
 /* ================= 响应式 ================= */
