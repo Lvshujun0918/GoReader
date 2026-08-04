@@ -68,12 +68,17 @@ export READER_APP_SECURE=true             # 开启多用户安全模式（可选
 
 > 非 secure 模式单用户（default）；secure 模式注册/登录后使用。
 
-### Docker（可选）
+### Docker（推荐——镜像内置 chromium，验证码/CF 质询浏览器流可直接使用）
 
-```dockerfile
-# 示例：构建镜像（arm64/amd64 多架构）
-docker build -f Dockerfile.source -t reader-dev .
+```bash
+# 构建（多阶段：Rust 编译 + 前端构建 + 运行镜像（debian + chromium））
+docker build -t reader-dev .
+
+# 运行（数据持久化到 ./data）
+docker run -d --name reader-dev -p 8080:8080   -v "$PWD/data:/data"   -e READER_APP_WORKDIR=/data   -e READER_APP_SECURE=true   reader-dev
 ```
+
+> 容器内验证码路径：**内置 chromium**（`READER_CHROME_PATH=/usr/bin/chromium`）→ 登录表单/滑块自动处理、CF 质询进程内求解；无需外部 FlareSolverr 容器（如需仍可 `FLARESOLVERR_URL` 指向 sidecar）。
 
 ---
 

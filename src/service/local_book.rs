@@ -49,47 +49,9 @@ pub fn parse_epub(bytes: &[u8]) -> Result<ImportedBook> {
     let opf = read_zip(&mut zip, &opf_path).context("读取 OPF 失败")?;
     let meta = parse_opf(&String::from_utf8_lossy(&opf));
 
-    // 3. spine（章节顺序）
+    // 3-4. spine/manifest + 章节内容（公共提取）
     let opf_str = String::from_utf8_lossy(&opf);
-    let spine_refs: Vec<String> = extract_all_attr(&opf_str, "itemref", "idref");
-    let manifest: std::collections::HashMap<String, (String, String)> = extract_manifest(&opf_str);
-
-    // 4. 章节内容（spine 顺序）
-    let mut chapters = Vec::new();
-    for idref in &spine_refs {
-        let Some((href, mediatype)) = manifest.get(idref) else { continue };
-        if !mediatype.contains("xhtml") && !mediatype.contains("html") {
-            continue;
-        }
-        // href 相对 OPF 目录
-        let full_path = resolve_opf_path(&opf_path, href);
-        let Ok(content_bytes) = read_zip(&mut zip, &full_path) else { continue };
-        let html = String::from_utf8_lossy(&content_bytes);
-        let text = html_to_text(&html);
-        if text.trim().is_empty() {
-            continue;
-        }
-        let title = extract_title(&html).unwrap_or_else(|| format!("第 {} 节", chapters.len() + 1));
-        chapters.push(Chapter { title, content: text });
-    }
-    if chapters.is_empty() {
-        // fallback：manifest 所有 xhtml
-        for ((href, mediatype)) in manifest.values() {
-            if !mediatype.contains("xhtml") && !mediatype.contains("html") {
-                continue;
-            }
-            let full_path = resolve_opf_path(&opf_path, href);
-            if let Ok(content_bytes) = read_zip(&mut zip, &full_path) {
-                let html = String::from_utf8_lossy(&content_bytes);
-                let text = html_to_text(&html);
-                if !text.trim().is_empty() {
-                    let title = extract_title(&html)
-                        .unwrap_or_else(|| format!("第 {} 节", chapters.len() + 1));
-                    chapters.push(Chapter { title, content: text });
-                }
-            }
-        }
-    }
+    let chapters = opf_chapters(&mut zip, &opf_path, &opf_str);
 
     // 5. 封面
     let cover = meta.cover_href.as_ref().and_then(|href| {
@@ -103,6 +65,83 @@ pub fn parse_epub(bytes: &[u8]) -> Result<ImportedBook> {
         cover,
         format: "epub".into(),
     })
+}
+
+/// 解析包含 OPF 的 zip（无 container.xml 的裸 OPF 结构——解包 EPUB 重新打包/纯 OPF 目录 zip）
+/// 自动查找 zip 内 .opf（根目录优先）→ OPF 元数据 + spine 顺序章节
+pub fn parse_opf_zip(bytes: &[u8]) -> Result<ImportedBook> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("不是有效的 zip")?;
+    // 找 .opf（优先根目录——其次任意路径）
+    let names: Vec<String> = (0..zip.len())
+        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+        .collect();
+    let opf_path = names
+        .iter()
+        .find(|n| n.ends_with(".opf") && !n.contains('/'))
+        .or_else(|| names.iter().find(|n| n.ends_with(".opf")))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("zip 内未找到 .opf 文件"))?;
+    let opf = read_zip(&mut zip, &opf_path).context("读取 OPF 失败")?;
+    let meta = parse_opf(&String::from_utf8_lossy(&opf));
+    let opf_str = String::from_utf8_lossy(&opf);
+    let chapters = opf_chapters(&mut zip, &opf_path, &opf_str);
+    if chapters.is_empty() {
+        return Err(anyhow::anyhow!("OPF 未解析到章节内容（spine 引用缺失）"));
+    }
+    let cover = meta.cover_href.as_ref().and_then(|href| {
+        let full = resolve_opf_path(&opf_path, href);
+        read_zip(&mut zip, &full).ok()
+    });
+    Ok(ImportedBook {
+        meta,
+        chapters,
+        cover,
+        format: "epub".into(),
+    })
+}
+
+/// 从 OPF 提取章节（spine 顺序；空则 fallback manifest 全部 xhtml）
+fn opf_chapters<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    opf_path: &str,
+    opf_str: &str,
+) -> Vec<Chapter> {
+    let spine_refs: Vec<String> = extract_all_attr(opf_str, "itemref", "idref");
+    let manifest: std::collections::HashMap<String, (String, String)> = extract_manifest(opf_str);
+    let mut chapters = Vec::new();
+    for idref in &spine_refs {
+        let Some((href, mediatype)) = manifest.get(idref) else { continue };
+        if !mediatype.contains("xhtml") && !mediatype.contains("html") {
+            continue;
+        }
+        let full_path = resolve_opf_path(opf_path, href);
+        let Ok(content_bytes) = read_zip(zip, &full_path) else { continue };
+        let html = String::from_utf8_lossy(&content_bytes);
+        let text = html_to_text(&html);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let title = extract_title(&html).unwrap_or_else(|| format!("第 {} 节", chapters.len() + 1));
+        chapters.push(Chapter { title, content: text });
+    }
+    if chapters.is_empty() {
+        for ((href, mediatype)) in manifest.values() {
+            if !mediatype.contains("xhtml") && !mediatype.contains("html") {
+                continue;
+            }
+            let full_path = resolve_opf_path(opf_path, href);
+            if let Ok(content_bytes) = read_zip(zip, &full_path) {
+                let html = String::from_utf8_lossy(&content_bytes);
+                let text = html_to_text(&html);
+                if !text.trim().is_empty() {
+                    let title = extract_title(&html)
+                        .unwrap_or_else(|| format!("第 {} 节", chapters.len() + 1));
+                    chapters.push(Chapter { title, content: text });
+                }
+            }
+        }
+    }
+    chapters
 }
 
 /// TXT 解析（编码检测 + 分章；使用内置默认规则）
@@ -834,7 +873,7 @@ pub fn is_local_book(book_url: &str, origin: &str) -> bool {
 }
 
 /// 支持的本地书扩展名白名单（上传 / getBookToc / getBookContent 分派共用）
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx", "zip"];
 
 /// 取文件名/路径的小写扩展名（不含点；无扩展名返回空串）
 pub fn file_ext(name: &str) -> String {
@@ -855,6 +894,8 @@ fn has_supported_ext(name: &str) -> bool {
 pub fn parse_file_bytes(bytes: &[u8], ext: &str, user_rules: &[String]) -> Result<ImportedBook> {
     match ext {
         "epub" => parse_epub(bytes),
+        // zip：优先标准 EPUB（container.xml）→ fallback 裸 OPF 结构
+        "zip" => parse_epub(bytes).or_else(|_| parse_opf_zip(bytes)),
         "txt" => parse_txt_with_rules(bytes, user_rules),
         "mobi" => parse_mobi(bytes),
         "azw3" => parse_azw3(bytes),
@@ -1015,6 +1056,55 @@ fn extract_title(html: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 裸 OPF zip（无 container.xml）：解析成功 + spine 顺序章节
+    #[test]
+    fn parse_opf_zip_bare_structure() {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("book.opf", opts).unwrap();
+            zip.write_all(r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">OPF测试书</dc:title></metadata>
+  <manifest>
+    <item id="c1" href="chap1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c2" href="chap2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="c1"/><itemref idref="c2"/>
+  </spine>
+</package>"#.as_bytes()).unwrap();
+            zip.start_file("chap1.xhtml", opts).unwrap();
+            zip.write_all("<html><head><title>第一章</title></head><body><p>第一段内容</p></body></html>".as_bytes()).unwrap();
+            zip.start_file("chap2.xhtml", opts).unwrap();
+            zip.write_all("<html><head><title>第二章</title></head><body><p>第二段内容</p></body></html>".as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let book = parse_opf_zip(&bytes).expect("解析成功");
+        assert_eq!(book.meta.title, "OPF测试书");
+        assert_eq!(book.chapters.len(), 2);
+        assert_eq!(book.chapters[0].title, "第一章");
+        assert!(book.chapters[1].content.contains("第二段内容"));
+    }
+
+    /// zip 内无 OPF → 明确报错
+    #[test]
+    fn parse_opf_zip_missing_opf() {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            zip.start_file("readme.txt", zip::write::FileOptions::default()).unwrap();
+            zip.write_all(b"no opf here").unwrap();
+            zip.finish().unwrap();
+        }
+        let err = parse_opf_zip(&buf.into_inner()).unwrap_err().to_string();
+        assert!(err.contains(".opf"), "错误应提示缺 OPF: {err}");
+    }
 
     #[test]
     fn parse_legacy_epub_dir() {

@@ -220,7 +220,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/getReadingStats", get(get_reading_stats).post(get_reading_stats))
         // 小项补全批：单书缓存删除 / 书架缓存信息 / 导入预览 / 书源文件读取 / 正文缓存写回 /
         // 用户书源删除 / 分组别名 / 目录规则单页调试
-        .route("/reader3/deleteBookCache", get(delete_book_cache))
+        .route("/reader3/deleteBookCache", get(delete_book_cache).post(delete_book_cache))
         .route(
             "/reader3/getShelfBookWithCacheInfo",
             get(get_shelf_book_with_cache_info).post(get_shelf_book_with_cache_info),
@@ -2553,7 +2553,9 @@ async fn refresh_local_book(
         }
     };
     let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
-    let is_file = url.starts_with("storage/")
+    // GAP 78：loc_book 文件书（storage/ 路径 / 支持扩展名 / origin=loc_book）与 local:// 均支持
+    let is_file = book.origin == "loc_book"
+        || url.starts_with("storage/")
         || crate::service::local_book::SUPPORTED_EXTENSIONS
             .iter()
             .any(|e| url.to_lowercase().ends_with(&format!(".{e}")));
@@ -2623,10 +2625,12 @@ async fn refresh_local_book(
     }
     let _ = state.storage.patch_book(&namespace, &url, &patch).await;
     tracing::info!("refreshLocalBook [{namespace}] {url}: {} 章", pairs.len());
+    // 返回新 totalChapterNum（GAP 78：前端重扫后展示最新章数）
     Json(ReturnData::ok(json!({
         "bookUrl": url,
         "name": book.name,
         "chapterCount": pairs.len(),
+        "totalChapterNum": pairs.len() as i64,
     })))
 }
 
@@ -3827,7 +3831,15 @@ pub(crate) async fn resolve_namespace(
         return Err(login_required());
     }
     match state.storage.find_user(username).await {
-        Ok(Some(user)) if !user.token.is_empty() && user.token == token => Ok(user.username),
+        Ok(Some(user)) if !user.token.is_empty() && user.token == token => {
+            // GAP 118：token 过期——基于 users.last_login_at + READER_TOKEN_TTL_DAYS（默认 30 天）；
+            // 过期（或 legacy 用户 last_login_at=0 从未登录）→ NEED_LOGIN 重新登录；ttl<=0 永不过期
+            let ttl_days = state.storage.config.token_ttl_days;
+            if ttl_days > 0 && now_millis() - user.last_login_at > ttl_days * 86_400_000 {
+                return Err(login_required());
+            }
+            Ok(user.username)
+        }
         _ => Err(login_required()),
     }
 }
@@ -3932,6 +3944,8 @@ async fn opds_dispatch(
         Ok(ns) => ns,
         Err(resp) => return resp,
     };
+    // GAP 52：自引用 base（Host 头优先，缺失回退 localhost:{port}）——所有链接绝对化
+    let base = crate::api::opds::opds_base(&headers, state.storage.config.port);
     let (start, max) = crate::api::opds::parse_page(&params);
     let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -3960,29 +3974,29 @@ async fn opds_dispatch(
     let resp = match segs.as_slice() {
         // ---------------- OPDS 1.2 ----------------
         [] => make(
-            crate::api::opds::root(&state.storage, &ns).await,
+            crate::api::opds::root(&state.storage, &ns, &base).await,
             "application/atom+xml;profile=opds-catalog;kind=navigation;charset=utf-8",
         ),
         ["opensearch.xml"] => make(
-            Ok(crate::api::opds::open_search_xml()),
+            Ok(crate::api::opds::open_search_xml(&base)),
             "application/opensearchdescription+xml;charset=utf-8",
         ),
-        ["shelf"] => make(crate::api::opds::shelf(&state.storage, &ns, start, max).await, atom),
-        ["recent"] => make(crate::api::opds::recent(&state.storage, &ns, start, max).await, atom),
-        ["local"] => make(crate::api::opds::local(&state.storage, &ns, start, max).await, atom),
-        ["groups"] => make(crate::api::opds::groups(&state.storage, &ns).await, atom),
+        ["shelf"] => make(crate::api::opds::shelf(&state.storage, &ns, start, max, &base).await, atom),
+        ["recent"] => make(crate::api::opds::recent(&state.storage, &ns, start, max, &base).await, atom),
+        ["local"] => make(crate::api::opds::local(&state.storage, &ns, start, max, &base).await, atom),
+        ["groups"] => make(crate::api::opds::groups(&state.storage, &ns, &base).await, atom),
         ["group", id] => match id.parse::<i64>() {
-            Ok(gid) => make(crate::api::opds::group(&state.storage, &ns, gid, start, max).await, atom),
+            Ok(gid) => make(crate::api::opds::group(&state.storage, &ns, gid, start, max, &base).await, atom),
             Err(_) => opds_404(),
         },
-        ["source"] => make(crate::api::opds::sources(&state.storage, &ns).await, atom),
+        ["source"] => make(crate::api::opds::sources(&state.storage, &ns, &base).await, atom),
         ["source", name] => make(
-            crate::api::opds::source(&state.storage, &ns, name, start, max).await,
+            crate::api::opds::source(&state.storage, &ns, name, start, max, &base).await,
             atom,
         ),
         ["search"] => {
             let q = params.get("q").cloned().unwrap_or_default();
-            make(crate::api::opds::search(&state.storage, &ns, &q, start, max).await, atom)
+            make(crate::api::opds::search(&state.storage, &ns, &q, start, max, &base).await, atom)
         }
         // 获取/下载
         ["acquire", id] => {
@@ -4033,7 +4047,7 @@ async fn opds_dispatch(
                     Err(_) => opds_404(),
                 }
             } else {
-                match crate::api::opds::save_entry_xml(&state.storage, &ns, id).await {
+                match crate::api::opds::save_entry_xml(&state.storage, &ns, id, &base).await {
                     Ok(xml) => Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "application/atom+xml;type=entry;charset=utf-8")
@@ -4044,35 +4058,35 @@ async fn opds_dispatch(
             }
         }
         // ---------------- OPDS 2.0 ----------------
-        ["catalog"] => make(crate::api::opds::catalog_json(&state.storage, &ns).await, opds2),
+        ["catalog"] => make(crate::api::opds::catalog_json(&state.storage, &ns, &base).await, opds2),
         ["catalog", "shelf"] => make(
-            crate::api::opds::shelf_json(&state.storage, &ns, start, max).await,
+            crate::api::opds::shelf_json(&state.storage, &ns, start, max, &base).await,
             opds2,
         ),
         ["catalog", "recent"] => make(
-            crate::api::opds::recent_json(&state.storage, &ns, start, max).await,
+            crate::api::opds::recent_json(&state.storage, &ns, start, max, &base).await,
             opds2,
         ),
         ["catalog", "local"] => make(
-            crate::api::opds::local_json(&state.storage, &ns, start, max).await,
+            crate::api::opds::local_json(&state.storage, &ns, start, max, &base).await,
             opds2,
         ),
-        ["catalog", "groups"] => make(crate::api::opds::groups_json(&state.storage, &ns).await, opds2),
+        ["catalog", "groups"] => make(crate::api::opds::groups_json(&state.storage, &ns, &base).await, opds2),
         ["catalog", "group", id] => match id.parse::<i64>() {
             Ok(gid) => make(
-                crate::api::opds::group_json(&state.storage, &ns, gid, start, max).await,
+                crate::api::opds::group_json(&state.storage, &ns, gid, start, max, &base).await,
                 opds2,
             ),
             Err(_) => opds_404(),
         },
-        ["catalog", "source"] => make(crate::api::opds::sources_json(&state.storage, &ns).await, opds2),
+        ["catalog", "source"] => make(crate::api::opds::sources_json(&state.storage, &ns, &base).await, opds2),
         ["catalog", "source", name] => make(
-            crate::api::opds::source_json(&state.storage, &ns, name, start, max).await,
+            crate::api::opds::source_json(&state.storage, &ns, name, start, max, &base).await,
             opds2,
         ),
         ["catalog", "search"] => {
             let q = params.get("q").cloned().unwrap_or_default();
-            make(crate::api::opds::search_json(&state.storage, &ns, &q, start, max).await, opds2)
+            make(crate::api::opds::search_json(&state.storage, &ns, &q, start, max, &base).await, opds2)
         }
         _ => opds_404(),
     };
@@ -4904,15 +4918,38 @@ async fn update_book_group_id(
 
 // ---------------- 小项补全批 ----------------
 
-/// GET /reader3/deleteBookCache：删除单书缓存（book_chapters 该 book_url 行——
-/// 本地书章节 + 书源书正文缓存）；不影响书架 books 行
+/// GET/POST /reader3/deleteBookCache：删除单书缓存（book_chapters 该 book_url 行——
+/// 本地书章节 + 书源书正文缓存）；不影响书架 books 行。
+/// GAP 79：支持 body {bookUrl}（兼容 query url）；按用户（先解析命名空间，且书需在本人书架）；
+/// 返回删除行数 {deleted}
 async fn delete_book_cache(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
-    let url = params.get("url").cloned().unwrap_or_default();
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let url = param_of(&params, body_json.as_ref(), "url");
+    let url = if url.is_empty() {
+        param_of(&params, body_json.as_ref(), "bookUrl")
+    } else {
+        url
+    };
     if url.is_empty() {
         return Json(ReturnData::err("参数错误"));
+    }
+    // 按用户：书必须在该用户书架（book_chapters 无命名空间列，借书架行校验归属）
+    match state.storage.find_book(&namespace, &url).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Json(ReturnData::err("书籍不存在")),
+        Err(e) => {
+            tracing::error!("deleteBookCache 查询失败 [{url}]: {e}");
+            return Json(ReturnData::err("系统错误"));
+        }
     }
     match state.storage.delete_book_cache(&url).await {
         Ok(deleted) => Json(ReturnData::ok(json!({ "deleted": deleted }))),
@@ -5672,7 +5709,7 @@ async fn upload_local_book(
 
     let ext = crate::service::local_book::file_ext(&file_name);
     if !crate::service::local_book::SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
-        return Json(ReturnData::err("仅支持 EPUB/TXT/MOBI/AZW3/PDF/FB2/DOCX"));
+        return Json(ReturnData::err("仅支持 EPUB/TXT/MOBI/AZW3/PDF/FB2/DOCX/ZIP(含OPF)"));
     }
     // 用户自定义 TXT 目录规则（启用 + 按 serialNumber 排序）；无则用内置默认规则（仅 TXT 使用）
     let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
@@ -6054,6 +6091,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = crate::AppConfig::from_env();
         config.work_dir = dir.to_string_lossy().into_owned();
+        // 既有认证测试不关心过期——默认禁用（GAP 118 过期由专用测试单独覆盖）
+        config.token_ttl_days = 0;
         let storage = crate::storage::init(&config).await.unwrap();
         (AppState { storage }, dir)
     }
@@ -6187,7 +6226,8 @@ mod tests {
         cleanup(state, dir).await;
     }
 
-    /// deleteBookCache：删单书缓存（book_chapters 行）——只删目标书、书架不受影响
+    /// deleteBookCache：删单书缓存（book_chapters 行）——只删目标书、书架不受影响；
+    /// GAP 79：支持 body {bookUrl}、按用户（书需在本人书架）、返回删除数
     #[tokio::test]
     async fn test_delete_book_cache_api() {
         let (state, dir) = test_state("delbcache").await;
@@ -6195,17 +6235,40 @@ mod tests {
         state.storage.save_chapters("https://book.com/b", &[("第一章".to_string(), "正文B".to_string())]).await.unwrap();
         state.storage.upsert_book("default", &crate::model::Book { book_url: "https://book.com/a".into(), name: "书A".into(), ..Default::default() }).await.unwrap();
 
+        // query url（GET）
         let params: HashMap<String, String> = [("url".into(), "https://book.com/a".into())].into_iter().collect();
-        let ret = delete_book_cache(AxumState(state.clone()), Query(params)).await;
+        let ret = delete_book_cache(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
         assert!(ret.0.is_success, "{}", ret.0.error_msg);
         assert_eq!(ret.0.data["deleted"], 1);
         assert_eq!(state.storage.count_chapters("https://book.com/a").await.unwrap(), 0);
         assert_eq!(state.storage.count_chapters("https://book.com/b").await.unwrap(), 1, "其他书缓存不受影响");
         assert!(state.storage.find_book("default", "https://book.com/a").await.unwrap().is_some(), "删除缓存不应动书架");
 
-        // 缺 url → 参数错误
-        let ret = delete_book_cache(AxumState(state.clone()), Query(HashMap::new())).await;
+        // body {bookUrl}（POST）
+        state.storage.save_chapters("https://book.com/a", &[("第一章".to_string(), "正文A2".to_string())]).await.unwrap();
+        let body = Bytes::from(r#"{"bookUrl":"https://book.com/a"}"#);
+        let ret = delete_book_cache(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["deleted"], 1);
+        assert_eq!(state.storage.count_chapters("https://book.com/a").await.unwrap(), 0);
+
+        // 缺 url/bookUrl → 参数错误
+        let ret = delete_book_cache(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
         assert_eq!(ret.0.error_msg, "参数错误");
+
+        // 按用户：书不在该用户书架 → 拒绝（缓存保留）
+        state.storage.save_chapters("https://book.com/b", &[("第一章".to_string(), "正文B".to_string())]).await.unwrap();
+        let body = Bytes::from(r#"{"bookUrl":"https://book.com/b"}"#);
+        let ret = delete_book_cache(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "书籍不存在", "书不在书架 → 按用户拒绝");
+        assert_eq!(state.storage.count_chapters("https://book.com/b").await.unwrap(), 1, "缓存应保留");
+        // 该书入自己的书架后即可删
+        state.storage.upsert_book("default", &crate::model::Book { book_url: "https://book.com/b".into(), name: "书B".into(), ..Default::default() }).await.unwrap();
+        let body = Bytes::from(r#"{"bookUrl":"https://book.com/b"}"#);
+        let ret = delete_book_cache(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["deleted"], 1);
         cleanup(state, dir).await;
     }
 
@@ -6479,6 +6542,113 @@ mod tests {
         let ret = logout(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.data, json!("NEED_LOGIN"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// GAP 118：token 过期——users.last_login_at + READER_TOKEN_TTL_DAYS（默认 30 天）；
+    /// 过期 → NEED_LOGIN 重新登录；ttl<=0 永不过期；登出清 token 后立即失效
+    #[tokio::test]
+    async fn test_token_expiry_by_last_login() {
+        let (state, dir) = test_state("tokenttl").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.token_ttl_days = 30;
+        let now = now_millis();
+        let day_ms = 86_400_000i64;
+        // 新登录用户（last_login_at = now）
+        state
+            .storage
+            .insert_user(&User {
+                username: "fresh".into(),
+                token: "tok-fresh".into(),
+                last_login_at: now,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 31 天前登录 → 已过期
+        state
+            .storage
+            .insert_user(&User {
+                username: "stale".into(),
+                token: "tok-stale".into(),
+                last_login_at: now - 31 * day_ms,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 29 天前登录 → 未过期（边界内）
+        state
+            .storage
+            .insert_user(&User {
+                username: "edge".into(),
+                token: "tok-edge".into(),
+                last_login_at: now - 29 * day_ms,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 从未登录（last_login_at=0，legacy 迁移数据）→ 过期
+        state
+            .storage
+            .insert_user(&User {
+                username: "never".into(),
+                token: "tok-never".into(),
+                last_login_at: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let auth = |u: &str, t: &str| {
+            let params: HashMap<String, String> =
+                [("accessToken".into(), format!("{u}:{t}"))].into_iter().collect();
+            params
+        };
+        // 未过期 → 正常解析命名空间
+        assert_eq!(
+            resolve_namespace(&state, &auth("fresh", "tok-fresh"), &HeaderMap::new()).await.unwrap(),
+            "fresh"
+        );
+        assert_eq!(
+            resolve_namespace(&state, &auth("edge", "tok-edge"), &HeaderMap::new()).await.unwrap(),
+            "edge"
+        );
+        // 过期 → NEED_LOGIN
+        for (u, t) in [("stale", "tok-stale"), ("never", "tok-never")] {
+            let ret = resolve_namespace(&state, &auth(u, t), &HeaderMap::new()).await;
+            assert!(ret.is_err());
+            assert_eq!(ret.unwrap_err().data, json!("NEED_LOGIN"), "{u} 应需重新登录");
+        }
+        // token 不匹配仍 NEED_LOGIN（不受过期影响）
+        let ret = resolve_namespace(&state, &auth("fresh", "wrong"), &HeaderMap::new()).await;
+        assert!(ret.is_err());
+
+        // ttl<=0（永不过期）→ stale 也可用
+        state.storage.config.token_ttl_days = 0;
+        assert_eq!(
+            resolve_namespace(&state, &auth("stale", "tok-stale"), &HeaderMap::new()).await.unwrap(),
+            "stale"
+        );
+
+        // 重新登录刷新 last_login_at → 恢复可用（模拟 login 更新会话）
+        state.storage.config.token_ttl_days = 30;
+        state
+            .storage
+            .update_user_session("stale", "tok-stale", now)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_namespace(&state, &auth("stale", "tok-stale"), &HeaderMap::new()).await.unwrap(),
+            "stale"
+        );
+
+        // 登出（清 token）→ 立即 NEED_LOGIN
+        state.storage.logout_user("fresh").await.unwrap();
+        let ret = resolve_namespace(&state, &auth("fresh", "tok-fresh"), &HeaderMap::new()).await;
+        assert!(ret.is_err());
+        assert_eq!(ret.unwrap_err().data, json!("NEED_LOGIN"));
 
         cleanup(state, dir).await;
     }
@@ -7971,10 +8141,12 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("第二段内容"));
 
-        // 书架目录（OPDS 2.0 JSON）：含两个 acquisition 链接（download + acquire）
-        let json = crate::api::opds::shelf_json(&state.storage, "default", 0, 50).await.unwrap();
-        assert!(json.contains(&format!("/opds/download/{id}")), "目录应含下载链接");
-        assert!(json.contains(&format!("/opds/acquire/{id}")), "目录应含正文链接");
+        // 书架目录（OPDS 2.0 JSON）：含两个 acquisition 链接（download + acquire，绝对 URL）
+        let json = crate::api::opds::shelf_json(&state.storage, "default", 0, 50, "http://reader.example.com")
+            .await
+            .unwrap();
+        assert!(json.contains(&format!("http://reader.example.com/opds/download/{id}")), "目录应含下载链接");
+        assert!(json.contains(&format!("http://reader.example.com/opds/acquire/{id}")), "目录应含正文链接");
         assert!(json.contains("本地书"));
 
         cleanup(state, dir).await;
@@ -7991,6 +8163,7 @@ mod tests {
             .insert_user(&User {
                 username: "alice".into(),
                 token: "tok123".into(),
+                last_login_at: now_millis(),
                 ..Default::default()
             })
             .await
@@ -8855,6 +9028,7 @@ mod tests {
         let ret = refresh_local_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
         assert!(ret.0.is_success, "{}", ret.0.error_msg);
         assert_eq!(ret.0.data["chapterCount"], 2);
+        assert_eq!(ret.0.data["totalChapterNum"], 2, "应返回新 totalChapterNum");
         assert_eq!(ret.0.data["name"], "刷新书");
         assert_eq!(state.storage.list_chapters(&book_url).await.unwrap().len(), 2, "章节已重扫入库");
         assert_eq!(
@@ -8889,6 +9063,7 @@ mod tests {
         let ret = refresh_local_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
         assert!(ret.0.is_success, "{}", ret.0.error_msg);
         assert_eq!(ret.0.data["chapterCount"], 3);
+        assert_eq!(ret.0.data["totalChapterNum"], 3);
 
         // 非本地书 → 拒绝；不存在 → 书籍不存在；缺 url → 参数错误
         state
@@ -10008,6 +10183,86 @@ mod tests {
         assert!(ret.0.is_success, "{}", ret.0.error_msg);
         assert_eq!(ret.0.data["books"].as_array().unwrap().len(), 0);
         assert_eq!(ret.0.data["hasMore"], serde_json::json!(false));
+        cleanup(state, dir).await;
+    }
+
+    /// GAP 51 边界：exploreBook page 参数——POST body 传 page / 缺省 1 / 0 与负数原样透传
+    #[tokio::test]
+    async fn test_explore_book_page_param_boundaries() {
+        let (state, dir) = test_state("explorepgb").await;
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                cap.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = "{\"data\":[]}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let base = format!("http://{addr}");
+        let explore_url = format!("{base}/list/{{{{page}}}}");
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base.clone(),
+                    book_source_name: "边界源".into(),
+                    enabled_explore: true,
+                    explore_url: Some(explore_url.clone()),
+                    rule_explore: Some(serde_json::json!({
+                        "bookList": "$.data[*]",
+                        "name": "$.name",
+                        "bookUrl": "$.url",
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let call = |params: HashMap<String, String>, body: Option<Bytes>| async {
+            explore_book(AxumState(state.clone()), Query(params), HeaderMap::new(), body).await
+        };
+
+        // POST body 传 page=5 → 请求 /list/5（body 优先于缺省）
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), explore_url.clone());
+        params.insert("bookSource".into(), base.clone());
+        let ret = call(params, Some(Bytes::from(r#"{"page":5}"#))).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let req = captured.lock().unwrap()[0].clone();
+        assert!(req.contains("GET /list/5 "), "POST body page 应生效: {req}");
+
+        // 缺 page → 默认 1
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), explore_url.clone());
+        params.insert("bookSource".into(), base.clone());
+        let ret = call(params, Some(Bytes::from(r#"{}"#))).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let req = captured.lock().unwrap()[1].clone();
+        assert!(req.contains("GET /list/1 "), "缺省 page 应为 1: {req}");
+
+        // page=0（0 基分页书源）→ 原样透传
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), explore_url);
+        params.insert("bookSource".into(), base);
+        params.insert("page".into(), "0".into());
+        let ret = call(params, None).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let req = captured.lock().unwrap()[2].clone();
+        assert!(req.contains("GET /list/0 "), "page=0 应原样透传: {req}");
+
         cleanup(state, dir).await;
     }
 
