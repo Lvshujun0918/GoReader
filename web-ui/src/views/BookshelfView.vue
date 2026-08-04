@@ -12,12 +12,12 @@ import {
   saveBookGroup,
   updateBookGroupId,
 } from '@/api/bookshelf'
-import { uploadLocalBook } from '@/api/upload'
+import { uploadLocalBook, importBookPreview } from '@/api/upload'
 import { exportBook, type ExportFormat } from '@/api/export'
 import { probeSecureMode } from '@/api/users'
 import { downloadBlob } from '@/utils/download'
 import { useUserStore } from '@/stores/user'
-import type { Book, BookGroup } from '@/types'
+import type { Book, BookGroup, ImportPreview } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
@@ -56,6 +56,60 @@ const searchMode = ref<'name' | 'full'>('name')
 const searchPlaceholder = computed(() =>
   searchMode.value === 'full' ? '搜索书名 / 作者 / 简介' : '搜索书名 / 作者',
 )
+
+/* ================= 书架排序（前端排序 books.value 副本——不改服务端顺序；localStorage: reader_shelf_sort） ================= */
+
+type SortMode = 'recent' | 'name' | 'author' | 'source' | 'group'
+const SORT_OPTIONS: { value: SortMode; label: string }[] = [
+  { value: 'recent', label: '最近阅读' },
+  { value: 'name', label: '书名' },
+  { value: 'author', label: '作者' },
+  { value: 'source', label: '来源' },
+  { value: 'group', label: '分组' },
+]
+const sortMode = ref<SortMode>('recent')
+{
+  const raw = localStorage.getItem('reader_shelf_sort')
+  if (SORT_OPTIONS.some((o) => o.value === raw)) sortMode.value = raw as SortMode
+}
+watch(sortMode, (v) => {
+  try {
+    localStorage.setItem('reader_shelf_sort', v)
+  } catch {
+    /* ignore */
+  }
+})
+
+/* ================= 分组折叠（排序=分组 的分组模式下：分组标题点击折叠；localStorage: reader_group_collapsed {groupId: bool}） ================= */
+
+const GROUP_COLLAPSE_KEY = 'reader_group_collapsed'
+const collapsedGroups = ref<Record<number, boolean>>({})
+{
+  try {
+    const raw = JSON.parse(localStorage.getItem(GROUP_COLLAPSE_KEY) ?? '{}') as Record<string, unknown>
+    if (raw && typeof raw === 'object') {
+      for (const [k, v] of Object.entries(raw)) {
+        const id = Number(k)
+        if (Number.isFinite(id) && typeof v === 'boolean') collapsedGroups.value[id] = v
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function groupCollapsed(id: number): boolean {
+  return !!collapsedGroups.value[id]
+}
+
+function toggleGroupCollapsed(id: number) {
+  collapsedGroups.value = { ...collapsedGroups.value, [id]: !collapsedGroups.value[id] }
+  try {
+    localStorage.setItem(GROUP_COLLAPSE_KEY, JSON.stringify(collapsedGroups.value))
+  } catch {
+    /* ignore */
+  }
+}
 
 /* ================= 书架分组 ================= */
 const groups = ref<BookGroup[]>([])
@@ -109,6 +163,8 @@ interface ImportItem {
   status: 'pending' | 'uploading' | 'done' | 'error'
   progress: number
   error?: string
+  /** 导入预览（POST /reader3/importBookPreview；undefined=探测中 / null=未实现或失败 → 直接上传） */
+  preview?: ImportPreview | null
 }
 
 const importOpen = ref(false)
@@ -133,6 +189,45 @@ const totalProgress = computed(() => {
 const hasPending = computed(() => importItems.value.some((it) => it.status === 'pending'))
 const hasPendingCount = computed(() => importItems.value.filter((it) => it.status === 'pending').length)
 const failedCount = computed(() => importItems.value.filter((it) => it.status === 'error').length)
+
+/* ================= 导入预览（POST /reader3/importBookPreview：选文件后先探测；404/未实现 → 直接上传） ================= */
+
+/** 是否任一文件拿到预览数据（后端实现判定） */
+const previewSupported = computed(() => importItems.value.some((it) => it.preview != null))
+/** 是否仍有文件在探测预览中 */
+const previewChecking = computed(() => importItems.value.some((it) => it.preview === undefined))
+/** 拿到预览数据的文件（用于弹窗展示） */
+const previewedItems = computed(() => importItems.value.filter((it) => it.preview != null))
+
+/** 预览章节标题（兼容 chapters / chapterList 命名与字符串项，截取前 5 章） */
+function previewChapters(item: ImportItem): string[] {
+  const p = item.preview
+  if (!p) return []
+  const raw = Array.isArray(p.chapters) ? p.chapters : p.chapterList
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((c) => (typeof c === 'string' ? c : (c?.title ?? '')))
+    .filter((t) => !!t)
+    .slice(0, 5)
+}
+
+function previewChapterCount(item: ImportItem): number {
+  const p = item.preview
+  if (!p) return 0
+  if (typeof p.chapterCount === 'number' && p.chapterCount >= 0) return p.chapterCount
+  const raw = Array.isArray(p.chapters) ? p.chapters : p.chapterList
+  return Array.isArray(raw) ? raw.length : 0
+}
+
+/** 单文件导入预览：成功 → 预览数据（弹窗展示，确认后仍走 uploadLocalBook）；404/未实现/失败 → preview=null 直接上传 */
+async function checkPreview(item: ImportItem) {
+  try {
+    const res = await importBookPreview(item.file)
+    item.preview = res.data ?? null
+  } catch {
+    item.preview = null
+  }
+}
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`
@@ -177,12 +272,19 @@ function addFiles(files: File[]) {
   if (uploadBusy.value) return
   const valid = files.filter(isSupported)
   const ignored = files.length - valid.length
-  for (const f of valid) importItems.value.push({ file: f, status: 'pending', progress: 0 })
+  const added: ImportItem[] = []
+  for (const f of valid) {
+    const item: ImportItem = { file: f, status: 'pending', progress: 0, preview: undefined }
+    importItems.value.push(item)
+    added.push(item)
+  }
   acceptTip.value = ignored > 0 ? `已忽略 ${ignored} 个不支持的文件（支持 .epub / .txt / .mobi / .azw3 / .pdf / .fb2 / .docx）` : ''
   if (valid.length > 0) {
     importDone.value = false
     importSummary.value = ''
   }
+  // 导入预览（后端 /reader3/importBookPreview；404/未实现 → 直接上传降级）
+  for (const item of added) void checkPreview(item)
 }
 
 function onPick(e: Event) {
@@ -335,7 +437,7 @@ function coverInitial(name: string): string {
 const filtered = computed(() => {
   const kw = keyword.value.trim().toLowerCase()
   const gid = activeGroup.value
-  return books.value.filter((b) => {
+  const list = books.value.filter((b) => {
     if (gid !== null && b.group !== gid) return false
     if (!kw) return true
     if (searchMode.value === 'full') {
@@ -348,6 +450,34 @@ const filtered = computed(() => {
     }
     return b.name.toLowerCase().includes(kw) || b.author.toLowerCase().includes(kw)
   })
+  // 前端排序 books 副本（不改变服务端 books.value 顺序）
+  const sorted = [...list]
+  switch (sortMode.value) {
+    case 'name':
+      sorted.sort((a, b) => a.name.localeCompare(b.name, 'zh') || a.author.localeCompare(b.author, 'zh'))
+      break
+    case 'author':
+      sorted.sort((a, b) => a.author.localeCompare(b.author, 'zh') || a.name.localeCompare(b.name, 'zh'))
+      break
+    case 'source':
+      sorted.sort(
+        (a, b) =>
+          (a.originName || a.origin || '').localeCompare(b.originName || b.origin || '', 'zh') ||
+          a.name.localeCompare(b.name, 'zh'),
+      )
+      break
+    case 'group':
+      sorted.sort((a, b) => (a.group ?? 0) - (b.group ?? 0) || a.name.localeCompare(b.name, 'zh'))
+      break
+    default:
+      // 最近阅读：服务端进度时间优先，其次最新章节时间
+      sorted.sort(
+        (a, b) =>
+          (b.durChapterTime ?? 0) - (a.durChapterTime ?? 0) ||
+          (b.latestChapterTime ?? 0) - (a.latestChapterTime ?? 0),
+      )
+  }
+  return sorted
 })
 
 const emptyText = computed(() => {
@@ -521,21 +651,69 @@ async function performMove(gid: number) {
   )
 }
 
-/* ================= 虚拟滚动 ================= */
-const totalRows = computed(() =>
-  Math.max(0, Math.ceil(filtered.value.length / Math.max(1, cols.value))),
-)
+/* ================= 虚拟滚动（行列表：分组模式含分组标题行；折叠组只留标题行，计数随之调整） ================= */
 
-const visibleBooks = computed(() => {
-  const total = filtered.value.length
-  if (total === 0) return []
-  const s = Math.min(total, startRow.value * cols.value)
-  const e = Math.min(total, endRow.value * cols.value)
-  return filtered.value.slice(s, Math.max(s, e))
+/** 分组标题行高（书行间距由 rowGap 提供，标题行同样追加） */
+const HEADER_ROW_H = 44
+
+type ShelfRow =
+  | { kind: 'books'; books: Book[] }
+  | { kind: 'header'; groupId: number; name: string; count: number }
+
+function rowStride(row: ShelfRow): number {
+  return (row.kind === 'header' ? HEADER_ROW_H : rowH.value) + rowGap.value
+}
+
+/** 行列表：排序=分组 时按分组分节（未分组在前，其余按 orderNum/order）；折叠组不产出书行 */
+const gridRows = computed<ShelfRow[]>(() => {
+  const list = filtered.value
+  if (list.length === 0) return []
+  const c = Math.max(1, cols.value)
+  const chunk = (books: Book[]): ShelfRow[] => {
+    const rows: ShelfRow[] = []
+    for (let i = 0; i < books.length; i += c) rows.push({ kind: 'books', books: books.slice(i, i + c) })
+    return rows
+  }
+  if (sortMode.value !== 'group') return chunk(list)
+  const gs = [...groups.value].sort(
+    (a, b) => (a.orderNum ?? a.order ?? a.id) - (b.orderNum ?? b.order ?? b.id),
+  )
+  const sections: { id: number; name: string; books: Book[] }[] = []
+  const ungrouped = list.filter((b) => !b.group)
+  if (ungrouped.length) sections.push({ id: 0, name: '未分组', books: ungrouped })
+  for (const g of gs) {
+    const bs = list.filter((b) => b.group === g.id)
+    if (bs.length) sections.push({ id: g.id, name: g.name, books: bs })
+  }
+  const rows: ShelfRow[] = []
+  for (const sec of sections) {
+    rows.push({ kind: 'header', groupId: sec.id, name: sec.name, count: sec.books.length })
+    if (!groupCollapsed(sec.id)) rows.push(...chunk(sec.books))
+  }
+  return rows
 })
 
-const padTop = computed(() => startRow.value * (rowH.value + rowGap.value))
-const padBottom = computed(() => (totalRows.value - endRow.value) * (rowH.value + rowGap.value))
+/** 行前缀高度（分组标题行与书行高度不同，按行累计精确撑高） */
+const rowOffsets = computed(() => {
+  const rows = gridRows.value
+  const offs = new Array<number>(rows.length + 1)
+  offs[0] = 0
+  for (let i = 0; i < rows.length; i++) offs[i + 1] = offs[i] + rowStride(rows[i])
+  return offs
+})
+
+const totalRows = computed(() => gridRows.value.length)
+const visibleRows = computed(() => gridRows.value.slice(startRow.value, endRow.value))
+const padTop = computed(() => rowOffsets.value[startRow.value] ?? 0)
+const padBottom = computed(() => {
+  const offs = rowOffsets.value
+  return (offs[offs.length - 1] ?? 0) - (offs[endRow.value] ?? 0)
+})
+
+function rowKey(row: ShelfRow): string {
+  if (row.kind === 'header') return `h-${row.groupId}`
+  return `r-${row.books.map((b) => b.bookUrl).join('|')}`
+}
 
 /** 按视口高度计算可见行（上下各缓冲 2 行），滚动时更新 */
 function updateViewport() {
@@ -543,18 +721,35 @@ function updateViewport() {
   if (!wrap) return
   const total = totalRows.value
   if (total <= 0) return
-  const stride = rowH.value + rowGap.value
-  if (stride <= 0) {
+  if (rowH.value <= 0) {
     // 尚未测得行高：先渲染首行作为测量锚点
     startRow.value = 0
-    endRow.value = Math.min(total, 1)
+    endRow.value = Math.min(total, 2)
     return
   }
+  const offs = rowOffsets.value
   const gridTop = wrap.getBoundingClientRect().top + window.scrollY
   const st = Math.max(0, window.scrollY - gridTop)
   const vh = window.innerHeight
-  const r0 = Math.max(0, Math.floor(st / stride) - 2)
-  const r1 = Math.min(total, Math.ceil((st + vh) / stride) + 2)
+  // 按累计行高定位首行（行高不一：分组标题行 / 书行）
+  let r0 = 0
+  for (let i = 0; i < total; i++) {
+    if (offs[i + 1] > st) {
+      r0 = i
+      break
+    }
+    r0 = i
+  }
+  r0 = Math.max(0, r0 - 2)
+  let r1 = r0
+  for (let i = r0; i < total; i++) {
+    if (offs[i + 1] - offs[r0] > vh) {
+      r1 = i
+      break
+    }
+    r1 = i
+  }
+  r1 = Math.min(total, r1 + 3)
   startRow.value = r0
   endRow.value = Math.max(r0 + 1, r1)
 }
@@ -601,8 +796,17 @@ watch(
   { flush: 'post' },
 )
 
-// 切换关键词 / 分组后回到网格顶部
-watch([keyword, activeGroup], () => {
+// 分组折叠/排序切换后行结构变化：重测行高并刷新可见窗口
+watch(
+  gridRows,
+  () => {
+    measureGrid()
+  },
+  { flush: 'post' },
+)
+
+// 切换关键词 / 分组 / 排序后回到网格顶部
+watch([keyword, activeGroup, sortMode], () => {
   const wrap = gridWrapRef.value
   if (!wrap) return
   window.scrollTo({ top: Math.max(0, wrap.getBoundingClientRect().top + window.scrollY - 96) })
@@ -1001,6 +1205,21 @@ onMounted(() => {
         </button>
       </div>
 
+      <!-- 排序胶囊（前端排序 books 副本，不改服务端顺序；localStorage: reader_shelf_sort） -->
+      <div class="sort-bar">
+        <span class="sort-label">排序</span>
+        <button
+          v-for="opt in SORT_OPTIONS"
+          :key="opt.value"
+          class="sort-capsule"
+          :class="{ active: sortMode === opt.value }"
+          type="button"
+          @click="sortMode = opt.value"
+        >
+          {{ opt.label }}
+        </button>
+      </div>
+
       <!-- 分组栏：全部 / 分组名 胶囊筛选（细字，active 强调色下划线） -->
       <div class="group-bar">
         <div class="group-tabs" role="tablist" aria-label="书架分组筛选">
@@ -1050,21 +1269,40 @@ onMounted(() => {
         <p class="empty-text">{{ emptyText }}</p>
       </div>
 
-      <!-- 书封网格（虚拟滚动：仅渲染可见行 + 上下缓冲 2 行，卡片样式不变） -->
+      <!-- 书封网格（虚拟滚动：仅渲染可见行 + 上下缓冲；分组模式含可点击折叠的分组标题行） -->
       <div v-else ref="gridWrapRef" class="virtual-grid">
         <div class="virtual-pad" :style="{ height: padTop + 'px' }"></div>
         <div class="book-grid">
-          <div
-            v-for="book in visibleBooks"
-            :key="book.bookUrl"
-            class="book-card"
-            :class="{ managing: manageMode, selected: selected.has(book.bookUrl) }"
-            @click="onCardClick(book)"
-            @contextmenu="onCardMenu(book, $event)"
-            @touchstart.passive="onCardTouchStart(book, $event)"
-            @touchend="onCardTouchEnd"
-            @touchcancel="onCardTouchEnd"
-          >
+          <template v-for="row in visibleRows" :key="rowKey(row)">
+            <!-- 分组标题行（排序=分组；点击折叠/展开该组，折叠后该组书隐藏） -->
+            <div v-if="row.kind === 'header'" class="group-head-row">
+              <button
+                class="group-head"
+                type="button"
+                :title="groupCollapsed(row.groupId) ? '展开该组' : '折叠该组'"
+                @click="toggleGroupCollapsed(row.groupId)"
+              >
+                <span class="group-caret" :class="{ open: !groupCollapsed(row.groupId) }">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6 9l6 6 6-6" />
+                  </svg>
+                </span>
+                <span class="group-head-name">{{ row.name }}</span>
+                <span class="group-head-count">{{ row.count }} 本</span>
+              </button>
+            </div>
+            <template v-else>
+              <div
+                v-for="book in row.books"
+                :key="book.bookUrl"
+                class="book-card"
+                :class="{ managing: manageMode, selected: selected.has(book.bookUrl) }"
+                @click="onCardClick(book)"
+                @contextmenu="onCardMenu(book, $event)"
+                @touchstart.passive="onCardTouchStart(book, $event)"
+                @touchend="onCardTouchEnd"
+                @touchcancel="onCardTouchEnd"
+              >
             <span class="select-dot" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M5 12.5l4.5 4.5L19 7.5" />
@@ -1117,7 +1355,9 @@ onMounted(() => {
                 {{ book.latestChapterTitle }}
               </p>
             </div>
-          </div>
+            </div>
+          </template>
+          </template>
         </div>
         <div class="virtual-pad" :style="{ height: padBottom + 'px' }"></div>
       </div>
@@ -1203,6 +1443,28 @@ onMounted(() => {
                 </button>
               </li>
             </ul>
+
+            <!-- 导入预览（后端 /reader3/importBookPreview：书名/作者/格式/章节数/前 5 章标题；未实现则隐藏并直接上传） -->
+            <div v-if="previewSupported" class="preview-panel">
+              <p class="preview-title">导入预览</p>
+              <div v-for="(item, i) in previewedItems" :key="`pv-${i}`" class="preview-item">
+                <p class="preview-head">
+                  <span class="preview-name" :title="item.preview?.name || item.file.name">
+                    {{ item.preview?.name || item.file.name }}
+                  </span>
+                  <span class="preview-meta">
+                    {{ item.preview?.author ? item.preview.author + ' · ' : '' }}{{ item.preview?.format || '未知格式' }} · {{ previewChapterCount(item) }} 章
+                  </span>
+                </p>
+                <ol v-if="previewChapters(item).length" class="preview-chapters">
+                  <li v-for="(ch, j) in previewChapters(item)" :key="j">{{ ch }}</li>
+                </ol>
+              </div>
+              <p class="preview-tip">预览由服务器解析 · 确认无误后点击「开始导入」（确认后仍走上传接口）</p>
+            </div>
+            <p v-else-if="importItems.length && !previewChecking" class="preview-tip muted">
+              服务器未提供导入预览（POST /reader3/importBookPreview），将直接上传
+            </p>
 
             <!-- 底部：整体进度 / 摘要 + 操作 -->
             <div class="dlg-foot">
@@ -2327,12 +2589,163 @@ onMounted(() => {
   transform: translateY(6px);
 }
 
+/* ================= 排序胶囊 ================= */
+.sort-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -14px 0 26px;
+  flex-wrap: wrap;
+}
+.sort-label {
+  font-size: 11.5px;
+  font-weight: 300;
+  letter-spacing: 2px;
+  color: var(--text-3);
+}
+.sort-capsule {
+  padding: 4px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.sort-capsule:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.sort-capsule.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ================= 分组标题行（排序=分组；点击折叠） ================= */
+.group-head-row {
+  grid-column: 1 / -1;
+}
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 4px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.group-head:hover {
+  color: var(--accent);
+}
+.group-caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+  transition: transform 0.2s ease;
+}
+.group-caret svg {
+  width: 12px;
+  height: 12px;
+}
+.group-caret.open {
+  transform: rotate(180deg);
+}
+.group-head-name {
+  font-size: 13.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-1);
+}
+.group-head-count {
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+
+/* ================= 导入预览 ================= */
+.preview-panel {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  max-height: 180px;
+  overflow-y: auto;
+}
+.preview-title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 2px;
+  color: var(--accent);
+}
+.preview-item + .preview-item {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+.preview-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0;
+}
+.preview-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.preview-meta {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.preview-chapters {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 11.5px;
+  font-weight: 300;
+  line-height: 1.8;
+  color: var(--text-3);
+}
+.preview-tip {
+  margin: 8px 2px 0;
+  font-size: 11px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.preview-tip.muted {
+  color: var(--text-3);
+}
+
 /* ================= 分组栏（胶囊筛选：细字 + 强调色下划线） ================= */
 .group-bar {
   display: flex;
   align-items: center;
   gap: 16px;
-  margin: -22px 0 32px;
+  margin: 0 0 32px;
   padding-bottom: 10px;
   border-bottom: 1px solid var(--border);
   overflow-x: auto;

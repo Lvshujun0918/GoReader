@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
@@ -25,6 +25,125 @@ const path = ref('')
 const files = ref<FileItem[]>([])
 const loading = ref(false)
 const selectedPath = ref<string | null>(null)
+
+/* ---------------- 多选模式（右键/长按进入；底部操作条：下载/删除） ---------------- */
+const multiMode = ref(false)
+const multiSelected = ref<Set<string>>(new Set())
+const multiBusy = ref(false)
+let longPressTimer: number | undefined
+let longPressFired = false
+
+function exitMulti() {
+  multiMode.value = false
+  multiSelected.value = new Set()
+}
+
+function enterMulti(item: FileItem) {
+  multiMode.value = true
+  selectedPath.value = null
+  multiSelected.value = new Set([item.path])
+}
+
+function toggleMulti(item: FileItem) {
+  const s = new Set(multiSelected.value)
+  if (s.has(item.path)) s.delete(item.path)
+  else s.add(item.path)
+  multiSelected.value = s
+}
+
+/** 右键：未多选时进入多选并选中该项；已多选时切换该项勾选 */
+function onRowContext(item: FileItem, e: MouseEvent) {
+  e.preventDefault()
+  if (longPressFired) {
+    // 长按已进入多选（合成 contextmenu 迟到），保持勾选状态
+    longPressFired = false
+    return
+  }
+  if (multiMode.value) {
+    toggleMulti(item)
+    return
+  }
+  enterMulti(item)
+}
+
+/** 长按 500ms 进入多选（与点击进文件互斥） */
+function onRowTouchStart(item: FileItem) {
+  longPressFired = false
+  longPressTimer = window.setTimeout(() => {
+    longPressFired = true
+    enterMulti(item)
+  }, 500)
+}
+
+function onRowTouchEnd() {
+  if (longPressTimer) {
+    clearTimeout(longPressTimer)
+    longPressTimer = undefined
+  }
+}
+
+/** 行点击：多选模式 = 勾选切换；长按后合成 click 吞掉；否则原行为（进目录/预览/下载） */
+function onRowClick(item: FileItem) {
+  if (longPressFired) {
+    longPressFired = false
+    return
+  }
+  if (multiMode.value) {
+    toggleMulti(item)
+    return
+  }
+  enter(item)
+}
+
+/** 多选下载：循环 GET file/download → downloadBlob */
+async function multiDownload() {
+  if (multiBusy.value) return
+  const items = files.value.filter((f) => multiSelected.value.has(f.path))
+  if (!items.length) return
+  multiBusy.value = true
+  let ok = 0
+  for (const item of items) {
+    try {
+      const blob = await downloadFile(item.path, home.value)
+      await downloadBlob(blob, item.name)
+      ok++
+    } catch {
+      // 单个失败继续
+    }
+  }
+  multiBusy.value = false
+  ElMessage.success(ok === items.length ? `已下载 ${ok} 个文件` : `已下载 ${ok}/${items.length} 个文件`)
+}
+
+/** 多选删除：确认后循环 POST file/delete */
+async function multiRemove() {
+  if (multiBusy.value) return
+  const items = files.value.filter((f) => multiSelected.value.has(f.path))
+  if (!items.length) return
+  try {
+    await ElMessageBox.confirm(
+      `确定删除选中的 ${items.length} 项吗？${items.some((f) => f.isDirectory) ? '目录及其内容将一并删除。' : ''}`,
+      '批量删除',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  multiBusy.value = true
+  let ok = 0
+  for (const item of items) {
+    try {
+      await deleteFile(item.path, home.value)
+      ok++
+    } catch (err) {
+      secureWriteHint(err)
+    }
+  }
+  multiBusy.value = false
+  exitMulti()
+  ElMessage.success(ok === items.length ? `已删除 ${ok} 项` : `已删除 ${ok}/${items.length} 项`)
+  await loadList()
+}
 
 /* ---------------- 弹窗状态 ---------------- */
 const uploadOpen = ref(false)
@@ -102,12 +221,14 @@ function switchHome(value: string) {
   home.value = value
   path.value = ''
   selectedPath.value = null
+  if (multiMode.value) exitMulti()
   void loadList()
 }
 
 function goCrumb(index: number) {
   path.value = index < 0 ? '' : crumbs.value[index].full
   selectedPath.value = null
+  if (multiMode.value) exitMulti()
   void loadList()
 }
 
@@ -115,6 +236,7 @@ function enter(item: FileItem) {
   if (item.isDirectory) {
     path.value = joinPath(path.value, item.name)
     selectedPath.value = null
+    if (multiMode.value) exitMulti()
     void loadList()
     return
   }
@@ -127,6 +249,10 @@ function enter(item: FileItem) {
 }
 
 function toggleSelect(item: FileItem) {
+  if (multiMode.value) {
+    toggleMulti(item)
+    return
+  }
   selectedPath.value = selectedPath.value === item.path ? null : item.path
 }
 
@@ -317,6 +443,13 @@ function formatTime(v: number | string | undefined): string {
 onMounted(() => {
   void loadList()
 })
+
+onBeforeUnmount(() => {
+  if (longPressTimer) {
+    clearTimeout(longPressTimer)
+    longPressTimer = undefined
+  }
+})
 </script>
 
 <template>
@@ -337,7 +470,7 @@ onMounted(() => {
       </div>
     </header>
 
-    <main class="content">
+    <main class="content" :class="{ 'with-multi-bar': multiMode }">
       <div class="section-head">
         <h1 class="section-title">文件</h1>
         <span class="count">{{ loading ? '…' : `${files.length} 项` }}</span>
@@ -403,17 +536,28 @@ onMounted(() => {
             v-for="item in files"
             :key="item.path"
             class="row"
-            :class="{ selected: selectedPath === item.path }"
+            :class="{
+              selected: selectedPath === item.path,
+              multi: multiMode && multiSelected.has(item.path),
+            }"
+            @contextmenu="onRowContext(item, $event)"
+            @touchstart.passive="onRowTouchStart(item)"
+            @touchend="onRowTouchEnd"
+            @touchcancel="onRowTouchEnd"
           >
             <button
               class="row-select"
               type="button"
-              :title="selectedPath === item.path ? '取消选中' : '选中'"
+              :title="multiMode ? (multiSelected.has(item.path) ? '取消勾选' : '勾选') : selectedPath === item.path ? '取消选中' : '选中'"
               @click="toggleSelect(item)"
             >
-              <span class="select-dot" />
+              <span class="select-dot">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M5 12.5l4.5 4.5L19 7.5" />
+                </svg>
+              </span>
             </button>
-            <button class="row-main" type="button" @click="enter(item)">
+            <button class="row-main" type="button" @click="onRowClick(item)">
               <svg
                 v-if="item.isDirectory"
                 class="row-icon dir"
@@ -447,6 +591,34 @@ onMounted(() => {
         </template>
       </div>
     </main>
+
+    <!-- 多选底部操作条（细字：已选 N 项 + 下载/删除/完成；fade 200ms） -->
+    <Transition name="bar">
+      <div v-if="multiMode" class="multi-bar">
+        <span class="multi-count">已选 {{ multiSelected.size }} 项</span>
+        <div class="multi-actions">
+          <button
+            class="multi-act"
+            type="button"
+            :disabled="multiSelected.size === 0 || multiBusy"
+            @click="multiDownload"
+          >
+            {{ multiBusy ? '处理中…' : '下载' }}
+          </button>
+          <button
+            class="multi-act danger"
+            type="button"
+            :disabled="multiSelected.size === 0 || multiBusy"
+            @click="multiRemove"
+          >
+            删除
+          </button>
+          <button class="multi-act accent" type="button" :disabled="multiBusy" @click="exitMulti">
+            完成
+          </button>
+        </div>
+      </div>
+    </Transition>
 
     <!-- 上传弹窗 -->
     <div v-if="uploadOpen" class="dlg-overlay" @click.self="uploadOpen = false">
@@ -805,6 +977,9 @@ onMounted(() => {
 .row.selected {
   background: var(--accent-soft);
 }
+.row.multi {
+  background: var(--accent-soft);
+}
 .row-select {
   display: flex;
   align-items: center;
@@ -815,13 +990,31 @@ onMounted(() => {
   cursor: pointer;
 }
 .select-dot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: 15px;
   height: 15px;
   border-radius: 50%;
   border: 1px solid var(--border-strong);
+  color: transparent;
   transition:
     background-color 0.2s ease,
-    border-color 0.2s ease;
+    border-color 0.2s ease,
+    color 0.2s ease;
+}
+.select-dot svg {
+  width: 8px;
+  height: 8px;
+  display: none;
+}
+.row.multi .select-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.row.multi .select-dot svg {
+  display: block;
 }
 .row-select:hover .select-dot {
   border-color: var(--accent);
@@ -1083,6 +1276,88 @@ onMounted(() => {
 .btn-primary:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+/* ================= 多选底部操作条（细字胶囊，fade 200ms） ================= */
+.multi-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 10px 16px 10px 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+}
+.multi-count {
+  font-size: 12.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-2);
+}
+.multi-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.multi-act {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: none;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.multi-act:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.multi-act.danger {
+  color: #cf4444;
+  border-color: rgba(207, 68, 68, 0.35);
+}
+.multi-act.danger:hover:not(:disabled) {
+  background: rgba(207, 68, 68, 0.08);
+  border-color: #cf4444;
+}
+.multi-act.accent {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.multi-act.accent:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent-deep);
+  color: var(--accent-deep);
+}
+.multi-act:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.bar-enter-active,
+.bar-leave-active {
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+.bar-enter-from,
+.bar-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 8px);
+}
+.content.with-multi-bar {
+  padding-bottom: 150px;
 }
 
 /* ================= 响应式 ================= */

@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { deleteBookSource, getBookSources, getInvalidBookSources, saveBookSource, saveBookSources } from '@/api/sources'
+import { deleteBookSource, getBookSources, getInvalidBookSources, saveBookSource, saveBookSources, setAsDefaultBookSources } from '@/api/sources'
 import { deleteSourceSub, getSourceSubs, refreshSourceSub, saveSourceSub } from '@/api/sourceSubs'
 import { exportBookSources } from '@/api/system'
 import { bookSourceDebugSSE, type DebugAction } from '@/api/sourceDebug'
@@ -22,6 +22,8 @@ async function load() {
   try {
     const res = await getBookSources()
     sources.value = res.data ?? []
+    // 探测默认书源字段：后端 getBookSources 返回 data[].isDefault 才显示「默认」标记（无则整列隐藏）
+    defaultField.value = sources.value.some((s) => typeof (s as { isDefault?: unknown }).isDefault === 'boolean')
   } catch (err) {
     errorMsg.value = err instanceof Error ? err.message : '加载书源失败'
   } finally {
@@ -246,6 +248,41 @@ watch(debugAction, () => {
   debugMsg.value = ''
   debugMsgError.value = false
 })
+
+/* ================= 默认书源标记（探测 getBookSources data[].isDefault；有则显示星标 + 点击调 POST setAsDefaultBookSources） ================= */
+
+/** 后端是否返回 isDefault 字段（无则隐藏默认标记 UI） */
+const defaultField = ref(false)
+const defaultBusy = ref<Set<string>>(new Set())
+
+function isDefaultSource(s: BookSource): boolean {
+  return (s as { isDefault?: unknown }).isDefault === true
+}
+
+/** 点击星标：设本源为默认书源（乐观更新，失败回滚）；后端未实现（404）时静默隐藏能力 */
+async function setDefault(s: BookSource) {
+  if (defaultBusy.value.has(s.bookSourceUrl)) return
+  defaultBusy.value.add(s.bookSourceUrl)
+  const before = sources.value.map((x) => ({ url: x.bookSourceUrl, def: isDefaultSource(x) }))
+  sources.value.forEach((x) => {
+    ;(x as { isDefault?: boolean }).isDefault = x.bookSourceUrl === s.bookSourceUrl
+  })
+  try {
+    await setAsDefaultBookSources([s.bookSourceUrl])
+    ElMessage.success(`已将「${s.bookSourceName}」设为默认书源`)
+  } catch (err) {
+    // 回滚
+    sources.value.forEach((x) => {
+      const b = before.find((y) => y.url === x.bookSourceUrl)
+      ;(x as { isDefault?: boolean }).isDefault = b?.def ?? false
+    })
+    if (!isNotImplemented(err)) {
+      ElMessage.error(err instanceof Error ? err.message : '设置默认书源失败')
+    }
+  } finally {
+    defaultBusy.value.delete(s.bookSourceUrl)
+  }
+}
 
 /* ================= 启用开关 ================= */
 const toggling = ref<Set<string>>(new Set())
@@ -909,6 +946,18 @@ onMounted(() => {
             {{ s.bookSourceGroup }}
           </span>
           <span v-if="invalidSources.has(s.bookSourceUrl)" class="source-badge invalid">失效</span>
+          <button
+            v-if="defaultField"
+            class="default-btn"
+            :class="{ on: isDefaultSource(s) }"
+            type="button"
+            :disabled="defaultBusy.has(s.bookSourceUrl)" :title="isDefaultSource(s) ? '当前默认书源' : '设为默认书源'"
+            @click="setDefault(s)"
+          >
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 2.8l2.8 5.9 6.4.9-4.7 4.5 1.2 6.4L12 17.6l-5.7 3 1.2-6.4L2.8 9.6l6.4-.9z" />
+            </svg>
+          </button>
           <span class="source-state" :class="{ on: s.enabled }">{{ s.enabled ? '启用' : '停用' }}</span>
           <button
             class="test-btn"
@@ -1582,6 +1631,42 @@ onMounted(() => {
 .source-state.on {
   color: var(--accent);
   font-weight: 400;
+}
+
+/* ================= 默认书源星标（探测 isDefault 字段后显示） ================= */
+.default-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.default-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.default-btn.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.default-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.default-btn svg {
+  width: 12px;
+  height: 12px;
 }
 
 /* 极简开关：细线圆角条 */

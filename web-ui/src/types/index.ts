@@ -245,6 +245,24 @@ export interface CacheClearResult {
   [key: string]: unknown
 }
 
+/** 导入预览章（POST /reader3/importBookPreview → data.chapters[]，兼容字符串或 {title} 对象） */
+export interface ImportPreviewChapter {
+  title: string
+  [key: string]: unknown
+}
+
+/** 导入预览（POST /reader3/importBookPreview → data；后端并行实现中——404/未实现时前端直接上传） */
+export interface ImportPreview {
+  name: string
+  author: string
+  format: string
+  chapterCount: number
+  /** 章节列表（预览前 5 章标题由前端截取；兼容后端返回 chapterList 的命名） */
+  chapters?: ImportPreviewChapter[] | null
+  chapterList?: ImportPreviewChapter[] | null
+  [key: string]: unknown
+}
+
 /** 缓存统计（GET /reader3/getCacheInfo → data；tocCacheCount=目录缓存数 / tocCacheSize=目录缓存大小 / chapterCount=章节缓存数 / chapterSize=章节缓存大小 / totalSize=总大小(字节)） */
 export interface CacheInfo {
   tocCacheCount: number

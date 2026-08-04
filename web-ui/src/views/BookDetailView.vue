@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
@@ -473,6 +473,71 @@ async function cancelCache() {
   cacheMsgError.value = false
 }
 
+/* ================= 简介展开/收起（超过 4 行显示「展开/收起」；展开移除 -webkit-line-clamp 限制） ================= */
+
+const introRef = ref<HTMLElement | null>(null)
+const introExpanded = ref(false)
+/** 是否已完成首测（未测前先按 4 行截断渲染，保证测量时 clamp 已生效） */
+const introMeasured = ref(false)
+const introLong = ref(false)
+/** 4 行截断：未展开且（未测量或确实超 4 行）时生效 */
+const introClamped = computed(() => !introExpanded.value && (introLong.value || !introMeasured.value))
+
+watch(
+  () => display.value.intro,
+  async () => {
+    introExpanded.value = false
+    introMeasured.value = false
+    introLong.value = false
+    await nextTick()
+    const el = introRef.value
+    if (el) {
+      introLong.value = el.scrollHeight > el.clientHeight + 2
+      introMeasured.value = true
+    }
+  },
+)
+
+/* ================= 相关推荐（后端 ruleRelated 契约：getBookInfo 返回 relatedBooks；未实现则整区隐藏） ================= */
+
+interface RelatedBook {
+  bookUrl: string
+  name: string
+  author: string
+  origin: string
+  originName: string
+  tocUrl: string
+  coverUrl?: string | null
+  [key: string]: unknown
+}
+
+const relatedBooks = computed<RelatedBook[]>(() => {
+  const raw = info.value?.relatedBooks
+  return Array.isArray(raw) ? (raw as RelatedBook[]) : []
+})
+
+/** 点击推荐书：组装 Book JSON 调 saveBook 加入书架（bookUrl 为主键，无需进入详情） */
+async function addRelated(r: RelatedBook) {
+  try {
+    await saveBook({
+      bookUrl: r.bookUrl,
+      tocUrl: r.tocUrl || '',
+      origin: r.origin,
+      originName: r.originName,
+      name: r.name,
+      author: r.author,
+      coverUrl: r.coverUrl ?? null,
+      charset: null,
+      type: 0,
+      group: 0,
+      latestChapterTime: 0,
+    } as Book)
+    ElMessage.success(`《${r.name}》已加入书架`)
+  } catch {
+    // 错误提示已由拦截器统一处理（saveBook 非 silent）
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -535,7 +600,17 @@ onMounted(load)
             最新章节：{{ display.latestChapterTitle }}
           </p>
 
-          <p v-if="display.intro" class="book-intro">{{ display.intro }}</p>
+          <p v-if="display.intro" ref="introRef" class="book-intro" :class="{ clamped: introClamped }">
+            {{ display.intro }}
+          </p>
+          <button
+            v-if="display.intro && introMeasured && introLong"
+            class="intro-toggle"
+            type="button"
+            @click="introExpanded = !introExpanded"
+          >
+            {{ introExpanded ? '收起' : '展开' }}
+          </button>
 
           <div class="actions">
             <!-- 书架书 → 开始阅读；非书架书 → 加入书架（入架成功后变开始阅读） -->
@@ -554,6 +629,24 @@ onMounted(load)
           </div>
         </div>
       </div>
+
+      <!-- 相关推荐（后端 ruleRelated 返回 relatedBooks 时显示；未实现则整区隐藏） -->
+      <section v-if="relatedBooks.length" class="related-section">
+        <h2 class="related-title">相关推荐</h2>
+        <div class="related-grid">
+          <button
+            v-for="r in relatedBooks"
+            :key="r.bookUrl"
+            class="related-card"
+            type="button"
+            :title="`将《${r.name}》加入书架`"
+            @click="addRelated(r)"
+          >
+            <span class="related-name">{{ r.name }}</span>
+            <span class="related-author">{{ r.author || '佚名' }}</span>
+          </button>
+        </div>
+      </section>
     </main>
 
     <!-- 全书搜索弹层（GET /reader3/searchBookContent） -->
@@ -901,7 +994,7 @@ onMounted(load)
   vertical-align: 2px;
 }
 
-/* 简介：留白段落 */
+/* 简介：留白段落（超过 4 行截断，展开移除限制） */
 .book-intro {
   margin: 28px 0 0;
   max-width: 560px;
@@ -911,6 +1004,28 @@ onMounted(load)
   letter-spacing: 0.5px;
   color: var(--text-2);
   white-space: pre-line;
+}
+.book-intro.clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.intro-toggle {
+  margin: 12px 0 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 300;
+  letter-spacing: 2px;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.intro-toggle:hover {
+  color: var(--accent-deep);
 }
 
 /* 操作区 */
@@ -987,6 +1102,63 @@ onMounted(load)
   color: var(--accent);
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+/* ================= 相关推荐 ================= */
+.related-section {
+  margin-top: 64px;
+  padding-top: 32px;
+  border-top: 1px solid var(--border);
+}
+.related-title {
+  margin: 0 0 20px;
+  font-size: 15px;
+  font-weight: 300;
+  letter-spacing: 2px;
+  color: var(--text-1);
+}
+.related-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+}
+.related-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.related-card:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.related-name {
+  font-size: 13.5px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.related-author {
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 /* ================= 骨架 / 空态 ================= */

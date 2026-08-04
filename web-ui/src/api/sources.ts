@@ -28,3 +28,11 @@ export function deleteBookSource(bookSourceUrl: string): Promise<ReturnData<null
 export function getInvalidBookSources(): Promise<ReturnData<string[]>> {
   return get<string[]>('/getInvalidBookSources', undefined, { silent: true })
 }
+
+/**
+ * POST /reader3/setAsDefaultBookSources：设置默认书源（body { bookSources: string[] }）。
+ * 后端并行实现中（可能 404）：调用方传 { silent: true } 自行降级提示。
+ */
+export function setAsDefaultBookSources(bookSources: string[]): Promise<ReturnData<null>> {
+  return post<null>('/setAsDefaultBookSources', { bookSources }, { silent: true })
+}

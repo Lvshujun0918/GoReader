@@ -126,6 +126,20 @@ watch(lineHeight, (v) => persist('reader_line_height', v))
 watch(paraSpacing, (v) => persist('reader_para_spacing', v))
 watch(fontWeight, (v) => persist('reader_font_weight', v))
 
+/* ---------------- 2.01 亮度（0.6-1.4 倍，filter: brightness() 作用于 .reader-main；localStorage: reader_brightness） ---------------- */
+
+const MIN_BRIGHT = 0.6
+const MAX_BRIGHT = 1.4
+const BRIGHT_KEY = 'reader_brightness'
+const brightness = ref(1)
+{
+  const raw = Number(localStorage.getItem(BRIGHT_KEY))
+  if (!Number.isNaN(raw) && raw >= MIN_BRIGHT && raw <= MAX_BRIGHT) brightness.value = raw
+}
+const round2 = (v: number) => Math.round(v * 100) / 100
+watch(brightness, (v) => persist(BRIGHT_KEY, round2(v)))
+const brightnessOpen = ref(false)
+
 /* ---------------- 2.1 字体（系统/衬线/圆体/黑体） ---------------- */
 
 type FontKind = 'system' | 'song' | 'hei' | 'kai' | 'fangsong' | 'round' | 'lishu' | 'yahei' | 'pingfang' | 'wenkai' | 'hanserif' | 'serif'
@@ -205,6 +219,7 @@ function resetTypography() {
   letterSpacing.value = 0
   textIndent.value = true
   textAlign.value = 'left'
+  brightness.value = 1
 }
 
 /* ---------------- 3. 翻页模式（滚动 / 滑动=整页节流） ---------------- */
@@ -1247,7 +1262,7 @@ function goBack() {
   else void router.replace(`/book/${encodeURIComponent(bookUrl.value)}`)
 }
 
-/* ---------------- B2 修复：目录抽屉打开时定位当前章 ---------------- */
+/* ---------------- B2 修复：目录抽屉打开时定位当前章（.current 高亮 + scrollIntoView block:center，仅打开时） ---------------- */
 
 const drawerListRef = ref<HTMLElement | null>(null)
 watch(drawerOpen, async (open) => {
@@ -1255,12 +1270,52 @@ watch(drawerOpen, async (open) => {
   await nextTick()
   await nextTick()
   const list = drawerListRef.value
-  const el = list?.querySelector<HTMLElement>('.chapter-item.active')
+  const el = list?.querySelector<HTMLElement>('.chapter-item.current')
   if (list && el) {
-    // 手动计算 scrollTop（不用 scrollIntoView，避免带动页面滚动）
-    list.scrollTop = el.offsetTop - list.offsetTop - (list.clientHeight - el.clientHeight) / 2
+    // 抽屉为 fixed 定位容器，scrollIntoView 只会滚动抽屉内部列表，不会带动页面
+    el.scrollIntoView({ block: 'center' })
   }
 })
+
+/* ---------------- 键盘翻页（←/→ 翻章；PageUp/PageDown 滚动；Space 自动阅读暂停/恢复；输入框聚焦时不触发） ---------------- */
+
+function isTypingTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false
+  if (el.isContentEditable) return true
+  const tag = el.tagName
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+}
+
+function onKeydown(e: KeyboardEvent) {
+  if (isTypingTarget(e.target)) return
+  if (e.metaKey || e.ctrlKey || e.altKey) return
+  switch (e.code) {
+    case 'ArrowLeft':
+      // 目录抽屉打开时 ←/→ 不翻章（避免浏览目录时误翻）
+      if (drawerOpen.value) return
+      e.preventDefault()
+      prevChapter()
+      break
+    case 'ArrowRight':
+      if (drawerOpen.value) return
+      e.preventDefault()
+      nextChapter()
+      break
+    case 'PageUp':
+      e.preventDefault()
+      window.scrollBy({ top: -window.innerHeight * 0.9, behavior: 'auto' })
+      break
+    case 'PageDown':
+      e.preventDefault()
+      window.scrollBy({ top: window.innerHeight * 0.9, behavior: 'auto' })
+      break
+    case 'Space':
+      // 自动阅读暂停/恢复切换（阻止默认的页面滚动）
+      e.preventDefault()
+      toggleAuto()
+      break
+  }
+}
 
 /* ---------------- 生命周期 ---------------- */
 
@@ -1282,6 +1337,7 @@ onMounted(() => {
   window.addEventListener('mouseup', onSelectionUp)
   window.addEventListener('touchend', onSelectionUp, { passive: true })
   window.addEventListener('mousedown', onDocMouseDown)
+  window.addEventListener('keydown', onKeydown)
   if (pageMode.value === 'slide') {
     window.addEventListener('wheel', onWheel, { passive: false })
     window.addEventListener('touchstart', onTouchStart, { passive: true })
@@ -1302,6 +1358,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', onSelectionUp)
   window.removeEventListener('touchend', onSelectionUp)
   window.removeEventListener('mousedown', onDocMouseDown)
+  window.removeEventListener('keydown', onKeydown)
   window.clearTimeout(saveTimer)
   window.clearTimeout(removeTimer)
   window.clearTimeout(flashTimer)
@@ -1355,6 +1412,15 @@ onBeforeUnmount(() => {
           {{ THEME_LABEL[theme] }}
         </button>
         <button
+          class="font-btn"
+          type="button"
+          :class="{ active: brightness !== 1 }"
+          title="亮度（0.6-1.4 倍）"
+          @click="brightnessOpen = true"
+        >
+          亮度
+        </button>
+        <button
           class="font-btn tts-btn"
           type="button"
           :class="{ active: ttsPlaying }"
@@ -1397,7 +1463,10 @@ onBeforeUnmount(() => {
     </header>
 
     <!-- 正文 -->
-    <main class="reader-main" :style="{ maxWidth: contentWidth }">
+    <main
+      class="reader-main"
+      :style="{ maxWidth: contentWidth, filter: `brightness(${brightness})` }"
+    >
       <!-- 不在书架 -->
       <div v-if="notFound" class="state">
         <p class="state-text">未找到这本书（可能不在书架中）</p>
@@ -1529,6 +1598,32 @@ onBeforeUnmount(() => {
             </li>
           </ul>
           <p v-else class="pop-hint">搜索范围：当前章（前端本地匹配，高亮显示，点击跳转）</p>
+        </div>
+      </div>
+    </transition>
+
+    <!-- 亮度弹层（滑条 0.6-1.4，filter: brightness() 作用于 .reader-main） -->
+    <transition name="pop">
+      <div v-if="brightnessOpen" class="pop-mask" @click="brightnessOpen = false">
+        <div class="pop-card" @click.stop>
+          <p class="pop-title">亮度</p>
+          <p class="pop-hint">0.6 – 1.4 倍 · 作用于正文区域</p>
+          <div class="bright-row">
+            <input
+              v-model.number="brightness"
+              class="bright-slider"
+              type="range"
+              min="0.6"
+              max="1.4"
+              step="0.05"
+              @input="brightness = round2(Number(brightness))"
+            />
+            <span class="bright-value">{{ brightness.toFixed(2) }}</span>
+          </div>
+          <div class="set-foot">
+            <button class="text-btn" type="button" @click="brightness = 1">恢复默认</button>
+            <button class="pop-btn" type="button" @click="brightnessOpen = false">关闭</button>
+          </div>
         </div>
       </div>
     </transition>
@@ -1972,7 +2067,7 @@ onBeforeUnmount(() => {
                 v-else
                 type="button"
                 class="chapter-item"
-                :class="{ active: i === chapterIndex }"
+                :class="{ current: i === chapterIndex }"
                 @click="goToChapter(i)"
               >
                 {{ ch.title }}
@@ -2070,7 +2165,8 @@ onBeforeUnmount(() => {
   border-color: var(--accent);
 }
 .font-btn.tts-btn.active,
-.font-btn.auto-btn.active {
+.font-btn.auto-btn.active,
+.font-btn.active {
   color: var(--accent);
   border-color: var(--accent);
   background: var(--accent-soft);
@@ -2416,6 +2512,31 @@ onBeforeUnmount(() => {
   letter-spacing: 1px;
   color: var(--text-3);
   text-align: center;
+}
+
+/* ================= 亮度弹层 ================= */
+.bright-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 22px;
+}
+.bright-slider {
+  flex: 1;
+  min-width: 0;
+  height: 4px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.bright-value {
+  flex-shrink: 0;
+  min-width: 38px;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-1);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 .pop-row {
   display: flex;
@@ -2810,7 +2931,7 @@ onBeforeUnmount(() => {
   color: var(--text-1);
   background: var(--hover);
 }
-.chapter-item.active {
+.chapter-item.current {
   color: var(--accent);
   border-left-color: var(--accent);
   background: var(--accent-soft);
