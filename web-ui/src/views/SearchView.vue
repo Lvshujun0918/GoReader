@@ -38,17 +38,27 @@ let batchAbort: AbortController | null = null
 /** 搜索代数：取消/停止后使在途 SSE/批量响应失效 */
 let searchSeq = 0
 
+/* ================= GAP 100：搜索分页（批量模式逐页「加载更多」；SSE 已全量则提示已全部） ================= */
+
+/** 批量模式当前已加载页（后端 searchBookMulti page 从 1 开始） */
+const batchPage = ref(1)
+/** 批量模式是否已全部（某页无新增去重结果 → 到底） */
+const batchExhausted = ref(false)
+const batchLoadingMore = ref(false)
+
 function labelOf(b: SearchBook): string {
   return b.originName || b.origin
 }
 
-/** bookUrl 去重合并：新书入表；同书追加来源标签并补全缺失展示字段 */
-function mergeBooks(books: SearchBook[]) {
+/** bookUrl 去重合并：新书入表；同书追加来源标签并补全缺失展示字段；返回新增书数 */
+function mergeBooks(books: SearchBook[]): number {
+  let added = 0
   for (const b of books) {
     let entry = bookMap.get(b.bookUrl)
     if (!entry) {
       entry = { book: b, origins: [] }
       bookMap.set(b.bookUrl, entry)
+      added++
     }
     const okey = b.origin || labelOf(b)
     if (!entry.origins.some((o) => o.key === okey)) {
@@ -61,6 +71,7 @@ function mergeBooks(books: SearchBook[]) {
     if (!cur.author && b.author) cur.author = b.author
   }
   results.value = Array.from(bookMap.values())
+  return added
 }
 
 /** 服务端业务错误（event: error）：NEED_LOGIN 跳登录，其余展示错误 */
@@ -93,6 +104,9 @@ async function doSearch(kw?: string) {
   bookMap.clear()
   completedSources.clear()
   searchedSources.value = 0
+  batchPage.value = 1
+  batchExhausted.value = false
+  batchLoadingMore.value = false
 
   // 1) 优先 SSE 流式搜索（增量显示）
   try {
@@ -143,11 +157,11 @@ async function doSearch(kw?: string) {
   }
 }
 
-/** 批量降级：现有 searchBookMulti（maxSources=50，AbortSignal 可中止），一次性出结果 */
-async function runBatch(word: string, seq: number) {
+/** 批量降级：现有 searchBookMulti（maxSources=50，AbortSignal 可中止），按 page 分页累加 */
+async function runBatch(word: string, seq: number, page = 1) {
   batchAbort = new AbortController()
   try {
-    const res = await searchBookMulti(word, 50, batchAbort.signal)
+    const res = await searchBookMulti(word, 50, batchAbort.signal, page)
     if (seq !== searchSeq) return
     if (!res.isSuccess) {
       if ((res.data as unknown) === 'NEED_LOGIN' || (res.errorMsg || '').includes('请登录')) {
@@ -158,7 +172,11 @@ async function runBatch(word: string, seq: number) {
       }
       throw new Error(res.errorMsg || '搜索失败，请稍后重试')
     }
+    const before = bookMap.size
     mergeBooks(res.data ?? [])
+    batchPage.value = page
+    // 该页无新增去重结果 → 已全部（后续「加载更多」不再出现）
+    if (bookMap.size === before) batchExhausted.value = true
     searched.value = true
     pushHistory(word)
   } catch (err) {
@@ -167,6 +185,32 @@ async function runBatch(word: string, seq: number) {
   } finally {
     if (seq === searchSeq) searching.value = false
     if (batchAbort && seq !== searchSeq) batchAbort = null
+  }
+}
+
+/** GAP 100：批量模式「加载更多」——下一页 searchBookMulti 合并去重 */
+async function loadMore() {
+  if (usingSSE.value || searching.value || batchLoadingMore.value || batchExhausted.value) return
+  const word = key.value.trim()
+  if (!word) return
+  const seq = searchSeq
+  const nextPage = batchPage.value + 1
+  batchLoadingMore.value = true
+  batchAbort = new AbortController()
+  try {
+    const res = await searchBookMulti(word, 50, batchAbort.signal, nextPage)
+    if (seq !== searchSeq) return
+    if (!res.isSuccess) throw new Error(res.errorMsg || '加载失败，请稍后重试')
+    const before = bookMap.size
+    mergeBooks(res.data ?? [])
+    batchPage.value = nextPage
+    if (bookMap.size === before) batchExhausted.value = true
+  } catch (err) {
+    if (seq !== searchSeq) return
+    errorMsg.value = err instanceof Error ? err.message : '加载失败，请稍后重试'
+  } finally {
+    if (seq === searchSeq) batchLoadingMore.value = false
+    batchAbort = null
   }
 }
 
@@ -522,6 +566,25 @@ onBeforeUnmount(() => {
             </div>
           </li>
         </ul>
+
+        <!-- GAP 100：底部加载更多（批量模式逐页；SSE 已全量则提示已全部） -->
+        <div v-if="searched && results.length" class="load-more">
+          <template v-if="usingSSE">
+            <span class="load-all">已全部加载（流式搜索全量返回）</span>
+          </template>
+          <template v-else>
+            <button
+              v-if="!batchExhausted"
+              class="load-btn"
+              type="button"
+              :disabled="batchLoadingMore"
+              @click="loadMore"
+            >
+              {{ batchLoadingMore ? '加载中…' : '加载更多' }}
+            </button>
+            <span v-else class="load-all">已全部加载</span>
+          </template>
+        </div>
       </div>
     </main>
   </div>
@@ -1046,6 +1109,44 @@ onBeforeUnmount(() => {
 .result-item:hover .result-arrow {
   color: var(--accent);
   transform: translateX(2px);
+}
+
+/* GAP 100：加载更多（批量模式逐页；SSE 已全部提示） */
+.load-more {
+  display: flex;
+  justify-content: center;
+  padding: 28px 0 8px;
+}
+.load-btn {
+  padding: 9px 36px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 300;
+  letter-spacing: 2px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.load-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.load-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.load-all {
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
 }
 
 /* ================= 响应式 ================= */

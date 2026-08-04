@@ -10,14 +10,16 @@ import {
   getBookGroups,
   getBookshelf,
   saveBookGroup,
+  saveBookGroupOrder,
   updateBookGroupId,
 } from '@/api/bookshelf'
+import { getBookmarks, deleteBookmark } from '@/api/bookmarks'
 import { uploadLocalBook, importBookPreview } from '@/api/upload'
-import { exportBook, type ExportFormat } from '@/api/export'
+import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export'
 import { probeSecureMode } from '@/api/users'
 import { downloadBlob } from '@/utils/download'
 import { useUserStore } from '@/stores/user'
-import type { Book, BookGroup, ImportPreview } from '@/types'
+import type { Book, BookGroup, Bookmark, ImportPreview } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
@@ -490,6 +492,12 @@ onBeforeUnmount(() => {
   wrapObserver?.disconnect()
   window.removeEventListener('scroll', onWindowScroll)
   window.removeEventListener('resize', onWindowResize)
+  // GAP 86：下拉刷新监听清理
+  window.removeEventListener('touchstart', onPullTouchStart)
+  window.removeEventListener('touchmove', onPullTouchMove)
+  window.removeEventListener('touchend', onPullTouchEnd)
+  // GAP 70：全局快捷键监听清理
+  window.removeEventListener('keydown', onGlobalKeydown)
   if (viewportRaf !== undefined) cancelAnimationFrame(viewportRaf)
   document.body.style.overflow = ''
 })
@@ -658,7 +666,7 @@ async function bulkRemove() {
   ElMessage.success(failed > 0 ? `已删除 ${ok} 本，${failed} 本失败` : `已删除 ${ok} 本书`)
 }
 
-/* ================= 导出（GET /reader3/exportBook：txt/epub/html blob 下载） ================= */
+/* ================= 导出（GET /reader3/exportBook：txt/epub/html blob 下载 + txt 编码选择） ================= */
 
 const EXPORT_FORMATS: { value: ExportFormat; label: string; tip: string }[] = [
   { value: 'txt', label: 'TXT', tip: '纯文本' },
@@ -670,6 +678,8 @@ const exportOpen = ref(false)
 const exportBookUrl = ref('')
 const exportName = ref('')
 const exportFormat = ref<ExportFormat>('txt')
+/** GAP 144：txt 导出编码（UTF-8 / GBK——后端并行实现中，未就绪时仍输出 UTF-8） */
+const exportEncoding = ref<ExportEncoding>('utf-8')
 const exportBusy = ref(false)
 const exportMsg = ref('')
 const exportMsgError = ref(false)
@@ -678,6 +688,7 @@ function openExportFor(book: Book) {
   exportBookUrl.value = book.bookUrl
   exportName.value = book.name || 'book'
   exportFormat.value = 'txt'
+  exportEncoding.value = 'utf-8'
   exportMsg.value = ''
   exportMsgError.value = false
   closeMenu()
@@ -698,7 +709,20 @@ async function confirmExport() {
   exportMsg.value = ''
   exportMsgError.value = false
   try {
-    const blob = await exportBook(exportBookUrl.value, exportFormat.value)
+    const blob = await exportBook(exportBookUrl.value, exportFormat.value, exportEncoding.value)
+    // 后端错误体（HTTP 200 + JSON）：在此识别并展示（encoding 未就绪时后端忽略参数仍输出 UTF-8）
+    if (blob.type.includes('application/json')) {
+      try {
+        const parsed = JSON.parse(await blob.text()) as { isSuccess?: boolean; errorMsg?: string }
+        if (parsed && typeof parsed === 'object' && (parsed.isSuccess === false || parsed.errorMsg)) {
+          exportMsg.value = parsed.errorMsg || '导出失败'
+          exportMsgError.value = true
+          return
+        }
+      } catch {
+        /* 非错误 JSON：按文件正常下载 */
+      }
+    }
     const name = `${exportName.value.replace(/[\\/:*?"<>|]/g, '_')}.${exportFormat.value}`
     const ok = await downloadBlob(blob, name)
     if (ok) {
@@ -1065,6 +1089,226 @@ async function deleteGroup(g: BookGroup) {
   }
 }
 
+/* ================= GAP 13：分组拖拽排序（HTML5 drag——拖拽后调 saveBookGroupOrder 保存） ================= */
+
+const draggingId = ref<number | null>(null)
+const groupOrderDirty = ref(false)
+const groupOrderSaving = ref(false)
+
+/** 拖拽开始（记录源分组 id） */
+function onGroupDragStart(g: BookGroup, e: DragEvent) {
+  draggingId.value = g.id
+  groupOrderDirty.value = true
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', String(g.id))
+  }
+}
+
+/** 经过目标行：阻止默认（允许 drop） */
+function onGroupDragOver(g: BookGroup, e: DragEvent) {
+  if (draggingId.value === null || draggingId.value === g.id) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+}
+
+/** 放下：把拖拽分组插入到目标分组位置（本地重排） */
+function onGroupDrop(g: BookGroup, e: DragEvent) {
+  e.preventDefault()
+  const from = draggingId.value
+  draggingId.value = null
+  if (from === null || from === g.id) return
+  const list = groups.value.slice()
+  const fromIdx = list.findIndex((x) => x.id === from)
+  const toIdx = list.findIndex((x) => x.id === g.id)
+  if (fromIdx < 0 || toIdx < 0) return
+  const [moved] = list.splice(fromIdx, 1)
+  list.splice(toIdx, 0, moved)
+  groups.value = list
+}
+
+function onGroupDragEnd() {
+  draggingId.value = null
+}
+
+/** 保存排序：POST /reader3/saveBookGroupOrder（body {order:[{id,orderNum}]}） */
+async function saveGroupOrder() {
+  if (groupOrderSaving.value) return
+  const order = groups.value.map((g, i) => ({ id: g.id, orderNum: i }))
+  if (!order.length) return
+  groupOrderSaving.value = true
+  try {
+    await saveBookGroupOrder(order)
+    groupOrderDirty.value = false
+    ElMessage.success('分组排序已保存')
+  } catch {
+    // 错误提示已由拦截器统一处理
+  } finally {
+    groupOrderSaving.value = false
+  }
+}
+
+/* ================= GAP 89：跨书书签列表（逐书 getBookmarks 汇总；点击跳阅读器该章；删除） ================= */
+
+interface AllBookmark {
+  bookUrl: string
+  bookName: string
+  bookmark: Bookmark
+}
+
+const bmOpen = ref(false)
+const bmLoading = ref(false)
+const bmItems = ref<AllBookmark[]>([])
+const bmMsg = ref('')
+const bmDeleting = ref(false)
+
+function openBookmarks() {
+  bmOpen.value = true
+  bmMsg.value = ''
+  bmItems.value = []
+  document.body.style.overflow = 'hidden'
+  void loadAllBookmarks()
+}
+
+function closeBookmarks() {
+  if (bmLoading.value || bmDeleting.value) return
+  bmOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 后端无批量接口：循环书架书逐本 getBookmarks（silent——无书签的书静默跳过） */
+async function loadAllBookmarks() {
+  bmLoading.value = true
+  bmItems.value = []
+  const out: AllBookmark[] = []
+  try {
+    const shelfRes = await getBookshelf()
+    const list = shelfRes.data ?? []
+    // 逐书串行拉取（避免并发打爆后端；每本失败静默跳过）
+    for (const b of list) {
+      try {
+        const res = await getBookmarks(b.bookUrl, { silent: true })
+        for (const bm of res.data ?? []) {
+          out.push({ bookUrl: b.bookUrl, bookName: b.name || b.bookUrl, bookmark: bm })
+        }
+      } catch {
+        /* 单书书签拉取失败：跳过 */
+      }
+    }
+    out.sort((a, b) => b.bookmark.createdAt - a.bookmark.createdAt)
+    bmItems.value = out
+    if (out.length === 0) bmMsg.value = '暂无书签——阅读时点「＋书签」添加'
+  } catch {
+    bmMsg.value = '书架拉取失败，请稍后重试'
+  } finally {
+    bmLoading.value = false
+  }
+}
+
+/** 点击 → 阅读器该章（chapterIndex 与阅读页 ?chapter 语义一致） */
+function goBookmark(item: AllBookmark) {
+  closeBookmarks()
+  void router.push(`/reader/${encodeURIComponent(item.bookUrl)}?chapter=${item.bookmark.chapterIndex}`)
+}
+
+/** 删除单条书签（POST /reader3/deleteBookmark：bookUrl + title） */
+async function removeBookmarkItem(item: AllBookmark) {
+  if (bmDeleting.value) return
+  bmDeleting.value = true
+  try {
+    await deleteBookmark(item.bookUrl, item.bookmark.title)
+    bmItems.value = bmItems.value.filter(
+      (x) => !(x.bookUrl === item.bookUrl && x.bookmark.title === item.bookmark.title),
+    )
+    if (bmItems.value.length === 0) bmMsg.value = '暂无书签——阅读时点「＋书签」添加'
+    ElMessage.success('已删除书签')
+  } catch {
+    // 错误提示已由拦截器统一处理
+  } finally {
+    bmDeleting.value = false
+  }
+}
+
+function fmtBmTime(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/* ================= GAP 86：移动端下拉刷新（touch 下拉 >60px 触发 load(true)） ================= */
+
+const pullDist = ref(0)
+const pullReady = ref(false)
+const PULL_THRESHOLD = 60
+let pullStartY = -1
+let pullTracking = false
+
+function onPullTouchStart(e: TouchEvent) {
+  // 仅页面顶部且无弹层时开始跟踪
+  if (window.scrollY > 0) return
+  if (document.querySelector('.dlg-overlay, .ctx-overlay, .manage-bar')) return
+  pullStartY = e.touches[0]?.clientY ?? -1
+  pullTracking = pullStartY >= 0
+  pullDist.value = 0
+  pullReady.value = false
+}
+
+function onPullTouchMove(e: TouchEvent) {
+  if (!pullTracking || pullStartY < 0) return
+  const y = e.touches[0]?.clientY ?? pullStartY
+  const dy = y - pullStartY
+  if (dy <= 0) {
+    pullDist.value = 0
+    pullReady.value = false
+    return
+  }
+  // 阻尼：前 60px 1:1，之后减半
+  pullDist.value = dy > PULL_THRESHOLD ? PULL_THRESHOLD + (dy - PULL_THRESHOLD) * 0.5 : dy
+  pullReady.value = pullDist.value >= PULL_THRESHOLD
+}
+
+function onPullTouchEnd() {
+  if (!pullTracking) return
+  pullTracking = false
+  pullStartY = -1
+  if (pullReady.value) {
+    pullDist.value = 0
+    pullReady.value = false
+    void load(true)
+  } else {
+    pullDist.value = 0
+    pullReady.value = false
+  }
+}
+
+/* ================= GAP 70：全局快捷键（书架：g 搜索 / s 设置 / r 刷新——输入框聚焦时不触发） ================= */
+
+function onGlobalKeydown(e: KeyboardEvent) {
+  const t = e.target
+  if (t instanceof HTMLElement && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) {
+    return
+  }
+  if (e.metaKey || e.ctrlKey || e.altKey) return
+  switch (e.key.toLowerCase()) {
+    case 'g': {
+      e.preventDefault()
+      const input = document.querySelector<HTMLInputElement>('.search-main .search-input')
+      input?.focus()
+      input?.select()
+      break
+    }
+    case 's':
+      e.preventDefault()
+      void router.push('/settings')
+      break
+    case 'r':
+      e.preventDefault()
+      void load(true)
+      break
+  }
+}
+
 /* ================= 书卡菜单 ================= */
 function openMenuAt(book: Book, x: number, y: number) {
   menuBook.value = book
@@ -1193,6 +1437,12 @@ onMounted(() => {
   })
   window.addEventListener('scroll', onWindowScroll, { passive: true })
   window.addEventListener('resize', onWindowResize)
+  // GAP 86：移动端下拉刷新（passive，不干扰纵向滚动）
+  window.addEventListener('touchstart', onPullTouchStart, { passive: true })
+  window.addEventListener('touchmove', onPullTouchMove, { passive: true })
+  window.addEventListener('touchend', onPullTouchEnd, { passive: true })
+  // GAP 70：全局快捷键
+  window.addEventListener('keydown', onGlobalKeydown)
   load()
   // 探测 secure 模式：仅 secure 模式显示「用户」管理入口（后端未就绪/非 secure → 隐藏）
   void probeSecureMode().then((v) => {
@@ -1270,6 +1520,7 @@ onMounted(() => {
 
       <div class="user-area">
         <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
+        <button class="nav-link" type="button" title="全部书签（跨书）" @click="openBookmarks">书签</button>
         <button class="nav-link" type="button" @click="router.push('/explore')">探索</button>
         <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
         <button class="nav-link" type="button" @click="router.push('/rules')">替换规则</button>
@@ -1283,6 +1534,26 @@ onMounted(() => {
     </header>
 
     <main class="content" :class="{ 'with-manage-bar': manageMode }">
+      <!-- GAP 86：移动端下拉刷新指示（下拉 >60px 释放触发刷新） -->
+      <Transition name="pull">
+        <div v-if="pullDist > 0" class="pull-indicator" :class="{ ready: pullReady }">
+          <svg
+            class="pull-arrow"
+            :style="{ transform: `rotate(${Math.min(pullDist / PULL_THRESHOLD, 1) * 180}deg)` }"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M12 5v14" />
+            <path d="M6 13l6 6 6-6" />
+          </svg>
+          <span>{{ pullReady ? '释放刷新' : '下拉刷新' }}</span>
+        </div>
+      </Transition>
+
       <!-- 标题区 -->
       <div class="section-head">
         <h1 class="section-title">我的书架</h1>
@@ -1785,9 +2056,30 @@ onMounted(() => {
               </button>
             </div>
 
-            <!-- 分组列表：名称 + 本书数 + 重命名 / 删除 -->
+            <!-- 分组列表：名称 + 本书数 + 重命名 / 删除（GAP 13：拖拽排序——拖到目标行释放即重排，保存排序提交） -->
             <ul v-if="groups.length" class="group-list">
-              <li v-for="g in groups" :key="g.id" class="group-row">
+              <li
+                v-for="g in groups"
+                :key="g.id"
+                class="group-row"
+                :class="{ dragging: draggingId === g.id }"
+                draggable="true"
+                @dragstart="onGroupDragStart(g, $event)"
+                @dragover="onGroupDragOver(g, $event)"
+                @drop="onGroupDrop(g, $event)"
+                @dragend="onGroupDragEnd"
+              >
+                <!-- GAP 13：拖拽手柄 -->
+                <span class="group-drag" title="拖拽排序">
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                    <circle cx="9" cy="6" r="1.4" />
+                    <circle cx="15" cy="6" r="1.4" />
+                    <circle cx="9" cy="12" r="1.4" />
+                    <circle cx="15" cy="12" r="1.4" />
+                    <circle cx="9" cy="18" r="1.4" />
+                    <circle cx="15" cy="18" r="1.4" />
+                  </svg>
+                </span>
                 <!-- 重命名：行内输入 -->
                 <template v-if="renamingId === g.id">
                   <input
@@ -1836,8 +2128,20 @@ onMounted(() => {
             </ul>
             <p v-else class="group-empty">还没有分组，输入名称新建一个吧</p>
 
+            <!-- GAP 13：排序保存（拖拽后显示） -->
+            <div v-if="groupOrderDirty" class="group-order-save">
+              <button
+                class="accent-btn"
+                type="button"
+                :disabled="groupOrderSaving"
+                @click="saveGroupOrder"
+              >
+                {{ groupOrderSaving ? '保存中…' : '保存排序' }}
+              </button>
+            </div>
+
             <div class="dlg-foot">
-              <span class="overall">重命名：改名称保存 · 删除：组内书移至未分组</span>
+              <span class="overall">重命名：改名称保存 · 删除：组内书移至未分组 · 拖拽手柄调整顺序后保存</span>
               <div class="dlg-actions">
                 <button class="ghost-btn" type="button" :disabled="groupSaving" @click="closeGroups">关闭</button>
               </div>
@@ -1951,13 +2255,104 @@ onMounted(() => {
                 <span class="fmt-tip">{{ f.tip }}</span>
               </button>
             </div>
-            <p class="field-tip">由服务器生成 {{ exportFormat.toUpperCase() }} 文件并下载。</p>
+            <!-- GAP 144：txt 编码选择（UTF-8 / GBK——后端并行实现中，未就绪时仍输出 UTF-8） -->
+            <div v-if="exportFormat === 'txt'" class="export-enc">
+              <span class="enc-label">编码</span>
+              <div class="enc-seg">
+                <button
+                  class="enc-btn"
+                  :class="{ active: exportEncoding === 'utf-8' }"
+                  type="button"
+                  :disabled="exportBusy"
+                  @click="exportEncoding = 'utf-8'"
+                >
+                  UTF-8
+                </button>
+                <button
+                  class="enc-btn"
+                  :class="{ active: exportEncoding === 'gbk' }"
+                  type="button"
+                  :disabled="exportBusy"
+                  @click="exportEncoding = 'gbk'"
+                >
+                  GBK
+                </button>
+              </div>
+            </div>
+            <p class="field-tip">由服务器生成 {{ exportFormat.toUpperCase() }} 文件并下载{{ exportFormat === 'txt' ? `（${exportEncoding.toUpperCase()} 编码）` : '' }}。</p>
             <p v-if="exportMsg" class="export-msg" :class="{ error: exportMsgError }">{{ exportMsg }}</p>
             <div class="dlg-actions">
               <button class="ghost-btn" type="button" :disabled="exportBusy" @click="closeExport">取消</button>
               <button class="accent-btn" type="button" :disabled="exportBusy" @click="confirmExport">
                 {{ exportBusy ? '导出中…' : '导出' }}
               </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- GAP 89：跨书书签列表弹层（逐书 getBookmarks 汇总；点击跳阅读器该章；删除） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="bmOpen" class="dlg-overlay" @click.self="closeBookmarks">
+          <div
+            class="dlg dlg-bookmarks"
+            role="dialog"
+            aria-modal="true"
+            aria-label="全部书签"
+            tabindex="-1"
+            @keydown.esc="closeBookmarks"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">全部书签{{ bmItems.length ? ` · ${bmItems.length} 条` : '' }}</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="bmLoading || bmDeleting" @click="closeBookmarks">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+
+            <div v-if="bmLoading" class="bm-state">
+              <svg class="mini-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <path d="M21 12a9 9 0 1 1-6.2-8.56" />
+              </svg>
+              <span>正在汇总全部书签…</span>
+            </div>
+            <p v-else-if="bmMsg" class="bm-state">{{ bmMsg }}</p>
+
+            <ul v-else class="bm-list">
+              <li v-for="(item, i) in bmItems" :key="`${item.bookUrl}-${item.bookmark.title}-${i}`" class="bm-item">
+                <button
+                  type="button"
+                  class="bm-jump"
+                  :title="`跳转到《${item.bookName}》第 ${item.bookmark.chapterIndex + 1} 章`"
+                  @click="goBookmark(item)"
+                >
+                  <span class="bm-book" :title="item.bookName">{{ item.bookName }}</span>
+                  <span class="bm-chapter">第 {{ item.bookmark.chapterIndex + 1 }} 章</span>
+                  <span class="bm-text" :title="item.bookmark.title">{{ item.bookmark.title }}</span>
+                  <span class="bm-time">{{ fmtBmTime(item.bookmark.createdAt) }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="bm-del"
+                  title="删除书签"
+                  :disabled="bmDeleting"
+                  @click="removeBookmarkItem(item)"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                    <path d="M6 6l12 12M18 6L6 18" />
+                  </svg>
+                </button>
+              </li>
+            </ul>
+
+            <div class="dlg-foot">
+              <span class="overall">点击跳转到对应章节 · 后端无批量接口，按书架逐书汇总</span>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="bmLoading || bmDeleting" @click="closeBookmarks">关闭</button>
+              </div>
             </div>
           </div>
         </div>
@@ -3303,6 +3698,33 @@ onMounted(() => {
   width: 12px;
   height: 12px;
 }
+/* GAP 13：拖拽手柄 + 拖拽中行样式 */
+.group-drag {
+  flex-shrink: 0;
+  width: 18px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  cursor: grab;
+}
+.group-drag svg {
+  width: 13px;
+  height: 13px;
+}
+.group-row.dragging {
+  opacity: 0.45;
+  border-style: dashed;
+}
+.group-row[draggable='true']:active .group-drag {
+  cursor: grabbing;
+}
+.group-order-save {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
 .group-empty {
   margin: 0;
   padding: 28px 0;
@@ -3315,11 +3737,13 @@ onMounted(() => {
 /* ================= 导出弹层 ================= */
 .export-formats {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 10px;
 }
 .fmt-btn {
-  flex: 1;
+  flex: 1 1 88px;
+  min-width: 72px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -3332,6 +3756,194 @@ onMounted(() => {
   transition:
     border-color 0.2s ease,
     background-color 0.2s ease;
+}
+
+/* txt 编码选择（GAP 144：UTF-8 / GBK） */
+.export-enc {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.enc-label {
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.enc-seg {
+  display: flex;
+  gap: 6px;
+}
+.enc-btn {
+  padding: 5px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.enc-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.enc-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.enc-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* ================= 跨书书签弹层（GAP 89） ================= */
+.dlg-bookmarks {
+  width: min(560px, 100%);
+}
+.bm-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 36px 0;
+  font-size: 12.5px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.bm-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bm-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  transition: border-color 0.2s ease;
+}
+.bm-item:hover {
+  border-color: var(--accent);
+}
+.bm-jump {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 12px;
+  border: none;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.bm-book {
+  flex-shrink: 0;
+  max-width: 130px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bm-chapter {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 300;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.bm-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 300;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bm-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 300;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.bm-del {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.bm-del:hover:not(:disabled) {
+  color: #cf4444;
+  background: rgba(207, 68, 68, 0.08);
+}
+.bm-del:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+.bm-del svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* ================= GAP 86：下拉刷新指示 ================= */
+.pull-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 44px;
+  margin: -24px 0 4px;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 2px;
+  color: var(--text-3);
+}
+.pull-indicator.ready {
+  color: var(--accent);
+}
+.pull-arrow {
+  width: 15px;
+  height: 15px;
+  transition: transform 0.15s ease;
+}
+.pull-enter-active,
+.pull-leave-active {
+  transition: opacity 0.15s ease;
+}
+.pull-enter-from,
+.pull-leave-to {
+  opacity: 0;
 }
 .fmt-btn:hover:not(:disabled) {
   border-color: var(--accent);

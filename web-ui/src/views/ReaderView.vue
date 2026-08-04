@@ -290,6 +290,51 @@ watch(pageMode, (mode, old) => {
   }
 })
 
+/* ---------------- GAP 85：移动端左右滑动翻章（touchstart/touchend deltaX 阈值 60px；横向主导才触发，不干扰纵向滚动） ---------------- */
+
+let swipeStartX = 0
+let swipeStartY = 0
+let swipeTracking = false
+const SWIPE_THRESHOLD = 60
+
+function onSwipeTouchStart(e: TouchEvent) {
+  if (isInsideOverlay(e.target)) return
+  const t = e.touches[0]
+  if (!t) return
+  swipeStartX = t.clientX
+  swipeStartY = t.clientY
+  swipeTracking = true
+}
+
+function onSwipeTouchEnd(e: TouchEvent) {
+  if (!swipeTracking) return
+  swipeTracking = false
+  // 任一弹层/抽屉/划词工具条打开时不翻章
+  if (
+    selOpen.value ||
+    drawerOpen.value ||
+    settingsOpen.value ||
+    ttsPanelOpen.value ||
+    bookmarksOpen.value ||
+    jumpOpen.value ||
+    searchOpen.value ||
+    brightnessOpen.value ||
+    imgViewerOpen.value
+  ) {
+    return
+  }
+  const t = e.changedTouches[0]
+  if (!t) return
+  const dx = t.clientX - swipeStartX
+  const dy = t.clientY - swipeStartY
+  // 横向主导（|dx|>=60 且明显大于 |dy|）→ 翻章；纵向滚动/划词选择不处理
+  if (Math.abs(dx) < SWIPE_THRESHOLD) return
+  if (Math.abs(dy) > Math.abs(dx) * 1.2) return
+  if ((window.getSelection()?.toString().trim() ?? '') !== '') return
+  if (dx < 0) nextChapter()
+  else prevChapter()
+}
+
 /* ---------------- 4. 进度显示 + 章节跳转 ---------------- */
 
 const scrollFrac = ref(0)
@@ -709,6 +754,7 @@ function ttsText(): string {
 
 /** 播放当前章：合成 → blob → audio 播放 */
 async function startTts() {
+  ttsSelectionMode = false // 整章朗读：结束允许自动连播
   const text = ttsText()
   if (!text) {
     ElMessage.info('本章暂无内容可朗读')
@@ -774,6 +820,7 @@ async function startTts() {
 function stopTts() {
   ttsLoadSeq++
   ttsAutoNext = false
+  ttsSelectionMode = false
   ttsState.value = 'idle'
   stopTtsParaTracking()
   const audio = ttsAudioRef.value
@@ -820,7 +867,7 @@ function toggleTts() {
   else void startTts()
 }
 
-/** 本章播完：自动连播下一章；最后一章则停止 */
+/** 本章播完：自动连播下一章；最后一章则停止；划词朗读播完即止 */
 function onTtsEnded() {
   if (ttsState.value === 'idle') return
   stopTtsParaTracking()
@@ -832,6 +879,12 @@ function onTtsEnded() {
   if (audio) {
     audio.removeAttribute('src')
     audio.load()
+  }
+  // GAP 92：划词朗读播完即止（不自动切章）
+  if (ttsSelectionMode) {
+    ttsSelectionMode = false
+    ttsState.value = 'idle'
+    return
   }
   if (hasNext.value) {
     ttsAutoNext = true
@@ -869,6 +922,70 @@ function onTtsError() {
   ttsErrorRetries = 0
   stopTts()
   ElMessage.error('语音播放失败')
+}
+
+/* ---------------- GAP 92：划词朗读（选中文本 TTS——复用现有合成/播放流程，播完不自动切章） ---------------- */
+
+/** 划词朗读模式：本章播完只停止不连播 */
+let ttsSelectionMode = false
+
+/** 朗读指定文本（划词朗读入口） */
+async function speakText(text: string) {
+  const clipped = text.slice(0, TTS_MAX_CHARS)
+  if (!clipped.trim()) return
+  await loadTtsOptions()
+  const audio = ttsAudioRef.value
+  if (!audio) return
+  if (ttsEngine.value === 'http' && !ttsHttpUrl.value) {
+    ElMessage.info('请先在设置页添加 HttpTTS 源')
+    return
+  }
+  const seq = ++ttsLoadSeq
+  ttsState.value = 'loading'
+  let blob: Blob
+  try {
+    blob = await synthesizeTts({
+      text: clipped,
+      voice: ttsVoice.value,
+      rate: ttsRateParam.value,
+      pitch: ttsPitchParam.value,
+      engine: ttsEngine.value,
+      httpUrl: ttsEngine.value === 'http' ? ttsHttpUrl.value : undefined,
+    })
+  } catch (e) {
+    if (seq === ttsLoadSeq) {
+      ttsState.value = 'idle'
+      ElMessage.error(e instanceof Error ? e.message : '语音合成失败')
+    }
+    return
+  }
+  const url = URL.createObjectURL(blob)
+  if (seq !== ttsLoadSeq) {
+    // 期间已停止/切章：丢弃过期结果
+    URL.revokeObjectURL(url)
+    return
+  }
+  if (ttsObjectUrl) URL.revokeObjectURL(ttsObjectUrl)
+  ttsObjectUrl = url
+  audio.pause()
+  audio.src = url
+  ttsState.value = 'playing'
+  ttsSelectionMode = true
+  try {
+    await audio.play()
+  } catch {
+    // 自动播放被拦截（异步合成后手势已失效）：保持待播，面板点「播放」即可恢复
+    if (ttsState.value === 'playing') ttsState.value = 'paused'
+  }
+}
+
+/** 划词工具条「朗读」按钮：朗读选中文本 */
+function speakSelection() {
+  const text = selText.value
+  clearSelection()
+  hideSelBar()
+  if (!text) return
+  void speakText(text)
 }
 
 /* ---------------- 8. 自动阅读（定时滚动，到底自动切章） ---------------- */
@@ -1563,6 +1680,9 @@ onMounted(() => {
   window.addEventListener('touchend', onSelectionUp, { passive: true })
   window.addEventListener('mousedown', onDocMouseDown)
   window.addEventListener('keydown', onKeydown)
+  // GAP 85：左右滑动翻章（passive——不 preventDefault，不干扰纵向滚动/选择）
+  window.addEventListener('touchstart', onSwipeTouchStart, { passive: true })
+  window.addEventListener('touchend', onSwipeTouchEnd, { passive: true })
   if (pageMode.value === 'slide') {
     window.addEventListener('wheel', onWheel, { passive: false })
     window.addEventListener('touchstart', onTouchStart, { passive: true })
@@ -1584,6 +1704,9 @@ onBeforeUnmount(() => {
   window.removeEventListener('touchend', onSelectionUp)
   window.removeEventListener('mousedown', onDocMouseDown)
   window.removeEventListener('keydown', onKeydown)
+  // GAP 85：左右滑动翻章监听清理
+  window.removeEventListener('touchstart', onSwipeTouchStart)
+  window.removeEventListener('touchend', onSwipeTouchEnd)
   window.clearTimeout(saveTimer)
   window.clearTimeout(removeTimer)
   window.clearTimeout(flashTimer)
@@ -2309,11 +2432,12 @@ onBeforeUnmount(() => {
       </div>
     </transition>
 
-    <!-- 划词工具条（复制 / 搜索） -->
+    <!-- 划词工具条（复制 / 搜索 / 朗读） -->
     <transition name="pop">
       <div v-if="selOpen" class="sel-bar" :style="{ left: `${selX}px`, top: `${selY}px` }">
         <button type="button" class="sel-btn" @click="copySelection">复制</button>
         <button type="button" class="sel-btn" @click="searchSelection">搜索</button>
+        <button type="button" class="sel-btn" title="朗读选中文本" @click="speakSelection">朗读</button>
       </div>
     </transition>
 

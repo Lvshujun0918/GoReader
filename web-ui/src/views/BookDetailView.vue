@@ -6,7 +6,7 @@ import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { getBookInfo, getBookToc, searchBookSource } from '@/api/books'
 import { getInvalidBookSources } from '@/api/sources'
 import { searchBookContent } from '@/api/cache'
-import { exportBook, type ExportFormat } from '@/api/export'
+import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export'
 import { cacheBookOnServer, cacheBookSSE, cancelCacheBook } from '@/api/cacheBook'
 import { uploadFile, mkdir } from '@/api/file'
 import { downloadBlob } from '@/utils/download'
@@ -32,15 +32,25 @@ const errorMsg = ref('')
 const coverFailed = ref(false)
 const saving = ref(false)
 
-/** 展示数据：实时详情优先，书架数据兜底；自定义封面（GAP 19）最优先 */
+/** 展示数据：实时详情优先，书架数据兜底；自定义封面（GAP 19）最优先；自定义简介（GAP 145）优先于书源解析 intro */
 const display = computed(() => ({
   name: info.value?.name || shelfBook.value?.name || '未知书名',
   author: info.value?.author || shelfBook.value?.author || '',
   cover: shelfBook.value?.customCoverUrl || info.value?.coverUrl || shelfBook.value?.coverUrl || '',
-  intro: info.value?.intro || shelfBook.value?.intro || '',
+  intro: shelfBook.value?.customIntro || info.value?.intro || shelfBook.value?.intro || '',
   latestChapterTitle:
     info.value?.latestChapterTitle || shelfBook.value?.latestChapterTitle || '',
 }))
+
+/** 标签（GAP 145：customTag 逗号分隔 → 展示 chips） */
+const displayTags = computed<string[]>(() => {
+  const raw = shelfBook.value?.customTag
+  if (typeof raw !== 'string' || !raw.trim()) return []
+  return raw
+    .split(/[,，]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+})
 
 /** 自定义封面走 file/download 内联流：展示时补当前 accessToken（重新登录后仍可显示） */
 function resolveCoverUrl(url: string): string {
@@ -274,6 +284,29 @@ const tocPreview = computed(() => {
   return out
 })
 
+/** 目录预览渲染条目（GAP 91：卷标题行 isVolume 渲染分隔行；GAP 147：当前章高亮 durChapterIndex） */
+const tocEntries = computed<{ kind: 'volume' | 'chapter'; index: number; title: string }[]>(() => {
+  const out: { kind: 'volume' | 'chapter'; index: number; title: string }[] = []
+  let count = 0
+  tocChapters.value.forEach((c, i) => {
+    if (c.isVolume) {
+      out.push({ kind: 'volume', index: i, title: c.title })
+      return
+    }
+    if (count >= TOC_PREVIEW_MAX) return
+    count++
+    out.push({ kind: 'chapter', index: i, title: c.title })
+  })
+  return out
+})
+
+/** GAP 147：书架进度章（durChapterIndex）——目录 tab 当前章高亮 */
+const currentChapterIndex = computed(() =>
+  typeof shelfBook.value?.durChapterIndex === 'number' && shelfBook.value.durChapterIndex >= 0
+    ? shelfBook.value.durChapterIndex
+    : -1,
+)
+
 /** 点击目录项 → 阅读器并跳章 */
 function goToChapterFromToc(idx: number) {
   void router.push(`/reader/${encodeURIComponent(bookUrl.value)}?chapter=${idx}`)
@@ -466,7 +499,7 @@ async function switchSource(r: SearchBook) {
   }
 }
 
-/* ================= 导出（GET /reader3/exportBook：txt/epub/html blob 下载） ================= */
+/* ================= 导出（GET /reader3/exportBook：txt/epub/html blob 下载 + txt 编码选择） ================= */
 
 const EXPORT_FORMATS: { value: ExportFormat; label: string; tip: string }[] = [
   { value: 'txt', label: 'TXT', tip: '纯文本' },
@@ -476,12 +509,15 @@ const EXPORT_FORMATS: { value: ExportFormat; label: string; tip: string }[] = [
 
 const exportOpen = ref(false)
 const exportFormat = ref<ExportFormat>('txt')
+/** GAP 144：txt 导出编码（UTF-8 / GBK——GBK 中文环境兼容；后端并行实现中，未就绪时仍输出 UTF-8） */
+const exportEncoding = ref<ExportEncoding>('utf-8')
 const exportBusy = ref(false)
 const exportMsg = ref('')
 const exportMsgError = ref(false)
 
 function openExport() {
   exportFormat.value = 'txt'
+  exportEncoding.value = 'utf-8'
   exportMsg.value = ''
   exportMsgError.value = false
   exportOpen.value = true
@@ -501,7 +537,20 @@ async function confirmExport() {
   exportMsg.value = ''
   exportMsgError.value = false
   try {
-    const blob = await exportBook(bookUrl.value, exportFormat.value)
+    const blob = await exportBook(bookUrl.value, exportFormat.value, exportEncoding.value)
+    // 后端错误体（HTTP 200 + JSON）：在此识别并展示（encoding 未就绪时后端忽略参数仍输出 UTF-8）
+    if (blob.type.includes('application/json')) {
+      try {
+        const parsed = JSON.parse(await blob.text()) as { isSuccess?: boolean; errorMsg?: string }
+        if (parsed && typeof parsed === 'object' && (parsed.isSuccess === false || parsed.errorMsg)) {
+          exportMsg.value = parsed.errorMsg || '导出失败'
+          exportMsgError.value = true
+          return
+        }
+      } catch {
+        /* 非错误 JSON：按文件正常下载 */
+      }
+    }
     const name = `${(display.value.name || 'book').replace(/[\\/:*?"<>|]/g, '_')}.${exportFormat.value}`
     const ok = await downloadBlob(blob, name)
     if (ok) {
@@ -517,6 +566,76 @@ async function confirmExport() {
     exportMsgError.value = true
   } finally {
     exportBusy.value = false
+  }
+}
+
+/* ================= GAP 145：元数据编辑（书名/作者/标签/简介弹窗表单——saveBook patch 字段，详情即时刷新） ================= */
+
+const editOpen = ref(false)
+const editBusy = ref(false)
+const editMsg = ref('')
+const editMsgError = ref(false)
+const editForm = ref({ name: '', author: '', tags: '', intro: '' })
+
+function openEdit() {
+  const b = shelfBook.value
+  if (!b) return
+  editForm.value = {
+    name: b.name || '',
+    author: b.author || '',
+    tags: typeof b.customTag === 'string' ? b.customTag : '',
+    intro: typeof b.customIntro === 'string' ? b.customIntro : b.intro || '',
+  }
+  editMsg.value = ''
+  editMsgError.value = false
+  editOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeEdit() {
+  if (editBusy.value) return
+  editOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 保存：saveBook 对已存在书按 body 字段增量 patch（name/author/customTag/customIntro，后端 patch_book 已支持） */
+async function confirmEdit() {
+  const b = shelfBook.value
+  if (!b || editBusy.value) return
+  const name = editForm.value.name.trim()
+  if (!name) {
+    editMsg.value = '书名不能为空'
+    editMsgError.value = true
+    return
+  }
+  editBusy.value = true
+  editMsg.value = ''
+  try {
+    await saveBook({
+      bookUrl: b.bookUrl,
+      name,
+      author: editForm.value.author.trim(),
+      customTag: editForm.value.tags.trim() || null,
+      customIntro: editForm.value.intro.trim() || null,
+    } as Book)
+    // 本地同步 + 详情即时刷新（display.intro 优先 customIntro）
+    b.name = name
+    b.author = editForm.value.author.trim()
+    b.customTag = editForm.value.tags.trim() || null
+    b.customIntro = editForm.value.intro.trim() || null
+    if (info.value) {
+      info.value.name = name
+      info.value.author = b.author
+    }
+    introExpanded.value = false
+    introMeasured.value = false
+    introLong.value = false
+    ElMessage.success('已保存')
+    closeEdit()
+  } catch {
+    // 失败提示由 request.ts 统一 toast（saveBook 非 silent）
+  } finally {
+    editBusy.value = false
   }
 }
 
@@ -768,10 +887,20 @@ onMounted(load)
             共 {{ tocChapters.filter((c) => !c.isVolume).length }} 章 · 预览前 {{ Math.min(TOC_PREVIEW_MAX, tocPreview.length) }} 章，点击进入阅读器并跳转
           </p>
           <ul class="toc-list">
-            <li v-for="c in tocPreview" :key="`${c.index}-${c.title}`">
-              <button class="toc-item" type="button" @click="goToChapterFromToc(c.index)">
+            <li v-for="c in tocEntries" :key="`${c.kind}-${c.index}-${c.title}`">
+              <!-- GAP 91：卷标题分隔行（isVolume） -->
+              <div v-if="c.kind === 'volume'" class="toc-volume">{{ c.title }}</div>
+              <!-- GAP 147：当前章高亮（书架进度 durChapterIndex） -->
+              <button
+                v-else
+                class="toc-item"
+                :class="{ current: c.index === currentChapterIndex }"
+                type="button"
+                @click="goToChapterFromToc(c.index)"
+              >
                 <span class="toc-idx">{{ c.index + 1 }}</span>
                 <span class="toc-title" :title="c.title">{{ c.title }}</span>
+                <span v-if="c.index === currentChapterIndex" class="toc-cur">读到</span>
               </button>
             </li>
           </ul>
@@ -816,6 +945,10 @@ onMounted(load)
         <div class="book-info">
           <h1 class="book-name">{{ display.name }}</h1>
           <p v-if="display.author" class="book-author">{{ display.author }}</p>
+          <!-- GAP 145：标签 chips（customTag 逗号分隔） -->
+          <p v-if="displayTags.length" class="book-tags">
+            <span v-for="t in displayTags" :key="t" class="tag-chip">{{ t }}</span>
+          </p>
           <p v-if="display.latestChapterTitle" class="book-latest">
             最新章节：{{ display.latestChapterTitle }}
           </p>
@@ -844,6 +977,8 @@ onMounted(load)
             </template>
             <!-- 全书搜索（书架书本地正文搜索；命中后跳阅读页该章） -->
             <button v-if="shelfBook" class="search-btn" type="button" @click="openSearch">全书搜索</button>
+            <!-- GAP 145：编辑元数据（书名/作者/标签/简介弹窗） -->
+            <button v-if="shelfBook" class="search-btn" type="button" @click="openEdit">编辑</button>
             <!-- 换源（书架书且带书源：搜索同书其他书源并切换） -->
             <button v-if="canSwitchSource()" class="search-btn" type="button" @click="openSource">换源</button>
             <!-- 导出（GET /reader3/exportBook：txt/epub/html blob 下载） -->
@@ -1017,7 +1152,31 @@ onMounted(load)
                 <span class="fmt-tip">{{ f.tip }}</span>
               </button>
             </div>
-            <p class="field-tip">由服务器生成 {{ exportFormat.toUpperCase() }} 文件并下载。</p>
+            <!-- GAP 144：txt 编码选择（UTF-8 / GBK——后端并行实现中，未就绪时仍输出 UTF-8） -->
+            <div v-if="exportFormat === 'txt'" class="export-enc">
+              <span class="enc-label">编码</span>
+              <div class="enc-seg">
+                <button
+                  class="enc-btn"
+                  :class="{ active: exportEncoding === 'utf-8' }"
+                  type="button"
+                  :disabled="exportBusy"
+                  @click="exportEncoding = 'utf-8'"
+                >
+                  UTF-8
+                </button>
+                <button
+                  class="enc-btn"
+                  :class="{ active: exportEncoding === 'gbk' }"
+                  type="button"
+                  :disabled="exportBusy"
+                  @click="exportEncoding = 'gbk'"
+                >
+                  GBK
+                </button>
+              </div>
+            </div>
+            <p class="field-tip">由服务器生成 {{ exportFormat.toUpperCase() }} 文件并下载{{ exportFormat === 'txt' ? `（${exportEncoding.toUpperCase()} 编码）` : '' }}。</p>
             <p v-if="exportMsg" class="search-msg" :class="{ error: exportMsgError }">{{ exportMsg }}</p>
             <div class="dlg-actions">
               <button class="ghost-btn" type="button" :disabled="exportBusy" @click="closeExport">取消</button>
@@ -1025,6 +1184,64 @@ onMounted(load)
                 {{ exportBusy ? '导出中…' : '导出' }}
               </button>
             </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+    <!-- GAP 145：元数据编辑弹窗（书名/作者/标签/简介——saveBook patch 字段） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="editOpen" class="dlg-overlay" @click.self="closeEdit">
+          <div
+            class="dlg dlg-edit"
+            role="dialog"
+            aria-modal="true"
+            aria-label="编辑书籍信息"
+            tabindex="-1"
+            @keydown.esc="closeEdit"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">编辑 · {{ display.name }}</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="editBusy" @click="closeEdit">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="confirmEdit">
+              <label class="field">
+                <span class="field-label">书名<em>*</em></span>
+                <input v-model="editForm.name" class="field-input" type="text" maxlength="100" spellcheck="false" :disabled="editBusy" />
+              </label>
+              <label class="field">
+                <span class="field-label">作者</span>
+                <input v-model="editForm.author" class="field-input" type="text" maxlength="60" spellcheck="false" :disabled="editBusy" />
+              </label>
+              <label class="field">
+                <span class="field-label">标签</span>
+                <input v-model="editForm.tags" class="field-input" type="text" placeholder="多个标签用逗号分隔，如：科幻, 连载中" spellcheck="false" :disabled="editBusy" />
+                <span class="field-tip">保存到 customTag，详情页以标签展示</span>
+              </label>
+              <label class="field">
+                <span class="field-label">简介</span>
+                <textarea
+                  v-model="editForm.intro"
+                  class="intro-textarea"
+                  rows="6"
+                  placeholder="自定义简介（留空则显示书源解析的简介）"
+                  spellcheck="false"
+                  :disabled="editBusy"
+                ></textarea>
+                <span class="field-tip">保存到 customIntro，展示优先于书源简介</span>
+              </label>
+              <p v-if="editMsg" class="field-tip" :class="{ error: editMsgError }">{{ editMsg }}</p>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="editBusy" @click="closeEdit">取消</button>
+                <button class="accent-btn" type="submit" :disabled="editBusy || !editForm.name.trim()">
+                  {{ editBusy ? '保存中…' : '保存' }}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       </Transition>
@@ -1890,15 +2107,17 @@ onMounted(load)
 
 /* ================= 导出弹层 ================= */
 .dlg-export {
-  width: min(420px, 100%);
+  width: min(440px, 100%);
 }
 .export-formats {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 10px;
 }
 .fmt-btn {
-  flex: 1;
+  flex: 1 1 88px;
+  min-width: 72px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2015,6 +2234,164 @@ onMounted(load)
   font-weight: 300;
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
+}
+
+/* txt 编码选择（GAP 144：UTF-8 / GBK） */
+.export-enc {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.enc-label {
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.enc-seg {
+  display: flex;
+  gap: 6px;
+}
+.enc-btn {
+  padding: 5px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.enc-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.enc-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.enc-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* ================= 元数据编辑弹层（GAP 145） ================= */
+.dlg-edit {
+  width: min(440px, 100%);
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.field-label {
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-2);
+}
+.field-label em {
+  color: #cf4444;
+  font-style: normal;
+}
+.field-input {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+.field-input:focus {
+  border-color: var(--accent);
+}
+.field-input::placeholder {
+  color: var(--text-3);
+  font-weight: 300;
+}
+.intro-textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 300;
+  line-height: 1.7;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+.intro-textarea:focus {
+  border-color: var(--accent);
+}
+.intro-textarea::placeholder {
+  color: var(--text-3);
+  font-weight: 300;
+}
+.field-tip.error {
+  color: #cf4444;
+}
+
+/* ================= 标签 chips（GAP 145） ================= */
+.book-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 0;
+}
+.tag-chip {
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+}
+
+/* ================= 目录卷标题分隔行（GAP 91）+ 当前章高亮（GAP 147） ================= */
+.toc-volume {
+  padding: 12px 6px 6px;
+  font-size: 11.5px;
+  font-weight: 300;
+  letter-spacing: 3px;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.toc-item.current .toc-title {
+  color: var(--accent);
+  font-weight: 500;
+}
+.toc-item.current .toc-idx {
+  color: var(--accent);
+}
+.toc-cur {
+  flex-shrink: 0;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
 }
 
 /* 弹窗动画：fade 200ms */

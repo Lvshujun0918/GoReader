@@ -57,3 +57,11 @@ export function deleteBookGroup(id: number, opts?: { silent?: boolean }): Promis
 export function updateBookGroupId(bookUrl: string, group: number): Promise<ReturnData<null>> {
   return post<null>('/updateBookGroupId', { bookUrl, group })
 }
+
+/**
+ * POST /reader3/saveBookGroupOrder：分组排序（body {order:[{id,orderNum}]}，orderNum 为新的序号）
+ * GAP 13：分组管理弹窗拖拽排序后保存。
+ */
+export function saveBookGroupOrder(order: { id: number; orderNum: number }[]): Promise<ReturnData<{ count: number }>> {
+  return post<{ count: number }>('/saveBookGroupOrder', { order })
+}

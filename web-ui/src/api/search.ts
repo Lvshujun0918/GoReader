@@ -2,9 +2,17 @@ import { post } from './request'
 import { useUserStore } from '@/stores/user'
 import type { ReturnData, SearchBook } from '@/types'
 
-/** POST /reader3/searchBookMulti：多书源并发搜索（body {key, maxSources}；signal 可中止请求） */
-export function searchBookMulti(key: string, maxSources = 50, signal?: AbortSignal): Promise<ReturnData<SearchBook[]>> {
-  return post<SearchBook[]>('/searchBookMulti', { key, maxSources }, { signal })
+/**
+ * POST /reader3/searchBookMulti：多书源并发搜索（body {key, maxSources, page}；signal 可中止请求）
+ * page 从 1 开始——普通（非 SSE）搜索分页场景（GAP 100：批量模式「加载更多」逐页累加）。
+ */
+export function searchBookMulti(
+  key: string,
+  maxSources = 50,
+  signal?: AbortSignal,
+  page = 1,
+): Promise<ReturnData<SearchBook[]>> {
+  return post<SearchBook[]>('/searchBookMulti', { key, maxSources, page }, { signal })
 }
 
 /* ================= SSE 流式搜索（/reader3/searchBookMultiSSE） ================= */

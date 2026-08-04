@@ -136,6 +136,8 @@ async function submit() {
         >
           {{ mode === 'login' ? '立即注册' : '去登录' }}
         </button>
+        <a class="tg-foot" href="https://t.me/readerdev" target="_blank" rel="noopener">Telegram 交流群</a>
+        </button>
       </p>
     </main>
 
@@ -329,5 +331,19 @@ async function submit() {
   font-weight: 300;
   letter-spacing: 2px;
   color: var(--text-3);
+}
+.tg-foot {
+  display: block;
+  margin-top: 18px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 0.5px;
+  color: var(--text-3, #aaa);
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+.tg-foot:hover {
+  color: var(--accent, #4f46e5);
 }
 </style>

@@ -13,6 +13,7 @@ import { login as loginApi } from '@/api/auth'
 import { resetUserPassword } from '@/api/users'
 import { getUserConfig, saveUserConfig } from '@/api/userConfig'
 import { getReadingStats } from '@/api/stats'
+import { getOpdsSettings, saveOpdsSettings } from '@/api/opds'
 import {
   loadReaderConfig,
   applyReaderConfig,
@@ -370,6 +371,7 @@ onMounted(() => {
   loadTxtTocRules()
   loadCacheInfo()
   loadServerPref()
+  loadOpdsCfg()
 })
 
 /* ================= 阅读偏好（多端同步：GET/POST /reader3/getUserConfig|saveUserConfig，服务器优先） ================= */
@@ -747,6 +749,121 @@ const opdsUrl = computed(() => {
   return store.accessToken ? `${base}?accessToken=${encodeURIComponent(store.accessToken)}` : base
 })
 const opdsCopied = ref(false)
+
+/* GAP 53：OPDS 独立账号 + 测试连接（GET/POST /reader3/getOpdsSettings|saveOpdsSettings；fetch /opds 验证） */
+const opdsCfg = ref<{ enabled: boolean; username: string; passwordSet: boolean }>({
+  enabled: false,
+  username: '',
+  passwordSet: false,
+})
+const opdsCfgOpen = ref(false)
+const opdsCfgBusy = ref(false)
+const opdsCfgMsg = ref('')
+const opdsCfgMsgError = ref(false)
+const opdsForm = ref({ username: '', password: '' })
+/** 配置时输入的密码留内存：测试连接用 Basic 认证（服务端不回传密码） */
+let opdsTestPassword = ''
+const opdsTesting = ref(false)
+const opdsTestOk = ref<boolean | null>(null)
+const opdsTestMsg = ref('')
+
+async function loadOpdsCfg() {
+  try {
+    const res = await getOpdsSettings()
+    const d = res.data
+    if (d) {
+      opdsCfg.value = { enabled: !!d.enabled, username: d.username || '', passwordSet: !!d.passwordSet }
+    }
+  } catch {
+    /* 后端不可用：保持默认 */
+  }
+}
+
+function openOpdsCfg() {
+  opdsForm.value = { username: opdsCfg.value.username, password: '' }
+  opdsCfgMsg.value = ''
+  opdsCfgMsgError.value = false
+  opdsCfgOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeOpdsCfg() {
+  if (opdsCfgBusy.value) return
+  opdsCfgOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 保存账号（username 空 = 禁用独立账号） */
+async function saveOpdsCfg() {
+  if (opdsCfgBusy.value) return
+  const username = opdsForm.value.username.trim()
+  const password = opdsForm.value.password
+  if (username && password.length < 4) {
+    opdsCfgMsg.value = '密码至少 4 位'
+    opdsCfgMsgError.value = true
+    return
+  }
+  if (username && !password && opdsCfg.value.username !== username) {
+    opdsCfgMsg.value = '新账号需填写密码'
+    opdsCfgMsgError.value = true
+    return
+  }
+  opdsCfgBusy.value = true
+  opdsCfgMsg.value = ''
+  try {
+    const res = await saveOpdsSettings(username, password)
+    const d = res.data
+    opdsCfg.value = {
+      enabled: !!d?.enabled,
+      username: d?.username ?? username,
+      passwordSet: !!d?.enabled,
+    }
+    // 本次输入的密码留内存供「测试连接」Basic 认证使用（刷新后失效——服务端不回传密码）
+    if (username && password) opdsTestPassword = password
+    if (!username) opdsTestPassword = ''
+    ElMessage.success(username ? 'OPDS 账号已保存' : '已禁用 OPDS 独立账号')
+    closeOpdsCfg()
+  } catch {
+    // 错误提示已由拦截器处理
+  } finally {
+    opdsCfgBusy.value = false
+  }
+}
+
+/** 测试连接：fetch /opds——配置了独立账号且密码在内存 → Basic 认证；否则带 accessToken */
+async function testOpds() {
+  if (opdsTesting.value) return
+  opdsTesting.value = true
+  opdsTestOk.value = null
+  opdsTestMsg.value = '测试中…'
+  try {
+    const url = `${window.location.origin}/opds`
+    const headers: Record<string, string> = { Accept: 'application/atom+xml, application/opds+json, */*' }
+    const user = opdsCfg.value.username.trim()
+    if (opdsCfg.value.enabled && user && opdsTestPassword) {
+      headers.Authorization = `Basic ${btoa(`${user}:${opdsTestPassword}`)}`
+    } else if (store.accessToken) {
+      // 独立账号密码不可用（未在本会话配置）→ 回退 accessToken
+      headers.Authorization = `Bearer ${store.accessToken}`
+    }
+    const resp = await fetch(url, { headers })
+    if (resp.ok) {
+      opdsTestOk.value = true
+      opdsTestMsg.value = `连接成功（HTTP ${resp.status} · ${resp.headers.get('content-type')?.split(';')[0] || 'OPDS'}）`
+    } else if (resp.status === 401 || resp.status === 403) {
+      opdsTestOk.value = false
+      opdsTestMsg.value = `连接失败：认证未通过（HTTP ${resp.status}）——请检查 OPDS 账号或 accessToken`
+    } else {
+      opdsTestOk.value = false
+      opdsTestMsg.value = `连接失败（HTTP ${resp.status}）`
+    }
+  } catch (err) {
+    opdsTestOk.value = false
+    opdsTestMsg.value = `连接失败：${err instanceof Error ? err.message : '网络错误'}`
+  } finally {
+    opdsTesting.value = false
+  }
+}
 
 /** 复制文本：优先剪贴板 API，不可用时 textarea 降级；返回是否成功 */
 async function copyText(text: string): Promise<boolean> {
@@ -1128,6 +1245,25 @@ async function runExportData() {
             {{ opdsCopied ? '已复制' : '复制' }}
           </button>
         </div>
+        <!-- GAP 53：OPDS 独立账号（getOpdsSettings/saveOpdsSettings）+ 测试连接 -->
+        <div class="row">
+          <span class="row-label">OPDS 账号</span>
+          <span class="row-value">
+            {{ opdsCfg.enabled ? opdsCfg.username + (opdsCfg.passwordSet ? '（已设密码）' : '') : '未配置（使用登录账号）' }}
+          </span>
+          <button class="row-action" type="button" @click="openOpdsCfg">
+            {{ opdsCfg.enabled ? '修改' : '配置' }}
+          </button>
+        </div>
+        <div class="row">
+          <span class="row-label">测试连接</span>
+          <span class="row-value opds-test" :class="{ ok: opdsTestOk === true, fail: opdsTestOk === false }">
+            {{ opdsTestMsg || '校验 OPDS 服务是否可访问（用当前配置账号）' }}
+          </span>
+          <button class="row-action" type="button" :disabled="opdsTesting" @click="testOpds">
+            {{ opdsTesting ? '测试中…' : '测试连接' }}
+          </button>
+        </div>
         <p class="card-note">外部阅读器（如 legado、静读天下等）可通过此地址连接书架；已在地址中附带 accessToken，复制后粘贴到阅读器 OPDS 地址栏即可（未登录时不附带）。</p>
       </section>
 
@@ -1286,8 +1422,69 @@ async function runExportData() {
             <span class="row-value">{{ sysInfo.bookSourceCount }}</span>
           </div>
         </template>
+        <div class="row">
+          <span class="row-label">交流</span>
+          <span class="row-value"><a class="tg-link" href="https://t.me/readerdev" target="_blank" rel="noopener">Telegram 群 t.me/readerdev</a></span>
+        </div>
       </section>
     </main>
+    <!-- GAP 53：OPDS 账号配置弹窗（saveOpdsSettings；username 空 = 禁用） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="opdsCfgOpen" class="dlg-overlay" @click.self="closeOpdsCfg">
+          <div
+            class="dlg"
+            role="dialog"
+            aria-modal="true"
+            aria-label="OPDS 账号"
+            tabindex="-1"
+            @keydown.esc="closeOpdsCfg"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">OPDS 独立账号</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="opdsCfgBusy" @click="closeOpdsCfg">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="saveOpdsCfg">
+              <label class="field">
+                <span class="field-label">用户名</span>
+                <input
+                  v-model="opdsForm.username"
+                  class="field-input"
+                  type="text"
+                  placeholder="留空 = 禁用独立账号（回退登录账号）"
+                  spellcheck="false"
+                  :disabled="opdsCfgBusy"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">密码</span>
+                <input
+                  v-model="opdsForm.password"
+                  class="field-input"
+                  type="password"
+                  autocomplete="new-password"
+                  placeholder="至少 4 位（已配置且不改则留空）"
+                  :disabled="opdsCfgBusy"
+                />
+              </label>
+              <p class="field-tip">外部阅读器用此账号 + 密码连接 OPDS（secure 模式优先于登录账号校验）</p>
+              <p v-if="opdsCfgMsg" class="field-tip" :class="{ error: opdsCfgMsgError }">{{ opdsCfgMsg }}</p>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="opdsCfgBusy" @click="closeOpdsCfg">取消</button>
+                <button class="accent-btn" type="submit" :disabled="opdsCfgBusy">
+                  {{ opdsCfgBusy ? '保存中…' : '保存' }}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
     <!-- 修改密码弹窗（GAP 87：旧密码校验 → resetUserPassword → 强制重新登录） -->
     <Teleport to="body">
       <Transition name="dlg">
@@ -2062,6 +2259,18 @@ async function runExportData() {
   font-weight: 300;
   color: var(--text-3);
 }
+/* GAP 53：OPDS 测试连接结果着色 */
+.row-value.opds-test {
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.row-value.opds-test.ok {
+  color: #2e9e5b;
+}
+.row-value.opds-test.fail {
+  color: #cf4444;
+}
 .row-hint {
   flex-shrink: 0;
   font-size: 11.5px;
@@ -2368,5 +2577,15 @@ async function runExportData() {
   .row-hint {
     display: none;
   }
+}
+.tg-link {
+  color: var(--text-2, #888);
+  text-decoration: none;
+  font-size: 12px;
+  font-weight: 300;
+  transition: color 0.2s ease;
+}
+.tg-link:hover {
+  color: var(--accent, #4f46e5);
 }
 </style>

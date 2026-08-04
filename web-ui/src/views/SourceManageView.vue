@@ -709,8 +709,23 @@ const editSource = ref<BookSource | null>(null)
 const editForm = ref({ bookSourceUrl: '', bookSourceName: '', bookSourceGroup: '' })
 const editRules = ref<Record<string, string>>({})
 const editWeight = ref(0)
+/* GAP 107：header（JSON）/ loginUrl / cookie 编辑 */
+const editHeader = ref('')
+const editLoginUrl = ref('')
+const editCookie = ref('')
 const editMsg = ref('')
 const editMsgError = ref(false)
+
+/** header 字段：字符串存的 JSON（legado 契约）——可解析时 pretty-print 便于编辑 */
+function headerToText(s: BookSource | null): string {
+  const v = s?.header
+  if (v === undefined || v === null || v === '') return ''
+  try {
+    return JSON.stringify(JSON.parse(v), null, 2)
+  } catch {
+    return String(v)
+  }
+}
 
 /** 书源字段 → textarea 文本（json 字段 pretty-print，text 字段原样） */
 function ruleToText(s: BookSource | null, f: RuleField): string {
@@ -737,6 +752,9 @@ function openEdit(s: BookSource) {
   editRules.value = {}
   for (const f of RULE_FIELDS) editRules.value[f.key] = ruleToText(s, f)
   editWeight.value = typeof s.weight === 'number' && Number.isFinite(s.weight) ? s.weight : 0
+  editHeader.value = headerToText(s)
+  editLoginUrl.value = typeof s.loginUrl === 'string' ? s.loginUrl : ''
+  editCookie.value = '' // cookie 不入书源 JSON（后端模型无此字段）——保存时非空走 setBookSourceCookie
   editMsg.value = ''
   editMsgError.value = false
   editOpen.value = true
@@ -1025,6 +1043,17 @@ async function confirmEdit() {
       return
     }
   }
+  // GAP 107：header 必须为合法 JSON
+  let headerJson: unknown = null
+  if (editHeader.value.trim()) {
+    try {
+      headerJson = JSON.parse(editHeader.value)
+    } catch (err) {
+      editMsg.value = `「header」不是有效 JSON：${err instanceof Error ? err.message : '语法错误'}`
+      editMsgError.value = true
+      return
+    }
+  }
   editBusy.value = true
   editMsg.value = ''
   try {
@@ -1041,7 +1070,26 @@ async function confirmEdit() {
         merged[f.key] = v
       }
     }
+    // GAP 107：header（JSON 字符串存储）/ loginUrl 合并；留空 = 清除
+    if (headerJson === null) {
+      delete merged.header
+    } else {
+      merged.header = JSON.stringify(headerJson)
+    }
+    if (editLoginUrl.value.trim()) {
+      merged.loginUrl = editLoginUrl.value.trim()
+    } else {
+      delete merged.loginUrl
+    }
     await saveBookSource(merged)
+    // GAP 107：cookie 非空 → 单独走 setBookSourceCookie（后端书源模型无 cookie 字段，cookie 存服务端 cookie 表）
+    if (editCookie.value.trim()) {
+      try {
+        await setBookSourceCookie(merged.bookSourceUrl, editCookie.value.trim())
+      } catch {
+        ElMessage.warning('书源已保存，但 Cookie 写入失败')
+      }
+    }
     editBusy.value = false // 先复位再关闭（closeEdit 忙碌中不允许关闭）
     closeEdit()
     ElMessage.success(`已保存「${merged.bookSourceName}」`)
@@ -1951,9 +1999,45 @@ onBeforeUnmount(() => {
                 />
                 <span class="field-tip">书源排序权重（数字越大越靠前，随 saveBookSource 提交 weight 字段）</span>
               </label>
+              <!-- GAP 107：header / loginUrl / cookie 编辑 -->
+              <label class="field">
+                <span class="field-label">header（请求头 JSON）</span>
+                <textarea
+                  v-model="editHeader"
+                  class="rule-textarea"
+                  placeholder='{ "User-Agent": "Mozilla/5.0 …" }'
+                  spellcheck="false"
+                  :disabled="editBusy"
+                ></textarea>
+                <span class="field-tip">请求头 JSON 对象（留空 = 清除）；保存后随书源提交 header 字段</span>
+              </label>
+              <label class="field">
+                <span class="field-label">loginUrl（登录地址）</span>
+                <input
+                  v-model="editLoginUrl"
+                  class="field-input"
+                  type="text"
+                  placeholder="https://…/login"
+                  spellcheck="false"
+                  :disabled="editBusy"
+                />
+                <span class="field-tip">书源登录页地址（留空 = 清除）</span>
+              </label>
+              <label class="field">
+                <span class="field-label">Cookie</span>
+                <input
+                  v-model="editCookie"
+                  class="field-input"
+                  type="text"
+                  placeholder="粘贴 Cookie（保存时写入服务端）"
+                  spellcheck="false"
+                  :disabled="editBusy"
+                />
+                <span class="field-tip">非空时保存后调 setBookSourceCookie 写入（清除请用登录弹窗「清除 Cookie」）</span>
+              </label>
               <div class="rules-head">
                 <h3 class="rules-title">规则字段</h3>
-                <span class="rules-sub">JSON 字段按对象编辑（单条规则）· 留空 = 清除该规则 · 登录/header 等其余字段原样保留</span>
+                <span class="rules-sub">JSON 字段按对象编辑（单条规则）· 留空 = 清除该规则 · header/loginUrl/cookie 见上方</span>
               </div>
               <label v-for="f in RULE_FIELDS" :key="f.key" class="field rule-field">
                 <span class="field-label">{{ f.label }}</span>
