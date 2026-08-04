@@ -664,7 +664,7 @@ pub const TURNSTILE_CLICK_JS: &str = r#"
     if (f) {
       try { f.scrollIntoView({ block: 'center' }); } catch (e) {}
       var r = f.getBoundingClientRect();
-      out = { ok: true, how: 'iframe', x: r.x + r.width * 0.3, y: r.y + r.height / 2, w: r.width, h: r.height };
+      out = { ok: true, how: 'iframe', x: r.x + Math.min(28, r.width * 0.18), y: r.y + Math.min(32, r.height * 0.35), w: r.width, h: r.height };
     }
     return out;
   } catch (e) { return { ok: false, reason: 'exception' }; }
@@ -895,11 +895,19 @@ async fn solve_with(
         //    也内嵌该 iframe，误判会触发 30s token 轮询上限并破坏经典质询等待循环）
         if !turnstile_mode {
             if let Ok(d) = browser.evaluate(TURNSTILE_DETECT_JS).await {
-                if d.get("turnstile").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let ts = d.get("turnstile").and_then(|v| v.as_bool()).unwrap_or(false);
+                if ts {
                     turnstile_mode = true;
                     turnstile_widget = d.get("hasContainer").and_then(|v| v.as_bool()).unwrap_or(false)
                         || d.get("hasInput").and_then(|v| v.as_bool()).unwrap_or(false)
                         || d.get("hasTitle").and_then(|v| v.as_bool()).unwrap_or(false);
+                    tracing::warn!(
+                        "Turnstile 检测命中 {url}: container={} input={} title={} iframeTs={}",
+                        d.get("hasContainer").and_then(|v| v.as_bool()).unwrap_or(false),
+                        d.get("hasInput").and_then(|v| v.as_bool()).unwrap_or(false),
+                        d.get("hasTitle").and_then(|v| v.as_bool()).unwrap_or(false),
+                        d.get("iframeIsTurnstile").and_then(|v| v.as_bool()).unwrap_or(false),
+                    );
                 }
             }
         } else if !turnstile_widget {
