@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+/// 内置浏览器 CF 质询求解的质询等待循环上限（任务要求最多 30s）
+pub const CF_SOLVE_MAX_WAIT_MS: u64 = 30_000;
+
 /// 抓取响应
 pub struct FetchResponse {
     pub body: String,
@@ -174,39 +177,24 @@ async fn http_fetch(
     // ② 直连
     let resp = fetch(url, &req_headers, timeout_secs, method, body, charset).await?;
 
-    // ③ CF 质询检测（503 + 特征 HTML）→ FlareSolverr 解
+    // ③ CF 质询检测（503 + 特征 HTML）→ 解质询降级链：FlareSolverr（配置了 URL）→
+    //    内置浏览器（进程内 CDP，见 solve_cf_builtin）
     if is_cloudflare_challenge(resp.status, &resp.body) {
         if let Some(fs) = flaresolverr_request(url, &cookie, method, body, timeout_secs).await? {
-            // FS 返回 cookie 与用户原 cookie 按 name 合并后存库（按用户）
-            if !fs.cookies.is_empty() || !fs.user_agent.is_empty() {
-                let storage_opt: Option<crate::storage::Storage> =
-                    COOKIE_STORAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                if let Some(su) = resolve_source_url(ns, url).await {
-                    if let Some(storage) = storage_opt {
-                        let merged = merge_fs_cookies(&cookie, &fs.cookies);
-                        if !merged.is_empty() {
-                            let _ = storage.set_cookie(ns, &su, &merged).await;
-                        }
-                        // UA 与库中不同则一并记录（部分站点 UA 绑定 cookie）
-                        if !fs.user_agent.is_empty() {
-                            let need_update = match storage.get_source_session(ns, &su).await {
-                                Ok(Some((_, old_ua))) => old_ua != fs.user_agent,
-                                _ => true,
-                            };
-                            if need_update {
-                                let _ = storage.set_cookie_user_agent(ns, &su, &fs.user_agent).await;
-                            }
-                        }
-                    }
-                }
-            }
+            // FS 解成功：cookie 与用户原 cookie 按 name 合并后存库（按用户）+ UA 记录；
+            // 响应用 FS 返回的最终 URL/状态（CF 重定向后）
+            let fs_pairs: Vec<(String, String)> =
+                fs.cookies.iter().map(|c| (c.name.clone(), c.value.clone())).collect();
+            store_solution_session(ns, url, &cookie, &fs_pairs, &fs.user_agent).await;
             return Ok(FetchResponse {
                 body: fs.response,
-                url: url.to_string(),
+                url: if fs.url.is_empty() { url.to_string() } else { fs.url },
                 headers: Vec::new(),
-                status: 200,
+                status: fs.status,
             });
         }
+        // 未配置 FLARESOLVERR_URL → 内置浏览器求解（进程内 CDP，不依赖外部容器）
+        return solve_cf_builtin(ns, url, &cookie).await;
     }
     Ok(resp)
 }
@@ -270,6 +258,10 @@ pub struct FsSolution {
     pub response: String,
     pub cookies: Vec<FsCookie>,
     pub user_agent: String,
+    /// FS 返回的最终 URL（CF 重定向后；空则回退请求 URL）
+    pub url: String,
+    /// FS 返回的最终 HTTP 状态（缺省 200）
+    pub status: u16,
 }
 
 /// FlareSolverr 请求配置（环境变量 FLARESOLVERR_URL，默认空 = 禁用）
@@ -346,9 +338,109 @@ pub async fn flaresolverr_request(
         .and_then(|u| u.as_str())
         .unwrap_or("")
         .to_string();
+    let final_url = solution
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
+    let status = solution
+        .get("status")
+        .and_then(|s| s.as_u64())
+        .unwrap_or(200)
+        .min(u16::MAX as u64) as u16;
     let cookies: Vec<FsCookie> = serde_json::from_value(solution.get("cookies").cloned().unwrap_or_default())
         .unwrap_or_default();
-    Ok(Some(FsSolution { response, cookies, user_agent }))
+    Ok(Some(FsSolution { response, cookies, user_agent, url: final_url, status }))
+}
+
+// ==================== 内置浏览器 CF 质询求解（进程内 CDP） ====================
+
+/// 浏览器可用性探测（CF 内置求解前置检查；测试钩子可强制覆盖）
+fn cf_browser_available() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        match CF_BROWSER_AVAIL_OVERRIDE.load(Ordering::Relaxed) {
+            1 => return true,
+            -1 => return false,
+            _ => {}
+        }
+    }
+    crate::service::browser::is_browser_available()
+}
+
+/// 测试钩子：强制浏览器可用性（Some(true)/Some(false) 强制；None 恢复自动探测）
+#[cfg(test)]
+pub(crate) fn force_cf_browser_available(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    CF_BROWSER_AVAIL_OVERRIDE.store(
+        match v {
+            Some(true) => 1,
+            Some(false) => -1,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+static CF_BROWSER_AVAIL_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(0);
+
+/// 内置浏览器 CF 质询求解（FLARESOLVERR_URL 未配置时的降级路径）：
+/// - 浏览器不可用 → 明确错误（提示安装 Edge/Chrome 或配置 FLARESOLVERR_URL）
+/// - 成功：solution.html 作为响应正文；cookies 与用户 cookie 按 name 合并后存库（按用户）
+///   + 浏览器 UA 记录（与 cf_clearance 绑定）
+async fn solve_cf_builtin(ns: &str, url: &str, user_cookie: &str) -> Result<FetchResponse> {
+    if !cf_browser_available() {
+        return Err(anyhow!("CF 质询需浏览器环境：安装 Edge/Chrome 或配置 FLARESOLVERR_URL"));
+    }
+    let cookies = parse_cookie_string(user_cookie);
+    let solution = crate::service::browser::solve_cf_challenge(url, &cookies, CF_SOLVE_MAX_WAIT_MS)
+        .await
+        .map_err(|e| anyhow!("内置浏览器解 CF 质询失败（{url}）: {e:#}"))?;
+    store_solution_session(ns, url, user_cookie, &solution.cookies, &solution.user_agent).await;
+    Ok(FetchResponse {
+        body: solution.html,
+        url: url.to_string(),
+        headers: Vec::new(),
+        status: 200,
+    })
+}
+
+/// 解质询成功后持久化（按用户）：cookies 与用户原 cookie 按 name 合并存库 + UA 记录。
+/// 两者都为空时跳过（无新信息）；存储失败仅告警（不影响本次响应）。
+async fn store_solution_session(
+    ns: &str,
+    url: &str,
+    user_cookie: &str,
+    solution_cookies: &[(String, String)],
+    user_agent: &str,
+) {
+    if solution_cookies.is_empty() && user_agent.is_empty() {
+        return;
+    }
+    let storage_opt: Option<crate::storage::Storage> =
+        COOKIE_STORAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(storage) = storage_opt else { return };
+    let Some(su) = resolve_source_url(ns, url).await else { return };
+    let fs_cookies: Vec<FsCookie> = solution_cookies
+        .iter()
+        .map(|(n, v)| FsCookie { name: n.clone(), value: v.clone(), domain: None, path: None })
+        .collect();
+    let merged = merge_fs_cookies(user_cookie, &fs_cookies);
+    if !merged.is_empty() {
+        let _ = storage.set_cookie(ns, &su, &merged).await;
+    }
+    // UA 与库中不同则一并记录（部分站点 UA 绑定 cookie）
+    if !user_agent.is_empty() {
+        let need_update = match storage.get_source_session(ns, &su).await {
+            Ok(Some((_, old_ua))) => old_ua != user_agent,
+            _ => true,
+        };
+        if need_update {
+            let _ = storage.set_cookie_user_agent(ns, &su, user_agent).await;
+        }
+    }
 }
 
 // ==================== cookie 工具（合并策略见下） ====================
@@ -514,5 +606,23 @@ mod tests {
         let r = rt.block_on(flaresolverr_request("https://a.com", "a=1", "GET", None, 15));
         assert!(r.is_ok());
         assert!(r.unwrap().is_none());
+    }
+
+    /// 浏览器不可用分支单测：solve_cf_builtin 返回明确错误（不启动浏览器、不发请求）
+    #[test]
+    fn test_cf_builtin_browser_unavailable_returns_clear_error() {
+        force_cf_browser_available(Some(false));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let r = rt.block_on(solve_cf_builtin("default", "https://cf.example.com/book/1", "sid=abc"));
+        force_cf_browser_available(None);
+        let err = r.err().expect("浏览器不可用应返回错误");
+        assert!(
+            err.to_string().contains("CF 质询需浏览器环境"),
+            "错误应提示浏览器环境: {err}"
+        );
+        assert!(
+            err.to_string().contains("FLARESOLVERR_URL"),
+            "错误应提示可配置 FLARESOLVERR_URL: {err}"
+        );
     }
 }

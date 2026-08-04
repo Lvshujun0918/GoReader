@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -89,11 +89,69 @@ pub struct Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
+        // 浏览器进程：launcher 可能已 handoff 退出（Windows 下 Chrome/Edge 常见）——
+        // 按 user-data-dir 特征杀干净真实浏览器进程，再杀 launcher 句柄
+        kill_browser_processes(&self.user_data_dir);
         if let Some(child) = &mut self.child {
             let _ = child.kill();
             let _ = child.wait();
         }
         let _ = std::fs::remove_dir_all(&self.user_data_dir);
+    }
+}
+
+/// 杀掉占用指定 user-data-dir 的浏览器进程（Windows：PowerShell CIM 按命令行特征匹配；
+/// 其他平台：无操作——launcher 即浏览器进程，由 child.kill 处理）
+fn kill_browser_processes(user_data_dir: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let dir = user_data_dir.to_string_lossy();
+        // 命令行包含 --user-data-dir=<dir> 的 msedge/chrome 进程（唯一特征：目录名含进程 id+uuid）
+        let ps = format!(
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{dir}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        );
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// 清理残留的 reader-cdp-* 会话（进程被强杀/崩溃时 Drop 不会执行——浏览器与临时目录
+/// 会残留）。目录名带 owner 进程 PID：owner 已死而浏览器仍存活 → 按 user-data-dir
+/// 特征杀浏览器并删目录。每次 launch 前调用（Windows 专用，开销约几十 ms）。
+fn sweep_stale_browser_sessions() {
+    #[cfg(windows)]
+    {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix("reader-cdp-") else { continue };
+            let owner: u32 = match rest.split('-').next().and_then(|p| p.parse().ok()) {
+                Some(p) => p,
+                None => continue,
+            };
+            if owner == std::process::id() {
+                continue; // 本进程自己的会话（存活中）
+            }
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            // owner 是否存活（tasklist 输出含 pid 即存活；探测失败按存活处理，保守跳过）
+            let owner_alive = Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {owner}"), "/NH"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains(&owner.to_string()))
+                .unwrap_or(true);
+            if owner_alive {
+                continue;
+            }
+            // owner 已死 → 清理残留浏览器进程 + 临时目录
+            kill_browser_processes(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -107,6 +165,8 @@ impl Browser {
 
     /// 用指定可执行文件启动（测试降级路径用）
     pub async fn launch_with(exe: PathBuf) -> Result<Browser> {
+        // 上次异常退出（进程被强杀/崩溃）残留的浏览器会话先清理
+        sweep_stale_browser_sessions();
         if !exe.exists() {
             return Err(anyhow!("浏览器可执行文件不存在（{}）——无法使用浏览器自动登录", exe.display()));
         }
@@ -134,7 +194,11 @@ impl Browser {
         let spawned = cmd.spawn().map_err(|e| anyhow!("启动浏览器失败（{}）: {e}", exe.display()))?;
         let mut child = Some(spawned);
 
-        // 从 stderr 解析 DevTools ws 地址（--remote-debugging-port=0 自动选端口）
+        // 从 stderr 或 DevToolsActivePort 解析 DevTools ws 地址：
+        // - 部分版本在 stderr 打印 "DevTools listening on ws://..."（--remote-debugging-port=0
+        //   自动选端口）；现代 Chrome/Edge（151+）launcher 进程会 handoff 后退出、且不一定
+        //   在管道 stderr 打印该行——标准做法是读 user-data-dir/DevToolsActivePort
+        //   （第一行端口、第二行 ws 路径）
         let stderr = child.as_mut().expect("stderr piped").stderr.take().expect("stderr piped");
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -146,9 +210,12 @@ impl Browser {
                 }
             }
         });
+        let port_file = user_data_dir.join("DevToolsActivePort");
         let ws_url = std::thread::scope(|_| -> Result<String> {
             let deadline = std::time::Instant::now() + LAUNCH_TIMEOUT;
+            let mut launcher_exited = false;
             loop {
+                // ① stderr 行（旧版兼容）
                 if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
                     if let Some(idx) = line.find("DevTools listening on ws://") {
                         let url = line[idx + "DevTools listening on ".len()..].trim().to_string();
@@ -157,24 +224,51 @@ impl Browser {
                         }
                     }
                 }
-                if std::time::Instant::now() > deadline {
-                    return Err(anyhow!("浏览器启动超时（15s）"));
+                // ② DevToolsActivePort 文件（现代 Chrome/Edge 标准位置）
+                if let Ok(content) = std::fs::read_to_string(&port_file) {
+                    let mut lines = content.lines();
+                    if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
+                        if let Ok(port) = port.trim().parse::<u16>() {
+                            let url = format!("ws://127.0.0.1:{port}{}", path.trim());
+                            if url.starts_with("ws://") {
+                                return Ok(url);
+                            }
+                        }
+                    }
                 }
-                if let Ok(Some(status)) = child.as_mut().expect("child").try_wait() {
-                    return Err(anyhow!("浏览器进程提前退出（{status}）"));
+                if std::time::Instant::now() > deadline {
+                    return Err(anyhow!("浏览器启动超时（15s）——未获取到 DevTools 地址"));
+                }
+                // launcher 提前退出：非零退出码 = 启动失败；零退出码 = handoff（继续等）
+                if !launcher_exited {
+                    if let Ok(Some(status)) = child.as_mut().expect("child").try_wait() {
+                        if !status.success() {
+                            return Err(anyhow!("浏览器进程启动失败（{status}）"));
+                        }
+                        launcher_exited = true;
+                    }
                 }
             }
         });
-        let ws_url = ws_url?;
+        let ws_url = match ws_url {
+            Ok(u) => u,
+            Err(e) => {
+                // launcher 可能已 handoff——按 user-data-dir 特征清理真实浏览器进程
+                kill_browser_processes(&user_data_dir);
+                return Err(e);
+            }
+        };
 
-        // CDP 连接（浏览器级）
-        let request = http::Request::builder()
-            .uri(&ws_url)
-            .body(())
-            .map_err(|e| anyhow!("构造 CDP 连接失败: {e}"))?;
-        let (ws, _resp) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| anyhow!("CDP 连接失败: {e}"))?;
+        // CDP 连接（浏览器级）——注意必须走 &str/String 路径：tungstenite 0.24 的
+        // `http::Request` 转换是恒等（不会补全握手头），只有 Uri/str 路径才会填充
+        // Host/Connection/Upgrade/Sec-WebSocket-Key 等头；否则 DevTools 会回 400
+        let (ws, _resp) = match tokio_tungstenite::connect_async(ws_url).await {
+            Ok(x) => x,
+            Err(e) => {
+                kill_browser_processes(&user_data_dir);
+                return Err(anyhow!("CDP 连接失败: {e}"));
+            }
+        };
         let (sink, stream) = ws.split();
         // reader 任务：按 id 路由响应到对应 oneshot（events 忽略）
         let pending: std::sync::Arc<std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>> =
@@ -407,6 +501,221 @@ impl Browser {
     }
 }
 
+// ==================== CF 质询求解（进程内浏览器 CDP；FlareSolverr 免容器替代） ====================
+
+/// CF 质询求解结果
+#[derive(Debug, Clone)]
+pub struct CfSolution {
+    /// 求解完成后目标页最终 HTML（document.documentElement.outerHTML）
+    pub html: String,
+    /// 求解后浏览器内该站点全部 cookie（name, value——含 cf_clearance；按 name 排序去重）
+    pub cookies: Vec<(String, String)>,
+    /// 浏览器真实 UA（与 cf_clearance 绑定：后续抓取需带同一 UA）
+    pub user_agent: String,
+}
+
+/// CF 质询状态检测 JS（质询等待循环每 500ms 求值一次）——challenge=true 表示仍在质询页
+pub const CF_CHALLENGE_STATE_JS: &str = r#"
+(function(){
+  try {
+    var features = document.querySelector('#challenge-form, [id^="cf-chl-"], [class*="cf-chl"], iframe[src*="challenges.cloudflare"], iframe[src*="challenge-platform"]');
+    var t = (document.title || '').toLowerCase();
+    var hasTitle = t.indexOf('just a moment') >= 0;
+    return {
+      challenge: !!(features || hasTitle),
+      ready: document.readyState,
+      url: location.href,
+      bodyChildren: document.body ? document.body.children.length : 0
+    };
+  } catch (e) { return { challenge: true, ready: 'error', url: '', bodyChildren: 0 }; }
+})()
+"#;
+
+/// 会话浏览器闲置回收时限（最后一次使用后 TTL 内无新请求 → 杀进程释放资源）
+const CF_SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
+
+/// 全局 CF 质询求解会话：惰性启动（首次 CF 命中时 launch）、并发互斥（tokio Mutex 排队）、
+/// 超时/异常自动重启（出错即弃用实例，下次调用重新 launch）
+struct CfSession {
+    browser: Browser,
+    last_used: std::time::Instant,
+}
+
+static CF_SESSION: LazyLock<tokio::sync::Mutex<Option<CfSession>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+/// 闲置回收：每次求解成功后挂一个定时任务——TTL 内无新使用则弃用会话（Drop 杀进程+清目录）。
+/// 并发触发多个无害（幂等：last_used 刷新后条件不满足即跳过）
+fn spawn_cf_session_reaper() {
+    tokio::spawn(async {
+        tokio::time::sleep(CF_SESSION_IDLE_TTL).await;
+        let mut guard = CF_SESSION.lock().await;
+        if let Some(s) = guard.as_ref() {
+            if s.last_used.elapsed() >= CF_SESSION_IDLE_TTL {
+                *guard = None; // Drop → 杀浏览器进程 + 清理 user-data-dir
+            }
+        }
+    });
+}
+
+/// 显式关闭 CF 求解会话（集成测试/优雅停机用；幂等）
+pub async fn shutdown_cf_session() {
+    let mut guard = CF_SESSION.lock().await;
+    if guard.is_some() {
+        *guard = None;
+    }
+}
+
+/// 解 CF 质询（进程内浏览器 CDP；会话级浏览器实例——惰性启动/互斥/异常自动重启）。
+///
+/// 流程：启动/复用会话浏览器（独立 user-data-dir，退出自动清理）→ Network.setCookies
+/// 注入 cookies → Page.navigate → 质询等待循环（每 500ms 求值 document：challenge 特征
+/// （#challenge-form/#cf-chl-*/iframe[src*=challenges.cloudflare]/title=="Just a moment"）
+/// 消失或 URL 变化到目标页；最多 max_wait_ms）→ 提取最终 HTML → Storage.getCookies
+/// （该站点全部，含 cf_clearance）→ {html, cookies, userAgent}。
+/// 超时返回明确错误；浏览器不可用/启动失败返回明确错误。
+pub async fn solve_cf_challenge(
+    url: &str,
+    cookies: &[(String, String)],
+    max_wait_ms: u64,
+) -> Result<CfSolution> {
+    let mut guard = CF_SESSION.lock().await;
+    // 惰性启动 / 复用（前次异常已在出错时弃用实例，这里自然重新 launch）
+    if guard.is_none() {
+        let browser = Browser::launch()
+            .await
+            .map_err(|e| anyhow!("CF 质询需浏览器环境：{e}"))?;
+        *guard = Some(CfSession {
+            browser,
+            last_used: std::time::Instant::now(),
+        });
+    }
+    let result = {
+        let session = guard.as_mut().expect("just initialized");
+        session.last_used = std::time::Instant::now();
+        solve_cf_with(&mut session.browser, url, cookies, max_wait_ms).await
+    };
+    match result {
+        Ok(sol) => {
+            spawn_cf_session_reaper();
+            Ok(sol)
+        }
+        Err(e) => {
+            // 超时/异常 → 弃用实例（Drop 杀进程 + 清 user-data-dir），下次调用自动重启
+            *guard = None;
+            Err(e)
+        }
+    }
+}
+
+/// 单次求解（浏览器实例已由会话就绪）
+async fn solve_cf_with(
+    browser: &mut Browser,
+    url: &str,
+    cookies: &[(String, String)],
+    max_wait_ms: u64,
+) -> Result<CfSolution> {
+    let parsed =
+        url::Url::parse(url).map_err(|e| anyhow!("URL 解析失败（{url}）: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("URL 无主机名（{url}）"))?
+        .to_string();
+    let secure = parsed.scheme() == "https";
+    let initial_url = url.to_string();
+
+    // ① 注入用户 cookie（会话连续性：cf_clearance 等登录态随请求携带）
+    browser.set_cookies(cookies, &host, secure).await?;
+
+    // ② 导航（navigate 内部已等 readyState==complete）
+    browser.navigate(url).await?;
+
+    // ③ 质询等待循环：每 500ms 求值 document——challenge 特征消失 或 URL 变化到目标页
+    let deadline = std::time::Instant::now() + Duration::from_millis(max_wait_ms);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "CF 质询求解超时（{}s）：{url}——页面仍停留在质询页（challenge 特征未消失）",
+                max_wait_ms / 1000
+            ));
+        }
+        match browser.evaluate(CF_CHALLENGE_STATE_JS).await {
+            Ok(state) => {
+                let challenge = state
+                    .get("challenge")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let ready = state
+                    .get("ready")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let cur_url = state
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let body_children = state
+                    .get("bodyChildren")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let url_changed = !cur_url.is_empty() && cur_url != initial_url;
+                let page_loaded = ready == "complete" || (ready != "loading" && body_children > 0);
+                if !challenge && (page_loaded || url_changed) {
+                    break;
+                }
+            }
+            Err(_) => { /* 导航中执行上下文切换——忽略，继续等待 */ }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // ④ 稳定等待 + 提取最终 HTML / 全部 cookie（含 cf_clearance）/ 浏览器 UA
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let html = browser
+        .evaluate("document.documentElement.outerHTML")
+        .await?
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let user_agent = browser
+        .evaluate("navigator.userAgent")
+        .await?
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let mut cookies_out: Vec<(String, String)> = browser
+        .get_cookies()
+        .await?
+        .into_iter()
+        .filter(|c| {
+            let domain = c.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+            cookie_domain_matches(domain, &host)
+        })
+        .filter_map(|c| {
+            let name = c.get("name")?.as_str()?.to_string();
+            let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Some((name, value))
+        })
+        .collect();
+    cookies_out.sort();
+    cookies_out.dedup();
+    Ok(CfSolution {
+        html,
+        cookies: cookies_out,
+        user_agent,
+    })
+}
+
+/// cookie domain 是否匹配目标主机（含父域 `.example.com` 形式；裸后缀 com 等不匹配）
+fn cookie_domain_matches(domain: &str, host: &str) -> bool {
+    let d = domain.trim_start_matches('.');
+    if d.is_empty() {
+        return false;
+    }
+    host == d || (d.contains('.') && host.ends_with(&format!(".{d}")))
+}
+
 /// 页面验证码检测 JS（DOM 启发式）——返回 {kind, ...} 或 null
 pub const DETECT_CAPTCHA_JS: &str = r#"
 (function(){
@@ -565,6 +874,29 @@ mod tests {
         let vars = std::collections::HashMap::new();
         let r = crate::parser::js::eval_js(DETECT_CAPTCHA_JS, &vars);
         assert!(r.is_ok(), "检测 JS 应可执行（无 DOM 时返回 null/空）");
+    }
+
+    #[test]
+    fn test_cf_challenge_state_js_shape() {
+        // 冒烟：JS 常量可被 boa 解析执行（无 DOM 时返回 challenge=true 状态对象）
+        let vars = std::collections::HashMap::new();
+        let r = crate::parser::js::eval_js(CF_CHALLENGE_STATE_JS, &vars);
+        assert!(r.is_ok(), "质询状态 JS 应可执行");
+    }
+
+    #[test]
+    fn test_cookie_domain_matches() {
+        // 精确主机
+        assert!(cookie_domain_matches("a.com", "a.com"));
+        // 父域（点前缀）
+        assert!(cookie_domain_matches(".a.com", "a.com"));
+        assert!(cookie_domain_matches(".a.com", "www.a.com"));
+        // 不匹配
+        assert!(!cookie_domain_matches("b.com", "a.com"));
+        assert!(!cookie_domain_matches("", "a.com"));
+        assert!(!cookie_domain_matches("com", "a.com")); // 裸后缀不匹配
+        assert!(!cookie_domain_matches(".com", "a.com"));
+        assert!(!cookie_domain_matches("a.com.evil.com", "a.com"));
     }
 }
 
