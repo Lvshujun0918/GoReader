@@ -1023,6 +1023,18 @@ async fn search_book_content(
         None if !has_chapters => return Json(ReturnData::err("书籍不存在")),
         None => {}
     }
+    // 文件型本地书（legacy loc_book：正文不入章节表）——解析文件逐章匹配
+    if let Some(book) = &shelf {
+        if book.origin == "loc_book" && book.book_url.starts_with("storage/") {
+            return match search_file_book_content(&state, &namespace, book, &key).await {
+                Ok(hits) => Json(ReturnData::ok(serde_json::to_value(hits).unwrap_or(serde_json::Value::Null))),
+                Err(e) => {
+                    tracing::warn!("searchBookContent 文件书失败 [{book_url}]: {e}");
+                    Json(ReturnData::err("搜索失败"))
+                }
+            };
+        }
+    }
     match state.storage.search_book_content(&book_url, &key, 100).await {
         Ok(hits) => Json(ReturnData::ok(
             serde_json::to_value(hits).unwrap_or(serde_json::Value::Null),
@@ -1032,6 +1044,58 @@ async fn search_book_content(
             Json(ReturnData::err("搜索失败"))
         }
     }
+}
+
+/// 文件型本地书全书搜索：解析文件 → 逐章匹配（key 大小写不敏感，snippet 取命中上下文）
+async fn search_file_book_content(
+    state: &AppState,
+    namespace: &str,
+    book: &crate::model::book::Book,
+    key: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let path = resolve_loc_book_file(&state.storage.config.storage_dir(), &book.book_url)
+        .ok_or_else(|| anyhow::anyhow!("文件不存在"))?;
+    let path_lower = path.to_string_lossy().to_lowercase();
+    let imported = if path_lower.ends_with(".epub") {
+        let bytes = std::fs::read(&path)?;
+        crate::service::local_book::parse_epub(&bytes)?
+    } else {
+        let user_rules = txt_toc_rule_regexes(state, namespace).await;
+        crate::service::local_book::parse_txt_file_with_rules(&path, &user_rules)?
+    };
+    let key_lower = key.to_lowercase();
+    let mut hits: Vec<serde_json::Value> = Vec::new();
+    for (i, ch) in imported.chapters.iter().enumerate() {
+        if hits.len() >= 100 {
+            break;
+        }
+        let title = if ch.title.is_empty() {
+            format!("第{}章", i + 1)
+        } else {
+            ch.title.clone()
+        };
+        let matched_in_title = ch.title.to_lowercase().contains(&key_lower);
+        let content_lower = ch.content.to_lowercase();
+        let pos = if matched_in_title {
+            Some(0usize)
+        } else {
+            content_lower.find(&key_lower)
+        };
+        if let Some(p) = pos {
+            let content = &ch.content;
+            let start = content.floor_char_boundary(p.saturating_sub(30));
+            let end = content.floor_char_boundary((p + key.len() + 50).min(content.len()));
+            let snippet = if start > 0 { "…" } else { "" }.to_string()
+                + &ch.content[start..end]
+                + if end < ch.content.len() { "…" } else { "" };
+            hits.push(serde_json::json!({
+                "chapterIndex": i,
+                "title": title,
+                "snippet": snippet,
+            }));
+        }
+    }
+    Ok(hits)
 }
 
 // ---------------- 书源订阅 ----------------
