@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { searchBookMulti, searchBookMultiSSE } from '@/api/search'
-import { getBookshelf } from '@/api/bookshelf'
+import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { useUserStore } from '@/stores/user'
 import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
 import type { Book, ReturnData, SearchBook } from '@/types'
@@ -312,8 +313,94 @@ function clearHistory() {
   history.value = []
 }
 
+/* ================= GAP 121：搜索热词（后端无接口——前端静态列表 + localStorage 记录点击排序） ================= */
+
+const HOT_SEARCHES = ['剑来', '诡秘之主', '凡人修仙传', '庆余年', '大奉打更人', '遮天', '雪中悍刀行', '斗破苍穹']
+const HOT_CLICKS_KEY = 'reader_hot_clicks'
+
+function loadHotClicks(): Record<string, number> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HOT_CLICKS_KEY) ?? '{}') as Record<string, unknown>
+    const out: Record<string, number> = {}
+    if (raw && typeof raw === 'object') {
+      for (const [k, v] of Object.entries(raw)) {
+        if (typeof v === 'number' && Number.isFinite(v)) out[k] = v
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+const hotClicks = ref<Record<string, number>>(loadHotClicks())
+/** 热词列表：静态表按本地点击次数降序（未点过保持原顺序） */
+const hotSearches = computed(() =>
+  [...HOT_SEARCHES].sort((a, b) => (hotClicks.value[b] ?? 0) - (hotClicks.value[a] ?? 0)),
+)
+/** 占位符：显示当前最热词 */
+const hotPlaceholder = computed(() =>
+  hotSearches.value[0] ? `热门：${hotSearches.value[0]}（书名 / 作者）` : '书名 / 作者',
+)
+function recordHotClick(word: string) {
+  hotClicks.value = { ...hotClicks.value, [word]: (hotClicks.value[word] ?? 0) + 1 }
+  try {
+    localStorage.setItem(HOT_CLICKS_KEY, JSON.stringify(hotClicks.value))
+  } catch {
+    /* ignore */
+  }
+}
+function searchHot(word: string) {
+  recordHotClick(word)
+  void doSearch(word)
+}
+
+/* ================= GAP 158：搜索结果快捷加入（行内「+」——saveBook 入架；失败静默不打断浏览） ================= */
+
+const shelfUrlSet = ref<Set<string>>(new Set())
+const shelfLoadedOnce = ref(false)
+const addingUrls = ref<Set<string>>(new Set())
+
+function loadShelfOnceForAdd() {
+  if (shelfLoadedOnce.value) return
+  shelfLoadedOnce.value = true
+  void getBookshelf()
+    .then((res) => {
+      shelfUrlSet.value = new Set((res.data ?? []).map((b) => b.bookUrl))
+    })
+    .catch(() => {
+      /* 静默：入架按钮仍可用，已入架状态未知 */
+    })
+}
+
+async function quickAdd(book: SearchBook) {
+  if (addingUrls.value.has(book.bookUrl) || shelfUrlSet.value.has(book.bookUrl)) return
+  addingUrls.value = new Set([...addingUrls.value, book.bookUrl])
+  try {
+    await saveBook({
+      bookUrl: book.bookUrl,
+      name: book.name,
+      author: book.author,
+      origin: book.origin,
+      originName: book.originName,
+      tocUrl: book.tocUrl,
+      intro: book.intro ?? '',
+      coverUrl: book.coverUrl ?? '',
+      group: 0,
+      type: book.type ?? 0,
+    } as Book)
+    shelfUrlSet.value = new Set([...shelfUrlSet.value, book.bookUrl])
+    ElMessage.success('已加入书架')
+  } catch {
+    // GAP 158：入架失败静默（不弹全局错误，不打断浏览）
+  } finally {
+    addingUrls.value = new Set([...addingUrls.value].filter((u) => u !== book.bookUrl))
+  }
+}
+
 onMounted(() => {
   loadHistory()
+  loadShelfOnceForAdd()
   // 支持 /search?key=xxx 预填并自动搜索（阅读页划词「搜索」跳转）
   const kw = typeof route.query.key === 'string' ? route.query.key.trim() : ''
   if (kw) void doSearch(kw)
@@ -416,7 +503,8 @@ onBeforeUnmount(() => {
         </svg>
         <span>书架</span>
       </button>
-      <span class="brand">夜读<span class="brand-dot">.</span></span>
+      <img class="brand-logo" src="/logo.svg" alt="夜读" />
+        <span class="brand">夜读<span class="brand-dot">.</span></span>
     </header>
 
     <main class="content">
@@ -439,7 +527,7 @@ onBeforeUnmount(() => {
           v-model="key"
           class="search-input"
           type="text"
-          placeholder="书名 / 作者"
+          :placeholder="hotPlaceholder"
           spellcheck="false"
           @keydown.enter="onEnter"
           @focus="onSearchFocus"
@@ -464,6 +552,25 @@ onBeforeUnmount(() => {
           <span v-if="s.sub" class="suggest-sub">{{ s.sub }}</span>
           <span class="suggest-tag" :class="s.kind">{{ s.kind === 'history' ? '历史' : '书架' }}</span>
         </button>
+      </div>
+
+      <!-- GAP 121：热门搜索（静态列表 + 本地点击计数排序） -->
+      <div v-if="!searching && !searched && !errorMsg" class="history hot">
+        <div class="history-head">
+          <span class="history-label">热门搜索</span>
+        </div>
+        <div class="history-chips">
+          <button
+            v-for="h in hotSearches"
+            :key="h"
+            class="history-chip hot"
+            type="button"
+            :title="`搜索「${h}」`"
+            @click="searchHot(h)"
+          >
+            {{ h }}
+          </button>
+        </div>
       </div>
 
       <!-- 搜索历史 -->
@@ -494,6 +601,18 @@ onBeforeUnmount(() => {
           {{ usingSSE ? `正在搜索 · 已搜索 ${searchedSources} 个书源` : '正在搜索多个书源…' }}
         </span>
         <button class="stop-btn" type="button" @click="stopSearch">停止</button>
+      </div>
+
+      <!-- GAP 72：搜索首载骨架（shimmer 行；首屏无结果时展示） -->
+      <div v-if="searching && results.length === 0" class="skeleton-list" aria-label="搜索中">
+        <div v-for="i in 6" :key="i" class="skeleton-row">
+          <div class="skeleton-cover"></div>
+          <div class="skeleton-body">
+            <div class="skeleton-line w60"></div>
+            <div class="skeleton-line w40"></div>
+            <div class="skeleton-line w85"></div>
+          </div>
+        </div>
       </div>
 
       <!-- 错误态（无结果时整行展示） -->
@@ -559,6 +678,20 @@ onBeforeUnmount(() => {
                   </p>
                   <p v-if="entry.book.intro" class="result-intro">{{ entry.book.intro }}</p>
                 </div>
+                <!-- GAP 158：快捷加入书架（hover 显示「+」；已在书架显示 ✓；失败静默） -->
+                <button
+                  class="quick-add"
+                  type="button"
+                  :class="{ done: shelfUrlSet.has(entry.book.bookUrl), busy: addingUrls.has(entry.book.bookUrl) }"
+                  :disabled="shelfUrlSet.has(entry.book.bookUrl) || addingUrls.has(entry.book.bookUrl)"
+                  :title="shelfUrlSet.has(entry.book.bookUrl) ? '已在书架' : '加入书架'"
+                  @click.stop="quickAdd(entry.book)"
+                >
+                  <svg v-if="shelfUrlSet.has(entry.book.bookUrl)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4.5 12.5l5 5L19.5 7" />
+                  </svg>
+                  <span v-else>{{ addingUrls.has(entry.book.bookUrl) ? '…' : '+' }}</span>
+                </button>
                 <svg class="result-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M9 6l6 6-6 6" />
                 </svg>
@@ -636,11 +769,13 @@ onBeforeUnmount(() => {
   height: 14px;
 }
 .brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   font-size: 15px;
   font-weight: 300;
   letter-spacing: 3px;
-  color: var(--text-1);
-}
+  color: var(--text-1);}
 .brand-dot {
   color: var(--accent);
   font-weight: 400;
@@ -1099,6 +1234,126 @@ onBeforeUnmount(() => {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+/* GAP 158：快捷加入按钮（hover 显示；触屏常显） */
+.quick-add {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  background: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 17px;
+  font-weight: 300;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transform: scale(0.9);
+  transition:
+    opacity 0.15s ease,
+    transform 0.15s ease,
+    background-color 0.2s ease,
+    color 0.2s ease;
+}
+.result-item:hover .quick-add,
+.quick-add:focus-visible {
+  opacity: 1;
+  transform: scale(1);
+}
+.quick-add:hover {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.quick-add:disabled {
+  cursor: default;
+}
+.quick-add.done {
+  border-color: #529b2e;
+  color: #529b2e;
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: none;
+}
+.quick-add.busy {
+  opacity: 1;
+}
+.quick-add svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* GAP 72：搜索骨架（shimmer 行） */
+.skeleton-list {
+  margin-top: 22px;
+  display: flex;
+  flex-direction: column;
+}
+.skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.skeleton-cover {
+  flex-shrink: 0;
+  width: 44px;
+  height: 58px;
+  border-radius: 6px;
+  background: #f0f0f2;
+  position: relative;
+  overflow: hidden;
+}
+.skeleton-body {
+  flex: 1;
+  min-width: 0;
+}
+.skeleton-line {
+  height: 11px;
+  border-radius: 4px;
+  background: #f0f0f2;
+  position: relative;
+  overflow: hidden;
+}
+.skeleton-line.w60 {
+  width: 60%;
+}
+.skeleton-line.w40 {
+  width: 40%;
+  margin-top: 9px;
+}
+.skeleton-line.w85 {
+  width: 85%;
+  margin-top: 9px;
+}
+.skeleton-cover::after,
+.skeleton-line::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.65), transparent);
+  animation: skeleton-shimmer 1.5s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* GAP 121：热门搜索 chips */
+.history.hot .history-chip {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--text-2);
+}
+.history.hot .history-chip:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
 .result-arrow {
   flex-shrink: 0;
   width: 14px;
@@ -1162,6 +1417,11 @@ onBeforeUnmount(() => {
   }
   .search-btn {
     padding: 6px 14px;
+  }
+  /* GAP 158：触屏无 hover——快捷加入常显 */
+  .quick-add {
+    opacity: 1;
+    transform: scale(1);
   }
 }
 </style>

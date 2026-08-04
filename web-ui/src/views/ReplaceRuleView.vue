@@ -2,7 +2,6 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import LogoMark from '@/components/LogoMark.vue'
 import { deleteReplaceRule, getReplaceRules, saveReplaceRule } from '@/api/replaceRules'
 import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
 import { useUserStore } from '@/stores/user'
@@ -353,7 +352,7 @@ onMounted(() => {
     <!-- 极简导航：字标 + 页面入口 -->
     <header class="topbar">
       <div class="brand">
-        <LogoMark class="brand-logo" />
+        <img class="brand-logo" src="/logo.svg" alt="夜读" />
         <span class="brand-name">夜读<span class="brand-dot">.</span></span>
       </div>
 

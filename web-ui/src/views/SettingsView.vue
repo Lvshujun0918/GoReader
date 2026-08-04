@@ -909,13 +909,23 @@ async function copyWebdavUrl() {
 const backupBusy = ref(false)
 const backupPath = ref('')
 const backupDownloadBusy = ref(false)
+/** GAP 151：备份目标子目录（默认 webdav/legado；localStorage 记忆） */
+const BACKUP_PATH_KEY = 'reader_backup_path'
+const backupDir = ref(localStorage.getItem(BACKUP_PATH_KEY) || 'webdav/legado')
+watch(backupDir, (v) => {
+  try {
+    localStorage.setItem(BACKUP_PATH_KEY, v)
+  } catch {
+    /* ignore */
+  }
+})
 
 async function runBackup() {
   if (backupBusy.value) return
   backupBusy.value = true
   backupPath.value = ''
   try {
-    const res = await backupToWebdav()
+    const res = await backupToWebdav(backupDir.value.trim() || undefined)
     backupPath.value = res.data?.path ?? ''
     if (!backupPath.value) {
       ElMessage.warning('备份完成，但未返回文件路径')
@@ -1278,8 +1288,20 @@ async function runExportData() {
           </button>
         </div>
         <div class="row">
+          <span class="row-label">备份路径</span>
+          <input
+            v-model="backupDir"
+            class="path-input"
+            type="text"
+            placeholder="webdav/legado"
+            maxlength="120"
+            spellcheck="false"
+            :title="backupDir"
+          />
+        </div>
+        <div class="row">
           <span class="row-label">WebDAV 备份</span>
-          <span class="row-value">{{ backupBusy ? '备份中…' : '备份到 WebDAV legado 目录' }}</span>
+          <span class="row-value">{{ backupBusy ? '备份中…' : '备份到 WebDAV' }}</span>
           <button class="row-action" type="button" :disabled="backupBusy" @click="runBackup">
             {{ backupBusy ? '备份中…' : '立即备份' }}
           </button>
@@ -1303,7 +1325,7 @@ async function runExportData() {
             {{ backupDownloadBusy ? '下载中…' : '下载备份' }}
           </button>
         </div>
-        <p class="card-note">WebDAV 地址供外部客户端（如 RaiDrive、文件管理器）挂载访问；备份/导出需要后端已配置 WebDAV。</p>
+        <p class="card-note">WebDAV 地址供外部客户端（如 RaiDrive、文件管理器）挂载访问；备份/导出需要后端已配置 WebDAV。备份路径参数已随请求发送，后端当前固定写入 webdav/legado 目录（路径参数待后端支持）。</p>
       </section>
 
       <!-- 缓存（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache） -->
@@ -2258,6 +2280,30 @@ async function runExportData() {
   font-size: 12px;
   font-weight: 300;
   color: var(--text-3);
+}
+/* GAP 151：备份路径输入（细字下划线风格） */
+.path-input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 2px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-1);
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  font-size: 12.5px;
+  font-weight: 400;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+.path-input::placeholder {
+  color: var(--text-3);
+  font-weight: 300;
+}
+.path-input:focus {
+  border-bottom-color: var(--accent);
 }
 /* GAP 53：OPDS 测试连接结果着色 */
 .row-value.opds-test {

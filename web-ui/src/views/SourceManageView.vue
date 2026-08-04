@@ -1454,7 +1454,8 @@ onBeforeUnmount(() => {
         </svg>
         <span>书架</span>
       </button>
-      <span class="brand">夜读<span class="brand-dot">.</span></span>
+      <img class="brand-logo" src="/logo.svg" alt="夜读" />
+        <span class="brand">夜读<span class="brand-dot">.</span></span>
     </header>
 
     <main class="content">
@@ -2241,11 +2242,13 @@ onBeforeUnmount(() => {
   height: 14px;
 }
 .brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   font-size: 15px;
   font-weight: 300;
   letter-spacing: 3px;
-  color: var(--text-1);
-}
+  color: var(--text-1);}
 .brand-dot {
   color: var(--accent);
   font-weight: 400;

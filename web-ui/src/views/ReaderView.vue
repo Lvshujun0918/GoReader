@@ -90,6 +90,16 @@ function cycleTheme() {
   theme.value = THEME_ORDER[(i + 1) % THEME_ORDER.length]
 }
 
+/* ---------------- GAP 5：纸纹（细噪点 radial-gradient 微纹理叠在阅读页背景上；3 主题通用，纸色主题最佳） ---------------- */
+
+const TEXTURE_KEY = 'reader_texture'
+const paperTexture = ref(false)
+{
+  const raw = localStorage.getItem(TEXTURE_KEY)
+  if (raw === '1') paperTexture.value = true
+}
+watch(paperTexture, (v) => persist(TEXTURE_KEY, v ? '1' : '0'))
+
 /* ---------------- 2. 排版（行距/段距/字重） ---------------- */
 
 const MIN_LINE = 1.5
@@ -1119,6 +1129,32 @@ function searchSelection() {
   void router.push({ path: '/search', query: { key: text } })
 }
 
+/* ---------------- GAP 124：复制本章（navigator.clipboard 全文；失败回退 execCommand；提示字数） ---------------- */
+
+async function copyChapter() {
+  const text = paragraphs.value.join('\n')
+  if (!text) {
+    ElMessage.info('本章暂无内容可复制')
+    return
+  }
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    try {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    } catch {
+      ElMessage.error('复制失败，请手动长按选择复制')
+      return
+    }
+  }
+  ElMessage.success(`已复制本章（${text.length} 字）`)
+}
+
 /* ---------------- 10. 章节图片预加载（下一章前 5 张） ---------------- */
 
 const preloadedChapters = new Set<string>()
@@ -1719,7 +1755,18 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="pageRef" class="reader-page">
+  <div ref="pageRef" class="reader-page" :class="{ texture: paperTexture }">
+    <!-- GAP 149：顶部细进度条（scroll 比例，1px 强调色；点击可跳章） -->
+    <button
+      v-if="!loading && !loadError && !notFound && realChapters.length > 0"
+      class="reading-progress"
+      type="button"
+      title="跳转章节"
+      @click="jumpOpen = true"
+    >
+      <i class="reading-progress-fill" :style="{ width: `${progressPct}%` }"></i>
+    </button>
+
     <!-- 顶部极简栏 -->
     <header class="topbar">
       <button class="icon-btn" type="button" title="返回" @click="goBack">
@@ -1793,6 +1840,15 @@ onBeforeUnmount(() => {
         </button>
         <button class="font-btn" type="button" title="搜索本章内容" @click="openChapterSearch">
           搜索
+        </button>
+        <button
+          class="font-btn"
+          type="button"
+          :disabled="loading || loadError || paragraphs.length === 0"
+          title="复制本章全文"
+          @click="copyChapter"
+        >
+          复制本章
         </button>
         <button
           class="font-btn auto-btn"
@@ -2182,6 +2238,23 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="set-row">
+            <span class="set-label">纸纹</span>
+            <div class="set-controls">
+              <button
+                class="switch"
+                :class="{ on: paperTexture }"
+                type="button"
+                role="switch"
+                :aria-checked="paperTexture"
+                :title="paperTexture ? '关闭纸纹' : '开启纸纹（细噪点微纹理，纸色主题效果最佳）'"
+                @click="paperTexture = !paperTexture"
+              >
+                <span class="switch-knob"></span>
+              </button>
+            </div>
+          </div>
+
+          <div class="set-row">
             <span class="set-label">翻页</span>
             <div class="seg">
               <button
@@ -2479,6 +2552,40 @@ onBeforeUnmount(() => {
   /* 阅读主题变量在 .reader-page[data-reader-theme] 上覆盖（与界面主题分离），此处显式取背景 */
   background: var(--bg);
   animation: fade-in 0.2s ease both;
+}
+
+/* ================= GAP 5：纸纹（细噪点——radial-gradient 微纹理叠在背景色上；亮色主题黑点、深色主题白点） ================= */
+.reader-page.texture {
+  background-image:
+    radial-gradient(rgba(0, 0, 0, 0.03) 0.7px, transparent 0.9px),
+    radial-gradient(rgba(0, 0, 0, 0.018) 0.5px, transparent 0.8px);
+  background-size: 4px 4px, 6px 6px;
+  background-position: 0 0, 2px 3px;
+}
+.reader-page.texture[data-reader-theme='dark'] {
+  background-image:
+    radial-gradient(rgba(255, 255, 255, 0.025) 0.7px, transparent 0.9px),
+    radial-gradient(rgba(255, 255, 255, 0.015) 0.5px, transparent 0.8px);
+}
+
+/* ================= GAP 149：顶部细进度条（1px 强调色，scroll 比例） ================= */
+.reading-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 25;
+  height: 2px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+.reading-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.15s ease;
 }
 
 /* ================= 顶部极简栏 ================= */

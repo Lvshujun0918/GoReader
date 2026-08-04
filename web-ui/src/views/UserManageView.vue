@@ -2,7 +2,6 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import LogoMark from '@/components/LogoMark.vue'
 import {
   addUser,
   deleteUser,
@@ -382,7 +381,7 @@ onBeforeUnmount(() => {
     <!-- 极简导航：字标 + 页面入口 -->
     <header class="topbar">
       <div class="brand">
-        <LogoMark class="brand-logo" />
+        <img class="brand-logo" src="/logo.svg" alt="夜读" />
         <span class="brand-name">夜读<span class="brand-dot">.</span></span>
       </div>
 

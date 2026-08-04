@@ -76,7 +76,13 @@ const router = createRouter({
       component: () => import('@/views/UserManageView.vue'),
       meta: { title: '用户管理' },
     },
-    { path: '/:pathMatch(.*)*', redirect: '/' },
+    // GAP 128：路由兜底——未匹配路径进简单 404 页（返回书架）
+    {
+      path: '/:pathMatch(.*)*',
+      name: 'not-found',
+      component: () => import('@/views/NotFoundView.vue'),
+      meta: { title: '页面不存在' },
+    },
   ],
 })
 

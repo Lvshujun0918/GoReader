@@ -274,3 +274,12 @@ body {
     min-height: 40px;
   }
 }
+
+/* 全局徽标（各视图 brand 统一；具体尺寸由各视图覆盖） */
+.brand-logo {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  object-fit: cover;
+}

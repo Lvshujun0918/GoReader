@@ -2,7 +2,6 @@
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import LogoMark from '@/components/LogoMark.vue'
 import { useUserStore } from '@/stores/user'
 import { listFiles, getFile, saveFile, downloadFile, uploadFile, mkdir, deleteFile } from '@/api/file'
 import { isNeedSecureKey } from '@/api/users'
@@ -575,7 +574,7 @@ onBeforeUnmount(() => {
     <!-- 极简导航：字标 + 页面入口 -->
     <header class="topbar">
       <div class="brand">
-        <LogoMark class="brand-logo" />
+        <img class="brand-logo" src="/logo.svg" alt="夜读" />
         <span class="brand-name">夜读<span class="brand-dot">.</span></span>
       </div>
 

@@ -12,6 +12,8 @@ const store = useUserStore()
 const mode = ref<'login' | 'register'>('login')
 const loading = ref(false)
 const form = reactive({ username: '', password: '', code: '' })
+/** GAP 150：记住我——不勾选时 token 存 sessionStorage（关闭标签页即登出） */
+const remember = ref(localStorage.getItem('reader_remember') !== '0')
 
 function switchMode(m: 'login' | 'register') {
   mode.value = m
@@ -41,9 +43,12 @@ async function submit() {
       // GAP 90：注册模式携带邀请码（后端 register 校验 code 参数）
       code: mode.value === 'register' && form.code.trim() ? form.code.trim() : undefined,
     })
-    store.setSession(res.data.accessToken, res.data.username)
+    store.setSession(res.data.accessToken, res.data.username, remember.value)
     ElMessage.success(mode.value === 'login' ? '欢迎回来' : '注册成功，已自动登录')
-    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
+    // GAP 127：登录成功回跳 redirect query（仅限站内路径，防开放重定向）
+    const q = route.query.redirect
+    const redirect =
+      typeof q === 'string' && q.startsWith('/') && !q.startsWith('//') ? q : '/'
     await router.replace(redirect)
   } catch {
     // 错误提示已由 axios 拦截器统一处理
@@ -122,6 +127,12 @@ async function submit() {
           />
         </label>
 
+        <!-- GAP 150：记住我（不勾选 → sessionStorage 存 token，关闭标签页即登出） -->
+        <label class="remember-row">
+          <input v-model="remember" class="remember-box" type="checkbox" />
+          <span class="remember-label">记住我（30 天免登录；不勾选则关闭标签页后需重新登录）</span>
+        </label>
+
         <button class="submit-btn" type="submit" :disabled="loading">
           <span v-if="loading" class="btn-spinner" aria-hidden="true"></span>
           <span v-else>{{ mode === 'login' ? '登 录' : '注 册' }}</span>
@@ -138,7 +149,6 @@ async function submit() {
           {{ mode === 'login' ? '立即注册' : '去登录' }}
         </button>
         <a class="tg-foot" href="https://t.me/readerdev" target="_blank" rel="noopener">Telegram 交流群</a>
-        </button>
       </p>
     </main>
 
@@ -255,6 +265,29 @@ async function submit() {
 }
 .field-input:focus {
   border-bottom-color: var(--accent);
+}
+
+/* ---------- 记住我（GAP 150） ---------- */
+.remember-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: -12px;
+  cursor: pointer;
+}
+.remember-box {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.remember-label {
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 0.5px;
+  color: var(--text-3);
+  cursor: pointer;
+  user-select: none;
 }
 
 /* ---------- 提交按钮（纯色无渐变） ---------- */

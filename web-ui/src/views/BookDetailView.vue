@@ -164,6 +164,13 @@ function startReading() {
   void router.push(`/reader/${encodeURIComponent(shelfBook.value.bookUrl)}`)
 }
 
+/** GAP 157：续读进度——durChapterIndex>0 时「开始阅读」显示「续读 第 N 章」（N=章节号 1 起） */
+const resumeLabel = computed(() => {
+  const idx = shelfBook.value?.durChapterIndex
+  if (typeof idx === 'number' && idx > 0) return `续读 第 ${idx + 1} 章`
+  return '开始阅读'
+})
+
 /** 非书架书直接阅读（不加入书架——退出时阅读器提醒入架） */
 function startReadingTemp() {
   const b = shelfBook.value ?? info.value
@@ -832,7 +839,8 @@ onMounted(load)
         </svg>
         <span>书架</span>
       </button>
-      <span class="brand">夜读<span class="brand-dot">.</span></span>
+      <img class="brand-logo" src="/logo.svg" alt="夜读" />
+        <span class="brand">夜读<span class="brand-dot">.</span></span>
     </header>
 
     <main class="content">
@@ -968,7 +976,7 @@ onMounted(load)
           <div class="actions">
             <!-- GAP 21：书架书显示「已在书架」标记 + 开始阅读；非书架书 → 加入书架（入架成功后变开始阅读） -->
             <span v-if="shelfBook" class="onshelf-tag" title="本书已在书架中">已在书架</span>
-            <button v-if="shelfBook" class="read-btn" type="button" @click="startReading">开始阅读</button>
+            <button v-if="shelfBook" class="read-btn" type="button" @click="startReading">{{ resumeLabel }}</button>
             <template v-else>
               <button class="read-btn ghost" type="button" @click="startReadingTemp">直接阅读</button>
               <button class="add-btn" type="button" :disabled="saving" @click="addToShelf">
@@ -1340,11 +1348,13 @@ onMounted(load)
   height: 15px;
 }
 .brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   font-size: 15px;
   font-weight: 300;
   letter-spacing: 3px;
-  color: var(--text-1);
-}
+  color: var(--text-1);}
 .brand-dot {
   color: var(--accent);
   font-weight: 400;

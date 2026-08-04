@@ -550,6 +550,47 @@ function coverInitial(name: string): string {
   return ch ? ch.toUpperCase() : '书'
 }
 
+/* ================= GAP 146：书架置顶（localStorage: reader_pinned {url: ts}——排序优先置顶） ================= */
+
+const PINNED_KEY = 'reader_pinned'
+const pinned = ref<Record<string, number>>({})
+{
+  try {
+    const raw = JSON.parse(localStorage.getItem(PINNED_KEY) ?? '{}') as Record<string, unknown>
+    if (raw && typeof raw === 'object') {
+      for (const [k, v] of Object.entries(raw)) {
+        if (typeof v === 'number' && Number.isFinite(v)) pinned.value[k] = v
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+function persistPinned() {
+  try {
+    localStorage.setItem(PINNED_KEY, JSON.stringify(pinned.value))
+  } catch {
+    /* ignore */
+  }
+}
+const isPinned = (book: Book) => !!pinned.value[book.bookUrl]
+
+/** 书卡菜单「置顶/取消置顶」（长按菜单 / 右键 / ⋯） */
+function togglePin() {
+  const book = menuBook.value
+  if (!book) return
+  if (pinned.value[book.bookUrl]) {
+    const next = { ...pinned.value }
+    delete next[book.bookUrl]
+    pinned.value = next
+  } else {
+    pinned.value = { ...pinned.value, [book.bookUrl]: Date.now() }
+  }
+  persistPinned()
+  ElMessage.success(isPinned(book) ? '已置顶（排序优先）' : '已取消置顶')
+  closeMenu()
+}
+
 const filtered = computed(() => {
   const kw = keyword.value.trim().toLowerCase()
   const gid = activeGroup.value
@@ -592,6 +633,11 @@ const filtered = computed(() => {
           (b.durChapterTime ?? 0) - (a.durChapterTime ?? 0) ||
           (b.latestChapterTime ?? 0) - (a.latestChapterTime ?? 0),
       )
+  }
+  // GAP 146：置顶优先（置顶时间倒序；无置顶书时保持原排序；sort 稳定故未置顶书相对顺序不变）
+  if (Object.keys(pinned.value).length > 0) {
+    const pinTs = (b: Book) => pinned.value[b.bookUrl] ?? 0
+    sorted.sort((a, b) => pinTs(b) - pinTs(a))
   }
   return sorted
 })
@@ -1777,6 +1823,8 @@ onMounted(() => {
               <span v-if="bookProgress(book) !== null" class="progress-badge" :title="`已读 ${bookProgress(book)}%（第 ${(book.durChapterIndex ?? 0) + 1}/${book.totalChapterNum} 章）`">
                 {{ bookProgress(book) }}%
               </span>
+              <!-- GAP 146：置顶角标 -->
+              <span v-if="isPinned(book)" class="pin-badge" title="已置顶（长按/右键菜单可取消）">置顶</span>
             </div>
             <div class="book-meta">
               <p class="book-name" :title="book.name">{{ book.name }}</p>
@@ -1964,6 +2012,13 @@ onMounted(() => {
         <div v-if="menuOpen && menuBook" class="ctx-overlay" @click="onOverlayClick" @contextmenu.prevent="closeMenu">
           <div class="ctx-menu" :style="{ left: menuPos.x + 'px', top: menuPos.y + 'px' }" @click.stop>
             <template v-if="!movePanel">
+              <button class="ctx-item" type="button" @click="togglePin">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M9 4h6l-1 6 3 3v2H7v-2l3-3z" />
+                  <path d="M12 15v5" />
+                </svg>
+                {{ isPinned(menuBook) ? '取消置顶' : '置顶' }}
+              </button>
               <button class="ctx-item" type="button" @click="movePanel = true">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h4L12 6.5h6.5A1.5 1.5 0 0 1 20 8v10.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5z" />
@@ -2720,6 +2775,12 @@ onMounted(() => {
   bottom: 4px;
   right: 4px;
 }
+.book-grid.list .pin-badge {
+  font-size: 9.5px;
+  padding: 1px 5px;
+  left: 4px;
+  bottom: 4px;
+}
 
 .book-card {
   position: relative;
@@ -2852,22 +2913,57 @@ onMounted(() => {
   text-overflow: ellipsis;
 }
 
-/* ================= 骨架屏（浅灰静置） ================= */
+/* ================= 骨架屏（浅灰静置 + GAP 72 shimmer 扫光） ================= */
+.skeleton-cover,
+.skeleton-line {
+  position: relative;
+  overflow: hidden;
+  background: #f0f0f2;
+}
 .skeleton-cover {
   aspect-ratio: 3 / 4;
   border-radius: 10px;
-  background: #f0f0f2;
   border: 1px solid var(--border);
 }
 .skeleton-line {
   height: 11px;
   margin-top: 12px;
   border-radius: 4px;
-  background: #f0f0f2;
 }
 .skeleton-line.short {
   width: 55%;
   margin-top: 8px;
+}
+/* GAP 72：shimmer 扫光（渐变平移） */
+.skeleton-cover::after,
+.skeleton-line::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.65), transparent);
+  animation: skeleton-shimmer 1.5s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* GAP 146：置顶角标（封面左下角细字） */
+.pin-badge {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  z-index: 2;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: rgba(24, 24, 27, 0.72);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  pointer-events: none;
 }
 
 /* ================= 空状态 ================= */

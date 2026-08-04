@@ -3,12 +3,15 @@ import { downloadFile } from './file'
 import type { ReturnData } from '@/types'
 
 /**
- * POST /reader3/backupToWebdav：备份数据到 WebDAV legado 目录。
+ * POST /reader3/backupToWebdav：备份数据到 WebDAV。
+ * body { path?: string }：目标子目录（默认 webdav/legado）。
+ * GAP 151：路径参数已随请求发送；后端当前固定写入 webdav/legado（create_backup_zip 硬编码），
+ * 尚未消费 path 参数——前端先传参预留，后端支持后即可切换目录。
  * 响应：ReturnData<{ path: string }>，path 为备份 zip 的绝对路径
  * （storage/data/{ns}/webdav/legado/backup-{ts}.zip）。
  */
-export function backupToWebdav(): Promise<ReturnData<{ path: string }>> {
-  return post<{ path: string }>('/backupToWebdav')
+export function backupToWebdav(path?: string): Promise<ReturnData<{ path: string }>> {
+  return post<{ path: string }>('/backupToWebdav', path ? { path } : undefined)
 }
 
 /**

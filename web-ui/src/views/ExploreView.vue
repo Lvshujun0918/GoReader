@@ -7,7 +7,8 @@
           <path d="M19 12H5" /><path d="M11 18l-6-6 6-6" />
         </svg>
       </button>
-      <span class="brand">夜读<em>.</em></span>
+      <img class="brand-logo" src="/logo.svg" alt="夜读" />
+        <span class="brand">夜读<em>.</em></span>
       <span class="title">{{ source ? applyHan(source.bookSourceName, hanMode) : '探索' }}</span>
       <div class="top-actions">
         <button class="han-btn" type="button" :title="'简繁转换（当前：' + hanLabel + '）'" @click="toggleHan(); updateHanLabel()">
@@ -22,6 +23,26 @@
     <!-- 书源列表（legado 语义：所有 enabledExplore 书源） -->
     <main v-if="!source" class="main" :style="{ maxWidth: contentWidth }">
       <p class="page-hint">书源探索</p>
+
+      <!-- GAP 123：收藏的书单（点击直达对应书源分类） -->
+      <div v-if="favList.length" class="fav-section">
+        <p class="page-hint">收藏的书单</p>
+        <div class="fav-chips">
+          <button
+            v-for="f in favList"
+            :key="f.url"
+            type="button"
+            class="fav-chip"
+            :title="`${f.sourceName} · ${f.title}`"
+            @click="openFav(f)"
+          >
+            <span class="fav-star">★</span>
+            <span class="fav-name">{{ applyHan(f.title, hanMode) }}</span>
+            <span class="fav-src">{{ f.sourceName }}</span>
+          </button>
+        </div>
+      </div>
+
       <!-- 搜索框：下拉提示最近搜索（localStorage 最近 10 条，与搜索页共用） -->
       <div class="search-wrap">
         <div class="explore-search">
@@ -125,6 +146,14 @@
             @click="openCategory(c)"
           >
             <template v-if="c.type === 'link'">↗</template>
+            <!-- GAP 123：书单标题旁收藏星标（点击星标收藏/取消，不切换分类） -->
+            <span
+              v-else
+              class="cat-star"
+              :class="{ fav: isFav(c.url) }"
+              :title="isFav(c.url) ? '取消收藏该书单' : '收藏该书单'"
+              @click.stop="toggleFav(c)"
+            >{{ isFav(c.url) ? '★' : '☆' }}</span>
             {{ c.title ? applyHan(c.title, hanMode) : '默认' }}
           </button>
         </div>
@@ -176,6 +205,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
 import { applyHan, getHanMode, type HanMode } from '@/utils/chinese'
 import { useRouter } from 'vue-router'
 import { getExploreSources, getExploreUrls, exploreBook } from '@/api/explore'
@@ -269,6 +299,93 @@ const filteredBooks = computed(() => {
     return hanName.includes(kw) || hanAuthor.includes(kw)
   })
 })
+
+/* ============ GAP 123：书单收藏（localStorage: reader_fav_explores {url: {title, sourceUrl, sourceName}}） ============ */
+
+interface FavExplore {
+  title: string
+  sourceUrl: string
+  sourceName: string
+}
+
+const FAV_KEY = 'reader_fav_explores'
+
+function loadFavExplores(): Record<string, FavExplore> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FAV_KEY) ?? '{}') as Record<string, unknown>
+    const out: Record<string, FavExplore> = {}
+    if (raw && typeof raw === 'object') {
+      for (const [k, v] of Object.entries(raw)) {
+        if (v && typeof v === 'object' && typeof (v as FavExplore).title === 'string') {
+          out[k] = v as FavExplore
+        }
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+const favExplores = ref<Record<string, FavExplore>>(loadFavExplores())
+
+function persistFavExplores() {
+  try {
+    localStorage.setItem(FAV_KEY, JSON.stringify(favExplores.value))
+  } catch {
+    /* ignore */
+  }
+}
+
+const isFav = (url: string) => !!favExplores.value[url]
+
+/** 收藏/取消收藏当前书单（分类） */
+function toggleFav(c: ExploreCategory) {
+  if (!source.value) return
+  if (favExplores.value[c.url]) {
+    const next = { ...favExplores.value }
+    delete next[c.url]
+    favExplores.value = next
+    ElMessage.info('已取消收藏书单')
+  } else {
+    favExplores.value = {
+      ...favExplores.value,
+      [c.url]: {
+        title: c.title || '默认',
+        sourceUrl: source.value.bookSourceUrl,
+        sourceName: source.value.bookSourceName,
+      },
+    }
+    ElMessage.success('已收藏书单')
+  }
+  persistFavExplores()
+}
+
+const favList = computed(() =>
+  Object.entries(favExplores.value).map(([url, f]) => ({ url, ...f })),
+)
+
+/** 打开收藏：进入对应书源并选中收藏的分类（分类加载为异步，用 pendingFavUrl 消费） */
+let pendingFavUrl = ''
+async function openFav(f: { url: string; title: string; sourceUrl: string; sourceName: string }) {
+  if (source.value && source.value.bookSourceUrl === f.sourceUrl) {
+    pendingFavUrl = f.url
+    if (categories.value.length > 0) {
+      if (activeUrl.value !== f.url) switchCategory(f.url)
+      pendingFavUrl = ''
+    }
+    return
+  }
+  // 书源列表未加载完成时先等待
+  if (sources.value.length === 0) await loadSources()
+  const s = sources.value.find((x) => x.bookSourceUrl === f.sourceUrl)
+  if (!s) {
+    ElMessage.warning('该书单所属书源不存在或已禁用探索')
+    return
+  }
+  pendingFavUrl = f.url
+  selectSource(s)
+}
 
 /* ============ 分页（GAP #51：后端契约 {books, hasMore}） ============ */
 /** 后端分页契约就绪状态：null=未知 / true={books,hasMore} / false=仍返回旧数组 */
@@ -369,8 +486,15 @@ async function loadCategories() {
     const entries = (res.data ?? []) as ExploreCategory[]
     categories.value = entries
     if (entries.length > 0) {
-      activeUrl.value = entries[0].url
-      await loadBooks(1)
+      // GAP 123：从收藏入口进入时选中收藏的分类
+      if (pendingFavUrl && entries.some((c) => c.url === pendingFavUrl)) {
+        activeUrl.value = pendingFavUrl
+        pendingFavUrl = ''
+        await loadBooks(1)
+      } else {
+        activeUrl.value = entries[0].url
+        await loadBooks(1)
+      }
     }
   } catch {
     catsError.value = '分类加载失败'
@@ -504,10 +628,12 @@ onBeforeUnmount(() => {
   height: 20px;
 }
 .brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   font-size: 16px;
   font-weight: 300;
-  letter-spacing: 1px;
-}
+  letter-spacing: 1px;}
 .brand em {
   font-style: normal;
   color: var(--accent, #4f46e5);
@@ -804,6 +930,80 @@ onBeforeUnmount(() => {
 .cat.link {
   border-style: dashed;
   color: var(--text-3, #999);
+}
+/* GAP 123：书单标题旁收藏星标（空心=未收藏；实心=已收藏） */
+.cat-star {
+  display: inline-block;
+  margin-right: 5px;
+  font-size: 11px;
+  color: var(--text-3, #999);
+  transition: color 0.2s ease, transform 0.15s ease;
+  user-select: none;
+}
+.cat-star:hover {
+  transform: scale(1.25);
+}
+.cat-star.fav {
+  color: #eab308;
+}
+.cat:hover .cat-star {
+  color: var(--accent, #4f46e5);
+}
+.cat:hover .cat-star.fav {
+  color: #eab308;
+}
+
+/* GAP 123：收藏的书单（探索页入口） */
+.fav-section {
+  margin-bottom: 22px;
+}
+.fav-section .page-hint {
+  margin-bottom: 10px;
+}
+.fav-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.fav-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 5px 13px;
+  border: 1px solid color-mix(in srgb, #eab308 55%, var(--border, #ececec));
+  border-radius: 999px;
+  background: color-mix(in srgb, #eab308 7%, transparent);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text-2, #666);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.fav-chip:hover {
+  border-color: #eab308;
+  color: var(--text-1, #1a1a1a);
+}
+.fav-star {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #eab308;
+}
+.fav-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fav-src {
+  flex-shrink: 0;
+  max-width: 140px;
+  font-size: 11px;
+  font-weight: 300;
+  color: var(--text-3, #999);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .book-grid {
   display: grid;
