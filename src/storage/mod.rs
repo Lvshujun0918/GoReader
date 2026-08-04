@@ -259,6 +259,10 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             user_namespace TEXT DEFAULT '',
             created_at INTEGER DEFAULT 0,
             raw_json TEXT,
+            local_file TEXT,
+            local_file_mtime INTEGER DEFAULT 0,
+            local_file_size INTEGER DEFAULT 0,
+            local_file_deleted INTEGER DEFAULT 0,
             PRIMARY KEY (book_url, user_namespace)
         );
         "#,
@@ -296,6 +300,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             rule_book_info TEXT,
             rule_toc TEXT,
             rule_content TEXT,
+            rule_related TEXT,
             search_rule TEXT,
             explore_rule TEXT,
             book_info_rule TEXT,
@@ -513,6 +518,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     // 幂等补列（兼容旧库：缺列则 ALTER TABLE 补上）
     let columns = [
         ("users", &["token_map", "raw_json"][..]),
+        ("book_sources", &["rule_related"][..]),
         (
             "books",
             &[
@@ -528,6 +534,12 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             ensure_column(&pool, table, col).await?;
         }
     }
+
+    // GAP 170 本地书双轨同步列（幂等补列；local_file TEXT + 变更检测/删除标记 INTEGER）
+    ensure_column_typed(&pool, "books", "local_file", "TEXT").await?;
+    ensure_column_typed(&pool, "books", "local_file_mtime", "INTEGER DEFAULT 0").await?;
+    ensure_column_typed(&pool, "books", "local_file_size", "INTEGER DEFAULT 0").await?;
+    ensure_column_typed(&pool, "books", "local_file_deleted", "INTEGER DEFAULT 0").await?;
 
     tracing::info!("storage initialized at {}", db_path.display());
 
@@ -1319,6 +1331,17 @@ impl Storage {
     pub async fn upsert_book(&self, ns: &str, book: &Book) -> Result<()> {
         let mut b = book.clone();
         b.user_namespace = ns.to_string();
+        // GAP 170 双轨同步：local_file 为服务端内部字段（客户端 saveBook 不带）——
+        // 旧客户端全量覆盖时保留既有文件关联，避免打断文件↔DB 双轨
+        let local_file = if b.local_file.is_some() {
+            b.local_file.clone()
+        } else {
+            self.find_book(ns, &b.book_url)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|old| old.local_file)
+        };
         sqlx::query(
             r#"INSERT OR REPLACE INTO books
             (book_url, name, author, origin, origin_name, kind, custom_tag, cover_url,
@@ -1329,11 +1352,12 @@ impl Storage {
              use_replace_rule, variable, read_config, is_in_shelf, cbz, display_cover,
              display_intro, local_epub, local_pdf, pdf, split_long_chapter,
              last_check_error, info_html, toc_html, language, publisher, published_at,
-             user_namespace, created_at, raw_json)
+             user_namespace, created_at, raw_json, local_file, local_file_mtime,
+             local_file_size, local_file_deleted)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
                     ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
-                    ?41, ?42, ?43, ?44, ?45, ?46, ?47)"#,
+                    ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51)"#,
         )
         .bind(&b.book_url)
         .bind(&b.name)
@@ -1382,6 +1406,12 @@ impl Storage {
         .bind(&b.user_namespace)
         .bind(b.created_at)
         .bind(&b.raw_json)
+        // GAP 170 双轨同步：local_file 为服务端内部字段（客户端 saveBook 不带）——
+        // 旧客户端全量覆盖时保留既有文件关联，避免打断文件↔DB 双轨
+        .bind(local_file)
+        .bind(b.local_file_mtime)
+        .bind(b.local_file_size)
+        .bind(b.local_file_deleted)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2126,6 +2156,87 @@ impl Storage {
         Ok(())
     }
 
+    // ---------------- GAP 170 本地书双轨同步 ----------------
+
+    /// 查询有 local_file 关联的书（含已删除标记的——文件重现时用于重链/重扫）
+    pub async fn list_linked_local_books(&self, ns: &str) -> Result<Vec<Book>> {
+        let rows = sqlx::query_as::<_, Book>(
+            "SELECT * FROM books WHERE user_namespace = ?1 AND local_file IS NOT NULL AND local_file != ''",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 查询无文件关联的 local:// DB 书（对账任务自动生成 epub 落书仓目录用）
+    pub async fn list_local_db_books_without_file(&self, ns: &str) -> Result<Vec<Book>> {
+        let rows = sqlx::query_as::<_, Book>(
+            "SELECT * FROM books WHERE user_namespace = ?1 AND book_url LIKE 'local://%' AND (local_file IS NULL OR local_file = '')",
+        )
+        .bind(ns)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 写入本地书文件关联（local_file=None 时仅更新变更检测/删除标记字段）
+    pub async fn link_local_file(
+        &self,
+        ns: &str,
+        book_url: &str,
+        local_file: Option<&str>,
+        mtime: i64,
+        size: i64,
+        deleted: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE books SET local_file = ?3, local_file_mtime = ?4, local_file_size = ?5, local_file_deleted = ?6              WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .bind(local_file)
+        .bind(mtime)
+        .bind(size)
+        .bind(deleted)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 替换本地书全部章节（重扫用：事务内先删后插——旧章残留清理，新章序从 0 开始）
+    pub async fn replace_chapters(&self, book_url: &str, chapters: &[(String, String)]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
+            .bind(book_url)
+            .execute(&mut *tx)
+            .await?;
+        for (i, (title, content)) in chapters.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO book_chapters (book_url, chapter_index, title, content) VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(book_url)
+            .bind(i as i64)
+            .bind(title)
+            .bind(content)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 本地书章节（含正文，全量——对账任务 epub 生成用）
+    pub async fn list_chapters_full(&self, book_url: &str) -> Result<Vec<(i64, String, String)>> {
+        let rows = sqlx::query_as::<_, (i64, String, String)>(
+            "SELECT chapter_index, title, content FROM book_chapters WHERE book_url = ?1 ORDER BY chapter_index",
+        )
+        .bind(book_url)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// 更新封面 URL（导入后写封面文件）
     pub async fn update_book_cover(&self, ns: &str, book_url: &str, cover_url: &str) -> Result<u64> {
         let r = sqlx::query("UPDATE books SET cover_url = ?3 WHERE user_namespace = ?1 AND book_url = ?2")
@@ -2184,6 +2295,43 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    // ---------------- GAP 59 多设备 token（users.token_map） ----------------
+
+    /// 登录：追加 token 到 token_map（JSON 数组，上限 5，最旧被丢），同时刷新主 token 与 last_login_at
+    pub async fn add_user_token(&self, username: &str, token: &str, last_login_at: i64) -> Result<()> {
+        let user = self.find_user(username).await?;
+        let map_json = crate::model::user::token_map_push(
+            &user.as_ref().and_then(|u| u.token_map.clone()),
+            token,
+        );
+        sqlx::query("UPDATE users SET token = ?1, token_map = ?2, last_login_at = ?3 WHERE username = ?4")
+            .bind(token)
+            .bind(&map_json)
+            .bind(last_login_at)
+            .bind(username)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 登出：从 token_map 移除指定 token；若移除的是主 token 则同时清空主 token
+    /// （其他设备 token 不受影响——多设备会话互不干扰）。返回受影响行数。
+    pub async fn remove_user_token(&self, username: &str, token: &str) -> Result<u64> {
+        let user = self.find_user(username).await?;
+        let Some(user) = user else { return Ok(0) };
+        let (map_json, removed) =
+            crate::model::user::token_map_remove(&user.token_map, token);
+        let clear_main = !user.token.is_empty() && user.token == token;
+        let main_token = if clear_main { "" } else { user.token.as_str() };
+        sqlx::query("UPDATE users SET token = ?1, token_map = ?2 WHERE username = ?3")
+            .bind(main_token)
+            .bind(&map_json)
+            .bind(username)
+            .execute(&self.pool)
+            .await?;
+        Ok(if removed || clear_main { 1 } else { 0 })
     }
 
     /// 查询某命名空间的书架（按插入顺序，兼容 legacy bookshelf.json 数组顺序）
@@ -3063,13 +3211,23 @@ pub(crate) fn normalize_base(url: &str) -> Option<String> {
 }
 
 async fn ensure_column(pool: &SqlitePool, table: &str, column: &str) -> anyhow::Result<()> {
+    ensure_column_typed(pool, table, column, "TEXT").await
+}
+
+/// 幂等补列（带列类型；GAP 170：local_file 等双轨同步列按类型补充）
+async fn ensure_column_typed(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    sql_type: &str,
+) -> anyhow::Result<()> {
     let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"))
         .fetch_one(pool)
         .await?;
     if row.0 == 0 {
-        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} TEXT");
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}");
         sqlx::query(&sql).execute(pool).await?;
-        tracing::info!("ALTER TABLE {table} ADD COLUMN {column}");
+        tracing::info!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}");
     }
     Ok(())
 }
@@ -3130,6 +3288,10 @@ async fn rebuild_books_bool_columns(pool: &SqlitePool) -> anyhow::Result<()> {
             user_namespace TEXT DEFAULT '',
             created_at INTEGER DEFAULT 0,
             raw_json TEXT,
+            local_file TEXT,
+            local_file_mtime INTEGER DEFAULT 0,
+            local_file_size INTEGER DEFAULT 0,
+            local_file_deleted INTEGER DEFAULT 0,
             PRIMARY KEY (book_url, user_namespace)
         );
         "#,
@@ -3170,11 +3332,11 @@ where
              concurrent_rate, header, login_url, login_ui, login_check_js, login_js,
              book_source_comment, variable_comment, last_update_time, respond_time,
              weight, explore_url, search_url, rule_explore, rule_search, rule_book_info,
-             rule_toc, rule_content, search_rule, explore_rule, book_info_rule, toc_rule,
+             rule_toc, rule_content, rule_related, search_rule, explore_rule, book_info_rule, toc_rule,
              content_rule, key, tag, logger, variable, user_namespace, raw_json)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)
+                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)
         "#,
     )
     .bind(&source.book_source_url)
@@ -3204,6 +3366,7 @@ where
     .bind(&source.rule_book_info)
     .bind(&source.rule_toc)
     .bind(&source.rule_content)
+    .bind(&source.rule_related)
     .bind(&source.search_rule)
     .bind(&source.explore_rule)
     .bind(&source.book_info_rule)
@@ -3977,6 +4140,68 @@ mod tests {
         assert!(storage.find_user("alice").await.unwrap().unwrap().token.is_empty());
         assert_eq!(storage.logout_user("ghost").await.unwrap(), 0);
         cleanup(storage, "logout").await;
+    }
+
+    /// GAP 59：登录追加 token（token_map 上限 5、去重）；登出仅移除当前设备 token
+    #[tokio::test]
+    async fn test_add_remove_user_token() {
+        let storage = test_storage("tokenmap").await;
+        storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t0".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 追加 6 个 token → 上限 5，最旧被丢
+        for i in 1..=6 {
+            storage.add_user_token("alice", &format!("tok-{i}"), 1000 + i).await.unwrap();
+        }
+        let user = storage.find_user("alice").await.unwrap().unwrap();
+        assert_eq!(user.token, "tok-6", "主 token 为最新");
+        let list = crate::model::user::token_map_list(&user.token_map);
+        assert_eq!(list, vec!["tok-2", "tok-3", "tok-4", "tok-5", "tok-6"], "上限 5 且最旧被丢");
+        // 重新登录同一 token → 去重（不重复计数）
+        storage.add_user_token("alice", "tok-5", 9999).await.unwrap();
+        let user = storage.find_user("alice").await.unwrap().unwrap();
+        let list = crate::model::user::token_map_list(&user.token_map);
+        assert_eq!(list.iter().filter(|t| *t == "tok-5").count(), 1, "去重");
+        assert_eq!(list.len(), 5);
+        // 登出：移除设备 token（主 token 保持）
+        storage.remove_user_token("alice", "tok-4").await.unwrap();
+        let user = storage.find_user("alice").await.unwrap().unwrap();
+        assert_eq!(user.token, "tok-5", "主 token 不受影响");
+        let list = crate::model::user::token_map_list(&user.token_map);
+        assert!(!list.contains(&"tok-4".to_string()));
+        assert_eq!(list.len(), 4);
+        // 登出主 token → 主 token 清空但 map 其余保留
+        storage.remove_user_token("alice", "tok-5").await.unwrap();
+        let user = storage.find_user("alice").await.unwrap().unwrap();
+        assert!(user.token.is_empty(), "主 token 清空");
+        let list = crate::model::user::token_map_list(&user.token_map);
+        assert_eq!(list.len(), 3, "其余设备 token 保留");
+        // 不存在的 token → 无影响
+        assert_eq!(storage.remove_user_token("alice", "nope").await.unwrap(), 0);
+        // legacy 对象形态 token_map 兼容（键即 token）——直接 UPDATE 注入旧形态数据
+        storage
+            .insert_user(&User {
+                username: "legacy".into(),
+                token: "main".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET token_map = ?1 WHERE username = 'legacy'")
+            .bind(serde_json::json!({"old-1": 1700000000000i64}).to_string())
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        storage.add_user_token("legacy", "new-1", 2000).await.unwrap();
+        let user = storage.find_user("legacy").await.unwrap().unwrap();
+        let list = crate::model::user::token_map_list(&user.token_map);
+        assert!(list.contains(&"old-1".to_string()) && list.contains(&"new-1".to_string()));
+        cleanup(storage, "tokenmap").await;
     }
 
     /// F-34：不活跃用户清理（GAP #95：users 行 + 用户级数据行 + 数据目录；except 保护）

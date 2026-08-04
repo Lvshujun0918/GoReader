@@ -86,6 +86,9 @@ pub struct BookSource {
     #[serde(rename = "ruleContent")]
     #[sqlx(rename = "rule_content")]
     pub rule_content: Option<serde_json::Value>,
+    #[serde(rename = "ruleRelated")]
+    #[sqlx(rename = "rule_related")]
+    pub rule_related: Option<serde_json::Value>,
     #[serde(rename = "searchRule")]
     #[sqlx(rename = "search_rule")]
     pub search_rule: Option<serde_json::Value>,

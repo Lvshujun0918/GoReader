@@ -62,6 +62,8 @@ block-padding = "0.3"
 mobi = "0.8.0"
 lopdf = "0.44.0"
 quick-xml = "0.41.0"
+notify = "6"           # GAP 170 本地书双轨同步：书仓目录文件监听
+fancy-regex = "0.19.0"
 
 [profile.release]
 lto = true

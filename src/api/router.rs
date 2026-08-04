@@ -315,8 +315,10 @@ struct LoginBody {
 }
 
 /// POST /reader3/login：注册或登录，返回 formatUser（camelCase）
+/// GAP 61 登录限流（用户名+IP 失败 5 次锁 5 分钟）+ GAP 59 多设备 token
 async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Json<ReturnData> {
     let username = body.username.clone().unwrap_or_default();
@@ -330,6 +332,12 @@ async fn login(
         return Json(ReturnData::err("请输入密码"));
     }
 
+    // GAP 61：登录限流（用户名+IP；锁定中直接拒绝）
+    let ip = client_ip(&headers);
+    if let Err(msg) = crate::util::login_limit::check_allowed(&username, &ip) {
+        return Json(ReturnData::err(msg));
+    }
+
     let user = match state.storage.find_user(&username).await {
         Ok(u) => u,
         Err(e) => {
@@ -341,6 +349,7 @@ async fn login(
     let Some(mut user) = user else {
         // 用户不存在
         if is_login {
+            crate::util::login_limit::record_failure(&username, &ip);
             return Json(ReturnData::err("用户不存在"));
         }
         return register(&state, &username, &password, body.code.clone()).await;
@@ -352,13 +361,15 @@ async fn login(
     }
     let encrypted = gen_encrypted_password(&password, &user.salt);
     if encrypted != user.password {
+        crate::util::login_limit::record_failure(&username, &ip);
         return Json(ReturnData::err("密码错误"));
     }
+    crate::util::login_limit::reset(&username, &ip);
 
-    // 生成新 token 并更新会话（uuid v4 随机——防预测；legacy 的 md5 时间戳 token 不再使用）
+    // GAP 59：生成新 token 并追加到 token_map（多设备会话，上限 5；uuid v4 随机防预测）
     let now = now_millis();
     let token = uuid::Uuid::new_v4().simple().to_string();
-    if let Err(e) = state.storage.update_user_session(&username, &token, now).await {
+    if let Err(e) = state.storage.add_user_token(&username, &token, now).await {
         tracing::error!("更新用户 {username} 会话失败: {e}");
         return Json(ReturnData::err("系统错误"));
     }
@@ -366,6 +377,23 @@ async fn login(
     user.last_login_at = now;
     tracing::info!("用户登录: {username}");
     Json(ReturnData::ok(format_user(&user)))
+}
+
+/// 客户端 IP（x-forwarded-for 优先取首个，其次 x-real-ip；无代理头时为空串——
+/// 此时限流退化为按用户名计数）
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 /// 自动注册（校验顺序与错误消息兼容 legacy）
@@ -2060,7 +2088,7 @@ async fn get_book_content(
 // ==================== 差距补全批：导出 / 调试 / 缓存 / 配置 / 刷新 / 批量 / 健康 / 统计 ====================
 
 /// GET /reader3/exportBook：多格式导出（url 单本 + format=txt|epub|html）
-/// txt=章节拼接、epub=zip 构造（mimetype/container.xml/OPF/spine）、html=单页
+/// txt=章节拼接（GAP 104：encoding=utf-8|gbk|gb2312|gb18030 转码）、epub=zip 构造、html=单页
 async fn export_book(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -2081,6 +2109,8 @@ async fn export_book(
     if !matches!(format, "txt" | "epub" | "html") {
         return Json(ReturnData::err("不支持的导出格式（txt|epub|html）")).into_response();
     }
+    // GAP 104：TXT 导出编码（utf-8 默认；gbk/gb2312/gb18030；其他格式固定 UTF-8）
+    let encoding = param_of(&params, body_json.as_ref(), "encoding");
     let (title, author, chapters) =
         match collect_export_chapters(&state, &namespace, &url, &params, body_json.as_ref()).await
         {
@@ -2100,19 +2130,27 @@ async fn export_book(
     let (bytes, mime, ext) = match format {
         "epub" => (
             crate::service::export_book::build_epub(&title, &author, &export_chapters),
-            "application/epub+zip",
+            "application/epub+zip".to_string(),
             "epub",
         ),
         "html" => (
             crate::service::export_book::build_html(&title, &export_chapters).into_bytes(),
-            "text/html; charset=utf-8",
+            "text/html; charset=utf-8".to_string(),
             "html",
         ),
-        _ => (
-            crate::service::export_book::build_txt(&title, &export_chapters).into_bytes(),
-            "text/plain; charset=utf-8",
-            "txt",
-        ),
+        _ => {
+            let txt = crate::service::export_book::build_txt(&title, &export_chapters);
+            let bytes = match crate::service::export_book::encode_txt(&txt, &encoding) {
+                Ok(b) => b,
+                Err(msg) => return Json(ReturnData::err(msg)).into_response(),
+            };
+            let charset = match encoding.trim().to_ascii_lowercase().as_str() {
+                "gbk" | "gb2312" | "gb_2312" => "gbk",
+                "gb18030" => "gb18030",
+                _ => "utf-8",
+            };
+            (bytes, format!("text/plain; charset={charset}"), "txt")
+        }
     };
     let filename = sanitize_filename(&title);
     let filename = if filename.is_empty() { "export".to_string() } else { filename };
@@ -2225,20 +2263,33 @@ async fn collect_export_chapters(
     let toc = crate::service::book::analyze_toc(ns, &toc_url, &source, 20)
         .await
         .map_err(|e| format!("获取目录失败: {e}"))?;
-    let mut chapters = Vec::with_capacity(toc.len());
-    for ch in toc {
-        if ch.is_volume {
-            continue;
+    // GAP 104b：书源书导出并发抓章（并发 4——网络抓取是瓶颈；错误章跳过继续；
+    // 结果按章节索引重组；章节缓存命中直接复用不抓取）
+    let jobs: Vec<(String, String)> = toc
+        .iter()
+        .filter(|ch| !ch.is_volume)
+        .map(|ch| (ch.title.clone(), ch.url.clone()))
+        .collect();
+    let storage = state.storage.clone();
+    let ns_owned = ns.to_string();
+    let book_url = url.to_string();
+    let src = source.clone();
+    let chapters = crate::service::export_book::fetch_chapters_concurrent(jobs, 4, move |_i, chapter_url| {
+        let storage = storage.clone();
+        let ns = ns_owned.clone();
+        let book_url = book_url.clone();
+        let src = src.clone();
+        async move {
+            let idx = crate::util::md5::chapter_url_hash(&chapter_url);
+            match storage.get_chapter_content(&book_url, idx).await.ok().flatten() {
+                Some(c) if !c.trim().is_empty() => Ok(c),
+                _ => crate::service::book::analyze_content(&ns, &chapter_url, &src, 5)
+                    .await
+                    .map_err(|e| format!("获取正文失败: {e}")),
+            }
         }
-        let idx = crate::util::md5::chapter_url_hash(&ch.url);
-        let content = match state.storage.get_chapter_content(url, idx).await.ok().flatten() {
-            Some(c) if !c.trim().is_empty() => c,
-            _ => crate::service::book::analyze_content(ns, &ch.url, &source, 5)
-                .await
-                .map_err(|e| format!("获取正文失败: {e}"))?,
-        };
-        chapters.push((ch.title, content));
-    }
+    })
+    .await;
     Ok((book.name, book.author, chapters))
 }
 
@@ -2539,6 +2590,9 @@ async fn refresh_local_book(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
+    // GAP 170：与本地书双轨同步对账互斥（重扫/重链读改写序列串行；对账幂等）
+    let sync_lock = crate::service::local_sync::namespace_sync_lock(&namespace);
+    let _sync_guard = sync_lock.lock().await;
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let url = param_of(&params, body_json.as_ref(), "url");
     if url.is_empty() {
@@ -2560,7 +2614,13 @@ async fn refresh_local_book(
             .iter()
             .any(|e| url.to_lowercase().ends_with(&format!(".{e}")));
     let imported = if url.starts_with("local://") {
-        // 原文件：storage/data/{ns}/opds_files/{id}.{ext}
+        // ① 双轨同步关联文件优先（书仓目录 / env READER_LOCAL_BOOK_DIR）
+        let linked = book
+            .local_file
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_file());
+        // ② 回退原文件：storage/data/{ns}/opds_files/{id}.{ext}（上传时落盘）
         let id = url.trim_start_matches("local://").split('/').next().unwrap_or("").to_string();
         let dir = state
             .storage
@@ -2569,20 +2629,22 @@ async fn refresh_local_book(
             .join("data")
             .join(&namespace)
             .join("opds_files");
-        let mut found = None;
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                let stem = p
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let ext_ok = crate::service::local_book::SUPPORTED_EXTENSIONS.iter().any(|ext| {
-                    p.to_string_lossy().to_lowercase().ends_with(&format!(".{ext}"))
-                });
-                if stem == id && ext_ok {
-                    found = Some(p);
-                    break;
+        let mut found = linked;
+        if found.is_none() {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    let stem = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let ext_ok = crate::service::local_book::SUPPORTED_EXTENSIONS.iter().any(|ext| {
+                        p.to_string_lossy().to_lowercase().ends_with(&format!(".{ext}"))
+                    });
+                    if stem == id && ext_ok {
+                        found = Some(p);
+                        break;
+                    }
                 }
             }
         }
@@ -2957,9 +3019,10 @@ async fn get_available_book_source(
         if !url.is_empty() {
             if let Some(pattern) = &s.book_url_pattern {
                 if !pattern.is_empty() {
-                    // 正则编译失败视为放行（书源可用性不受坏规则影响）
+                    // 正则编译失败视为放行（书源可用性不受坏规则影响）；
+                    // GAP 153：lookbehind 等经 fancy-regex 兼容层
                     let matched =
-                        regex::Regex::new(pattern).map(|re| re.is_match(&url)).unwrap_or(true);
+                        crate::util::regex::Regex::new(pattern).map(|re| re.is_match(&url)).unwrap_or(true);
                     if !matched {
                         continue;
                     }
@@ -3258,6 +3321,7 @@ async fn get_shelf_book(
 }
 
 /// F-25：POST /reader3/logout：退出登录（清 token，token 立即失效）
+/// GAP 59：仅移除当前设备 token（token_map 中其余设备 token 保持有效）
 async fn logout(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -3273,7 +3337,17 @@ async fn logout(
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
-    match state.storage.logout_user(&username).await {
+    // 当前请求的 token（resolve_namespace 校验通过后从同一来源取）
+    let token = access_token_of(&params, &headers)
+        .and_then(|t| t.split_once(':').map(|(_, tk)| tk.to_string()))
+        .unwrap_or_default();
+    let result = if token.is_empty() {
+        // 兼容：无 token 可定位时回退 legacy 全清
+        state.storage.logout_user(&username).await
+    } else {
+        state.storage.remove_user_token(&username, &token).await
+    };
+    match result {
         Ok(_) => {
             tracing::info!("用户退出登录: {username}");
             Json(ReturnData::ok(serde_json::Value::Null))
@@ -3798,6 +3872,7 @@ fn login_required() -> ReturnData {
 /// 解析命名空间：
 /// - 非 secure → "default"
 /// - secure → 从 query/header 解析 accessToken（username:token）并校验 token，合法则返回用户名
+/// GAP 59：主 token 或 users.token_map（多设备）中任一 token 均可通过
 pub(crate) async fn resolve_namespace(
     state: &AppState,
     params: &HashMap<String, String>,
@@ -3806,7 +3881,37 @@ pub(crate) async fn resolve_namespace(
     if !state.storage.config.secure {
         return Ok("default".to_string());
     }
-    let access_token = params
+    let Some(access_token) = access_token_of(params, headers) else {
+        return Err(login_required());
+    };
+    let Some((username, token)) = access_token.split_once(':') else {
+        return Err(login_required());
+    };
+    if username.is_empty() || token.is_empty() {
+        return Err(login_required());
+    }
+    match state.storage.find_user(username).await {
+        Ok(Some(user)) => {
+            let token_ok = (!user.token.is_empty() && user.token == token)
+                || crate::model::user::token_map_contains(&user.token_map, token);
+            if !token_ok {
+                return Err(login_required());
+            }
+            // GAP 118：token 过期——基于 users.last_login_at + READER_TOKEN_TTL_DAYS（默认 30 天）；
+            // 过期（或 legacy 用户 last_login_at=0 从未登录）→ NEED_LOGIN 重新登录；ttl<=0 永不过期
+            let ttl_days = state.storage.config.token_ttl_days;
+            if ttl_days > 0 && now_millis() - user.last_login_at > ttl_days * 86_400_000 {
+                return Err(login_required());
+            }
+            Ok(user.username)
+        }
+        _ => Err(login_required()),
+    }
+}
+
+/// 从 query/header 提取 accessToken（query → accessToken 头 → Authorization: Bearer）
+fn access_token_of(params: &HashMap<String, String>, headers: &HeaderMap) -> Option<String> {
+    params
         .get("accessToken")
         .cloned()
         .or_else(|| {
@@ -3820,28 +3925,7 @@ pub(crate) async fn resolve_namespace(
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).to_string())
-        });
-    let Some(access_token) = access_token else {
-        return Err(login_required());
-    };
-    let Some((username, token)) = access_token.split_once(':') else {
-        return Err(login_required());
-    };
-    if username.is_empty() || token.is_empty() {
-        return Err(login_required());
-    }
-    match state.storage.find_user(username).await {
-        Ok(Some(user)) if !user.token.is_empty() && user.token == token => {
-            // GAP 118：token 过期——基于 users.last_login_at + READER_TOKEN_TTL_DAYS（默认 30 天）；
-            // 过期（或 legacy 用户 last_login_at=0 从未登录）→ NEED_LOGIN 重新登录；ttl<=0 永不过期
-            let ttl_days = state.storage.config.token_ttl_days;
-            if ttl_days > 0 && now_millis() - user.last_login_at > ttl_days * 86_400_000 {
-                return Err(login_required());
-            }
-            Ok(user.username)
-        }
-        _ => Err(login_required()),
-    }
+        })
 }
 
 /// formatUser：登录/注册返回结构（camelCase，兼容 legacy BaseController.formatUser）
@@ -6653,6 +6737,117 @@ mod tests {
         cleanup(state, dir).await;
     }
 
+    /// GAP 59：多设备 token——主 token 与 token_map 任一 token 均可解析命名空间；
+    /// 登出仅移除当前设备（其余设备不受影响）。GAP 61：登录限流（用户名+IP 失败 5 次锁 5 分钟）
+    #[tokio::test]
+    async fn test_multi_device_token_and_login_rate_limit() {
+        let (state, dir) = test_state("multidev").await;
+        let mut state = state;
+        state.storage.config.secure = true;
+        state.storage.config.token_ttl_days = 0;
+        let now = now_millis();
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "main".into(),
+                last_login_at: now,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 模拟两台设备登录（追加 token_map）+ 主 token 刷新
+        state.storage.add_user_token("alice", "dev1", now).await.unwrap();
+        state.storage.add_user_token("alice", "dev2", now).await.unwrap();
+        state.storage.add_user_token("alice", "main", now).await.unwrap();
+        let auth = |t: &str| {
+            let params: HashMap<String, String> =
+                [("accessToken".into(), format!("alice:{t}"))].into_iter().collect();
+            params
+        };
+        // 主 token 与 token_map 任一 token 均可通过
+        for t in ["main", "dev1", "dev2"] {
+            assert_eq!(
+                resolve_namespace(&state, &auth(t), &HeaderMap::new()).await.unwrap(),
+                "alice",
+                "token {t} 应可通过"
+            );
+        }
+        // 未记录 token → NEED_LOGIN
+        let ret = resolve_namespace(&state, &auth("ghost-token"), &HeaderMap::new()).await;
+        assert!(ret.is_err());
+        assert_eq!(ret.unwrap_err().data, json!("NEED_LOGIN"));
+        // 登出 dev1 → 仅 dev1 失效，dev2/main 仍有效
+        let ret = logout(AxumState(state.clone()), Query(auth("dev1")), HeaderMap::new(), None).await;
+        assert!(ret.0.is_success, "logout 应成功: {}", ret.0.error_msg);
+        assert!(resolve_namespace(&state, &auth("dev1"), &HeaderMap::new()).await.is_err());
+        assert!(resolve_namespace(&state, &auth("dev2"), &HeaderMap::new()).await.is_ok());
+        assert!(resolve_namespace(&state, &auth("main"), &HeaderMap::new()).await.is_ok());
+
+        // GAP 61：登录限流（用户名+IP 失败 5 次 → 锁定，返回“尝试过多请稍后”）
+        let login_body = |u: &str, pw: &str| {
+            Json(LoginBody {
+                username: Some(u.into()),
+                password: Some(pw.into()),
+                is_login: Some(true),
+                code: None,
+            })
+        };
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        for _ in 0..5 {
+            let ret = login(AxumState(state.clone()), h.clone(), login_body("alice", "wrong")).await;
+            assert_eq!(ret.0.error_msg, "密码错误");
+        }
+        // 第 6 次（已锁定）→ 尝试过多请稍后（即使密码正确也不放行）
+        let ret = login(AxumState(state.clone()), h.clone(), login_body("alice", "whatever")).await;
+        assert_eq!(ret.0.error_msg, "尝试过多请稍后");
+        // 同用户名不同 IP 不受影响
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        let ret = login(AxumState(state.clone()), h2, login_body("alice", "wrong")).await;
+        assert_eq!(ret.0.error_msg, "密码错误");
+
+        // 正确密码登录成功 → 计数清零（新用户名+IP，避免与上文锁定状态耦合）
+        state
+            .storage
+            .insert_user(&User {
+                username: "bob".into(),
+                password: crate::util::md5::gen_encrypted_password("pass1234", "saltsalt"),
+                salt: "saltsalt".into(),
+                token: "bobt".into(),
+                last_login_at: now,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut hb = HeaderMap::new();
+        hb.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        for _ in 0..4 {
+            let ret = login(AxumState(state.clone()), hb.clone(), login_body("bob", "bad")).await;
+            assert_eq!(ret.0.error_msg, "密码错误");
+        }
+        // 第 5 次失败 → 锁定（错误消息仍为密码错误，但后续被拒）
+        let ret = login(AxumState(state.clone()), hb.clone(), login_body("bob", "bad")).await;
+        assert_eq!(ret.0.error_msg, "密码错误");
+        let ret = login(AxumState(state.clone()), hb.clone(), login_body("bob", "pass1234")).await;
+        assert_eq!(ret.0.error_msg, "尝试过多请稍后");
+        // 锁定自动恢复（5 分钟过期）已由 util::login_limit 单测覆盖——此处验证正确密码
+        // 在未锁定状态下可登录成功并重置计数
+        let mut hc = HeaderMap::new();
+        hc.insert("x-forwarded-for", "198.51.100.8".parse().unwrap());
+        let ret = login(AxumState(state.clone()), hc.clone(), login_body("bob", "pass1234")).await;
+        assert!(ret.0.is_success, "正确密码应登录成功: {}", ret.0.error_msg);
+        // 登录成功后计数清零：再失败 4 次仍不锁（需满 5 次）
+        for _ in 0..4 {
+            let ret = login(AxumState(state.clone()), hc.clone(), login_body("bob", "bad")).await;
+            assert_eq!(ret.0.error_msg, "密码错误");
+        }
+        assert!(crate::util::login_limit::check_allowed("bob", "198.51.100.8").is_ok(), "成功登录已重置计数");
+
+        cleanup(state, dir).await;
+    }
+
     /// F-34：clearInactiveUsers——secureKey 校验 + 仅删超期用户（调用者受保护）
     #[tokio::test]
     async fn test_clear_inactive_users() {
@@ -7472,6 +7667,33 @@ mod tests {
                     let mut b = bodies.lock().unwrap();
                     if b.len() > 1 { b.remove(0) } else { b[0].clone() }
                 };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/sources.json")
+    }
+
+    /// 按请求路径返回响应体的 mock（并发抓取场景确定性——请求到达序 ≠ 队列序时
+    /// 路径寻址保证每个 URL 拿到自己的响应；普通顺序场景仍用 serve_bodies）
+    async fn serve_bodies_by_path(entries: Vec<(String, String)>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let map: std::sync::Arc<std::collections::HashMap<String, String>> =
+                std::sync::Arc::new(entries.into_iter().collect());
+            for _ in 0..10 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let req = String::from_utf8_lossy(&buf);
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body = map.get(&path).cloned().unwrap_or_default();
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -8846,13 +9068,15 @@ mod tests {
     }
 
     /// cacheBookOnServer：书源书后台缓存（目录 → 并发 3 逐章 → 缓存表）
+    /// 注意：mock 按请求路径返回（并发抓章时请求到达序不定——路径寻址保证确定性）
     #[tokio::test]
     async fn test_cache_book_web_api() {
         let (state, dir) = test_state("cacheweb").await;
-        let base_url = serve_bodies(vec![
-            r#"<ul class="chapters"><li><a href="/ch1.html">第一章</a></li><li><a href="/ch2.html">第二章</a></li></ul>"#.to_string(),
-            r#"<html><body><div class="content">正文一。</div></body></html>"#.to_string(),
-            r#"<html><body><div class="content">正文二。</div></body></html>"#.to_string(),
+        let base_url = serve_bodies_by_path(vec![
+            // toc_url 未持久化（upsert_book 列缺失，预存问题）→ 任务回退抓 book_url 当目录页
+            ("/book/cache".to_string(), r#"<ul class="chapters"><li><a href="/ch1.html">第一章</a></li><li><a href="/ch2.html">第二章</a></li></ul>"#.to_string()),
+            ("/ch1.html".to_string(), r#"<html><body><div class="content">正文一。</div></body></html>"#.to_string()),
+            ("/ch2.html".to_string(), r#"<html><body><div class="content">正文二。</div></body></html>"#.to_string()),
         ])
         .await;
         let base = base_url.trim_end_matches("/sources.json").to_string();

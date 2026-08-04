@@ -10,6 +10,7 @@ pub mod explore;
 pub mod export_book;
 pub mod health;
 pub mod local_book;
+pub mod local_sync;
 pub mod login;
 pub mod rss;
 pub mod schedule;

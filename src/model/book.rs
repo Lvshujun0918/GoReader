@@ -163,4 +163,22 @@ pub struct Book {
     #[serde(skip)]
     #[sqlx(rename = "raw_json")]
     pub raw_json: Option<String>,
+    /// 本地书双轨同步（GAP 170）：关联的书仓文件路径（服务端内部字段——不对外序列化，
+    /// 客户端 saveBook 无法改写；仅对账/导入/重扫任务维护）
+    #[serde(skip)]
+    #[sqlx(rename = "local_file")]
+    pub local_file: Option<String>,
+    /// 关联文件修改时间（ms epoch——与 local_file_size 一起用于变更检测）
+    #[serde(skip)]
+    #[sqlx(rename = "local_file_mtime")]
+    pub local_file_mtime: i64,
+    /// 关联文件大小（字节——与 local_file_mtime 一起用于变更检测）
+    #[serde(skip)]
+    #[sqlx(rename = "local_file_size")]
+    pub local_file_size: i64,
+    /// 关联文件删除标记（0=正常；1=文件缺失——书籍/进度/章节保留，文件重现时自动重链，
+    /// 避免重复导入产生副本）
+    #[serde(skip)]
+    #[sqlx(rename = "local_file_deleted")]
+    pub local_file_deleted: bool,
 }

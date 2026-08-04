@@ -59,6 +59,48 @@ pub async fn fetch_url(ns: &str, url: &str, source: &BookSource) -> Result<crawl
     crawler::http_get(ns, url, &headers, 15).await
 }
 
+/// ruleRelated 结构（GAP 17b：相关推荐——字段与 ruleExplore 一致：bookList + 字段规则）
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RelatedRule {
+    pub book_list: Option<String>,
+    pub name: Option<String>,
+    pub author: Option<String>,
+    pub book_url: Option<String>,
+    pub cover_url: Option<String>,
+}
+
+/// 相关推荐解析（GAP 17b）：ruleRelated 应用详情页 HTML，同 ruleExplore 风格
+/// （bookList CSS 链式 + 字段规则）→ [{name, author, bookUrl, coverUrl}]
+pub fn analyze_related_books(html: &str, base_url: &str, source: &BookSource) -> Vec<crate::model::book_chapter::RelatedBook> {
+    let rule: RelatedRule = source
+        .rule_related
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let Some(book_list_rule) = rule.book_list.clone() else {
+        return vec![];
+    };
+    // 复用 ruleExplore 书单解析（SearchRule 字段名与 RelatedRule 一致）
+    let search_rule = crate::service::search::SearchRule {
+        book_list: rule.book_list,
+        name: rule.name,
+        author: rule.author,
+        book_url: rule.book_url,
+        cover_url: rule.cover_url,
+        ..Default::default()
+    };
+    crate::service::search::analyze_book_list_for_explore(html, base_url, source, &search_rule, &book_list_rule)
+        .into_iter()
+        .map(|b| crate::model::book_chapter::RelatedBook {
+            name: b.name,
+            author: b.author,
+            book_url: b.book_url,
+            cover_url: b.cover_url,
+        })
+        .collect()
+}
+
 /// 详情解析（ruleBookInfo 字段应用于详情页 HTML）
 pub fn analyze_book_info(html: &str, base_url: &str, source: &BookSource, book_url: &str) -> BookInfo {
     let rule: BookInfoRule = source
@@ -90,6 +132,7 @@ pub fn analyze_book_info(html: &str, base_url: &str, source: &BookSource, book_u
         language: None,
         publisher: None,
         published_at: None,
+        related_books: analyze_related_books(html, base_url, source),
     }
 }
 
@@ -286,19 +329,21 @@ pub fn analyze_content_from(html: &str, source: &BookSource) -> String {
         return String::new();
     };
     let mut content = field(html, Some(&content_rule), "");
-    // sourceRegex 清洗（legacy：正则移除干扰内容）
+    // sourceRegex 清洗（legacy：正则移除干扰内容；GAP 153：lookbehind 经 fancy-regex）
     if let Some(sr) = &rule.source_regex {
         if !sr.is_empty() {
-            if let Ok(re) = regex::Regex::new(sr) {
-                content = re.replace_all(&content, "").to_string();
+            match crate::util::regex::Regex::new(sr) {
+                Ok(re) => content = re.replace_all(&content, "").to_string(),
+                Err(e) => tracing::warn!("sourceRegex 编译失败（跳过清洗）: {e}"),
             }
         }
     }
     // replaceRegex 替换
     if let Some(rr) = &rule.replace_regex {
         if let Some((old, new)) = rr.split_once("##") {
-            if let Ok(re) = regex::Regex::new(old.trim()) {
-                content = re.replace_all(&content, new.trim()).to_string();
+            match crate::util::regex::Regex::new(old.trim()) {
+                Ok(re) => content = re.replace_all(&content, new.trim()).to_string(),
+                Err(e) => tracing::warn!("replaceRegex 编译失败（跳过替换）: {e}"),
             }
         }
     }
@@ -401,5 +446,67 @@ mod tests {
         let items = toc_items("<js>JSON.parse(result).data</js>", body);
         assert_eq!(items.len(), 1);
         assert!(items[0].contains("包章"));
+    }
+
+    /// GAP 17b：ruleRelated CSS 链式解析 → relatedBooks
+    #[test]
+    fn test_analyze_related_books() {
+        let mut src = test_source();
+        src.rule_related = Some(serde_json::json!({
+            "bookList": "ul.related@li",
+            "name": "a.bookname@text",
+            "author": "span.author@text",
+            "bookUrl": "a@href",
+            "coverUrl": "img@src"
+        }));
+        let html = r#"<ul class="related">
+            <li><a class="bookname" href="/r/1">推荐书1</a><span class="author">作者甲</span><img src="/c1.jpg"></li>
+            <li><a class="bookname" href="/r/2">推荐书2</a><span class="author">作者乙</span><img src="/c2.jpg"></li>
+        </ul>"#;
+        let related = analyze_related_books(html, "http://127.0.0.1:9999/book/1", &src);
+        assert_eq!(related.len(), 2);
+        assert_eq!(related[0].name, "推荐书1");
+        assert_eq!(related[0].author, "作者甲");
+        assert_eq!(related[0].book_url, "http://127.0.0.1:9999/r/1");
+        // coverUrl 经 field_url 绝对化（与 ruleExplore 书单一致）
+        assert_eq!(related[0].cover_url.as_deref(), Some("http://127.0.0.1:9999/c1.jpg"));
+        assert_eq!(related[1].name, "推荐书2");
+        // 无 ruleRelated / 无 bookList → 空
+        assert!(analyze_related_books(html, "http://x", &test_source()).is_empty());
+        let mut src2 = test_source();
+        src2.rule_related = Some(serde_json::json!({"name": "a@text"}));
+        assert!(analyze_related_books(html, "http://x", &src2).is_empty());
+    }
+
+    /// GAP 17b：getBookInfo 完整链路——analyze_book_info 返回 relatedBooks
+    #[test]
+    fn test_analyze_info_includes_related_books() {
+        let mut src = test_source();
+        src.rule_related = Some(serde_json::json!({
+            "bookList": "ul.related@li",
+            "name": "a@text",
+            "bookUrl": "a@href"
+        }));
+        let html = r#"<h1 class="bookname">测试书</h1><p class="author">作者X</p>
+            <ul class="related"><li><a href="/r/9">推荐书9</a></li></ul>"#;
+        let info = analyze_book_info(html, "http://127.0.0.1:9999/book/1", &src, "http://127.0.0.1:9999/book/1");
+        assert_eq!(info.related_books.len(), 1);
+        assert_eq!(info.related_books[0].name, "推荐书9");
+        assert_eq!(info.related_books[0].book_url, "http://127.0.0.1:9999/r/9");
+    }
+
+    /// GAP 153：sourceRegex/replaceRegex 支持 lookbehind（regex crate 不支持）
+    #[test]
+    fn test_analyze_content_lookbehind_regex() {
+        let mut src = test_source();
+        src.rule_content = Some(serde_json::json!({
+            "content": "div.content@text",
+            "sourceRegex": "(?<=广告：)\\S+",
+            "replaceRegex": "(?<=第).+(?=章)##X"
+        }));
+        let html = r#"<div class="content">正文：第一章 测试内容 广告：烦人</div>"#;
+        let content = analyze_content_from(html, &src);
+        // sourceRegex（lookbehind）移除 "烦人"；replaceRegex（lookbehind+lookahead）把 "一章 " 替换为 X
+        assert_eq!(content, "正文：第X章 测试内容 广告：");
     }
 }

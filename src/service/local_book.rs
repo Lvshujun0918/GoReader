@@ -219,15 +219,19 @@ fn split_by_rules(text: &str, rules: &[String]) -> Vec<Chapter> {
     // 收集所有规则匹配
     let mut matches: Vec<(usize, usize, String)> = Vec::new();
     for rule in rules {
-        if let Ok(re) = regex::RegexBuilder::new(rule).multi_line(true).build() {
-            for cap in re.captures_iter(text) {
-                if let Some(m) = cap.get(0) {
-                    let title = m.as_str().trim().to_string();
-                    if !title.is_empty() {
-                        matches.push((m.start(), m.end(), title));
+        // GAP 153：TXT 目录规则经兼容层编译（lookbehind 自动升级 fancy-regex）
+        match crate::util::regex::RegexBuilder::new(rule).multi_line(true).build() {
+            Ok(re) => {
+                for cap in re.captures_iter(text) {
+                    if let Some(m) = cap.get(0) {
+                        let title = m.as_str().trim().to_string();
+                        if !title.is_empty() {
+                            matches.push((m.start(), m.end(), title));
+                        }
                     }
                 }
             }
+            Err(e) => tracing::warn!("TXT 目录规则编译失败（忽略该规则）: {e}"),
         }
     }
     matches.sort_by_key(|m| m.0);
@@ -1461,5 +1465,166 @@ mod tests {
         assert!(is_local_book("C:/tmp/book.fb2", ""));
         assert!(!is_local_book("https://a.com/book", ""));
     }
+
+    // ---------- MOBI/AZW3 导入健壮性（构造最小合法 PalmDB+MOBI 文件往返） ----------
+
+    /// 构造最小合法 KF7 MOBI：PalmDB 头 + 3 记录（记录 0 = PalmDoc 头 + MOBI 头 + EXTH + 书名；
+    /// 记录 1 = 文本；记录 2 = 尾部占位（mobi crate 的 range 切片不含末记录——与真实文件
+    /// 尾部图片/索引记录布局一致）），无压缩。EXTH 位于记录 0 内（MOBI 头之后、full name 之前）
+    fn build_mini_mobi(title: &str, author: &str, text: &str) -> Vec<u8> {
+        // EXTH（记录 0 内，MOBI 头之后）
+        let mut exth: Vec<u8> = Vec::new();
+        exth.extend_from_slice(b"EXTH");
+        exth.extend_from_slice(&12u32.to_be_bytes());
+        exth.extend_from_slice(&2u32.to_be_bytes());
+        exth.extend_from_slice(&100u32.to_be_bytes());
+        exth.extend_from_slice(&((8 + author.len()) as u32).to_be_bytes());
+        exth.extend_from_slice(author.as_bytes());
+        exth.extend_from_slice(&503u32.to_be_bytes());
+        exth.extend_from_slice(&((8 + title.len()) as u32).to_be_bytes());
+        exth.extend_from_slice(title.as_bytes());
+        if exth.len() % 2 == 1 {
+            exth.push(0);
+        }
+        let name_offset = 16 + 232 + exth.len();
+
+        // 记录 0 = PalmDoc 头（16B）+ MOBI 头（232B）+ EXTH + full name
+        let mut rec0: Vec<u8> = Vec::new();
+        // PalmDoc 头（mobi crate 在记录 0 起始处读取）
+        rec0.extend_from_slice(&1u16.to_be_bytes()); // compression = 1（无压缩）
+        rec0.extend_from_slice(&0u16.to_be_bytes()); // unused
+        rec0.extend_from_slice(&(text.len() as u32).to_be_bytes()); // text_length
+        rec0.extend_from_slice(&1u16.to_be_bytes()); // record_count（1 条文本记录）
+        rec0.extend_from_slice(&4096u16.to_be_bytes()); // record_size
+        rec0.extend_from_slice(&0u16.to_be_bytes()); // encryption = 无
+        rec0.extend_from_slice(&0u16.to_be_bytes()); // unused
+        rec0.extend_from_slice(b"MOBI");
+        rec0.extend_from_slice(&232u32.to_be_bytes());
+        let mut f: Vec<u8> = Vec::new();
+        f.extend_from_slice(&2u32.to_be_bytes()); // mobi_type = book
+        f.extend_from_slice(&65001u32.to_be_bytes()); // text encoding = UTF-8
+        f.extend_from_slice(&0u32.to_be_bytes()); // id
+        f.extend_from_slice(&6u32.to_be_bytes()); // gen version
+        f.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // ortho index
+        f.extend_from_slice(&0u32.to_be_bytes()); // inflect index
+        f.extend_from_slice(&0u32.to_be_bytes()); // index names
+        f.extend_from_slice(&0u32.to_be_bytes()); // index keys
+        for _ in 0..6 {
+            f.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // extra indices
+        }
+        f.extend_from_slice(&3u32.to_be_bytes()); // first non-book index（记录 3）
+        f.extend_from_slice(&(name_offset as u32).to_be_bytes()); // full name offset（记录 0 内）
+        f.extend_from_slice(&(title.len() as u32).to_be_bytes()); // full name length
+        f.extend_from_slice(&0u16.to_be_bytes()); // unused
+        f.push(0); // locale
+        f.push(9); // language code
+        f.extend_from_slice(&0u32.to_be_bytes()); // input language
+        f.extend_from_slice(&0u32.to_be_bytes()); // output language
+        f.extend_from_slice(&6u32.to_be_bytes()); // format version
+        f.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // first image index
+        f.extend_from_slice(&0u32.to_be_bytes()); // huff record offset
+        f.extend_from_slice(&0u32.to_be_bytes()); // huff record count
+        f.extend_from_slice(&0u32.to_be_bytes()); // huff table offset
+        f.extend_from_slice(&0u32.to_be_bytes()); // huff table length
+        f.extend_from_slice(&0x40u32.to_be_bytes()); // EXTH flags on
+        f.extend_from_slice(&[0u8; 32]); // unused_0
+        f.extend_from_slice(&0u32.to_be_bytes()); // unused_1
+        f.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // drm offset
+        f.extend_from_slice(&0u32.to_be_bytes()); // drm count
+        f.extend_from_slice(&0u32.to_be_bytes()); // drm size
+        f.extend_from_slice(&0u32.to_be_bytes()); // drm flags
+        f.extend_from_slice(&[0u8; 8]); // unused_2
+        f.extend_from_slice(&1u16.to_be_bytes()); // first content record
+        f.extend_from_slice(&1u16.to_be_bytes()); // last content record
+        f.extend_from_slice(&0u32.to_be_bytes()); // unused_3
+        f.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // fcis record
+        f.extend_from_slice(&0u32.to_be_bytes()); // unused_4
+        f.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // flis record
+        f.extend_from_slice(&0u32.to_be_bytes()); // unused_5
+        f.extend_from_slice(&0u64.to_be_bytes()); // unused_6
+        f.extend_from_slice(&0u32.to_be_bytes()); // unused_7
+        f.extend_from_slice(&0u32.to_be_bytes()); // compilation section count
+        f.extend_from_slice(&0u32.to_be_bytes()); // data section count
+        f.extend_from_slice(&0u32.to_be_bytes()); // unused_8
+        f.extend_from_slice(&0u32.to_be_bytes()); // extra record data flags
+        f.extend_from_slice(&0u32.to_be_bytes()); // first index record（0 = 无）
+        assert_eq!(f.len(), 224, "MOBI 头字段应填满 232-8 字节");
+        rec0.extend_from_slice(&f);
+        rec0.extend_from_slice(&exth);
+        rec0.extend_from_slice(title.as_bytes());
+        if rec0.len() % 2 == 1 {
+            rec0.push(0);
+        }
+
+        // 记录 1：文本（无压缩）；记录 2：尾部占位（空）
+        let text_bytes = text.as_bytes();
+
+        let rec0_off = 78 + 3 * 8 + 2; // PalmDB 头 + 记录表 + extra_bytes 字段
+        let rec1_off = rec0_off + rec0.len();
+        let rec2_off = rec1_off + text_bytes.len();
+
+        let mut out: Vec<u8> = Vec::new();
+        // PalmDB 头
+        let mut name = [0u8; 32];
+        let nb = title.as_bytes();
+        name[..nb.len().min(32)].copy_from_slice(&nb[..nb.len().min(32)]);
+        out.extend_from_slice(&name);
+        out.extend_from_slice(&0u16.to_be_bytes()); // attributes
+        out.extend_from_slice(&0u16.to_be_bytes()); // version
+        for _ in 0..6 {
+            out.extend_from_slice(&0u32.to_be_bytes()); // 日期/序号/应用/排序
+        }
+        out.extend_from_slice(b"BOOK");
+        out.extend_from_slice(b"MOBI");
+        out.extend_from_slice(&0u32.to_be_bytes()); // uid seed
+        out.extend_from_slice(&0u32.to_be_bytes()); // next record list
+        out.extend_from_slice(&3u16.to_be_bytes()); // 记录数
+        // 记录表
+        for off in [rec0_off, rec1_off, rec2_off] {
+            out.extend_from_slice(&(off as u32).to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes()); // id
+        }
+        out.extend_from_slice(&0u16.to_be_bytes()); // extra bytes（mobi crate 读取）
+        // 记录体
+        out.extend_from_slice(&rec0);
+        out.extend_from_slice(text_bytes);
+        out.push(0); // 占位记录（空）
+        out
+    }
+
+    /// MOBI 导入：构造的最小 KF7 文件应完整读回（标题/作者/章节）
+    #[test]
+    fn parse_mobi_roundtrip() {
+        let text = "简介内容\n第一章\n这里是正文一\n第二章\n这里是正文二";
+        let bytes = build_mini_mobi("测试书", "作者甲", text);
+        let book = parse_mobi(&bytes).expect("最小 MOBI 应可解析");
+        assert_eq!(book.meta.title, "测试书");
+        assert_eq!(book.meta.author, "作者甲");
+        assert!(book.chapters.len() >= 2, "应分出章节: {:?}", book.chapters.len());
+        let ch1 = book.chapters.iter().find(|c| c.title == "第一章").expect("含第一章");
+        assert!(ch1.content.contains("这里是正文一"));
+        let ch2 = book.chapters.iter().find(|c| c.title == "第二章").expect("含第二章");
+        assert!(ch2.content.contains("这里是正文二"));
+        assert_eq!(book.format, "mobi");
+    }
+
+    /// AZW3 导入：同一容器经 parse_azw3 读回（KF8 兼容层）
+    #[test]
+    fn parse_azw3_roundtrip() {
+        let bytes = build_mini_mobi("AZW3测试书", "作者乙", "内容简介\n第一章\n这里是正文A");
+        let book = parse_azw3(&bytes).expect("最小 AZW3 应可解析");
+        assert_eq!(book.meta.title, "AZW3测试书");
+        assert_eq!(book.format, "azw3");
+        assert!(!book.chapters.is_empty());
+    }
+
+    /// 非法输入：明确报错而非 panic
+    #[test]
+    fn parse_mobi_invalid_bytes_errors() {
+        let err = parse_mobi(b"not a mobi file at all").unwrap_err();
+        assert!(format!("{err:#}").contains("MOBI"), "应提示 MOBI 相关错误: {err:#}");
+        assert!(parse_azw3(b"").is_err());
+    }
 }
+
 

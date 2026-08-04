@@ -7,8 +7,7 @@
 //! - 多规则：`&&` 分隔依次执行
 //! - 结果：字符串列表（legado 返回字符串列表语义）
 
-use regex::Regex;
-use scraper::{Html, Selector};
+// GAP 153：正则经 util::regex 兼容层执行（lookbehind 自动升级 fancy-regex）
 
 /// 解析后的规则
 #[derive(Debug, Clone)]
@@ -230,10 +229,14 @@ fn css_select(rule: &Rule, html: &str) -> Vec<String> {
 }
 
 /// Regex 执行（legado：规则整体当正则，提取 group 1 或全匹配）
+/// GAP 153：经 fancy-regex 兼容层编译（支持 lookbehind）；编译失败记日志并返回空
 fn regex_match(pattern: &str, text: &str) -> Vec<String> {
-    let re = match Regex::new(pattern) {
+    let re = match crate::util::regex::Regex::new(pattern) {
         Ok(r) => r,
-        Err(_) => return vec![],
+        Err(e) => {
+            tracing::warn!("正则规则编译失败（规则引擎返回空）: {e}");
+            return vec![];
+        }
     };
     re.captures_iter(text)
         .map(|c| {
@@ -470,10 +473,11 @@ fn apply_post(results: Vec<String>, rule: &Rule) -> Vec<String> {
                 }
             }
             if let Some(replace) = &rule.replace {
-                // 替换规则：旧值##新值（legado：正则替换）
+                // 替换规则：旧值##新值（legado：正则替换；GAP 153：lookbehind 经 fancy-regex）
                 if let Some((old, new)) = replace.split_once("##") {
-                    if let Ok(re) = Regex::new(old.trim()) {
-                        s = re.replace_all(&s, new.trim()).to_string();
+                    match crate::util::regex::Regex::new(old.trim()) {
+                        Ok(re) => s = re.replace_all(&s, new.trim()).to_string(),
+                        Err(e) => tracing::warn!("替换规则编译失败（跳过该替换）: {e}"),
                     }
                 }
             }
@@ -517,6 +521,18 @@ mod tests {
         let html = "书名：测试书 作者：张三";
         let r = apply("书名：(.+?)\\s", html);
         assert_eq!(r.first().map(String::as_str), Some("测试书"));
+    }
+
+    /// GAP 153：规则正则支持 lookbehind（fancy-regex 升级路径）
+    #[test]
+    fn test_regex_lookbehind() {
+        let html = "书名：测试书 作者：张三";
+        // 规则主体 lookbehind
+        let r = apply("(?<=书名：)\\S+", html);
+        assert_eq!(r, vec!["测试书".to_string()]);
+        // 替换规则（## 第三段）lookbehind：旧值 (?<=：)(.+?)$ 命中 "测试书"
+        let r = apply("(.+?)$##(?<=：)(.+?)$##[$1]", "书名：测试书");
+        assert_eq!(r, vec!["书名：[测试书]".to_string()]);
     }
 
     #[test]

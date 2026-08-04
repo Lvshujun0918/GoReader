@@ -88,6 +88,8 @@ impl AppConfig {
     /// 启动服务（axum）
     pub async fn serve(self) -> anyhow::Result<()> {
         let storage = storage::init(&self).await?;
+        // GAP 170 本地书双轨同步仓：启动对账 + 书仓目录文件监听（notify，300ms 去抖）
+        service::local_sync::spawn_local_sync(storage.clone());
         // F-35 定时书架更新检查（每 10 分钟）+ GAP #101 订阅/RSS 自动刷新
         service::schedule::spawn_schedule_jobs(storage.clone());
         // GAP #57 自动备份（每天 READER_AUTO_BACKUP_HOUR 03:00 默认）

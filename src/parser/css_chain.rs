@@ -52,9 +52,9 @@ fn css_chain_single(rule: &str, doc_html: &str) -> Vec<String> {
                 }
             }
         }
-        // 单段规则且 CSS 解析无结果 → 回退正则（legacy 兼容）
+        // 单段规则且 CSS 解析无结果 → 回退正则（legacy 兼容；GAP 153：lookbehind 经 fancy-regex）
         if next.is_empty() && parts.len() == 1 && i == 0 {
-            if let Ok(re) = regex::Regex::new(&selector) {
+            if let Ok(re) = crate::util::regex::Regex::new(&selector) {
                 let r: Vec<String> = re
                     .captures_iter(doc_html)
                     .map(|c| {
@@ -248,5 +248,13 @@ mod tests {
         let html = r#"<div>直接<span>子</span></div>"#;
         let r = css_chain("div@ownText", html);
         assert_eq!(r, vec!["直接".to_string()]);
+    }
+
+    /// GAP 153：CSS 解析失败回退正则时支持 lookbehind（fancy-regex 升级）
+    #[test]
+    fn test_chain_regex_fallback_lookbehind() {
+        let html = "书名：测试书 作者：张三";
+        let r = css_chain("(?<=书名：)\\S+", html);
+        assert_eq!(r, vec!["测试书".to_string()]);
     }
 }

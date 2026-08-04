@@ -9,7 +9,16 @@ async fn main() -> Result<()> {
 
     init_tracing();
 
-    reader_dev::AppConfig::from_env().serve().await
+    let config = reader_dev::AppConfig::from_env();
+    // GAP 148：数据库迁移/升级前自动备份（storage 初始化之前）
+    // reader.db → reader.db.bak-{日期}（保留最近 5 份；env READER_DB_BACKUP=0 禁用）
+    match reader_dev::util::db_backup::backup_reader_db(&config.storage_dir()).await {
+        Ok(Some(path)) => tracing::info!("启动备份完成: {}", path.display()),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("启动数据库备份失败（继续启动）: {e}"),
+    }
+
+    config.serve().await
 }
 
 /// 日志初始化（GAP 114：长期运行日志增长）

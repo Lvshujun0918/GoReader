@@ -230,9 +230,16 @@ fn display_cover(book: &Book) -> Option<String> {
 // ---------------- 本地书原文件 ----------------
 
 /// 本地书原文件定位：
+/// - local_file 双轨同步关联（GAP 170：书仓目录 / env READER_LOCAL_BOOK_DIR）优先
 /// - local://{uuid} → storage/data/{ns}/opds_files/{uuid}.*（上传时落盘）
 /// - storage/ 文件书（legacy）→ 按路径解析（兼容 index.epub 目录形态）
 fn resolve_local_file(storage: &Storage, ns: &str, book: &Book) -> Option<PathBuf> {
+    if let Some(p) = &book.local_file {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
     if book.book_url.starts_with("local://") {
         let id = book.book_url.trim_start_matches("local://");
         let dir = storage

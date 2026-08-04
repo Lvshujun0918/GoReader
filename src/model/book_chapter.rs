@@ -24,6 +24,19 @@ pub struct BookInfo {
     /// 出版时间
     #[serde(rename = "publishedAt")]
     pub published_at: Option<String>,
+    /// 相关推荐（GAP 17b：书源 ruleRelated 解析，[{name, author, bookUrl, coverUrl}]）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_books: Vec<RelatedBook>,
+}
+
+/// 相关推荐书（GAP 17b：legacy RelatedBook 字段）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RelatedBook {
+    pub name: String,
+    pub author: String,
+    pub book_url: String,
+    pub cover_url: Option<String>,
 }
 
 /// 章节（兼容 legacy BookChapter）

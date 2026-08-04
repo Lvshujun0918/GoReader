@@ -329,11 +329,11 @@ async fn migrate_book_sources(
                      concurrent_rate, header, login_url, login_ui, login_check_js, login_js,
                      book_source_comment, variable_comment, last_update_time, respond_time,
                      weight, explore_url, search_url, rule_explore, rule_search, rule_book_info,
-                     rule_toc, rule_content, search_rule, explore_rule, book_info_rule, toc_rule,
+                     rule_toc, rule_content, rule_related, search_rule, explore_rule, book_info_rule, toc_rule,
                      content_rule, key, tag, logger, variable, user_namespace, raw_json)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                        ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)
+                        ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)
                 "#,
             )
             .bind(&src.book_source_url)
@@ -363,6 +363,7 @@ async fn migrate_book_sources(
             .bind(&val(&src.rule_book_info))
             .bind(&val(&src.rule_toc))
             .bind(&val(&src.rule_content))
+            .bind(&val(&src.rule_related))
             .bind(&val(&src.search_rule))
             .bind(&val(&src.explore_rule))
             .bind(&val(&src.book_info_rule))
