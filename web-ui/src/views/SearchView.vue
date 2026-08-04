@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { searchBookMulti, searchBookMultiSSE } from '@/api/search'
 import { useUserStore } from '@/stores/user'
@@ -33,6 +33,7 @@ const searchedSources = ref(0)
 const bookMap = new Map<string, MergedResult>()
 const completedSources = new Set<number>()
 let sseAbort: (() => void) | null = null
+let batchAbort: AbortController | null = null
 /** 搜索代数：取消/停止后使在途 SSE/批量响应失效 */
 let searchSeq = 0
 
@@ -80,6 +81,7 @@ async function doSearch(kw?: string) {
   key.value = word
   const seq = ++searchSeq
   sseAbort = null
+  batchAbort = null
   searching.value = true
   searched.value = false
   errorMsg.value = ''
@@ -139,10 +141,11 @@ async function doSearch(kw?: string) {
   }
 }
 
-/** 批量降级：现有 searchBookMulti（maxSources=50），一次性出结果 */
+/** 批量降级：现有 searchBookMulti（maxSources=50，AbortSignal 可中止），一次性出结果 */
 async function runBatch(word: string, seq: number) {
+  batchAbort = new AbortController()
   try {
-    const res = await searchBookMulti(word, 50)
+    const res = await searchBookMulti(word, 50, batchAbort.signal)
     if (seq !== searchSeq) return
     if (!res.isSuccess) {
       if ((res.data as unknown) === 'NEED_LOGIN' || (res.errorMsg || '').includes('请登录')) {
@@ -161,16 +164,77 @@ async function runBatch(word: string, seq: number) {
     errorMsg.value = err instanceof Error ? err.message : '搜索失败，请稍后重试'
   } finally {
     if (seq === searchSeq) searching.value = false
+    if (batchAbort && seq !== searchSeq) batchAbort = null
   }
 }
 
-/** 停止搜索：中断 SSE，保留已到达的部分结果 */
+/* ================= 按书源分组折叠（GAP 23：组头=源名+数量，点击展开/收起，localStorage 持久化） ================= */
+interface SourceGroup {
+  key: string
+  label: string
+  count: number
+  entries: MergedResult[]
+}
+
+const COLLAPSE_KEY = 'reader_search_collapsed_sources'
+
+function loadCollapsedSources(): Set<string> {
+  try {
+    const raw = localStorage.getItem(COLLAPSE_KEY)
+    if (!raw) return new Set()
+    const arr = JSON.parse(raw)
+    return new Set(Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
+const collapsedSources = ref<Set<string>>(loadCollapsedSources())
+
+function persistCollapsedSources() {
+  try {
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(Array.from(collapsedSources.value)))
+  } catch {
+    /* localStorage 不可用时静默 */
+  }
+}
+
+function toggleSourceGroup(key: string) {
+  const s = new Set(collapsedSources.value)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  collapsedSources.value = s
+  persistCollapsedSources()
+}
+
+/** 结果按书源分组：每组为该源命中的书（书在多源命中时出现在多个组）；按命中数降序、源名升序 */
+const sourceGroups = computed<SourceGroup[]>(() => {
+  const groups = new Map<string, SourceGroup>()
+  for (const entry of results.value) {
+    for (const o of entry.origins) {
+      let g = groups.get(o.key)
+      if (!g) {
+        g = { key: o.key, label: o.label, count: 0, entries: [] }
+        groups.set(o.key, g)
+      }
+      g.count++
+      g.entries.push(entry)
+    }
+  }
+  return Array.from(groups.values()).sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
+})
+
+/** 停止搜索：中断 SSE/批量请求，保留已到达的部分结果 */
 function stopSearch() {
   if (!searching.value) return
   searchSeq++
   if (sseAbort) {
     sseAbort()
     sseAbort = null
+  }
+  if (batchAbort) {
+    batchAbort.abort()
+    batchAbort = null
   }
   stopped.value = true
   searched.value = true
@@ -294,7 +358,7 @@ onMounted(() => {
         <span class="state-text">{{ stopped ? '已停止搜索' : `没有找到与「${key.trim()}」相关的书籍` }}</span>
       </div>
 
-      <!-- 结果列表（SSE 增量累积） -->
+      <!-- 结果列表（SSE 增量累积；按书源分组折叠，GAP 23） -->
       <div v-if="results.length" class="results-wrap">
         <p v-if="errorMsg" class="result-note error">{{ errorMsg }}</p>
         <p v-else-if="stopped" class="result-note">已停止 · 以下为部分结果</p>
@@ -302,35 +366,55 @@ onMounted(() => {
           共 {{ results.length }} 本书<span v-if="searchedSources"> · 来自 {{ searchedSources }} 个书源</span>
         </p>
         <ul class="result-list">
-          <li
-            v-for="entry in results"
-            :key="entry.book.bookUrl"
-            class="result-item"
-            @click="openBook(entry.book)"
-          >
-            <span v-if="entry.book.coverUrl && !failedCovers.has(entry.book.bookUrl)" class="result-cover">
-              <img :src="entry.book.coverUrl" :alt="entry.book.name" loading="lazy" @error="failedCovers.add(entry.book.bookUrl)" />
-            </span>
-            <span v-else class="result-cover placeholder">{{ entry.book.name.charAt(0) }}</span>
-            <div class="result-main">
-              <p class="result-name" :title="entry.book.name">{{ entry.book.name }}</p>
-              <p class="result-sub">
-                <span class="result-author">{{ entry.book.author || '佚名' }}</span>
-                <span
-                  v-for="o in entry.origins"
-                  :key="o.key"
-                  class="source-badge"
-                  :title="o.label"
-                >{{ o.label }}</span>
-                <span v-if="entry.book.latestChapterTitle" class="result-chapter" :title="entry.book.latestChapterTitle">
-                  {{ entry.book.latestChapterTitle }}
+          <li v-for="g in sourceGroups" :key="g.key" class="source-group">
+            <button class="group-head" type="button" @click="toggleSourceGroup(g.key)">
+              <svg
+                class="group-chevron"
+                :class="{ open: !collapsedSources.has(g.key) }"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M9 6l6 6-6 6" />
+              </svg>
+              <span class="group-name" :title="g.label">{{ g.label }}</span>
+              <span class="group-count">{{ g.count }} 本</span>
+            </button>
+            <div v-if="!collapsedSources.has(g.key)" class="group-body">
+              <div
+                v-for="entry in g.entries"
+                :key="entry.book.bookUrl"
+                class="result-item"
+                @click="openBook(entry.book)"
+              >
+                <span v-if="entry.book.coverUrl && !failedCovers.has(entry.book.bookUrl)" class="result-cover">
+                  <img :src="entry.book.coverUrl" :alt="entry.book.name" loading="lazy" @error="failedCovers.add(entry.book.bookUrl)" />
                 </span>
-              </p>
-              <p v-if="entry.book.intro" class="result-intro">{{ entry.book.intro }}</p>
+                <span v-else class="result-cover placeholder">{{ entry.book.name.charAt(0) }}</span>
+                <div class="result-main">
+                  <p class="result-name" :title="entry.book.name">{{ entry.book.name }}</p>
+                  <p class="result-sub">
+                    <span class="result-author">{{ entry.book.author || '佚名' }}</span>
+                    <span
+                      v-for="o in entry.origins"
+                      :key="o.key"
+                      class="source-badge"
+                      :title="o.label"
+                    >{{ o.label }}</span>
+                    <span v-if="entry.book.latestChapterTitle" class="result-chapter" :title="entry.book.latestChapterTitle">
+                      {{ entry.book.latestChapterTitle }}
+                    </span>
+                  </p>
+                  <p v-if="entry.book.intro" class="result-intro">{{ entry.book.intro }}</p>
+                </div>
+                <svg class="result-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M9 6l6 6-6 6" />
+                </svg>
+              </div>
             </div>
-            <svg class="result-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M9 6l6 6-6 6" />
-            </svg>
           </li>
         </ul>
       </div>
@@ -594,7 +678,7 @@ onMounted(() => {
   border-color: var(--accent);
 }
 
-/* ================= 结果列表 ================= */
+/* ================= 结果列表（按书源分组） ================= */
 .results-wrap {
   margin-top: 22px;
 }
@@ -621,6 +705,66 @@ onMounted(() => {
   padding: 0;
   display: flex;
   flex-direction: column;
+}
+/* 书源分组：组头 = 源名 + 数量，点击展开/收起 */
+.source-group {
+  border-bottom: 1px solid var(--border);
+}
+.source-group:last-child {
+  border-bottom: none;
+}
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 11px 6px;
+  border: none;
+  background: none;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+.group-head:hover {
+  background: var(--surface);
+}
+.group-chevron {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  color: var(--text-3);
+  transition: transform 0.2s ease;
+}
+.group-chevron.open {
+  transform: rotate(90deg);
+}
+.group-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 0.2s ease;
+}
+.group-head:hover .group-name {
+  color: var(--accent);
+}
+.group-count {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.group-body .result-item {
+  padding-left: 22px;
+}
+.group-body .result-item:first-child {
+  border-top: none;
 }
 .result-item {
   display: flex;

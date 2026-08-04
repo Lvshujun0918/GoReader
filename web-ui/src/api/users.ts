@@ -54,6 +54,33 @@ export function resetUserPassword(username: string, newPassword: string): Promis
   return post('/resetUserPassword', { username, newPassword }, managerParams())
 }
 
+/** 新增用户请求体（POST /reader3/addUser；后端并行实现中——404 时调用方降级 register） */
+export interface AddUserPayload {
+  username: string
+  password: string
+  enableWebdav?: boolean
+  enableLocalStore?: boolean
+  enableBookSource?: boolean
+  enableRssSource?: boolean
+}
+
+/**
+ * POST /reader3/addUser：新增用户（silent——未实现时降级 register，业务错误由调用方提示）
+ * secure 模式同样需 secureKey（缺/错返回 NEED_SECURE_KEY，由调用方引导输入）。
+ */
+export function addUser(payload: AddUserPayload): Promise<ReturnData<unknown>> {
+  return post('/addUser', payload, { silent: true })
+}
+
+/** 判断接口是否未实现（404/501/网络失败）——用于 addUser 未就绪时降级 register */
+export function isNotImplemented(err: unknown): boolean {
+  const e = err as { response?: { status?: number }; message?: string } | null | undefined
+  const status = e?.response?.status
+  if (status === 404 || status === 501) return true
+  const msg = e?.message ?? ''
+  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
+}
+
 /**
  * 探测后端是否处于 secure 模式（决定书架导航「用户」入口是否显示）。
  * getUsers 无 secureKey 返回 NEED_SECURE_KEY ⇒ secure；其余（成功/404/网络错误）视为非 secure。

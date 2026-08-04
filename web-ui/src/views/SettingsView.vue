@@ -9,6 +9,8 @@ import { backupToWebdav, downloadBackupZip } from '@/api/backup'
 import { getSystemInfo } from '@/api/system'
 import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
 import { getBookshelf } from '@/api/bookshelf'
+import { login as loginApi } from '@/api/auth'
+import { resetUserPassword } from '@/api/users'
 import { getUserConfig, saveUserConfig } from '@/api/userConfig'
 import { getReadingStats } from '@/api/stats'
 import {
@@ -16,6 +18,7 @@ import {
   applyReaderConfig,
   toServerConfig,
   fromServerConfig,
+  READER_CONFIG_DEFAULTS,
   type ReaderConfig,
   type HanMode,
   type Theme,
@@ -66,6 +69,82 @@ async function logout() {
   store.clear() // 清空 localStorage（reader_access_token / reader_username）
   ElMessage.success('已退出登录')
   void router.replace('/login')
+}
+
+/* ================= GAP 87：修改密码（旧密码校验 → POST /reader3/resetUserPassword → 强制重新登录） ================= */
+
+const pwdOpen = ref(false)
+const pwdBusy = ref(false)
+const pwdForm = ref({ oldPassword: '', newPassword: '', confirmPassword: '' })
+const pwdMsg = ref('')
+const pwdMsgError = ref(false)
+
+function openPwd() {
+  pwdForm.value = { oldPassword: '', newPassword: '', confirmPassword: '' }
+  pwdMsg.value = ''
+  pwdMsgError.value = false
+  pwdOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closePwd() {
+  if (pwdBusy.value) return
+  pwdOpen.value = false
+  document.body.style.overflow = ''
+}
+
+async function submitPwd() {
+  if (pwdBusy.value) return
+  const { oldPassword, newPassword, confirmPassword } = pwdForm.value
+  if (!store.username) {
+    pwdMsg.value = '未登录，无法修改密码'
+    pwdMsgError.value = true
+    return
+  }
+  if (!oldPassword || !newPassword) {
+    pwdMsg.value = '请填写旧密码与新密码'
+    pwdMsgError.value = true
+    return
+  }
+  if (newPassword.length < 8) {
+    pwdMsg.value = '新密码不能低于 8 位'
+    pwdMsgError.value = true
+    return
+  }
+  if (newPassword !== confirmPassword) {
+    pwdMsg.value = '两次输入的新密码不一致'
+    pwdMsgError.value = true
+    return
+  }
+  pwdBusy.value = true
+  pwdMsg.value = ''
+  pwdMsgError.value = false
+  try {
+    // ① 旧密码校验：调登录接口（密码错则后端拒绝；登录会刷新 token，成功后同步本地会话）
+    const loginRes = await loginApi({
+      username: store.username,
+      password: oldPassword,
+      isLogin: true,
+    })
+    store.setSession(loginRes.data.accessToken, loginRes.data.username)
+    // ② 重置密码（后端重置后旧 token 失效）
+    await resetUserPassword(store.username, newPassword)
+    // ③ 强制重新登录
+    ElMessage.success('密码已修改，请重新登录')
+    store.clear()
+    void router.replace('/login')
+  } catch (err) {
+    if ((err as { data?: unknown } | null)?.data === 'NEED_SECURE_KEY') {
+      pwdMsg.value = '当前为 secure 模式，后端 resetUserPassword 需管理密码——个人改密接口后端待实现'
+    } else if (err instanceof Error && err.message.includes('密码错误')) {
+      pwdMsg.value = '旧密码错误'
+    } else {
+      pwdMsg.value = `修改失败：${err instanceof Error ? err.message : '请稍后重试'}`
+    }
+    pwdMsgError.value = true
+  } finally {
+    pwdBusy.value = false
+  }
 }
 /* ================= 听书设置（HttpTTS，localStorage 占位，见 api/httpTts.ts 契约注释） ================= */
 
@@ -408,6 +487,55 @@ async function savePref() {
   }
 }
 
+/* ================= 恢复默认设置（GAP 38：清空阅读偏好 localStorage + 重置为默认，确认弹窗） ================= */
+/** 阅读偏好 localStorage 键（与 utils/readerConfig.ts 的 KEY_MAP 一致） */
+const READER_PREF_KEYS = [
+  'reader_han_mode',
+  'reader_theme',
+  'reader_font_size',
+  'reader_line_height',
+  'reader_para_spacing',
+  'reader_font_weight',
+  'reader_content_width',
+  'reader_font_family',
+  'reader_letter_spacing',
+  'reader_text_indent',
+  'reader_text_align',
+  'reader_page_mode',
+]
+
+const resetPrefBusy = ref(false)
+
+async function resetPref() {
+  if (resetPrefBusy.value) return
+  try {
+    await ElMessageBox.confirm(
+      '确定恢复默认设置吗？本机阅读偏好将清空并重置为默认值（服务器配置仍优先，可点「保存到云端」覆盖）。',
+      '恢复默认',
+      { confirmButtonText: '恢复默认', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  resetPrefBusy.value = true
+  try {
+    for (const k of READER_PREF_KEYS) {
+      try {
+        localStorage.removeItem(k)
+      } catch {
+        /* 单个键失败继续 */
+      }
+    }
+    const defaults = { ...READER_CONFIG_DEFAULTS }
+    pref.value = defaults
+    applyReaderConfig(defaults)
+    prefMsg.value = '已恢复默认设置（本机）'
+    prefMsgError.value = false
+  } finally {
+    resetPrefBusy.value = false
+  }
+}
+
 /* ================= 阅读统计（GET /reader3/getReadingStats；后端未就绪时本地进度降级） ================= */
 
 /** 归一化后的展示模型（兼容后端秒数形态与契约对象形态） */
@@ -620,23 +748,44 @@ const opdsUrl = computed(() => {
 })
 const opdsCopied = ref(false)
 
-async function copyOpdsUrl() {
-  const text = opdsUrl.value
+/** 复制文本：优先剪贴板 API，不可用时 textarea 降级；返回是否成功 */
+async function copyText(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text)
+    return true
   } catch {
-    // 剪贴板 API 不可用（非 https 等）：textarea 降级
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    document.execCommand('copy')
-    document.body.removeChild(ta)
+    try {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+      return true
+    } catch {
+      return false
+    }
   }
-  opdsCopied.value = true
-  window.setTimeout(() => (opdsCopied.value = false), 1600)
+}
+
+async function copyOpdsUrl() {
+  if (await copyText(opdsUrl.value)) {
+    opdsCopied.value = true
+    window.setTimeout(() => (opdsCopied.value = false), 1600)
+  }
+}
+
+/* ================= WebDAV 访问地址（GAP 40：http://host:port/reader3/webdav/，与 OPDS 卡片同风格） ================= */
+const webdavUrl = computed(() => `${window.location.origin}/reader3/webdav/`)
+const webdavCopied = ref(false)
+
+async function copyWebdavUrl() {
+  if (await copyText(webdavUrl.value)) {
+    webdavCopied.value = true
+    window.setTimeout(() => (webdavCopied.value = false), 1600)
+  }
 }
 
 /* ================= 数据备份（WebDAV） ================= */
@@ -677,6 +826,30 @@ async function downloadBackup() {
     // 请求层已提示
   } finally {
     backupDownloadBusy.value = false
+  }
+}
+
+/* ================= 导出数据（GAP 39：备份为 zip 并直接下载，复用备份/下载逻辑） ================= */
+const exportBusy = ref(false)
+
+async function runExportData() {
+  if (exportBusy.value) return
+  exportBusy.value = true
+  try {
+    const res = await backupToWebdav()
+    const abs = res.data?.path ?? ''
+    if (!abs) {
+      ElMessage.warning('备份完成但未返回文件路径，无法下载')
+      return
+    }
+    const blob = await downloadBackupZip(abs)
+    const name = abs.split(/[\\/]/).filter(Boolean).pop() || 'backup.zip'
+    await downloadBlob(blob, name)
+    ElMessage.success('已导出备份')
+  } catch {
+    // 请求层已提示
+  } finally {
+    exportBusy.value = false
   }
 }
 </script>
@@ -726,6 +899,7 @@ async function downloadBackup() {
           </button>
         </div>
         <div class="card-foot">
+          <button class="ghost-btn" type="button" @click="openPwd">修改密码</button>
           <button class="danger-btn" type="button" @click="logout">退出登录</button>
         </div>
       </section>
@@ -767,6 +941,9 @@ async function downloadBackup() {
           <span class="card-sub">简繁 / 阅读主题 / 排版 · 服务器与本地合并，服务器优先</span>
           <button class="row-action" type="button" :disabled="prefSaving" @click="savePref">
             {{ prefSaving ? '保存中…' : '保存到云端' }}
+          </button>
+          <button class="row-action" type="button" :disabled="resetPrefBusy" @click="resetPref">
+            恢复默认
           </button>
         </div>
         <div class="row">
@@ -958,10 +1135,24 @@ async function downloadBackup() {
       <section class="card">
         <h2 class="card-title">数据备份</h2>
         <div class="row">
+          <span class="row-label">WebDAV 地址</span>
+          <span class="row-value mono" :title="webdavUrl">{{ webdavUrl }}</span>
+          <button class="row-action" type="button" @click="copyWebdavUrl">
+            {{ webdavCopied ? '已复制' : '复制' }}
+          </button>
+        </div>
+        <div class="row">
           <span class="row-label">WebDAV 备份</span>
           <span class="row-value">{{ backupBusy ? '备份中…' : '备份到 WebDAV legado 目录' }}</span>
           <button class="row-action" type="button" :disabled="backupBusy" @click="runBackup">
             {{ backupBusy ? '备份中…' : '立即备份' }}
+          </button>
+        </div>
+        <div class="row">
+          <span class="row-label">导出数据</span>
+          <span class="row-value">备份为 zip 并直接下载（webdav/legado 目录）</span>
+          <button class="row-action" type="button" :disabled="exportBusy" @click="runExportData">
+            {{ exportBusy ? '导出中…' : '导出数据' }}
           </button>
         </div>
         <div v-if="backupPath" class="row">
@@ -976,6 +1167,7 @@ async function downloadBackup() {
             {{ backupDownloadBusy ? '下载中…' : '下载备份' }}
           </button>
         </div>
+        <p class="card-note">WebDAV 地址供外部客户端（如 RaiDrive、文件管理器）挂载访问；备份/导出需要后端已配置 WebDAV。</p>
       </section>
 
       <!-- 缓存（契约 GET /reader3/getCacheInfo + POST /reader3/clearCache） -->
@@ -1096,6 +1288,78 @@ async function downloadBackup() {
         </template>
       </section>
     </main>
+    <!-- 修改密码弹窗（GAP 87：旧密码校验 → resetUserPassword → 强制重新登录） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="pwdOpen" class="dlg-overlay" @click.self="closePwd">
+          <div
+            class="dlg"
+            role="dialog"
+            aria-modal="true"
+            aria-label="修改密码"
+            tabindex="-1"
+            @keydown.esc="closePwd"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">修改密码</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="pwdBusy" @click="closePwd">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="submitPwd">
+              <label class="field">
+                <span class="field-label">旧密码<em>*</em></span>
+                <input
+                  v-model="pwdForm.oldPassword"
+                  class="field-input"
+                  type="password"
+                  placeholder="当前密码"
+                  maxlength="64"
+                  autocomplete="current-password"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">新密码<em>*</em></span>
+                <input
+                  v-model="pwdForm.newPassword"
+                  class="field-input"
+                  type="password"
+                  placeholder="至少 8 位"
+                  maxlength="64"
+                  autocomplete="new-password"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">确认新密码<em>*</em></span>
+                <input
+                  v-model="pwdForm.confirmPassword"
+                  class="field-input"
+                  type="password"
+                  placeholder="再次输入新密码"
+                  maxlength="64"
+                  autocomplete="new-password"
+                />
+              </label>
+              <p class="field-tip">校验旧密码后调用 POST /reader3/resetUserPassword；成功后需重新登录。</p>
+              <p v-if="pwdMsg" class="pwd-msg" :class="{ error: pwdMsgError }">{{ pwdMsg }}</p>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="pwdBusy" @click="closePwd">取消</button>
+                <button
+                  class="accent-btn"
+                  type="submit"
+                  :disabled="pwdBusy || !pwdForm.oldPassword || !pwdForm.newPassword"
+                >
+                  {{ pwdBusy ? '提交中…' : '确认修改' }}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
     <!-- 新增听书源弹窗 -->
     <Teleport to="body">
       <Transition name="dlg">
@@ -1652,6 +1916,16 @@ async function downloadBackup() {
   font-size: 11.5px;
   font-weight: 300;
   color: var(--text-3);
+}
+/* GAP 87：修改密码结果提示 */
+.pwd-msg {
+  margin: 2px 0 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+}
+.pwd-msg.error {
+  color: #cf4444;
 }
 .dlg-actions {
   display: flex;

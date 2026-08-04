@@ -11,7 +11,7 @@ const store = useUserStore()
 
 const mode = ref<'login' | 'register'>('login')
 const loading = ref(false)
-const form = reactive({ username: '', password: '' })
+const form = reactive({ username: '', password: '', code: '' })
 
 function switchMode(m: 'login' | 'register') {
   mode.value = m
@@ -38,6 +38,8 @@ async function submit() {
       username: username.trim(),
       password,
       isLogin: mode.value === 'login',
+      // GAP 90：注册模式携带邀请码（后端 register 校验 code 参数）
+      code: mode.value === 'register' && form.code.trim() ? form.code.trim() : undefined,
     })
     store.setSession(res.data.accessToken, res.data.username)
     ElMessage.success(mode.value === 'login' ? '欢迎回来' : '注册成功，已自动登录')
@@ -102,6 +104,20 @@ async function submit() {
             placeholder="至少 8 位"
             maxlength="64"
             autocomplete="current-password"
+          />
+        </label>
+
+        <!-- GAP 90：注册模式邀请码（后端开启邀请注册时必填；未开启可留空） -->
+        <label v-if="mode === 'register'" class="field">
+          <span class="field-label">邀请码</span>
+          <input
+            v-model="form.code"
+            class="field-input"
+            type="text"
+            placeholder="邀请码（如后端未开启邀请注册可留空）"
+            maxlength="64"
+            autocomplete="off"
+            spellcheck="false"
           />
         </label>
 

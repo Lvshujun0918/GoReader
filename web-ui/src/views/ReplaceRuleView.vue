@@ -4,8 +4,9 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import { deleteReplaceRule, getReplaceRules, saveReplaceRule } from '@/api/replaceRules'
+import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
 import { useUserStore } from '@/stores/user'
-import type { ReplaceRule } from '@/types'
+import type { ReplaceRule, TxtTocRule } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
@@ -112,23 +113,28 @@ async function toggleRule(r: ReplaceRule) {
   }
 }
 
-/* ================= 删除（极简确认弹窗） ================= */
-const deleting = ref<ReplaceRule | null>(null)
+/* ================= 删除（极简确认弹窗；替换规则 / TXT 目录规则共用） ================= */
+const deleting = ref<{ kind: 'replace' | 'txt'; id: string; name: string } | null>(null)
 const deleteBusy = ref(false)
 
-function askDelete(r: ReplaceRule) {
-  deleting.value = r
+function askDelete(kind: 'replace' | 'txt', r: { id: string; name: string }) {
+  deleting.value = { kind, id: r.id, name: r.name }
   document.body.style.overflow = 'hidden'
 }
 
 async function confirmDelete() {
-  const r = deleting.value
-  if (!r || deleteBusy.value) return
+  const t = deleting.value
+  if (!t || deleteBusy.value) return
   deleteBusy.value = true
   try {
-    // 当前为 localStorage 占位；后端就绪后走 POST /reader3/deleteReplaceRule（见 api/replaceRules.ts）
-    await deleteReplaceRule(r.id)
-    rules.value = rules.value.filter((x) => x.id !== r.id)
+    if (t.kind === 'replace') {
+      // 当前为 localStorage 占位；后端就绪后走 POST /reader3/deleteReplaceRule（见 api/replaceRules.ts）
+      await deleteReplaceRule(t.id)
+      rules.value = rules.value.filter((x) => x.id !== t.id)
+    } else {
+      await deleteTxtTocRule(t.id)
+      txtRules.value = txtRules.value.filter((x) => x.id !== t.id)
+    }
     closeDelete()
   } catch {
     // 已提示
@@ -142,7 +148,204 @@ function closeDelete() {
   document.body.style.overflow = ''
 }
 
-onMounted(load)
+/* ================= 选项卡：替换规则 / TXT 目录规则 ================= */
+const activeTab = ref<'replace' | 'txt'>('replace')
+
+/* ================= 规则测试（GAP 4 相关：弹窗输入样本文本 → 本地应用 → 前后对比） ================= */
+const testOpen = ref(false)
+const testingRule = ref<ReplaceRule | null>(null)
+const sampleText = ref('')
+const regexMode = ref(false)
+const testResult = ref<{ after: string; count: number; error: string } | null>(null)
+const testRunBusy = ref(false)
+
+function openTest(r: ReplaceRule) {
+  testingRule.value = r
+  sampleText.value = ''
+  regexMode.value = false
+  testResult.value = null
+  testOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeTest() {
+  if (testRunBusy.value) return
+  testOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 本地应用单条规则：默认与阅读页渲染同引擎（字面 replaceAll）；可切正则模式（简化版规则引擎） */
+function runTest() {
+  const r = testingRule.value
+  if (!r || testRunBusy.value) return
+  testRunBusy.value = true
+  testResult.value = null
+  try {
+    const input = sampleText.value
+    const find = r.find || ''
+    const replace = r.replace ?? ''
+    let after: string
+    let count = 0
+    if (regexMode.value) {
+      const re = new RegExp(find, 'g')
+      after = input.replace(re, replace)
+      count = (input.match(re) ?? []).length
+    } else {
+      const parts = input.split(find)
+      count = parts.length - 1
+      after = parts.join(replace)
+    }
+    testResult.value = { after, count, error: '' }
+  } catch (e) {
+    testResult.value = { after: sampleText.value, count: 0, error: e instanceof Error ? e.message : String(e) }
+  } finally {
+    testRunBusy.value = false
+  }
+}
+
+/* ================= TXT 目录规则（GAP 4 相关：管理 + 测试匹配章节标题） ================= */
+const txtRules = ref<TxtTocRule[]>([])
+const txtLoading = ref(true)
+const txtError = ref('')
+const txtBusy = ref(false)
+
+const txtEnabledCount = computed(() => txtRules.value.filter((r) => r.enable).length)
+
+async function loadTxtRules() {
+  txtLoading.value = true
+  txtError.value = ''
+  try {
+    const res = await getTxtTocRules()
+    txtRules.value = res.data ?? []
+  } catch {
+    txtError.value = '目录规则加载失败'
+  } finally {
+    txtLoading.value = false
+  }
+}
+
+/** 内置默认规则（后端固定 id default-N）：不可停用 / 删除 */
+function isDefaultTxtRule(r: TxtTocRule): boolean {
+  return (r.id || '').startsWith('default-')
+}
+
+async function toggleTxtRule(r: TxtTocRule) {
+  if (txtBusy.value || isDefaultTxtRule(r)) return
+  txtBusy.value = true
+  const prev = r.enable
+  r.enable = !prev // 乐观更新
+  try {
+    await saveTxtTocRule({ ...r, enable: !prev })
+  } catch {
+    r.enable = prev // 失败回滚
+  } finally {
+    txtBusy.value = false
+  }
+}
+
+async function importTxtDefaults() {
+  if (txtBusy.value) return
+  txtBusy.value = true
+  try {
+    await importDefaultTxtTocRules()
+    await loadTxtRules()
+  } catch {
+    // 已提示
+  } finally {
+    txtBusy.value = false
+  }
+}
+
+/* TXT 规则新增弹窗 */
+const txtEditorOpen = ref(false)
+const txtForm = ref({ name: '', rule: '', enable: true })
+
+function openTxtAdd() {
+  txtForm.value = { name: '', rule: '', enable: true }
+  txtEditorOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeTxtEditor() {
+  if (txtBusy.value) return
+  txtEditorOpen.value = false
+  document.body.style.overflow = ''
+}
+
+async function confirmTxtSave() {
+  if (txtBusy.value) return
+  const name = txtForm.value.name.trim()
+  const rule = txtForm.value.rule.trim()
+  if (!name) {
+    ElMessage.warning('「名称」不能为空')
+    return
+  }
+  if (!rule) {
+    ElMessage.warning('「规则」不能为空')
+    return
+  }
+  try {
+    new RegExp(rule, 'gm')
+  } catch {
+    ElMessage.warning('正则表达式无效')
+    return
+  }
+  txtBusy.value = true
+  try {
+    await saveTxtTocRule({
+      id: '',
+      name,
+      rule,
+      enable: txtForm.value.enable,
+      serialNumber: txtRules.value.length,
+    })
+    closeTxtEditor()
+    await loadTxtRules()
+  } finally {
+    txtBusy.value = false
+  }
+}
+
+/* TXT 规则测试弹窗：输入样本文本 → 正则按行匹配（MULTILINE，与后端分章同语义）→ 显示匹配章节标题 */
+const txtTestOpen = ref(false)
+const txtTestingRule = ref<TxtTocRule | null>(null)
+const txtSample = ref('')
+const txtTestResult = ref<{ titles: string[]; error: string } | null>(null)
+
+function openTxtTest(r: TxtTocRule) {
+  txtTestingRule.value = r
+  txtSample.value = ''
+  txtTestResult.value = null
+  txtTestOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeTxtTest() {
+  txtTestOpen.value = false
+  document.body.style.overflow = ''
+}
+
+function runTxtTest() {
+  const r = txtTestingRule.value
+  if (!r) return
+  txtTestResult.value = null
+  try {
+    const re = new RegExp(r.rule, 'gm')
+    const titles: string[] = []
+    for (const m of txtSample.value.matchAll(re)) {
+      const t = (m[0] || '').trim()
+      if (t) titles.push(t)
+    }
+    txtTestResult.value = { titles, error: '' }
+  } catch (e) {
+    txtTestResult.value = { titles: [], error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+onMounted(() => {
+  load()
+  loadTxtRules()
+})
 </script>
 
 <template>
@@ -166,61 +369,128 @@ onMounted(load)
 
     <main class="content">
       <div class="section-head">
-        <h1 class="section-title">替换规则</h1>
-        <span class="count">{{ rules.length }} 条 · {{ enabledCount }} 启用</span>
-        <button class="add-btn" type="button" @click="openAdd">新增规则</button>
+        <h1 class="section-title">{{ activeTab === 'replace' ? '替换规则' : 'TXT 目录规则' }}</h1>
+        <span class="count">{{ activeTab === 'replace' ? rules.length + ' 条 · ' + enabledCount + ' 启用' : txtRules.length + ' 条 · ' + txtEnabledCount + ' 启用' }}</span>
+        <button class="add-btn" type="button" @click="activeTab === 'replace' ? openAdd() : openTxtAdd()">新增规则</button>
       </div>
 
-      <!-- 加载态 -->
-      <div v-if="loading" class="state-row">
-        <p class="state-text">加载中…</p>
+      <!-- 选项卡 -->
+      <div class="tabs">
+        <button class="tab" :class="{ active: activeTab === 'replace' }" type="button" @click="activeTab = 'replace'">替换规则</button>
+        <button class="tab" :class="{ active: activeTab === 'txt' }" type="button" @click="activeTab = 'txt'">TXT 目录规则</button>
       </div>
 
-      <!-- 空状态 -->
-      <div v-else-if="rules.length === 0" class="state-row">
-        <p class="state-text">暂无规则，点击右上角新增</p>
-      </div>
+      <!-- ================= 替换规则 ================= -->
+      <template v-if="activeTab === 'replace'">
+        <!-- 加载态 -->
+        <div v-if="loading" class="state-row">
+          <p class="state-text">加载中…</p>
+        </div>
 
-      <!-- 规则列表（极简表格） -->
-      <div v-else class="table-wrap">
-        <table class="rule-table">
-          <thead>
-            <tr>
-              <th class="th-name">名称</th>
-              <th class="th-find">查找</th>
-              <th class="th-replace">替换</th>
-              <th class="th-enabled">启用</th>
-              <th class="th-ops">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="r in rules" :key="r.id">
-              <td class="td-name" :title="r.name">{{ r.name }}</td>
-              <td class="td-find mono" :title="r.find">{{ r.find }}</td>
-              <td class="td-replace mono" :title="r.replace">{{ r.replace || '—' }}</td>
-              <td class="td-enabled">
-                <button
-                  class="switch"
-                  :class="{ on: r.enabled }"
-                  type="button"
-                  role="switch"
-                  :aria-checked="r.enabled"
-                  :title="r.enabled ? '停用' : '启用'"
-                  @click="toggleRule(r)"
-                >
-                  <span class="switch-knob"></span>
-                </button>
-              </td>
-              <td class="td-ops">
-                <button class="op-btn" type="button" @click="openEdit(r)">编辑</button>
-                <button class="op-btn danger" type="button" @click="askDelete(r)">删除</button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+        <!-- 空状态 -->
+        <div v-else-if="rules.length === 0" class="state-row">
+          <p class="state-text">暂无规则，点击右上角新增</p>
+        </div>
 
-      <p class="foot-tip">规则已同步到服务端（登录账号内多设备一致）；服务不可用时自动降级为本地浏览器存储</p>
+        <!-- 规则列表（极简表格） -->
+        <div v-else class="table-wrap">
+          <table class="rule-table">
+            <thead>
+              <tr>
+                <th class="th-name">名称</th>
+                <th class="th-find">查找</th>
+                <th class="th-replace">替换</th>
+                <th class="th-enabled">启用</th>
+                <th class="th-ops">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in rules" :key="r.id">
+                <td class="td-name" :title="r.name">{{ r.name }}</td>
+                <td class="td-find mono" :title="r.find">{{ r.find }}</td>
+                <td class="td-replace mono" :title="r.replace">{{ r.replace || '—' }}</td>
+                <td class="td-enabled">
+                  <button
+                    class="switch"
+                    :class="{ on: r.enabled }"
+                    type="button"
+                    role="switch"
+                    :aria-checked="r.enabled"
+                    :title="r.enabled ? '停用' : '启用'"
+                    @click="toggleRule(r)"
+                  >
+                    <span class="switch-knob"></span>
+                  </button>
+                </td>
+                <td class="td-ops">
+                  <button class="op-btn" type="button" @click="openTest(r)">测试</button>
+                  <button class="op-btn" type="button" @click="openEdit(r)">编辑</button>
+                  <button class="op-btn danger" type="button" @click="askDelete('replace', r)">删除</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
+
+      <!-- ================= TXT 目录规则 ================= -->
+      <template v-else>
+        <div class="sub-head">
+          <span class="sub-tip">上传 TXT 本地书时，按启用的规则正则匹配行作为章节标题</span>
+          <button class="op-btn" type="button" :disabled="txtBusy" @click="importTxtDefaults">导入默认规则</button>
+        </div>
+
+        <!-- 加载态 -->
+        <div v-if="txtLoading" class="state-row">
+          <p class="state-text">加载中…</p>
+        </div>
+        <p v-else-if="txtError" class="state-error-line">{{ txtError }} <button class="retry-btn" type="button" @click="loadTxtRules">重试</button></p>
+
+        <!-- 空状态 -->
+        <div v-else-if="txtRules.length === 0" class="state-row">
+          <p class="state-text">暂无目录规则，可导入内置默认规则或新增</p>
+        </div>
+
+        <!-- 规则列表 -->
+        <div v-else class="table-wrap">
+          <table class="rule-table">
+            <thead>
+              <tr>
+                <th class="th-name">名称</th>
+                <th class="th-find">规则（正则）</th>
+                <th class="th-enabled">启用</th>
+                <th class="th-ops">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in txtRules" :key="r.id">
+                <td class="td-name" :title="r.name">{{ r.name }}</td>
+                <td class="td-find mono" :title="r.rule">{{ r.rule }}</td>
+                <td class="td-enabled">
+                  <button
+                    class="switch"
+                    :class="{ on: r.enable }"
+                    type="button"
+                    role="switch"
+                    :aria-checked="r.enable"
+                    :disabled="isDefaultTxtRule(r)"
+                    :title="isDefaultTxtRule(r) ? '内置默认规则' : (r.enable ? '停用' : '启用')"
+                    @click="toggleTxtRule(r)"
+                  >
+                    <span class="switch-knob"></span>
+                  </button>
+                </td>
+                <td class="td-ops">
+                  <button class="op-btn" type="button" @click="openTxtTest(r)">测试</button>
+                  <button v-if="!isDefaultTxtRule(r)" class="op-btn danger" type="button" @click="askDelete('txt', r)">删除</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
+
+      <p class="foot-tip">替换规则已同步到服务端（登录账号内多设备一致）；服务不可用时自动降级为本地浏览器存储。TXT 目录规则存储于服务端，上传 TXT 本地书时分章使用。</p>
     </main>
 
     <!-- 新增 / 编辑规则弹窗 -->
@@ -279,9 +549,9 @@ onMounted(load)
     <Teleport to="body">
       <Transition name="dlg">
         <div v-if="deleting" class="dlg-overlay" @click.self="closeDelete">
-          <div class="dlg dlg-confirm" role="alertdialog" aria-modal="true" aria-label="删除规则" tabindex="-1" @keydown.esc="closeDelete">
+          <div class="dlg dlg-confirm" role="alertdialog" aria-modal="true" aria-label="删除确认" tabindex="-1" @keydown.esc="closeDelete">
             <div class="dlg-head">
-              <h2 class="dlg-title">删除规则</h2>
+              <h2 class="dlg-title">删除{{ deleting.kind === 'txt' ? '目录规则' : '规则' }}</h2>
             </div>
             <p class="confirm-text">确定删除「{{ deleting.name }}」吗？此操作不可恢复。</p>
             <div class="dlg-actions">
@@ -290,6 +560,150 @@ onMounted(load)
                 {{ deleteBusy ? '删除中…' : '删除' }}
               </button>
             </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 替换规则测试弹窗：输入样本文本 → 本地应用 → 前后对比 -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="testOpen" class="dlg-overlay" @click.self="closeTest">
+          <div class="dlg dlg-test" role="dialog" aria-modal="true" aria-label="测试替换规则" tabindex="-1" @keydown.esc="closeTest">
+            <div class="dlg-head">
+              <h2 class="dlg-title">测试「{{ testingRule?.name }}」</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="testRunBusy" @click="closeTest">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <p class="test-rule-info mono">查找：{{ testingRule?.find }}</p>
+            <p class="test-rule-info mono">替换：{{ testingRule?.replace || '（删除匹配）' }}</p>
+            <label class="field">
+              <span class="field-label">样本文本</span>
+              <textarea v-model="sampleText" class="field-textarea" rows="5" placeholder="粘贴正文片段…" spellcheck="false"></textarea>
+            </label>
+            <div class="test-opts">
+              <label class="check">
+                <input v-model="regexMode" type="checkbox" />
+                <span>按正则匹配（默认字面替换，与阅读页一致）</span>
+              </label>
+              <button class="accent-btn" type="button" :disabled="testRunBusy || !sampleText" @click="runTest">
+                {{ testRunBusy ? '应用中…' : '应用规则' }}
+              </button>
+            </div>
+            <div v-if="testResult" class="test-result">
+              <p v-if="testResult.error" class="test-error">规则无效：{{ testResult.error }}</p>
+              <template v-else>
+                <p class="test-count">共替换 {{ testResult.count }} 处</p>
+                <div class="cmp">
+                  <span class="cmp-label">替换前</span>
+                  <pre class="cmp-box before">{{ sampleText }}</pre>
+                </div>
+                <div class="cmp">
+                  <span class="cmp-label">替换后</span>
+                  <pre class="cmp-box after">{{ testResult.after }}</pre>
+                </div>
+              </template>
+            </div>
+            <div class="dlg-actions">
+              <button class="ghost-btn" type="button" @click="closeTest">关闭</button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- TXT 目录规则测试弹窗：输入样本文本 → 匹配章节标题 -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="txtTestOpen" class="dlg-overlay" @click.self="closeTxtTest">
+          <div class="dlg dlg-test" role="dialog" aria-modal="true" aria-label="测试 TXT 目录规则" tabindex="-1" @keydown.esc="closeTxtTest">
+            <div class="dlg-head">
+              <h2 class="dlg-title">测试「{{ txtTestingRule?.name }}」</h2>
+              <button class="dlg-close" type="button" title="关闭" @click="closeTxtTest">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <p class="test-rule-info mono">{{ txtTestingRule?.rule }}</p>
+            <label class="field">
+              <span class="field-label">样本文本</span>
+              <textarea v-model="txtSample" class="field-textarea" rows="6" placeholder="粘贴 TXT 正文片段（按行匹配章节标题）…" spellcheck="false"></textarea>
+            </label>
+            <div class="test-opts">
+              <span class="sub-tip">规则按行匹配（MULTILINE），匹配的整行作为章节标题</span>
+              <button class="accent-btn" type="button" :disabled="!txtSample" @click="runTxtTest">匹配章节</button>
+            </div>
+            <div v-if="txtTestResult" class="test-result">
+              <p v-if="txtTestResult.error" class="test-error">规则无效：{{ txtTestResult.error }}</p>
+              <template v-else>
+                <p class="test-count">匹配到 {{ txtTestResult.titles.length }} 个章节标题</p>
+                <ul v-if="txtTestResult.titles.length" class="toc-matches">
+                  <li v-for="(t, i) in txtTestResult.titles" :key="i" class="toc-match mono">{{ t }}</li>
+                </ul>
+                <p v-else class="state-text">未匹配到章节标题</p>
+              </template>
+            </div>
+            <div class="dlg-actions">
+              <button class="ghost-btn" type="button" @click="closeTxtTest">关闭</button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 新增 TXT 目录规则弹窗 -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="txtEditorOpen" class="dlg-overlay" @click.self="closeTxtEditor">
+          <div class="dlg" role="dialog" aria-modal="true" aria-label="新增 TXT 目录规则" tabindex="-1" @keydown.esc="closeTxtEditor">
+            <div class="dlg-head">
+              <h2 class="dlg-title">新增 TXT 目录规则</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="txtBusy" @click="closeTxtEditor">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="confirmTxtSave">
+              <label class="field">
+                <span class="field-label">名称<em>*</em></span>
+                <input v-model="txtForm.name" class="field-input" type="text" placeholder="如：第X章" maxlength="40" spellcheck="false" />
+              </label>
+              <label class="field">
+                <span class="field-label">规则（正则）<em>*</em></span>
+                <textarea
+                  v-model="txtForm.rule"
+                  class="field-textarea"
+                  rows="3"
+                  placeholder="如：^\s*第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节卷回集部篇]"
+                  spellcheck="false"
+                ></textarea>
+              </label>
+              <div class="field">
+                <span class="field-label">启用</span>
+                <button
+                  class="switch"
+                  :class="{ on: txtForm.enable }"
+                  type="button"
+                  role="switch"
+                  :aria-checked="txtForm.enable"
+                  @click="txtForm.enable = !txtForm.enable"
+                >
+                  <span class="switch-knob"></span>
+                </button>
+              </div>
+              <p class="field-tip">正则按行匹配（MULTILINE），匹配到的整行作为章节标题；上传 TXT 本地书时按启用的规则分章</p>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="txtBusy" @click="closeTxtEditor">取消</button>
+                <button class="accent-btn" type="submit" :disabled="txtBusy || !txtForm.name.trim() || !txtForm.rule.trim()">
+                  {{ txtBusy ? '保存中…' : '保存' }}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       </Transition>
@@ -567,6 +981,194 @@ onMounted(load)
   font-size: 11.5px;
   font-weight: 300;
   color: var(--text-3);
+}
+
+/* ================= 选项卡 ================= */
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 20px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  padding: 6px 18px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.tab:hover {
+  color: var(--accent);
+}
+.tab.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ================= TXT 规则 ================= */
+.sub-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.sub-tip {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.state-error-line {
+  padding: 40px 0;
+  text-align: center;
+  font-size: 13px;
+  color: #cf4444;
+}
+.retry-btn {
+  margin-left: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--accent);
+  background: none;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.switch:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ================= 测试弹窗 ================= */
+.dlg-test {
+  width: min(560px, 100%);
+}
+.test-rule-info {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+  word-break: break-all;
+}
+.field-textarea {
+  width: 100%;
+  min-height: 96px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.7;
+  resize: vertical;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.2s ease;
+}
+.field-textarea:focus {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+.test-opts {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.check input {
+  accent-color: var(--accent);
+}
+.test-result {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+.test-count {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--accent);
+}
+.test-error {
+  margin: 0;
+  font-size: 12.5px;
+  color: #cf4444;
+  word-break: break-all;
+}
+.cmp + .cmp {
+  margin-top: 10px;
+}
+.cmp-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 11.5px;
+  font-weight: 300;
+  letter-spacing: 2px;
+  color: var(--text-3);
+}
+.cmp-box {
+  margin: 0;
+  max-height: 160px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-1);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.cmp-box.after {
+  border-color: var(--accent);
+}
+.toc-matches {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.toc-match {
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-1);
+  word-break: break-all;
 }
 
 /* ================= 弹窗 ================= */

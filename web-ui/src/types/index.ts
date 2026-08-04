@@ -38,6 +38,8 @@ export interface Book {
   durChapterIndex?: number
   durChapterPos?: number
   durChapterTime?: number
+  /** 总章数（后端 books.totalChapterNum；书卡进度角标用，缺省/为 0 时隐藏角标） */
+  totalChapterNum?: number
   [key: string]: unknown
 }
 

@@ -26,6 +26,42 @@ const files = ref<FileItem[]>([])
 const loading = ref(false)
 const selectedPath = ref<string | null>(null)
 
+/* ---------------- 搜索（GAP 33：前端过滤当前目录列表，名称包含） ---------------- */
+const searchKey = ref('')
+
+/* ---------------- 排序（GAP 34：名称/大小/时间 + 升降序，目录恒优先） ---------------- */
+type SortField = 'name' | 'size' | 'time'
+const sortBy = ref<SortField>('name')
+const sortDesc = ref(false)
+
+const SORT_OPTIONS: { value: SortField; label: string }[] = [
+  { value: 'name', label: '名称' },
+  { value: 'size', label: '大小' },
+  { value: 'time', label: '时间' },
+]
+
+/** 展示列表：名称过滤 → 目录在前 + 按字段/方向排序 */
+const displayFiles = computed<FileItem[]>(() => {
+  const kw = searchKey.value.trim().toLowerCase()
+  let list = files.value
+  if (kw) list = list.filter((f) => f.name.toLowerCase().includes(kw))
+  const dirs = list.filter((f) => f.isDirectory)
+  const others = list.filter((f) => !f.isDirectory)
+  const cmp = (a: FileItem, b: FileItem): number => {
+    let r = 0
+    if (sortBy.value === 'size') r = (a.size ?? -1) - (b.size ?? -1)
+    else if (sortBy.value === 'time') {
+      const ta = typeof a.lastModified === 'number' ? a.lastModified : new Date(String(a.lastModified)).getTime() || 0
+      const tb = typeof b.lastModified === 'number' ? b.lastModified : new Date(String(b.lastModified)).getTime() || 0
+      r = ta - tb
+    } else r = a.name.localeCompare(b.name)
+    return sortDesc.value ? -r : r
+  }
+  return [...dirs.sort(cmp), ...others.sort(cmp)]
+})
+
+const homeLabel = computed(() => HOME_OPTIONS.find((o) => o.value === home.value)?.label ?? '根')
+
 /* ---------------- 多选模式（右键/长按进入；底部操作条：下载/删除） ---------------- */
 const multiMode = ref(false)
 const multiSelected = ref<Set<string>>(new Set())
@@ -93,6 +129,78 @@ function onRowClick(item: FileItem) {
     return
   }
   enter(item)
+}
+
+/** 批量移动（GAP 补：后端无 MOVE 接口 → 文本文件 读→写→删 组合；目录/二进制提示） */
+const moveOpen = ref(false)
+const moveTarget = ref('')
+const moveBusy = ref(false)
+
+function openMultiMove() {
+  if (!multiSelected.value.size) return
+  moveTarget.value = ''
+  moveOpen.value = true
+}
+
+async function doMultiMove() {
+  if (moveBusy.value) return
+  const target = moveTarget.value.trim().replace(/^\/+|\/+$/g, '')
+  if (!target) {
+    ElMessage.warning('请输入目标目录')
+    return
+  }
+  const items = files.value.filter((f) => multiSelected.value.has(f.path))
+  if (!items.length) return
+  // 目标不能是选中项本身或其子路径
+  if (items.some((it) => it.path === target || target.startsWith(it.path + '/'))) {
+    ElMessage.warning('目标目录不能是选中项本身或其子目录')
+    return
+  }
+  moveBusy.value = true
+  try {
+    let ok = 0
+    const skipped: string[] = []
+    for (const item of items) {
+      if (item.isDirectory) {
+        skipped.push(`${item.name}（目录）`)
+        continue
+      }
+      if (!isTextFile(item.name)) {
+        skipped.push(`${item.name}（非文本）`)
+        continue
+      }
+      const newPath = joinPath(target, item.name)
+      if (newPath === item.path) {
+        skipped.push(`${item.name}（已在目标目录）`)
+        continue
+      }
+      if (files.value.some((f) => f.path !== item.path && f.path === newPath)) {
+        skipped.push(`${item.name}（同名已存在）`)
+        continue
+      }
+      try {
+        // file/save 自动建父目录；组合：读旧 → 写新 → 删旧（写失败则旧文件保留）
+        const res = await getFile(item.path, home.value)
+        await saveFile(newPath, res.data ?? '', home.value)
+        await deleteFile(item.path, home.value)
+        ok++
+      } catch (err) {
+        secureWriteHint(err)
+        skipped.push(item.name)
+      }
+    }
+    moveOpen.value = false
+    exitMulti()
+    const base = ok > 0 ? `已移动 ${ok} 项` : '未移动任何文件'
+    const extra = skipped.length
+      ? `；跳过 ${skipped.length} 项（${skipped.slice(0, 3).join('、')}${skipped.length > 3 ? '…' : ''}）`
+      : ''
+    if (ok > 0) ElMessage.success(base + extra)
+    else ElMessage.warning(base + extra)
+    await loadList()
+  } finally {
+    moveBusy.value = false
+  }
 }
 
 /** 多选下载：循环 GET file/download → downloadBlob */
@@ -473,7 +581,7 @@ onBeforeUnmount(() => {
     <main class="content" :class="{ 'with-multi-bar': multiMode }">
       <div class="section-head">
         <h1 class="section-title">文件</h1>
-        <span class="count">{{ loading ? '…' : `${files.length} 项` }}</span>
+        <span class="count">{{ loading ? '…' : `${displayFiles.length} 项` }}</span>
       </div>
 
       <!-- home 切换胶囊 -->
@@ -505,6 +613,19 @@ onBeforeUnmount(() => {
         </nav>
 
         <div class="toolbar">
+          <div class="sort-box" title="排序">
+            <select v-model="sortBy" class="sort-select" aria-label="排序字段">
+              <option v-for="o in SORT_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+            </select>
+            <button
+              class="sort-dir"
+              type="button"
+              :title="sortDesc ? '降序' : '升序'"
+              @click="sortDesc = !sortDesc"
+            >
+              {{ sortDesc ? '↓' : '↑' }}
+            </button>
+          </div>
           <button class="tool-btn" type="button" @click="openUpload">上传</button>
           <button class="tool-btn" type="button" @click="mkdirOpen = true">新建文件夹</button>
           <button
@@ -527,13 +648,41 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <!-- 搜索（GAP 33：前端过滤当前目录，名称包含） -->
+      <div class="filter-bar">
+        <div class="search-box">
+          <svg
+            class="search-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+          >
+            <circle cx="11" cy="11" r="6.5" />
+            <path d="M20 20l-3.8-3.8" />
+          </svg>
+          <input
+            v-model="searchKey"
+            class="search-input"
+            type="text"
+            placeholder="搜索当前目录"
+            spellcheck="false"
+          />
+          <button v-if="searchKey" class="search-clear" type="button" title="清空" @click="searchKey = ''">
+            ✕
+          </button>
+        </div>
+      </div>
+
       <!-- 文件列表 -->
       <div class="file-list">
         <div v-if="loading" class="list-hint">加载中…</div>
         <div v-else-if="files.length === 0" class="list-hint empty">此目录为空</div>
+        <div v-else-if="displayFiles.length === 0" class="list-hint empty">无匹配「{{ searchKey.trim() }}」的文件</div>
         <template v-else>
           <div
-            v-for="item in files"
+            v-for="item in displayFiles"
             :key="item.path"
             class="row"
             :class="{
@@ -604,6 +753,14 @@ onBeforeUnmount(() => {
             @click="multiDownload"
           >
             {{ multiBusy ? '处理中…' : '下载' }}
+          </button>
+          <button
+            class="multi-act"
+            type="button"
+            :disabled="multiSelected.size === 0 || multiBusy"
+            @click="openMultiMove"
+          >
+            移动
           </button>
           <button
             class="multi-act danger"
@@ -696,6 +853,36 @@ onBeforeUnmount(() => {
         <div class="preview-body">
           <p v-if="previewLoading" class="list-hint">加载中…</p>
           <pre v-else class="preview-content">{{ previewContent }}</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- 批量移动弹窗（GAP 补：文本文件 读→写→删 组合；目录/二进制提示后端 MOVE 未就绪） -->
+    <div v-if="moveOpen" class="dlg-overlay" @click.self="moveOpen = false">
+      <div class="dlg">
+        <h3 class="dlg-title">移动 {{ multiSelected.size }} 项</h3>
+        <p class="dlg-path">目标目录（{{ homeLabel }} 根下相对路径）</p>
+        <input
+          v-model="moveTarget"
+          class="dlg-input"
+          type="text"
+          placeholder="如 books/子目录（不存在将自动创建）"
+          spellcheck="false"
+          @keyup.enter="doMultiMove"
+        />
+        <p class="rename-tip">
+          以「读取内容 → 写入新路径 → 删除旧文件」组合实现（仅文本文件）；目录与二进制文件暂不支持——后端 MOVE 接口未就绪。
+        </p>
+        <div class="dlg-actions">
+          <button class="btn-plain" type="button" :disabled="moveBusy" @click="moveOpen = false">取消</button>
+          <button
+            class="btn-primary"
+            type="button"
+            :disabled="moveBusy || !moveTarget.trim()"
+            @click="doMultiMove"
+          >
+            {{ moveBusy ? '移动中…' : '移动' }}
+          </button>
         </div>
       </div>
     </div>
@@ -940,6 +1127,105 @@ onBeforeUnmount(() => {
 .tool-btn:disabled {
   opacity: 0.4;
   cursor: default;
+}
+
+/* ================= 搜索 + 排序 ================= */
+.filter-bar {
+  margin-bottom: 10px;
+}
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  height: 38px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  transition: border-color 0.2s ease;
+}
+.search-box:focus-within {
+  border-color: var(--accent);
+}
+.search-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--text-3);
+  transition: color 0.2s ease;
+}
+.search-box:focus-within .search-icon {
+  color: var(--accent);
+}
+.search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 300;
+  letter-spacing: 0.5px;
+  outline: none;
+}
+.search-input::placeholder {
+  color: var(--text-3);
+}
+.search-clear {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  color: var(--text-3);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.search-clear:hover {
+  color: var(--accent);
+}
+.sort-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.sort-select {
+  height: 28px;
+  padding: 0 6px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 300;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+.sort-select:focus {
+  border-color: var(--accent);
+}
+.sort-dir {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
+.sort-dir:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 /* ================= 文件列表 ================= */

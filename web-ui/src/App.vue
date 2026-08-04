@@ -1,6 +1,19 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { getCurrentInstance, onMounted } from 'vue'
 import { applyUiTheme, loadUiTheme } from '@/utils/uiTheme'
+import ErrorBoundary from '@/components/ErrorBoundary.vue'
+
+// GAP 69 全局错误处理：未被子组件捕获的渲染/生命周期/异步错误统一记录
+// （子组件渲染错误由 ErrorBoundary 的 onErrorCaptured 拦截并展示重载页，
+//   此处兜底记录 + 控制台可见，不打断用户操作）
+const app = getCurrentInstance()?.appContext.app
+if (app) {
+  app.config.errorHandler = (err, instance, info) => {
+    // eslint-disable-next-line no-console
+    console.error('[global-error]', err, info, instance)
+    // 渲染期错误：交给 ErrorBoundary 展示（errorCaptured 已 return false 时不会到这儿）
+  }
+}
 
 onMounted(() => {
   // 界面主题（浅色/深色/跟随系统）：进入即恢复，并监听系统深色偏好（system 时自动切换）
@@ -14,9 +27,11 @@ onMounted(() => {
 </script>
 
 <template>
-  <router-view v-slot="{ Component }">
-    <transition name="page" mode="out-in">
-      <component :is="Component" />
-    </transition>
-  </router-view>
+  <ErrorBoundary>
+    <router-view v-slot="{ Component }">
+      <transition name="page" mode="out-in">
+        <component :is="Component" />
+      </transition>
+    </router-view>
+  </ErrorBoundary>
 </template>

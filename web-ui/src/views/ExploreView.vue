@@ -99,6 +99,22 @@
       <div v-if="catsLoading" class="state"><p class="state-text">加载分类…</p></div>
       <p v-else-if="catsError" class="state-error">{{ catsError }} <button class="retry" type="button" @click="loadCategories">重试</button></p>
       <template v-else>
+        <!-- 书单页顶部：书单内搜索（GAP 49 补——前端过滤当前列表，不发请求） -->
+        <div class="list-search">
+          <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+            <circle cx="11" cy="11" r="6.5" />
+            <path d="M20 20l-3.8-3.8" />
+          </svg>
+          <input
+            v-model="listFilter"
+            class="search-input"
+            type="text"
+            placeholder="在书单中搜索（书名 / 作者）…"
+            spellcheck="false"
+          />
+          <button v-if="listFilter" class="list-search-clear" type="button" @click="listFilter = ''">清空</button>
+        </div>
+
         <div class="cats">
           <button
             v-for="c in categories"
@@ -115,37 +131,51 @@
 
         <div v-if="loadingBooks" class="state"><p class="state-text">加载中…</p></div>
         <p v-else-if="booksError" class="state-error">{{ booksError }} <button class="retry" type="button" @click="loadBooks(1)">重试</button></p>
-        <div v-else-if="books.length === 0" class="state"><p class="state-text">此分类暂无内容</p><p class="state-hint">可能为外部链接/站点失效，或书源探索规则未配置完整</p></div>
-        <div v-else class="book-grid">
-          <button v-for="b in books" :key="b.bookUrl" type="button" class="book-card" @click="goBook(b)">
-            <span class="book-cover" :style="{ background: coverGradient(b.name) }">
-              <img
-                v-if="b.coverUrl && !failedCovers.has(b.bookUrl)"
-                :src="b.coverUrl"
-                :alt="b.name"
-                loading="lazy"
-                class="cover-img"
-                @error="failedCovers.add(b.bookUrl)"
-              />
-              <template v-else>{{ applyHan(b.name, hanMode).charAt(0) }}</template>
-            </span>
-            <span class="book-name">{{ applyHan(b.name, hanMode) }}</span>
-            <span class="book-author">{{ applyHan(b.author || '未知作者', hanMode) }}</span>
-          </button>
-        </div>
-        <div v-if="books.length > 0" class="more-row">
-          <button v-if="!noMore" class="more-btn" type="button" :disabled="loadingMore" @click="loadBooks(page + 1)">
-            {{ loadingMore ? '加载中…' : '加载更多' }}
-          </button>
-          <span v-else class="no-more">没有更多了</span>
-        </div>
+        <template v-else>
+          <div v-if="books.length === 0" class="state"><p class="state-text">此分类暂无内容</p><p class="state-hint">可能为外部链接/站点失效，或书源探索规则未配置完整</p></div>
+          <template v-else>
+            <div v-if="filteredBooks.length === 0" class="state">
+              <p class="state-text">没有匹配「{{ listFilter.trim() }}」的书籍</p>
+            </div>
+            <div v-else class="book-grid">
+              <button v-for="b in filteredBooks" :key="b.bookUrl" type="button" class="book-card" @click="goBook(b)">
+                <span class="book-cover" :style="{ background: coverGradient(b.name) }">
+                  <img
+                    v-if="b.coverUrl && !failedCovers.has(b.bookUrl)"
+                    :src="b.coverUrl"
+                    :alt="b.name"
+                    loading="lazy"
+                    class="cover-img"
+                    @error="failedCovers.add(b.bookUrl)"
+                  />
+                  <template v-else>{{ applyHan(b.name, hanMode).charAt(0) }}</template>
+                </span>
+                <span class="book-name">{{ applyHan(b.name, hanMode) }}</span>
+                <span class="book-author">{{ applyHan(b.author || '未知作者', hanMode) }}</span>
+              </button>
+            </div>
+            <!-- GAP #51：分页（page 参数 + {books, hasMore} 契约；未就绪则标注并隐藏加载更多） -->
+            <div class="more-row">
+              <p v-if="pagingBackendReady === false" class="paging-note">后端分页接口待实现：当前仅展示第一页</p>
+              <template v-else-if="!noMore">
+                <button class="more-btn" type="button" :disabled="loadingMore" @click="loadBooks(page + 1)">
+                  {{ loadingMore ? '加载中…' : '加载更多' }}
+                </button>
+                <p class="paging-note">滚动到底部自动加载下一页</p>
+              </template>
+              <span v-else class="no-more">没有更多了</span>
+            </div>
+            <!-- 滚动哨兵：进入视口 → 自动加载下一页 -->
+            <div v-if="pagingBackendReady === true && !noMore && !loadingBooks" ref="sentinelEl" class="sentinel" aria-hidden="true"></div>
+          </template>
+        </template>
       </template>
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { applyHan, getHanMode, type HanMode } from '@/utils/chinese'
 import { useRouter } from 'vue-router'
 import { getExploreSources, getExploreUrls, exploreBook } from '@/api/explore'
@@ -223,6 +253,59 @@ const loadingBooks = ref(false)
 const loadingMore = ref(false)
 const noMore = ref(false)
 const booksError = ref('')
+
+/* ============ 书单内搜索（GAP 49 补：前端过滤当前列表） ============ */
+const listFilter = ref('')
+const filteredBooks = computed(() => {
+  const kw = listFilter.value.trim().toLowerCase()
+  if (!kw) return books.value
+  return books.value.filter((b) => {
+    const name = (b.name ?? '').toLowerCase()
+    const author = (b.author ?? '').toLowerCase()
+    if (name.includes(kw) || author.includes(kw)) return true
+    // 简繁再比一轮（繁体书名 + 简体搜索词等场景）
+    const hanName = applyHan(b.name ?? '', hanMode.value).toLowerCase()
+    const hanAuthor = applyHan(b.author ?? '', hanMode.value).toLowerCase()
+    return hanName.includes(kw) || hanAuthor.includes(kw)
+  })
+})
+
+/* ============ 分页（GAP #51：后端契约 {books, hasMore}） ============ */
+/** 后端分页契约就绪状态：null=未知 / true={books,hasMore} / false=仍返回旧数组 */
+const pagingBackendReady = ref<boolean | null>(null)
+
+/** 滚动哨兵：进入视口自动加载下一页（根观察，rootMargin 提前 160px 预载） */
+const sentinelEl = ref<HTMLElement | null>(null)
+let sentinelObserver: IntersectionObserver | null = null
+
+function tryLoadMore() {
+  if (!source.value || !activeUrl.value) return
+  if (loadingBooks.value || loadingMore.value || noMore.value) return
+  if (pagingBackendReady.value !== true) return
+  void loadBooks(page.value + 1)
+}
+
+function setupSentinel() {
+  sentinelObserver?.disconnect()
+  sentinelObserver = null
+  const el = sentinelEl.value
+  if (!el) return
+  sentinelObserver = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((e) => e.isIntersecting)) tryLoadMore()
+    },
+    { rootMargin: '160px 0px' },
+  )
+  sentinelObserver.observe(el)
+}
+
+watch(sentinelEl, (el) => {
+  if (el) setupSentinel()
+  else {
+    sentinelObserver?.disconnect()
+    sentinelObserver = null
+  }
+})
 
 const GRADIENTS = [
   'linear-gradient(150deg, #6366f1 0%, #a855f7 100%)',
@@ -312,6 +395,12 @@ function openCategory(c: ExploreCategory) {
   switchCategory(c.url)
 }
 
+/** GAP #51 契约：{books, hasMore}（后端并行实现中；未就绪时仍返回旧数组） */
+interface ExploreBookPage {
+  books: SearchBook[]
+  hasMore: boolean
+}
+
 async function loadBooks(p: number) {
   if (!source.value || !activeUrl.value) return
   if (p === 1) loadingBooks.value = true
@@ -319,19 +408,40 @@ async function loadBooks(p: number) {
   booksError.value = ''
   try {
     const res = await exploreBook(activeUrl.value, source.value.bookSourceUrl, p)
-    const list = (res.data ?? []) as SearchBook[]
+    const data = res.data as unknown
+    let list: SearchBook[] = []
+    let hasMore = false
+    if (data && typeof data === 'object' && !Array.isArray(data) && Array.isArray((data as ExploreBookPage).books)) {
+      // 新契约：后端分页就绪
+      const pageData = data as ExploreBookPage
+      list = pageData.books
+      hasMore = !!pageData.hasMore
+      pagingBackendReady.value = true
+    } else if (Array.isArray(data)) {
+      // 旧契约：后端分页未就绪——仅展示第一页，标注待实现
+      list = data as SearchBook[]
+      hasMore = false
+      pagingBackendReady.value = false
+    }
     if (p === 1) books.value = list
     else {
       const seen = new Set(books.value.map((b) => b.bookUrl))
       books.value.push(...list.filter((b) => !seen.has(b.bookUrl)))
     }
     page.value = p
-    noMore.value = list.length === 0
+    noMore.value = !hasMore
   } catch {
     if (p === 1) booksError.value = '探索失败'
   } finally {
     loadingBooks.value = false
     loadingMore.value = false
+    // 首屏未填满时哨兵仍在视口内（IO 不会重复触发）——补一次可见性检查
+    void nextTick(() => {
+      const el = sentinelEl.value
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      if (rect.top < window.innerHeight + 160) tryLoadMore()
+    })
   }
 }
 
@@ -354,6 +464,8 @@ onMounted(() => {
   catsEl?.addEventListener('wheel', onCatsWheel as EventListener, { passive: false })
 })
 onBeforeUnmount(() => {
+  sentinelObserver?.disconnect()
+  sentinelObserver = null
   document.querySelector('.cats')?.removeEventListener('wheel', onCatsWheel as EventListener)
 })
 </script>
@@ -767,6 +879,47 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 300;
   color: var(--text-3, #999);
+}
+
+/* ================= 书单内搜索 + 分页 ================= */
+.list-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 2px 8px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border, #ececec);
+  transition: border-color 0.2s ease;
+}
+.list-search:focus-within {
+  border-bottom-color: var(--accent, #4f46e5);
+}
+.list-search:focus-within .search-icon {
+  color: var(--accent, #4f46e5);
+}
+.list-search-clear {
+  flex-shrink: 0;
+  padding: 2px 10px;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3, #999);
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.list-search-clear:hover {
+  color: var(--accent, #4f46e5);
+}
+.paging-note {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3, #999);
+}
+.sentinel {
+  height: 1px;
 }
 
 /* ================= 响应式 ================= */

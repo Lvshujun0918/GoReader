@@ -3,15 +3,18 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
-import { getBookInfo, searchBookSource } from '@/api/books'
+import { getBookInfo, getBookToc, searchBookSource } from '@/api/books'
 import { searchBookContent } from '@/api/cache'
 import { exportBook, type ExportFormat } from '@/api/export'
 import { cacheBookOnServer, cacheBookSSE, cancelCacheBook } from '@/api/cacheBook'
+import { uploadFile, mkdir } from '@/api/file'
 import { downloadBlob } from '@/utils/download'
-import type { Book, BookInfo, ContentSearchHit, SearchBook } from '@/types'
+import { useUserStore } from '@/stores/user'
+import type { Book, BookChapter, BookInfo, ContentSearchHit, SearchBook } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
+const store = useUserStore()
 
 /** /book/:url —— vue-router 已自动解码 */
 const bookUrl = computed(() => String(route.params.url ?? ''))
@@ -28,15 +31,23 @@ const errorMsg = ref('')
 const coverFailed = ref(false)
 const saving = ref(false)
 
-/** 展示数据：实时详情优先，书架数据兜底 */
+/** 展示数据：实时详情优先，书架数据兜底；自定义封面（GAP 19）最优先 */
 const display = computed(() => ({
   name: info.value?.name || shelfBook.value?.name || '未知书名',
   author: info.value?.author || shelfBook.value?.author || '',
-  cover: info.value?.coverUrl || shelfBook.value?.coverUrl || '',
+  cover: shelfBook.value?.customCoverUrl || info.value?.coverUrl || shelfBook.value?.coverUrl || '',
   intro: info.value?.intro || shelfBook.value?.intro || '',
   latestChapterTitle:
     info.value?.latestChapterTitle || shelfBook.value?.latestChapterTitle || '',
 }))
+
+/** 自定义封面走 file/download 内联流：展示时补当前 accessToken（重新登录后仍可显示） */
+function resolveCoverUrl(url: string): string {
+  if (!url.startsWith('/reader3/file/')) return url
+  const token = store.accessToken
+  if (!token || url.includes('accessToken=')) return url
+  return `${url}${url.includes('?') ? '&' : '?'}accessToken=${encodeURIComponent(token)}`
+}
 
 function coverInitial(name: string): string {
   const ch = name.trim().charAt(0)
@@ -53,6 +64,10 @@ async function load() {
   loadFailed.value = false
   errorMsg.value = ''
   info.value = null
+  // 目录预览缓存随书重置（换源/重进详情后重新拉取）
+  tocLoaded.value = false
+  tocChapters.value = []
+  activeTab.value = 'detail'
   try {
     // ① 先查书架定位本书
     const res = await getBookshelf()
@@ -136,6 +151,118 @@ async function addToShelf() {
 function startReading() {
   if (!shelfBook.value) return
   void router.push(`/reader/${encodeURIComponent(shelfBook.value.bookUrl)}`)
+}
+
+/* ================= GAP 19：自定义封面（图片上传到 __HOME__/covers → saveBook customCoverUrl → 展示） ================= */
+
+const coverInputRef = ref<HTMLInputElement | null>(null)
+const coverBusy = ref(false)
+const COVER_MAX_MB = 10
+
+/** 上传的封面经 file/download（stream=1 内联）展示，URL 存 customCoverUrl */
+function coverDownloadUrl(name: string): string {
+  const base = `/reader3/file/download?path=covers/${encodeURIComponent(name)}&home=__HOME__&stream=1`
+  return store.accessToken
+    ? `${base}&accessToken=${encodeURIComponent(store.accessToken)}`
+    : base
+}
+
+function openCoverPicker() {
+  if (coverBusy.value || !shelfBook.value) return
+  coverInputRef.value?.click()
+}
+
+async function onCoverPick(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = '' // 允许重复选择同一文件
+  if (!file || coverBusy.value || !shelfBook.value) return
+  if (!file.type.startsWith('image/')) {
+    ElMessage.warning('请选择图片文件')
+    return
+  }
+  if (file.size > COVER_MAX_MB * 1024 * 1024) {
+    ElMessage.warning(`图片不能超过 ${COVER_MAX_MB} MB`)
+    return
+  }
+  coverBusy.value = true
+  try {
+    // ① 确保 __HOME__/covers 目录存在（后端 file/upload 要求目标目录已存在；已存在则忽略）
+    try {
+      await mkdir('', 'covers', '__HOME__', { silent: true })
+    } catch {
+      /* 目录已存在 / 后端未实现：继续上传 */
+    }
+    // ② 上传到 __HOME__/covers（后端 file/upload 已实现；未就绪时 404 由请求层提示）
+    const ext = (file.name.match(/\.(png|jpe?g|gif|webp|bmp|svg)$/i)?.[0] || '.jpg').toLowerCase()
+    const name = `cover-${Date.now().toString(36)}${ext}`
+    await uploadFile(file, 'covers', '__HOME__')
+    // ③ saveBook 更新 customCoverUrl（存在即增量 patch 该字段）
+    await saveBook({ bookUrl: shelfBook.value.bookUrl, customCoverUrl: coverDownloadUrl(name) } as Book)
+    // ③ 本地同步 + 刷新封面展示
+    shelfBook.value.customCoverUrl = coverDownloadUrl(name)
+    coverFailed.value = false
+    ElMessage.success('自定义封面已更新')
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '封面上传失败（请确认后端 file/upload 可用）')
+  } finally {
+    coverBusy.value = false
+  }
+}
+
+/* ================= GAP 18：目录预览（getBookToc → 前 50 章 → 点击进阅读器跳章） ================= */
+
+const activeTab = ref<'detail' | 'toc'>('detail')
+const tocChapters = ref<BookChapter[]>([])
+const tocLoading = ref(false)
+const tocLoaded = ref(false)
+const tocError = ref(false)
+const TOC_PREVIEW_MAX = 50
+
+/** 目录数据源：tocUrl 取实时详情/书架，缺省用 bookUrl 兜底（与阅读页一致）；origin 同上 */
+function tocParams(): { tocUrl: string; origin: string } | null {
+  const origin = shelfBook.value?.origin || info.value?.origin || queryOrigin.value
+  if (!origin) return null
+  const tocUrl = info.value?.tocUrl || shelfBook.value?.tocUrl || bookUrl.value
+  return { tocUrl, origin }
+}
+
+async function openToc() {
+  activeTab.value = 'toc'
+  if (tocLoaded.value) return
+  const p = tocParams()
+  if (!p) {
+    tocError.value = true
+    return
+  }
+  tocLoading.value = true
+  tocError.value = false
+  try {
+    const res = await getBookToc(p.tocUrl, p.origin)
+    tocChapters.value = res.data ?? []
+    tocLoaded.value = true
+    if (tocChapters.value.length === 0) tocError.value = true
+  } catch {
+    tocError.value = true
+  } finally {
+    tocLoading.value = false
+  }
+}
+
+/** 前 50 章（跳过卷标题行；index 为完整目录数组下标，与阅读页 ?chapter 语义一致） */
+const tocPreview = computed(() => {
+  const out: { index: number; title: string }[] = []
+  tocChapters.value.forEach((c, i) => {
+    if (out.length >= TOC_PREVIEW_MAX) return
+    if (c.isVolume) return
+    out.push({ index: i, title: c.title })
+  })
+  return out
+})
+
+/** 点击目录项 → 阅读器并跳章 */
+function goToChapterFromToc(idx: number) {
+  void router.push(`/reader/${encodeURIComponent(bookUrl.value)}?chapter=${idx}`)
 }
 
 /* ================= 全书搜索（GET /reader3/searchBookContent，本地书正文逐章匹配） ================= */
@@ -290,6 +417,8 @@ async function switchSource(r: SearchBook) {
     b.tocUrl = r.tocUrl
     currentOrigin.value = r.origin
     info.value = null
+    tocLoaded.value = false
+    tocChapters.value = []
     try {
       const infoRes = await getBookInfo(bookUrl.value, r.origin)
       if (infoRes.isSuccess) info.value = infoRes.data
@@ -556,6 +685,26 @@ onMounted(load)
     </header>
 
     <main class="content">
+      <!-- GAP 18：详情 / 目录 tab -->
+      <div class="tabs">
+        <button
+          type="button"
+          class="tab"
+          :class="{ active: activeTab === 'detail' }"
+          @click="activeTab = 'detail'"
+        >
+          详情
+        </button>
+        <button
+          type="button"
+          class="tab"
+          :class="{ active: activeTab === 'toc' }"
+          @click="openToc"
+        >
+          目录
+        </button>
+      </div>
+
       <!-- 加载骨架（浅灰静置块） -->
       <div v-if="loading" class="detail-layout" aria-label="加载中">
         <div class="skeleton-cover"></div>
@@ -576,13 +725,45 @@ onMounted(load)
         </div>
       </div>
 
+      <!-- GAP 18：目录预览面板（前 50 章，点击进阅读器跳章） -->
+      <div v-else-if="activeTab === 'toc'" class="toc-panel">
+        <p v-if="tocLoading" class="toc-state">目录加载中…</p>
+        <p v-else-if="tocError" class="toc-state">
+          目录获取失败（接口 GET /reader3/getBookToc 或书源不可用）
+        </p>
+        <template v-else>
+          <p class="toc-hint">
+            共 {{ tocChapters.filter((c) => !c.isVolume).length }} 章 · 预览前 {{ Math.min(TOC_PREVIEW_MAX, tocPreview.length) }} 章，点击进入阅读器并跳转
+          </p>
+          <ul class="toc-list">
+            <li v-for="c in tocPreview" :key="`${c.index}-${c.title}`">
+              <button class="toc-item" type="button" @click="goToChapterFromToc(c.index)">
+                <span class="toc-idx">{{ c.index + 1 }}</span>
+                <span class="toc-title" :title="c.title">{{ c.title }}</span>
+              </button>
+            </li>
+          </ul>
+        </template>
+      </div>
+
       <!-- 详情 -->
       <div v-else class="detail-layout">
         <!-- 封面 -->
         <div class="cover-wrap">
+          <!-- GAP 19：换封面（右上角；仅书架书可保存） -->
+          <button
+            v-if="shelfBook"
+            class="cover-change"
+            type="button"
+            :disabled="coverBusy"
+            :title="coverBusy ? '上传中…' : '更换封面（上传图片到服务器）'"
+            @click="openCoverPicker"
+          >
+            {{ coverBusy ? '上传中…' : '换封面' }}
+          </button>
           <img
             v-if="display.cover && !coverFailed"
-            :src="display.cover"
+            :src="resolveCoverUrl(display.cover)"
             class="cover-img"
             :alt="display.name"
             @error="coverFailed = true"
@@ -590,6 +771,13 @@ onMounted(load)
           <div v-else class="cover-ph">
             <span class="cover-ph-char">{{ coverInitial(display.name) }}</span>
           </div>
+          <input
+            ref="coverInputRef"
+            class="cover-file-input"
+            type="file"
+            accept="image/*"
+            @change="onCoverPick"
+          />
         </div>
 
         <!-- 信息 -->
@@ -631,7 +819,7 @@ onMounted(load)
       </div>
 
       <!-- 相关推荐（后端 ruleRelated 返回 relatedBooks 时显示；未实现则整区隐藏） -->
-      <section v-if="relatedBooks.length" class="related-section">
+      <section v-if="activeTab === 'detail' && relatedBooks.length" class="related-section">
         <h2 class="related-title">相关推荐</h2>
         <div class="related-grid">
           <button
@@ -905,6 +1093,147 @@ onMounted(load)
 .brand-dot {
   color: var(--accent);
   font-weight: 400;
+}
+
+/* ================= 详情 / 目录 tab（GAP 18） ================= */
+.tabs {
+  display: flex;
+  gap: 32px;
+  margin-bottom: 32px;
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  position: relative;
+  padding: 4px 2px 12px;
+  border: none;
+  background: none;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 300;
+  letter-spacing: 3px;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.tab:hover {
+  color: var(--text-2);
+}
+.tab.active {
+  color: var(--accent);
+  font-weight: 400;
+}
+.tab.active::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* ================= 目录预览面板（GAP 18） ================= */
+.toc-panel {
+  min-height: 40vh;
+}
+.toc-state {
+  padding: 64px 0;
+  margin: 0;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.toc-hint {
+  margin: 0 0 16px;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+}
+.toc-list li + li {
+  border-top: 1px solid var(--border);
+}
+.toc-item {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 11px 6px;
+  border: none;
+  background: none;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.toc-item:hover {
+  background: var(--accent-soft);
+}
+.toc-item:hover .toc-title {
+  color: var(--accent);
+}
+.toc-idx {
+  flex-shrink: 0;
+  min-width: 34px;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.toc-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 0.15s ease;
+}
+
+/* ================= 自定义封面（GAP 19） ================= */
+.cover-change {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  padding: 4px 10px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(20, 20, 24, 0.66);
+  color: #fff;
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  opacity: 0;
+  backdrop-filter: blur(2px);
+  transition: opacity 0.2s ease, background-color 0.2s ease;
+}
+.cover-wrap:hover .cover-change,
+.cover-change:focus-visible {
+  opacity: 1;
+}
+.cover-change:hover:not(:disabled) {
+  background: var(--accent);
+}
+.cover-change:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.cover-file-input {
+  display: none;
 }
 
 /* ================= 内容 ================= */

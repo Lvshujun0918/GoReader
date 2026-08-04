@@ -1,4 +1,4 @@
-import request from './request'
+import request, { type RequestOptions } from './request'
 import type { ReturnData, FileItem } from '@/types'
 
 /**
@@ -27,9 +27,14 @@ export function saveFile(path: string, content: string, home = ''): Promise<Retu
 }
 
 /** POST /reader3/file/mkdir：新建文件夹（body { path: 父目录, name: 文件夹名 }） */
-export function mkdir(parent: string, name: string, home = ''): Promise<ReturnData<null>> {
+export function mkdir(
+  parent: string,
+  name: string,
+  home = '',
+  opts?: RequestOptions,
+): Promise<ReturnData<null>> {
   return request
-    .post('/file/mkdir', { path: parent, name, ...(home ? { home } : {}) })
+    .post('/file/mkdir', { path: parent, name, ...(home ? { home } : {}) }, { silent: opts?.silent })
     .then((r) => r.data as ReturnData<null>)
 }
 

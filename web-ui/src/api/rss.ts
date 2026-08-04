@@ -1,4 +1,4 @@
-import { get, post } from './request'
+import { get, post, type RequestOptions } from './request'
 import type { RssArticle, RssSource, ReturnData } from '@/types'
 
 /** GET /reader3/getRssSources：当前用户 RSS 订阅源列表 */
@@ -16,9 +16,16 @@ export function deleteRssSource(rssSourceUrl: string): Promise<ReturnData<null>>
   return post<null>('/deleteRssSource', { rssSourceUrl })
 }
 
-/** GET /reader3/getRssArticles：订阅源文章列表（params rssSourceUrl + page，分页；hasRead 已读标记） */
-export function getRssArticles(rssSourceUrl: string, page = 1): Promise<ReturnData<RssArticle[]>> {
-  return get<RssArticle[]>('/getRssArticles', { rssSourceUrl, page })
+/**
+ * GET /reader3/getRssArticles：订阅源文章列表（params rssSourceUrl + page，分页；hasRead 已读标记）。
+ * 后端每次调用会重新抓取 feed——「刷新全部」即逐源循环调此接口（silent 模式不弹全局提示）。
+ */
+export function getRssArticles(
+  rssSourceUrl: string,
+  page = 1,
+  opts?: RequestOptions,
+): Promise<ReturnData<RssArticle[]>> {
+  return get<RssArticle[]>('/getRssArticles', { rssSourceUrl, page }, opts)
 }
 
 /** POST /reader3/markRssArticleRead：标记文章已读/未读（body { articleUrl, read }） */

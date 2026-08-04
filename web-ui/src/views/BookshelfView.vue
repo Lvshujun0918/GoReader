@@ -22,6 +22,62 @@ import type { Book, BookGroup, ImportPreview } from '@/types'
 const router = useRouter()
 const store = useUserStore()
 
+/* ================= 网格密度（GAP 11：小/中/大——CSS 变量 --card-w，localStorage: reader_card_density） ================= */
+
+type CardDensity = 's' | 'm' | 'l'
+const DENSITY_OPTIONS: { value: CardDensity; label: string }[] = [
+  { value: 's', label: '小' },
+  { value: 'm', label: '中' },
+  { value: 'l', label: '大' },
+]
+/** 桌面端卡片最小宽（宽屏） */
+const DENSITY_MIN_W: Record<CardDensity, number> = { s: 128, m: 160, l: 204 }
+/** 窄屏（<=720px）卡片最小宽 */
+const DENSITY_NARROW_W: Record<CardDensity, number> = { s: 96, m: 120, l: 150 }
+const DENSITY_KEY = 'reader_card_density'
+const density = ref<CardDensity>('m')
+{
+  const raw = localStorage.getItem(DENSITY_KEY)
+  if (raw === 's' || raw === 'm' || raw === 'l') density.value = raw
+}
+function setDensity(v: CardDensity) {
+  density.value = v
+  try {
+    localStorage.setItem(DENSITY_KEY, v)
+  } catch {
+    /* ignore */
+  }
+}
+const cardMinW = computed(() =>
+  narrowMq.matches ? DENSITY_NARROW_W[density.value] : DENSITY_MIN_W[density.value],
+)
+
+/* ================= 视图切换（GAP 103：网格 / 列表——列表=小缩略图行，localStorage: reader_shelf_view） ================= */
+
+const VIEW_KEY = 'reader_shelf_view'
+const viewMode = ref<'grid' | 'list'>('grid')
+{
+  const raw = localStorage.getItem(VIEW_KEY)
+  if (raw === 'grid' || raw === 'list') viewMode.value = raw
+}
+function setViewMode(v: 'grid' | 'list') {
+  viewMode.value = v
+  try {
+    localStorage.setItem(VIEW_KEY, v)
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 书卡进度角标（GAP 14）：durChapterIndex / totalChapterNum；无数据（缺字段/总章数 0）时返回 null 隐藏 */
+function bookProgress(book: Book): number | null {
+  const total = book.totalChapterNum
+  const cur = book.durChapterIndex
+  if (typeof total !== 'number' || total <= 0) return null
+  if (typeof cur !== 'number' || cur < 0) return null
+  return Math.min(100, Math.round((cur / total) * 100))
+}
+
 /** 后端 secure 模式（用户管理入口仅 secure 模式显示，探测见 api/users.ts） */
 const secureMode = ref(false)
 
@@ -417,7 +473,16 @@ function coverColor(name: string): string {
 }
 
 function coverSrc(book: Book): string | null {
-  return book.customCoverUrl || book.coverUrl || null
+  const src = book.customCoverUrl || book.coverUrl || null
+  return src ? resolveCoverUrl(src) : null
+}
+
+/** 自定义封面走 file/download 内联流（GAP 19）：展示时补当前 accessToken（重新登录后仍可显示） */
+function resolveCoverUrl(url: string): string {
+  if (!url.startsWith('/reader3/file/')) return url
+  const token = store.accessToken
+  if (!token || url.includes('accessToken=')) return url
+  return `${url}${url.includes('?') ? '&' : '?'}accessToken=${encodeURIComponent(token)}`
 }
 
 function hasCover(book: Book): boolean {
@@ -760,13 +825,16 @@ function measureGrid() {
   if (!wrap) return
   const w = wrap.clientWidth
   if (w <= 0) return
-  const minW = narrowMq.matches ? 120 : 160
+  const minW = viewMode.value === 'list' ? 1 : cardMinW.value
   const colGap = narrowMq.matches ? 16 : 28
   rowGap.value = narrowMq.matches ? 24 : 32
   cols.value = Math.max(1, Math.floor((w + colGap) / (minW + colGap)))
   const card = wrap.querySelector('.book-card')
   if (card) {
     rowH.value = Math.round(card.getBoundingClientRect().height)
+  } else if (viewMode.value === 'list') {
+    // 列表行：缩略图 42px(3:4≈56px) + 上下内边距 20px
+    rowH.value = 76
   } else {
     const cw = (w - (cols.value - 1) * colGap) / cols.value
     rowH.value = Math.round((cw * 4) / 3 + 78)
@@ -804,6 +872,11 @@ watch(
   },
   { flush: 'post' },
 )
+
+// GAP 11/103：密度 / 视图切换后重测（列表模式下行高由 .book-card 实际布局测得）
+watch([density, viewMode], () => {
+  void nextTick(() => measureGrid())
+})
 
 // 切换关键词 / 分组 / 排序后回到网格顶部
 watch([keyword, activeGroup, sortMode], () => {
@@ -1220,6 +1293,41 @@ onMounted(() => {
         </button>
       </div>
 
+      <!-- 显示设置：网格密度（GAP 11，localStorage: reader_card_density）+ 网格/列表切换（GAP 103，localStorage: reader_shelf_view） -->
+      <div class="view-bar">
+        <span class="sort-label">密度</span>
+        <button
+          v-for="opt in DENSITY_OPTIONS"
+          :key="opt.value"
+          class="sort-capsule"
+          :class="{ active: density === opt.value }"
+          type="button"
+          :title="`卡片：${opt.label}（${cardMinW}px 起）`"
+          @click="setDensity(opt.value)"
+        >
+          {{ opt.label }}
+        </button>
+        <span class="view-sep"></span>
+        <button
+          class="view-toggle"
+          type="button"
+          :title="viewMode === 'grid' ? '切换到列表视图（小缩略图行）' : '切换到网格视图'"
+          @click="setViewMode(viewMode === 'grid' ? 'list' : 'grid')"
+        >
+          <svg v-if="viewMode === 'grid'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+            <rect x="4" y="4" width="7" height="7" rx="1.5" />
+            <rect x="13" y="4" width="7" height="7" rx="1.5" />
+            <rect x="4" y="13" width="7" height="7" rx="1.5" />
+            <rect x="13" y="13" width="7" height="7" rx="1.5" />
+          </svg>
+          <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+            <rect x="4" y="4" width="16" height="5" rx="1.5" />
+            <rect x="4" y="9.5" width="16" height="5" rx="1.5" />
+            <rect x="4" y="15" width="16" height="5" rx="1.5" />
+          </svg>
+        </button>
+      </div>
+
       <!-- 分组栏：全部 / 分组名 胶囊筛选（细字，active 强调色下划线） -->
       <div class="group-bar">
         <div class="group-tabs" role="tablist" aria-label="书架分组筛选">
@@ -1272,7 +1380,11 @@ onMounted(() => {
       <!-- 书封网格（虚拟滚动：仅渲染可见行 + 上下缓冲；分组模式含可点击折叠的分组标题行） -->
       <div v-else ref="gridWrapRef" class="virtual-grid">
         <div class="virtual-pad" :style="{ height: padTop + 'px' }"></div>
-        <div class="book-grid">
+        <div
+          class="book-grid"
+          :class="{ list: viewMode === 'list' }"
+          :style="{ '--card-w': cardMinW + 'px' }"
+        >
           <template v-for="row in visibleRows" :key="rowKey(row)">
             <!-- 分组标题行（排序=分组；点击折叠/展开该组，折叠后该组书隐藏） -->
             <div v-if="row.kind === 'header'" class="group-head-row">
@@ -1347,6 +1459,10 @@ onMounted(() => {
               <div v-else class="cover-ph" :style="{ background: coverColor(book.name) }">
                 <span class="cover-ph-char">{{ coverInitial(book.name) }}</span>
               </div>
+              <!-- GAP 14：阅读进度角标（durChapterIndex/totalChapterNum；无数据隐藏） -->
+              <span v-if="bookProgress(book) !== null" class="progress-badge" :title="`已读 ${bookProgress(book)}%（第 ${(book.durChapterIndex ?? 0) + 1}/${book.totalChapterNum} 章）`">
+                {{ bookProgress(book) }}%
+              </span>
             </div>
             <div class="book-meta">
               <p class="book-name" :title="book.name">{{ book.name }}</p>
@@ -2099,11 +2215,71 @@ onMounted(() => {
   height: 14px;
 }
 
-/* ================= 书封网格（大间距 28-32px） ================= */
+/* ================= 书封网格（大间距 28-32px；列宽由 GAP 11 密度变量 --card-w 控制） ================= */
 .book-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(var(--card-w, 160px), 1fr));
   gap: 32px 28px;
+}
+
+/* GAP 103：列表视图（小缩略图行） */
+.book-grid.list {
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+.book-grid.list .book-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.book-grid.list .book-card:hover {
+  transform: none;
+  background: var(--hover);
+}
+.book-grid.list .cover-wrap {
+  flex-shrink: 0;
+  width: 42px;
+  border-radius: 6px;
+}
+.book-grid.list .book-meta {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+}
+.book-grid.list .book-name {
+  flex: 0 1 auto;
+  max-width: 38%;
+  font-size: 14px;
+}
+.book-grid.list .book-author {
+  margin: 0;
+  flex-shrink: 0;
+  font-size: 12px;
+}
+.book-grid.list .book-chapter {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 12px;
+  text-align: right;
+}
+.book-grid.list .detail-btn,
+.book-grid.list .card-menu-btn {
+  top: auto;
+  left: auto;
+  right: 8px;
+  bottom: 8px;
+}
+.book-grid.list .progress-badge {
+  font-size: 9.5px;
+  padding: 1px 5px;
+  bottom: 4px;
+  right: 4px;
 }
 
 .book-card {
@@ -2169,6 +2345,25 @@ onMounted(() => {
 }
 .cover-img.is-loaded {
   opacity: 1;
+}
+
+/* GAP 14：阅读进度角标（封面右下角） */
+.progress-badge {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  z-index: 2;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(20, 20, 24, 0.72);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 0.5px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  backdrop-filter: blur(2px);
+  pointer-events: none;
 }
 
 /* 莫兰迪纯色占位 + 细体首字 */
@@ -2627,6 +2822,46 @@ onMounted(() => {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-soft);
+}
+
+/* ================= 显示设置：密度 + 视图切换（GAP 11 / GAP 103） ================= */
+.view-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 26px;
+  flex-wrap: wrap;
+}
+.view-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: var(--border);
+}
+.view-toggle {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.view-toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.view-toggle svg {
+  width: 14px;
+  height: 14px;
 }
 
 /* ================= 分组标题行（排序=分组；点击折叠） ================= */
@@ -3361,7 +3596,7 @@ onMounted(() => {
     padding: 32px 16px 56px;
   }
   .book-grid {
-    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(var(--card-w, 120px), 1fr));
     gap: 24px 16px;
   }
   .section-head {
@@ -3381,7 +3616,7 @@ onMounted(() => {
 /* 小屏手机：书架列数继续加密 + 底部操作栏避开手势区 */
 @media (max-width: 480px) {
   .book-grid {
-    grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(var(--card-w, 104px), 1fr));
     gap: 20px 12px;
   }
   .brand-name {

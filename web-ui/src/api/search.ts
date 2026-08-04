@@ -2,9 +2,9 @@ import { post } from './request'
 import { useUserStore } from '@/stores/user'
 import type { ReturnData, SearchBook } from '@/types'
 
-/** POST /reader3/searchBookMulti：多书源并发搜索（body {key, maxSources}） */
-export function searchBookMulti(key: string, maxSources = 50): Promise<ReturnData<SearchBook[]>> {
-  return post<SearchBook[]>('/searchBookMulti', { key, maxSources })
+/** POST /reader3/searchBookMulti：多书源并发搜索（body {key, maxSources}；signal 可中止请求） */
+export function searchBookMulti(key: string, maxSources = 50, signal?: AbortSignal): Promise<ReturnData<SearchBook[]>> {
+  return post<SearchBook[]>('/searchBookMulti', { key, maxSources }, { signal })
 }
 
 /* ================= SSE 流式搜索（/reader3/searchBookMultiSSE） ================= */

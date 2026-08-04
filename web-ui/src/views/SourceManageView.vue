@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { deleteBookSource, getBookSources, getInvalidBookSources, saveBookSource, saveBookSources, setAsDefaultBookSources } from '@/api/sources'
 import { deleteSourceSub, getSourceSubs, refreshSourceSub, saveSourceSub } from '@/api/sourceSubs'
 import { exportBookSources } from '@/api/system'
@@ -50,6 +50,156 @@ const groups = computed(() => {
   }
   return Array.from(set).sort()
 })
+
+/* ================= GAP 28：分组管理（胶囊长按/右键 → 重命名/删除组，批量改 bookSourceGroup） ================= */
+
+const groupMenu = ref<{ name: string; x: number; y: number } | null>(null)
+const groupMenuBusy = ref(false)
+let groupLongPressTimer: number | undefined
+let groupLongPressFired = false
+
+function openGroupMenu(name: string, x: number, y: number) {
+  groupMenu.value = {
+    name,
+    x: Math.min(Math.max(8, x), window.innerWidth - 170),
+    y: Math.min(Math.max(8, y), window.innerHeight - 120),
+  }
+}
+
+function closeGroupMenu() {
+  groupMenu.value = null
+}
+
+/** 触屏长按 500ms 唤出分组菜单（与点击筛选互斥） */
+function onGroupTouchStart(name: string, e: TouchEvent) {
+  groupLongPressFired = false
+  const t = e.touches[0]
+  window.clearTimeout(groupLongPressTimer)
+  groupLongPressTimer = window.setTimeout(() => {
+    groupLongPressFired = true
+    openGroupMenu(name, t.clientX, t.clientY)
+  }, 500)
+}
+
+/** 胶囊点击：长按唤出菜单后吞掉紧随的合成点击，避免误切筛选 */
+function onGroupCapsuleClick(g: string) {
+  if (groupLongPressFired) {
+    groupLongPressFired = false
+    return
+  }
+  activeGroup.value = g
+}
+
+function onGroupTouchEnd() {
+  window.clearTimeout(groupLongPressTimer)
+  groupLongPressTimer = undefined
+}
+
+function onGroupTouchMove() {
+  window.clearTimeout(groupLongPressTimer)
+  groupLongPressTimer = undefined
+}
+
+/** 分组 token 替换（newName=null 表示删除该分组） */
+function replaceGroupToken(src: BookSource, oldName: string, newName: string | null): BookSource {
+  const tokens = new Set((src.bookSourceGroup ?? '').split(/\s+/).filter(Boolean))
+  tokens.delete(oldName)
+  if (newName) tokens.add(newName)
+  return { ...src, bookSourceGroup: Array.from(tokens).join(' ') || null }
+}
+
+/**
+ * 批量改分组：逐源 saveBookSource 优先；接口未实现（404）时降级 saveBookSources 一次性批量保存。
+ * 返回成功更新的书源数。
+ */
+async function applyGroupChange(oldName: string, newName: string | null): Promise<number> {
+  const targets = sources.value.filter((s) =>
+    (s.bookSourceGroup ?? '').split(/\s+/).includes(oldName),
+  )
+  if (targets.length === 0) return 0
+  const updated = targets.map((s) => replaceGroupToken(s, oldName, newName))
+  let ok = 0
+  let fellBack = false
+  for (let i = 0; i < updated.length; i++) {
+    try {
+      await saveBookSource(updated[i])
+      ok++
+    } catch (err) {
+      if (!fellBack && isNotImplemented(err)) {
+        // 单个保存接口未就绪：整批降级 saveBookSources
+        fellBack = true
+        try {
+          const res = await saveBookSources(updated)
+          return res.data?.count ?? updated.length
+        } catch {
+          return ok // 降级也失败：已成功的部分返回
+        }
+      }
+      // 单源失败（非 404）：跳过继续
+    }
+  }
+  return ok
+}
+
+/** 重命名分组（输入新名；空名取消） */
+async function renameGroup(oldName: string) {
+  closeGroupMenu()
+  if (groupMenuBusy.value) return
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `将分组「${oldName}」重命名为：`,
+      '重命名分组',
+      {
+        confirmButtonText: '保存',
+        cancelButtonText: '取消',
+        inputValue: oldName,
+        inputPattern: /\S+/,
+        inputErrorMessage: '名称不能为空',
+      },
+    )
+    const name = String(value ?? '').trim()
+    if (!name || name === oldName) return
+    groupMenuBusy.value = true
+    try {
+      const n = await applyGroupChange(oldName, name)
+      await load()
+      if (activeGroup.value === oldName) activeGroup.value = name
+      ElMessage.success(`已重命名分组「${oldName}」→「${name}」（更新 ${n} 个书源）`)
+    } catch {
+      // 错误提示已由拦截器处理
+    } finally {
+      groupMenuBusy.value = false
+    }
+  } catch {
+    // 用户取消
+  }
+}
+
+/** 删除分组（从所有书源的 bookSourceGroup 中移除该 token） */
+async function deleteGroupByName(name: string) {
+  closeGroupMenu()
+  if (groupMenuBusy.value) return
+  try {
+    await ElMessageBox.confirm(
+      `确定删除分组「${name}」吗？组内书源将从该分组移除（书源本身保留）。`,
+      '删除分组',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  groupMenuBusy.value = true
+  try {
+    const n = await applyGroupChange(name, null)
+    await load()
+    if (activeGroup.value === name) activeGroup.value = '全部'
+    ElMessage.success(`已删除分组「${name}」（更新 ${n} 个书源）`)
+  } catch {
+    // 错误提示已由拦截器处理
+  } finally {
+    groupMenuBusy.value = false
+  }
+}
 
 /* ================= 搜索过滤 ================= */
 const filterKey = ref('')
@@ -1083,6 +1233,11 @@ onMounted(() => {
   load()
   void loadSubs()
 })
+
+onBeforeUnmount(() => {
+  window.clearTimeout(groupLongPressTimer)
+  groupLongPressTimer = undefined
+})
 </script>
 
 <template>
@@ -1154,7 +1309,13 @@ onMounted(() => {
             class="capsule"
             :class="{ active: activeGroup === g }"
             type="button"
-            @click="activeGroup = g"
+            :title="`右键/长按管理分组「${g}」`"
+            @click="onGroupCapsuleClick(g)"
+            @contextmenu.prevent="openGroupMenu(g, $event.clientX, $event.clientY)"
+            @touchstart.passive="onGroupTouchStart(g, $event)"
+            @touchend="onGroupTouchEnd"
+            @touchmove.passive="onGroupTouchMove"
+            @touchcancel="onGroupTouchEnd"
           >
             {{ g }}
           </button>
@@ -1429,6 +1590,44 @@ onMounted(() => {
                 {{ deleteSubBusy ? '删除中…' : '删除' }}
               </button>
             </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+    <!-- GAP 28：分组胶囊右键/长按菜单（重命名 / 删除组） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="groupMenu" class="ctx-overlay" @click="closeGroupMenu" @contextmenu.prevent="closeGroupMenu">
+          <div
+            class="ctx-menu"
+            :style="{ left: groupMenu.x + 'px', top: groupMenu.y + 'px' }"
+            @click.stop
+          >
+            <div class="ctx-title" :title="groupMenu.name">分组：{{ groupMenu.name }}</div>
+            <button
+              class="ctx-item"
+              type="button"
+              :disabled="groupMenuBusy"
+              @click="renameGroup(groupMenu.name)"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+              </svg>
+              重命名分组
+            </button>
+            <button
+              class="ctx-item danger"
+              type="button"
+              :disabled="groupMenuBusy"
+              @click="deleteGroupByName(groupMenu.name)"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 7h16" />
+                <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+                <path d="M6.5 7l.8 12a1.5 1.5 0 0 0 1.5 1.4h6.4a1.5 1.5 0 0 0 1.5-1.4l.8-12" />
+              </svg>
+              删除分组
+            </button>
           </div>
         </div>
       </Transition>
@@ -1875,6 +2074,73 @@ onMounted(() => {
   border-color: var(--accent);
   background: var(--accent-soft);
   font-weight: 400;
+}
+
+/* ================= GAP 28：分组胶囊右键/长按菜单 ================= */
+.ctx-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+}
+.ctx-menu {
+  position: fixed;
+  z-index: 121;
+  min-width: 168px;
+  max-width: 220px;
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.1);
+}
+.ctx-title {
+  padding: 4px 10px 8px;
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ctx-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+.ctx-item:hover:not(:disabled) {
+  color: var(--text-1);
+  background: var(--hover);
+}
+.ctx-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.ctx-item.danger {
+  color: #cf4444;
+}
+.ctx-item.danger:hover:not(:disabled) {
+  color: #b33535;
+  background: rgba(207, 68, 68, 0.07);
+}
+.ctx-item svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
 }
 .filter-box {
   position: relative;

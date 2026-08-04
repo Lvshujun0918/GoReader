@@ -15,6 +15,8 @@ declare module 'axios' {
 export interface RequestOptions {
   /** 静默模式：业务失败 / HTTP 错误均不弹 ElMessage（探测未实现契约接口用） */
   silent?: boolean
+  /** 中止信号（axios 原生支持，用于搜索取消等场景） */
+  signal?: AbortSignal
 }
 
 /** axios 实例：baseURL=/reader3，accessToken 自动携带（query），401/NEED_LOGIN 跳登录 */
@@ -82,10 +84,10 @@ export function post<T>(
   data?: unknown,
   paramsOrOpts?: Record<string, unknown> | RequestOptions,
 ): Promise<ReturnData<T>> {
-  const isOpts = !!paramsOrOpts && 'silent' in paramsOrOpts
+  const isOpts = !!paramsOrOpts && ('silent' in paramsOrOpts || 'signal' in paramsOrOpts)
   const params = isOpts ? undefined : (paramsOrOpts as Record<string, unknown> | undefined)
-  const silent = isOpts ? (paramsOrOpts as RequestOptions).silent : undefined
-  return request.post(url, data, { params, silent }).then((r) => r.data as ReturnData<T>)
+  const opts = isOpts ? (paramsOrOpts as RequestOptions) : undefined
+  return request.post(url, data, { params, silent: opts?.silent, signal: opts?.signal }).then((r) => r.data as ReturnData<T>)
 }
 
 export default request

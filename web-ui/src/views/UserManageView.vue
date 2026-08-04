@@ -1,18 +1,21 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import {
+  addUser,
   deleteUser,
   getStoredSecureKey,
   getUsers,
   isNeedSecureKey,
+  isNotImplemented,
   probeSecureMode,
   resetUserPassword,
   storeSecureKey,
   updateUser,
 } from '@/api/users'
+import { login } from '@/api/auth'
 import { useUserStore } from '@/stores/user'
 import type { ReaderUser, UserUpdatePayload } from '@/types'
 
@@ -96,6 +99,93 @@ async function confirmKey() {
   keyError.value = ''
   if (op) await op()
   else await loadUsers()
+}
+
+/* ================= 搜索（GAP 42：前端过滤用户名） ================= */
+const searchKey = ref('')
+
+const filteredUsers = computed(() => {
+  const kw = searchKey.value.trim().toLowerCase()
+  if (!kw) return users.value
+  return users.value.filter((u) => u.username.toLowerCase().includes(kw))
+})
+
+/* ================= 添加用户（GAP 43：addUser 未就绪时降级 register） ================= */
+const adding = ref(false)
+const addBusy = ref(false)
+const addForm = ref<{
+  username: string
+  password: string
+  enableWebdav: boolean
+  enableLocalStore: boolean
+  enableBookSource: boolean
+  enableRssSource: boolean
+}>({
+  username: '',
+  password: '',
+  enableWebdav: false,
+  enableLocalStore: true,
+  enableBookSource: true,
+  enableRssSource: false,
+})
+
+function openAdd() {
+  addForm.value = { username: '', password: '', enableWebdav: false, enableLocalStore: true, enableBookSource: true, enableRssSource: false }
+  addBusy.value = false
+  adding.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeAdd() {
+  if (addBusy.value) return
+  adding.value = false
+  document.body.style.overflow = ''
+}
+
+async function confirmAdd() {
+  if (addBusy.value) return
+  const username = addForm.value.username.trim()
+  const password = addForm.value.password
+  if (!username) {
+    ElMessage.warning('请输入用户名')
+    return
+  }
+  if (!password) {
+    ElMessage.warning('请输入密码')
+    return
+  }
+  addBusy.value = true
+  try {
+    // 1) 后端 addUser（silent：未实现时静默，业务错误手动提示）
+    await addUser({
+      username,
+      password,
+      enableWebdav: addForm.value.enableWebdav,
+      enableLocalStore: addForm.value.enableLocalStore,
+      enableBookSource: addForm.value.enableBookSource,
+      enableRssSource: addForm.value.enableRssSource,
+    })
+    ElMessage.success('已创建用户')
+    closeAdd()
+    await loadUsers()
+  } catch (err) {
+    if (handleManageError(err, confirmAdd)) return // NEED_SECURE_KEY → 密码框 + 重试
+    if (isNotImplemented(err)) {
+      // 2) addUser 未就绪 → register 接口降级（isLogin=false；默认权限，注册错误由拦截器提示）
+      try {
+        await login({ username, password, isLogin: false })
+        ElMessage.success('已创建用户（默认权限，可在编辑中调整）')
+        closeAdd()
+        await loadUsers()
+      } catch {
+        // 注册业务错误已由请求层提示
+      }
+    } else {
+      ElMessage.error(err instanceof Error ? err.message : '创建失败')
+    }
+  } finally {
+    addBusy.value = false
+  }
 }
 
 /* ================= 权限开关（表格内直接切换） ================= */
@@ -312,13 +402,41 @@ onBeforeUnmount(() => {
       <!-- 标题区 -->
       <div class="section-head">
         <h1 class="section-title">用户管理</h1>
-        <span class="count">{{ users.length }} 个用户</span>
+        <span class="count">{{ searchKey.trim() ? `${filteredUsers.length} / ${users.length}` : users.length }} 个用户</span>
+        <button class="add-btn" type="button" @click="openAdd">添加用户</button>
         <button class="refresh-btn" type="button" title="刷新" @click="loadUsers()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 12a9 9 0 1 1-2.64-6.36" />
             <path d="M21 3v6h-6" />
           </svg>
         </button>
+      </div>
+
+      <!-- 搜索（GAP 42：前端过滤用户名） -->
+      <div class="filter-bar">
+        <div class="search-box">
+          <svg
+            class="search-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+          >
+            <circle cx="11" cy="11" r="6.5" />
+            <path d="M20 20l-3.8-3.8" />
+          </svg>
+          <input
+            v-model="searchKey"
+            class="search-input"
+            type="text"
+            placeholder="搜索用户名"
+            spellcheck="false"
+          />
+          <button v-if="searchKey" class="search-clear" type="button" title="清空" @click="searchKey = ''">
+            ✕
+          </button>
+        </div>
       </div>
 
       <!-- secure 模式提示（细字） -->
@@ -338,6 +456,9 @@ onBeforeUnmount(() => {
       <!-- 空状态 -->
       <div v-else-if="users.length === 0" class="state-line">暂无用户</div>
 
+      <!-- 搜索无匹配 -->
+      <div v-else-if="filteredUsers.length === 0" class="state-line">无匹配「{{ searchKey.trim() }}」的用户</div>
+
       <!-- 细字用户表格 -->
       <div v-else class="table-wrap">
         <table class="user-table">
@@ -352,7 +473,7 @@ onBeforeUnmount(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="u in users" :key="u.username">
+            <tr v-for="u in filteredUsers" :key="u.username">
               <td class="col-user">
                 <span class="uname" :title="u.username">{{ u.username }}</span>
                 <span v-if="u.username === store.username" class="self-tag" title="当前登录账号">我</span>
@@ -421,6 +542,59 @@ onBeforeUnmount(() => {
               <div class="dlg-actions">
                 <button class="ghost-btn" type="button" @click="closeKeyDialog">取消</button>
                 <button class="accent-btn" type="submit" :disabled="!keyInput.trim()">确认</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 添加用户弹窗（GAP 43：addUser 未就绪时降级 register，默认权限） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="adding" class="dlg-overlay" @click.self="closeAdd">
+          <div class="dlg" role="dialog" aria-modal="true" aria-label="添加用户" tabindex="-1" @keydown.esc="closeAdd">
+            <div class="dlg-head">
+              <h2 class="dlg-title">添加用户</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="addBusy" @click="closeAdd">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="confirmAdd">
+              <label class="field">
+                <span class="field-label">用户名<em>*</em></span>
+                <input v-model="addForm.username" class="field-input" type="text" placeholder="字母或数字，至少 5 位" autocomplete="off" spellcheck="false" />
+              </label>
+              <label class="field">
+                <span class="field-label">密码<em>*</em></span>
+                <input v-model="addForm.password" class="field-input mono" type="password" placeholder="至少 8 位" autocomplete="new-password" spellcheck="false" />
+              </label>
+              <div class="field">
+                <span class="field-label">权限</span>
+                <div class="perm-rows">
+                  <div v-for="(label, field) in PERM_LABEL" :key="field" class="perm-row">
+                    <span class="perm-row-label">{{ label }}</span>
+                    <button
+                      class="switch"
+                      :class="{ on: addForm[field as PermField] }"
+                      type="button"
+                      role="switch"
+                      :aria-checked="addForm[field as PermField]"
+                      @click="addForm[field as PermField] = !addForm[field as PermField]"
+                    >
+                      <span class="switch-knob"></span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <p class="field-tip">后端 POST /reader3/addUser 未就绪时自动降级为注册接口（isLogin=false），新用户为默认权限，可在编辑中调整。</p>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="addBusy" @click="closeAdd">取消</button>
+                <button class="accent-btn" type="submit" :disabled="addBusy || !addForm.username.trim() || !addForm.password">
+                  {{ addBusy ? '创建中…' : '创建' }}
+                </button>
               </div>
             </form>
           </div>
@@ -653,6 +827,83 @@ onBeforeUnmount(() => {
 .refresh-btn svg {
   width: 14px;
   height: 14px;
+}
+.add-btn {
+  flex-shrink: 0;
+  padding: 5px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+  background: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.add-btn:hover {
+  color: var(--accent-deep);
+  border-color: var(--accent-deep);
+  background: var(--accent-soft);
+}
+
+/* 搜索框（GAP 42） */
+.filter-bar {
+  margin-bottom: 18px;
+}
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  height: 38px;
+  max-width: 320px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  transition: border-color 0.2s ease;
+}
+.search-box:focus-within {
+  border-color: var(--accent);
+}
+.search-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--text-3);
+  transition: color 0.2s ease;
+}
+.search-box:focus-within .search-icon {
+  color: var(--accent);
+}
+.search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 300;
+  outline: none;
+}
+.search-input::placeholder {
+  color: var(--text-3);
+}
+.search-clear {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  color: var(--text-3);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.search-clear:hover {
+  color: var(--accent);
 }
 
 /* secure 模式提示 */

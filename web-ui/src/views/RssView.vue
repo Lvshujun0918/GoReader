@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import {
   deleteRssSource,
@@ -177,6 +178,40 @@ function sanitizeHtml(html: string): string {
     .replace(/\s(?:href|src)\s*=\s*["']?\s*javascript:[^"'\s>]*/gi, '')
 }
 
+/* ================= GAP 45：刷新全部（逐源重新抓取 feed；后端无批量接口时逐源循环） ================= */
+
+const refreshingAll = ref(false)
+const refreshAllIndex = ref(0)
+const refreshAllTotal = ref(0)
+
+async function refreshAll() {
+  if (refreshingAll.value) return
+  // 全部订阅源（含停用的也刷新，保持列表新鲜；失败单源跳过）
+  const list = sources.value
+  if (list.length === 0) {
+    ElMessage.info('还没有订阅源')
+    return
+  }
+  refreshingAll.value = true
+  refreshAllIndex.value = 0
+  refreshAllTotal.value = list.length
+  let ok = 0
+  for (let i = 0; i < list.length; i++) {
+    refreshAllIndex.value = i + 1
+    try {
+      // getRssArticles 后端每次重新抓取 feed → 逐源即刷新；静默失败不打断
+      await getRssArticles(list[i].rssSourceUrl, 1, { silent: true })
+      ok++
+    } catch {
+      // 单源失败继续
+    }
+  }
+  // 全部刷新后重拉当前选中源列表（若选中的源刷新失败，loadArticles 会提示）
+  if (selectedUrl.value) await loadArticles(1)
+  refreshingAll.value = false
+  ElMessage.success(`刷新完成：${ok}/${list.length} 个订阅源已更新`)
+}
+
 /* ================= 新增订阅弹窗 ================= */
 const addOpen = ref(false)
 const addBusy = ref(false)
@@ -290,6 +325,21 @@ onBeforeUnmount(() => {
         <div class="col-head">
           <h2 class="col-title">订阅源</h2>
           <span class="col-count">{{ enabledCount }}/{{ sources.length }}</span>
+          <button
+            class="add-btn refresh-all-btn"
+            type="button"
+            :disabled="refreshingAll"
+            :title="refreshingAll ? `正在刷新 ${refreshAllIndex}/${refreshAllTotal}` : '刷新全部（逐源重新抓取 feed）'"
+            @click="refreshAll"
+          >
+            <svg v-if="!refreshingAll" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 11a8 8 0 1 0-2.3 6.3" />
+              <path d="M20 5v6h-6" />
+            </svg>
+            <svg v-else class="refresh-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <path d="M21 12a9 9 0 1 1-6.2-8.56" />
+            </svg>
+          </button>
           <button class="add-btn" type="button" title="新增订阅" @click="openAdd">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
               <path d="M12 5v14M5 12h14" />
@@ -647,9 +697,25 @@ onBeforeUnmount(() => {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
+.add-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
 .add-btn svg {
   width: 11px;
   height: 11px;
+}
+/* GAP 45：刷新全部按钮（刷新中旋转） */
+.refresh-all-btn {
+  margin-left: 0;
+}
+.refresh-spin {
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* 分组胶囊 */

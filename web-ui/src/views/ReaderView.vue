@@ -600,6 +600,44 @@ watch(ttsHttpUrl, (v) => persist(TTS_HTTP_URL_KEY, v))
 
 /** 播放中（顶栏按钮高亮） */
 const ttsPlaying = computed(() => ttsState.value === 'playing')
+
+/* ---------------- GAP 7：朗读段落高亮（播放中定时取当前段落，.tts-reading 浅背景） ---------------- */
+
+const ttsReadingPara = ref(-1)
+let ttsParaTimer: number | undefined
+/** 朗读锚点线：视口高度 32% 处（当前段落 = 最后一个顶部越过锚点的段落） */
+const TTS_READ_LINE = 0.32
+
+function updateTtsReadingPara() {
+  const paras = document.querySelectorAll<HTMLElement>('.reader-content .reader-para')
+  const line = window.innerHeight * TTS_READ_LINE
+  let idx = -1
+  paras.forEach((p, i) => {
+    if (p.getBoundingClientRect().top <= line) idx = i
+  })
+  if (ttsReadingPara.value !== idx) ttsReadingPara.value = idx
+}
+
+/** 播放/继续时启动定时器（暂停时保留高亮位置） */
+function startTtsParaTracking() {
+  stopTtsParaTracking()
+  updateTtsReadingPara()
+  ttsParaTimer = window.setInterval(updateTtsReadingPara, 400)
+}
+
+/** 暂停：仅停定时器，保留当前高亮段落 */
+function pauseTtsParaTracking() {
+  if (ttsParaTimer !== undefined) {
+    window.clearInterval(ttsParaTimer)
+    ttsParaTimer = undefined
+  }
+}
+
+/** 停止/切章：停定时器并清除高亮 */
+function stopTtsParaTracking() {
+  pauseTtsParaTracking()
+  ttsReadingPara.value = -1
+}
 /** 顶栏按钮文案 */
 const ttsTopLabel = computed(() =>
   ttsState.value === 'playing' || ttsState.value === 'loading'
@@ -714,6 +752,7 @@ async function startTts() {
   ttsState.value = 'playing'
   try {
     await audio.play()
+    startTtsParaTracking()
   } catch {
     // 自动播放被拦截（异步 fetch 后手势已失效）：保持待播，面板点「播放」即可恢复
     if (ttsState.value === 'playing') ttsState.value = 'paused'
@@ -724,6 +763,7 @@ function stopTts() {
   ttsLoadSeq++
   ttsAutoNext = false
   ttsState.value = 'idle'
+  stopTtsParaTracking()
   const audio = ttsAudioRef.value
   if (audio) {
     audio.pause()
@@ -741,6 +781,7 @@ function pauseTts() {
   if (!audio || ttsState.value !== 'playing') return
   audio.pause()
   ttsState.value = 'paused'
+  pauseTtsParaTracking()
 }
 
 function resumeTts() {
@@ -749,6 +790,7 @@ function resumeTts() {
   void audio.play().catch(() => {
     /* 保持暂停 */
   })
+  startTtsParaTracking()
 }
 
 /** 面板播放/暂停/继续 */
@@ -769,6 +811,7 @@ function toggleTts() {
 /** 本章播完：自动连播下一章；最后一章则停止 */
 function onTtsEnded() {
   if (ttsState.value === 'idle') return
+  stopTtsParaTracking()
   if (ttsObjectUrl) {
     URL.revokeObjectURL(ttsObjectUrl)
     ttsObjectUrl = ''
@@ -964,6 +1007,44 @@ function preloadNextChapterImages() {
     })
 }
 
+/* ---------------- GAP 102：正文图片全屏查看（段落为单张图片时渲染 <img>，点击全屏） ---------------- */
+
+const imgViewerOpen = ref(false)
+const imgViewerUrl = ref('')
+
+function openImgViewer(url: string) {
+  imgViewerUrl.value = url
+  imgViewerOpen.value = true
+}
+
+function closeImgViewer() {
+  imgViewerOpen.value = false
+  imgViewerUrl.value = ''
+}
+
+/** 段落是否为单张图片（markdown 语法或裸图片 URL）→ 返回图片地址，否则 null */
+function singleImageUrl(para: string): string | null {
+  const md = /^!\[[^\]]*]\(\s*([^)\s]+)\s*\)$/.exec(para)
+  if (md) return md[1]
+  if (
+    /^https?:\/\/[^\s"'<>，。！？、；：“”‘’（）【】]+\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\?[^\s"'<>]*)?$/i.test(
+      para,
+    )
+  ) {
+    return para
+  }
+  return null
+}
+
+/** 与 paragraphs 同源切分（原始文本，不经替换/简繁转换），逐段标注图片地址 */
+const paraImgs = computed<(string | null)[]>(() =>
+  content.value
+    .split(/\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map(singleImageUrl),
+)
+
 /* ---------------- 目录/章节 ---------------- */
 
 /** 有效章节（跳过卷标题分隔行） */
@@ -1118,6 +1199,8 @@ async function loadContent(chapterUrl: string) {
   }
   // 当前章渲染后：预加载下一章前 5 张图片（仅当下一章含图片 URL）
   preloadNextChapterImages()
+  // 切章后清除朗读高亮（连播/手动切章后由 startTts 重新跟踪）
+  ttsReadingPara.value = -1
 }
 
 function goToChapter(idx: number) {
@@ -1313,6 +1396,13 @@ function onKeydown(e: KeyboardEvent) {
       // 自动阅读暂停/恢复切换（阻止默认的页面滚动）
       e.preventDefault()
       toggleAuto()
+      break
+    case 'Escape':
+      // 图片全屏查看：Esc 关闭
+      if (imgViewerOpen.value) {
+        e.preventDefault()
+        closeImgViewer()
+      }
       break
   }
 }
@@ -1511,15 +1601,25 @@ onBeforeUnmount(() => {
             textAlign,
           }"
         >
-          <p
-            v-for="(para, i) in paragraphs"
-            :key="i"
-            class="reader-para"
-            :class="{ flash: flashParaIdx === i }"
-            :style="{ marginBottom: `${paraSpacing}em`, textIndent: textIndent ? '2em' : '0' }"
-          >
-            {{ para }}
-          </p>
+          <template v-for="(para, i) in paragraphs" :key="i">
+            <!-- 单张图片段落（GAP 102）：渲染图片，点击全屏查看 -->
+            <img
+              v-if="paraImgs[i]"
+              v-lazy="paraImgs[i] as string"
+              class="reader-img"
+              :alt="`正文图片 ${i + 1}`"
+              loading="lazy"
+              @click="openImgViewer(paraImgs[i] as string)"
+            />
+            <p
+              v-else
+              class="reader-para"
+              :class="{ flash: flashParaIdx === i, 'tts-reading': ttsReadingPara === i }"
+              :style="{ marginBottom: `${paraSpacing}em`, textIndent: textIndent ? '2em' : '0' }"
+            >
+              {{ para }}
+            </p>
+          </template>
         </article>
 
         <!-- 底部极简导航 -->
@@ -2010,6 +2110,18 @@ onBeforeUnmount(() => {
     <!-- 隐藏音频元素：后端 TTS 音频流播放（ended → 自动连播） -->
     <audio ref="ttsAudioRef" preload="auto" @ended="onTtsEnded" @error="onTtsError"></audio>
 
+    <!-- GAP 102：正文图片全屏查看（遮罩 + 原始图 + 关闭；点击遮罩/关闭按钮退出） -->
+    <transition name="pop">
+      <div v-if="imgViewerOpen" class="img-viewer" @click="closeImgViewer">
+        <img :src="imgViewerUrl" class="img-viewer-original" alt="正文图片" @click.stop />
+        <button class="img-viewer-close" type="button" title="关闭" @click="closeImgViewer">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
+        </button>
+      </div>
+    </transition>
+
     <!-- 书签列表弹层 -->
     <transition name="pop">
       <div v-if="bookmarksOpen" class="pop-mask" @click="bookmarksOpen = false">
@@ -2231,6 +2343,72 @@ onBeforeUnmount(() => {
   100% {
     background: transparent;
   }
+}
+
+/* GAP 7：TTS 朗读中当前段落浅背景高亮 */
+.reader-para.tts-reading {
+  background: var(--tts-reading-bg, rgba(79, 70, 229, 0.12));
+  border-radius: 4px;
+  box-shadow: 0 0 0 4px var(--tts-reading-bg, rgba(79, 70, 229, 0.12));
+  transition: background 0.25s ease;
+}
+
+/* GAP 102：正文图片（段落内单张图片） */
+.reader-img {
+  display: block;
+  max-width: 100%;
+  max-height: 72vh;
+  margin: 0 auto 1em;
+  border-radius: 8px;
+  cursor: zoom-in;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.reader-img.is-loaded {
+  opacity: 1;
+}
+
+/* GAP 102：图片全屏查看层 */
+.img-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgba(10, 10, 12, 0.92);
+}
+.img-viewer-original {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+}
+.img-viewer-close {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  width: 38px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+.img-viewer-close:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+.img-viewer-close svg {
+  width: 16px;
+  height: 16px;
 }
 
 /* ================= 加载 / 错误 / 空 ================= */
