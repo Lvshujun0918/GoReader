@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { getBookInfo, getBookToc, searchBookSource } from '@/api/books'
+import { getInvalidBookSources } from '@/api/sources'
 import { searchBookContent } from '@/api/cache'
 import { exportBook, type ExportFormat } from '@/api/export'
 import { cacheBookOnServer, cacheBookSSE, cancelCacheBook } from '@/api/cacheBook'
@@ -151,6 +152,19 @@ async function addToShelf() {
 function startReading() {
   if (!shelfBook.value) return
   void router.push(`/reader/${encodeURIComponent(shelfBook.value.bookUrl)}`)
+}
+
+/** 非书架书直接阅读（不加入书架——退出时阅读器提醒入架） */
+function startReadingTemp() {
+  const b = shelfBook.value ?? info.value
+  if (!b) return
+  const q = new URLSearchParams({
+    source: b.origin || '',
+    sourceName: b.originName || '',
+    toc: b.tocUrl || b.bookUrl || '',
+    name: b.name || '',
+  })
+  void router.push(`/reader/${encodeURIComponent(b.bookUrl)}?${q.toString()}`)
 }
 
 /* ================= GAP 19：自定义封面（图片上传到 __HOME__/covers → saveBook customCoverUrl → 展示） ================= */
@@ -338,6 +352,8 @@ const sourceResults = ref<SearchBook[]>([])
 const sourceMsg = ref('')
 const sourceMsgError = ref(false)
 const currentOrigin = ref('')
+/** 失效书源 URL 集合（GAP 20：getInvalidBookSources 探测，失败静默 → 空集不标注） */
+const invalidSourceUrls = ref<Set<string>>(new Set())
 
 /** 判断是否接口未实现（404 / 后端未就绪） */
 function isNotImplemented(err: unknown): boolean {
@@ -374,16 +390,32 @@ async function runSourceSearch() {
   sourceMsg.value = ''
   sourceMsgError.value = false
   currentOrigin.value = b.origin
+  invalidSourceUrls.value = new Set()
   try {
+    // 失效书源探测（后端并行实现中，可能 404：silent 降级 → 不标注）
+    try {
+      const inv = await getInvalidBookSources()
+      invalidSourceUrls.value = new Set(Array.isArray(inv.data) ? inv.data : [])
+    } catch {
+      invalidSourceUrls.value = new Set()
+    }
     const res = await searchBookSource(b.bookUrl, b.origin, { silent: true })
     // 按书源去重（同一源多条结果只留首个）
     const seen = new Set<string>()
-    sourceResults.value = (res.data ?? []).filter((r) => {
+    const list = (res.data ?? []).filter((r) => {
       const k = r.origin || r.originName
       if (!k || seen.has(k)) return false
       seen.add(k)
       return true
     })
+    // GAP 20：当前源置顶 → 其余按 originName 升序（失效源沉底，带「失效」标注）
+    const cur = list.filter((r) => r.origin === currentOrigin.value)
+    const rest = list.filter((r) => r.origin !== currentOrigin.value)
+    const invalid = rest.filter((r) => invalidSourceUrls.value.has(r.origin))
+    const valid = rest.filter((r) => !invalidSourceUrls.value.has(r.origin))
+    const byName = (a: SearchBook, c: SearchBook) =>
+      (a.originName || a.origin || '').localeCompare(c.originName || c.origin || '')
+    sourceResults.value = [...cur, ...valid.sort(byName), ...invalid.sort(byName)]
     if (sourceResults.value.length === 0) {
       sourceMsg.value = '未找到其他书源'
       sourceMsgError.value = false
@@ -801,11 +833,15 @@ onMounted(load)
           </button>
 
           <div class="actions">
-            <!-- 书架书 → 开始阅读；非书架书 → 加入书架（入架成功后变开始阅读） -->
+            <!-- GAP 21：书架书显示「已在书架」标记 + 开始阅读；非书架书 → 加入书架（入架成功后变开始阅读） -->
+            <span v-if="shelfBook" class="onshelf-tag" title="本书已在书架中">已在书架</span>
             <button v-if="shelfBook" class="read-btn" type="button" @click="startReading">开始阅读</button>
-            <button v-else class="add-btn" type="button" :disabled="saving" @click="addToShelf">
-              加入书架
-            </button>
+            <template v-else>
+              <button class="read-btn ghost" type="button" @click="startReadingTemp">直接阅读</button>
+              <button class="add-btn" type="button" :disabled="saving" @click="addToShelf">
+                加入书架
+              </button>
+            </template>
             <!-- 全书搜索（书架书本地正文搜索；命中后跳阅读页该章） -->
             <button v-if="shelfBook" class="search-btn" type="button" @click="openSearch">全书搜索</button>
             <!-- 换源（书架书且带书源：搜索同书其他书源并切换） -->
@@ -916,19 +952,21 @@ onMounted(load)
                 <span>正在搜索其他书源…</span>
               </div>
 
-              <!-- 结果列表：书源名 + 来源，当前源置灰标记 -->
+              <!-- 结果列表：当前源置顶 + originName 排序 + 失效标注（GAP 20） -->
               <ul v-else-if="sourceResults.length" class="source-list">
                 <li v-for="(r, i) in sourceResults" :key="i">
                   <button
                     class="source-row"
+                    :class="{ invalid: invalidSourceUrls.has(r.origin) }"
                     type="button"
-                    :disabled="sourceSwitching || r.origin === currentOrigin"
-                    :title="r.origin === currentOrigin ? '当前书源' : '切换到该书源'"
+                    :disabled="sourceSwitching || r.origin === currentOrigin || invalidSourceUrls.has(r.origin)"
+                    :title="r.origin === currentOrigin ? '当前书源' : invalidSourceUrls.has(r.origin) ? '失效书源（不可切换）' : '切换到该书源'"
                     @click="switchSource(r)"
                   >
                     <span class="source-name">{{ r.originName || r.origin || '未知书源' }}</span>
                     <span class="source-url">{{ r.origin }}</span>
                     <span v-if="r.origin === currentOrigin" class="source-cur">当前</span>
+                    <span v-else-if="invalidSourceUrls.has(r.origin)" class="source-cur invalid">失效</span>
                   </button>
                 </li>
               </ul>
@@ -1364,6 +1402,16 @@ onMounted(load)
   align-items: center;
   gap: 16px;
   flex-wrap: wrap;
+}
+/* 已在书架标记（GAP 21）：细字徽标，紧邻开始阅读 */
+.onshelf-tag {
+  padding: 2px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 2px;
 }
 .read-btn {
   padding: 13px 44px;
@@ -1826,6 +1874,14 @@ onMounted(load)
   font-size: 10.5px;
   font-weight: 400;
   letter-spacing: 1px;
+}
+/* 失效书源标注（GAP 20）：行置灰 + 红色「失效」徽标 */
+.source-row.invalid {
+  opacity: 0.55;
+}
+.source-cur.invalid {
+  border-color: rgba(207, 68, 68, 0.5);
+  color: #cf4444;
 }
 .source-retry {
   display: flex;

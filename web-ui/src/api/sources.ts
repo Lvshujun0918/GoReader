@@ -22,6 +22,17 @@ export function deleteBookSource(bookSourceUrl: string): Promise<ReturnData<null
 }
 
 /**
+ * POST /reader3/deleteBookSources：批量删除书源（body = 书源 URL 数组）。
+ * 后端并行实现中（可能 404）：调用方传 { silent: true } 自行降级逐源 deleteBookSource。
+ */
+export function deleteBookSources(
+  urls: string[],
+  opts?: { silent?: boolean },
+): Promise<ReturnData<{ deleted?: number } | null>> {
+  return post<{ deleted?: number } | null>('/deleteBookSources', urls, opts)
+}
+
+/**
  * GET /reader3/getInvalidBookSources：检测失效书源，返回失效书源 URL 列表（string[]）。
  * 后端并行实现中（可能 404）：调用方传 { silent: true } 自行降级提示。
  */

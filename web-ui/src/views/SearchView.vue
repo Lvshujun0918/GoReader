@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { searchBookMulti, searchBookMultiSSE } from '@/api/search'
+import { getBookshelf } from '@/api/bookshelf'
 import { useUserStore } from '@/stores/user'
 import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
-import type { ReturnData, SearchBook } from '@/types'
+import type { Book, ReturnData, SearchBook } from '@/types'
 
 const router = useRouter()
 const route = useRoute()
@@ -79,6 +80,7 @@ async function doSearch(kw?: string) {
   const word = (kw ?? key.value).trim()
   if (!word || searching.value) return
   key.value = word
+  suggestOpen.value = false // 开始搜索时收起联想
   const seq = ++searchSeq
   sseAbort = null
   batchAbort = null
@@ -272,6 +274,91 @@ onMounted(() => {
   const kw = typeof route.query.key === 'string' ? route.query.key.trim() : ''
   if (kw) void doSearch(kw)
 })
+
+/* ================= GAP 22：搜索建议（输入联想——搜索历史 + 本地书架书匹配；debounce 250ms） ================= */
+
+interface Suggestion {
+  text: string
+  kind: 'history' | 'book'
+  sub?: string
+}
+
+const suggestOpen = ref(false)
+const suggestions = ref<Suggestion[]>([])
+const shelfBooks = ref<Book[]>([])
+let shelfLoaded = false
+let suggestTimer: number | undefined
+
+/** 书架书懒加载一次（失败静默：仅历史联想） */
+function loadShelfOnce() {
+  if (shelfLoaded) return
+  shelfLoaded = true
+  void getBookshelf()
+    .then((res) => {
+      shelfBooks.value = res.data ?? []
+    })
+    .catch(() => {
+      /* 静默 */
+    })
+}
+
+/** 联想：历史命中优先（最多 8 条，去重），再补书架书书名命中 */
+function computeSuggestions() {
+  const kw = key.value.trim()
+  if (!kw || searching.value) {
+    suggestions.value = []
+    suggestOpen.value = false
+    return
+  }
+  const out: Suggestion[] = []
+  const seen = new Set<string>()
+  for (const h of history.value) {
+    if (out.length >= 8) break
+    if (h.includes(kw) && !seen.has(h)) {
+      seen.add(h)
+      out.push({ text: h, kind: 'history' })
+    }
+  }
+  for (const b of shelfBooks.value) {
+    if (out.length >= 8) break
+    const n = b.name.trim()
+    if (n && n.includes(kw) && !seen.has(n)) {
+      seen.add(n)
+      out.push({ text: n, kind: 'book', sub: b.author || b.originName || undefined })
+    }
+  }
+  suggestions.value = out
+  suggestOpen.value = out.length > 0
+}
+
+watch(key, () => {
+  window.clearTimeout(suggestTimer)
+  if (!key.value.trim()) {
+    suggestions.value = []
+    suggestOpen.value = false
+    return
+  }
+  loadShelfOnce()
+  suggestTimer = window.setTimeout(computeSuggestions, 250)
+})
+
+function pickSuggestion(s: Suggestion) {
+  suggestOpen.value = false
+  void doSearch(s.text)
+}
+
+function onSearchFocus() {
+  suggestOpen.value = suggestions.value.length > 0
+}
+
+function closeSuggest() {
+  window.clearTimeout(suggestTimer)
+  suggestOpen.value = false
+}
+
+onBeforeUnmount(() => {
+  window.clearTimeout(suggestTimer)
+})
 </script>
 
 <template>
@@ -311,9 +398,27 @@ onMounted(() => {
           placeholder="书名 / 作者"
           spellcheck="false"
           @keydown.enter="onEnter"
+          @focus="onSearchFocus"
+          @blur="closeSuggest"
         />
         <button class="search-btn" type="button" :disabled="searching || !key.trim()" @click="onEnter">
           {{ searching ? '搜索中…' : '搜索' }}
+        </button>
+      </div>
+
+      <!-- GAP 22：输入联想（搜索历史 + 书架书匹配，debounce 250ms；mousedown.prevent 保证点击前不丢焦点） -->
+      <div v-if="suggestOpen && !searching && key.trim()" class="suggest">
+        <button
+          v-for="(s, i) in suggestions"
+          :key="`${s.kind}-${s.text}-${i}`"
+          class="suggest-item"
+          type="button"
+          @mousedown.prevent
+          @click="pickSuggestion(s)"
+        >
+          <span class="suggest-text">{{ s.text }}</span>
+          <span v-if="s.sub" class="suggest-sub">{{ s.sub }}</span>
+          <span class="suggest-tag" :class="s.kind">{{ s.kind === 'history' ? '历史' : '书架' }}</span>
         </button>
       </div>
 
@@ -555,6 +660,68 @@ onMounted(() => {
 .search-btn:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+/* ================= 搜索联想（GAP 22） ================= */
+.suggest {
+  display: flex;
+  flex-direction: column;
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-float);
+  overflow: hidden;
+}
+.suggest-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 300;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.suggest-item:last-child {
+  border-bottom: none;
+}
+.suggest-item:hover {
+  background: var(--accent-soft);
+}
+.suggest-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.suggest-sub {
+  flex-shrink: 0;
+  max-width: 180px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.suggest-tag {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-3);
+  font-size: 10.5px;
+  letter-spacing: 1px;
+}
+.suggest-tag.book {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 /* ================= 搜索历史 ================= */

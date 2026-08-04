@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { deleteBookSource, getBookSources, getInvalidBookSources, saveBookSource, saveBookSources, setAsDefaultBookSources } from '@/api/sources'
+import { deleteBookSource, deleteBookSources, getBookSources, getInvalidBookSources, saveBookSource, saveBookSources, setAsDefaultBookSources } from '@/api/sources'
 import { deleteSourceSub, getSourceSubs, refreshSourceSub, saveSourceSub } from '@/api/sourceSubs'
 import { exportBookSources } from '@/api/system'
 import { bookSourceDebugSSE, type DebugAction } from '@/api/sourceDebug'
@@ -459,6 +459,143 @@ async function toggleSource(s: BookSource) {
   }
 }
 
+/* ================= GAP 27：多选模式（勾选行 → 底部批量启用/禁用/删除） ================= */
+const manageMode = ref(false)
+const selectedSources = ref<Set<string>>(new Set())
+const batchBusy = ref(false)
+
+/** 勾选的书源对象（按列表顺序） */
+const selectedList = computed(() =>
+  sources.value.filter((s) => selectedSources.value.has(s.bookSourceUrl)),
+)
+const selectedCount = computed(() => selectedSources.value.size)
+/** 当前筛选结果是否全部勾选 */
+const allFilteredSelected = computed(
+  () => filtered.value.length > 0 && filtered.value.every((s) => selectedSources.value.has(s.bookSourceUrl)),
+)
+
+function toggleManage() {
+  manageMode.value = !manageMode.value
+  if (!manageMode.value) selectedSources.value.clear()
+}
+
+function toggleSelect(s: BookSource) {
+  const set = new Set(selectedSources.value)
+  if (set.has(s.bookSourceUrl)) set.delete(s.bookSourceUrl)
+  else set.add(s.bookSourceUrl)
+  selectedSources.value = set
+}
+
+function toggleSelectAll() {
+  const set = new Set(selectedSources.value)
+  if (allFilteredSelected.value) {
+    for (const s of filtered.value) set.delete(s.bookSourceUrl)
+  } else {
+    for (const s of filtered.value) set.add(s.bookSourceUrl)
+  }
+  selectedSources.value = set
+}
+
+/**
+ * 批量启用/禁用：逐源 saveBookSource 循环；单源接口未实现（404）时降级 saveBookSources 整批。
+ * 返回成功更新的书源数。
+ */
+async function batchSetEnabled(enabled: boolean): Promise<number> {
+  const targets = selectedList.value.filter((s) => s.enabled !== enabled)
+  if (targets.length === 0) return 0
+  const updated = targets.map((s) => ({ ...s, enabled }))
+  let ok = 0
+  let fellBack = false
+  for (let i = 0; i < updated.length; i++) {
+    try {
+      await saveBookSource(updated[i])
+      ok++
+    } catch (err) {
+      if (!fellBack && isNotImplemented(err)) {
+        // 单个保存接口未就绪：整批降级 saveBookSources
+        fellBack = true
+        try {
+          const res = await saveBookSources(updated)
+          return res.data?.count ?? updated.length
+        } catch {
+          return ok // 降级也失败：已成功的部分返回
+        }
+      }
+      // 单源失败（非 404）：跳过继续
+    }
+  }
+  return ok
+}
+
+async function batchEnable() {
+  await runBatchEnabled(true)
+}
+
+async function batchDisable() {
+  await runBatchEnabled(false)
+}
+
+async function runBatchEnabled(enabled: boolean) {
+  if (batchBusy.value || selectedCount.value === 0) return
+  batchBusy.value = true
+  try {
+    const n = await batchSetEnabled(enabled)
+    if (n > 0) {
+      ElMessage.success(`已${enabled ? '启用' : '禁用'} ${n} 个书源`)
+      await load()
+    } else {
+      ElMessage.info(`所选书源已全部处于${enabled ? '启用' : '停用'}状态`)
+    }
+  } finally {
+    batchBusy.value = false
+  }
+}
+
+/** 批量删除：优先 POST /reader3/deleteBookSources；接口未实现（404）时降级逐源 deleteBookSource */
+async function batchDelete() {
+  if (batchBusy.value || selectedCount.value === 0) return
+  try {
+    await ElMessageBox.confirm(
+      `确定删除选中的 ${selectedCount.value} 个书源吗？此操作不可恢复。`,
+      '批量删除书源',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  batchBusy.value = true
+  const urls = selectedList.value.map((s) => s.bookSourceUrl)
+  try {
+    const res = await deleteBookSources(urls, { silent: true })
+    const deleted = res.data?.deleted ?? urls.length
+    ElMessage.success(`已删除 ${deleted} 个书源`)
+    selectedSources.value.clear()
+    await load()
+  } catch (err) {
+    if (isNotImplemented(err)) {
+      // 批量接口未实现：降级逐源删除
+      let ok = 0
+      for (const u of urls) {
+        try {
+          await deleteBookSource(u)
+          ok++
+        } catch {
+          // 单源失败跳过
+        }
+      }
+      ElMessage.success(`已删除 ${ok} 个书源`)
+      if (ok > 0) {
+        selectedSources.value.clear()
+        await load()
+      }
+    } else {
+      ElMessage.error(err instanceof Error ? err.message : '批量删除失败')
+    }
+  } finally {
+    batchBusy.value = false
+  }
+}
+
 /* ================= 删除（极简确认弹窗） ================= */
 const deleting = ref<BookSource | null>(null)
 const deleteBusy = ref(false)
@@ -571,6 +708,7 @@ const editBusy = ref(false)
 const editSource = ref<BookSource | null>(null)
 const editForm = ref({ bookSourceUrl: '', bookSourceName: '', bookSourceGroup: '' })
 const editRules = ref<Record<string, string>>({})
+const editWeight = ref(0)
 const editMsg = ref('')
 const editMsgError = ref(false)
 
@@ -598,6 +736,7 @@ function openEdit(s: BookSource) {
   }
   editRules.value = {}
   for (const f of RULE_FIELDS) editRules.value[f.key] = ruleToText(s, f)
+  editWeight.value = typeof s.weight === 'number' && Number.isFinite(s.weight) ? s.weight : 0
   editMsg.value = ''
   editMsgError.value = false
   editOpen.value = true
@@ -890,6 +1029,8 @@ async function confirmEdit() {
   editMsg.value = ''
   try {
     const merged = buildSource(editForm.value, base)
+    // 权重（GAP 29：数字输入 → BookSource.weight 字段提交）
+    merged.weight = Number.isFinite(editWeight.value) ? Math.max(0, Math.round(editWeight.value)) : 0
     for (const f of RULE_FIELDS) {
       const v = editRules.value[f.key]?.trim() ?? ''
       if (v === '') {
@@ -915,12 +1056,26 @@ async function confirmEdit() {
 /* ================= 导出（blob 下载 bookSource.json） ================= */
 const exporting = ref(false)
 
+/**
+ * 导出：勾选多选时逐源构造 JSON 下载（后端 exportBookSources 不支持筛选参数）；
+ * 未勾选 → 全量走 GET /reader3/exportBookSources。
+ */
 async function doExport() {
   if (exporting.value) return
   exporting.value = true
   try {
-    const blob = await exportBookSources()
-    await downloadBlob(blob, 'bookSource.json')
+    const picked = selectedList.value
+    if (manageMode.value && picked.length > 0) {
+      // 勾选导出：前端按勾选书源构造 bookSource.json（与全量导出同构）
+      const blob = new Blob([JSON.stringify(picked, null, 2)], {
+        type: 'application/json;charset=utf-8',
+      })
+      await downloadBlob(blob, 'bookSource.json')
+      ElMessage.success(`已导出 ${picked.length} 个书源`)
+    } else {
+      const blob = await exportBookSources()
+      await downloadBlob(blob, 'bookSource.json')
+    }
   } catch {
     // 请求层已提示
   } finally {
@@ -1276,10 +1431,19 @@ onBeforeUnmount(() => {
             class="ghost-btn"
             type="button"
             :disabled="exporting"
-            title="下载当前账号全部书源（bookSource.json）"
+            :title="manageMode && selectedCount > 0 ? `导出勾选的 ${selectedCount} 个书源（bookSource.json）` : '下载当前账号全部书源（bookSource.json）'"
             @click="doExport"
           >
-            {{ exporting ? '导出中…' : '导出' }}
+            {{ exporting ? '导出中…' : manageMode && selectedCount > 0 ? `导出勾选 (${selectedCount})` : '导出' }}
+          </button>
+          <button
+            class="ghost-btn"
+            type="button"
+            :class="{ active: manageMode }"
+            :title="manageMode ? '退出多选模式' : '多选模式：勾选行后批量启用/禁用/删除/导出'"
+            @click="toggleManage"
+          >
+            {{ manageMode ? '完成' : '多选' }}
           </button>
           <button class="accent-outline-btn" type="button" @click="openAdd">新增书源</button>
           <input
@@ -1361,7 +1525,21 @@ onBeforeUnmount(() => {
 
       <!-- 书源列表 -->
       <ul v-else class="source-list">
-        <li v-for="s in filtered" :key="s.bookSourceUrl" class="source-row" :class="{ invalid: invalidSources.has(s.bookSourceUrl) }">
+        <li v-for="s in filtered" :key="s.bookSourceUrl" class="source-row" :class="{ invalid: invalidSources.has(s.bookSourceUrl), selected: selectedSources.has(s.bookSourceUrl) }">
+          <button
+            v-if="manageMode"
+            class="select-box"
+            :class="{ on: selectedSources.has(s.bookSourceUrl) }"
+            type="button"
+            role="checkbox"
+            :aria-checked="selectedSources.has(s.bookSourceUrl)"
+            :title="selectedSources.has(s.bookSourceUrl) ? '取消勾选' : '勾选'"
+            @click="toggleSelect(s)"
+          >
+            <svg v-if="selectedSources.has(s.bookSourceUrl)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5 12.5l4.5 4.5L19 7" />
+            </svg>
+          </button>
           <div class="source-main">
             <p class="source-name" :title="s.bookSourceName">{{ s.bookSourceName }}</p>
             <p class="source-url" :title="s.bookSourceUrl">{{ s.bookSourceUrl }}</p>
@@ -1418,6 +1596,27 @@ onBeforeUnmount(() => {
           </button>
         </li>
       </ul>
+
+      <!-- 多选模式批量操作栏（GAP 27：批量启用/禁用/删除 + 勾选导出） -->
+      <div v-if="manageMode" class="batch-bar">
+        <button class="ghost-btn batch-all" type="button" :disabled="batchBusy || filtered.length === 0" @click="toggleSelectAll">
+          {{ allFilteredSelected ? '取消全选' : '全选' }}
+        </button>
+        <span class="batch-count">已选 {{ selectedCount }} 个</span>
+        <span class="batch-sep"></span>
+        <button class="batch-btn" type="button" :disabled="batchBusy || selectedCount === 0" @click="batchEnable">
+          批量启用
+        </button>
+        <button class="batch-btn" type="button" :disabled="batchBusy || selectedCount === 0" @click="batchDisable">
+          批量禁用
+        </button>
+        <button class="batch-btn danger" type="button" :disabled="batchBusy || selectedCount === 0" @click="batchDelete">
+          {{ batchBusy ? '处理中…' : '批量删除' }}
+        </button>
+        <button class="batch-btn" type="button" :disabled="exporting || selectedCount === 0" @click="doExport">
+          导出勾选
+        </button>
+      </div>
 
       <!-- 订阅源：远程书源订阅（后端 /reader3/getSourceSubs 等为主，localStorage 降级，见 api/sourceSubs.ts） -->
       <section class="subs-section">
@@ -1739,6 +1938,18 @@ onBeforeUnmount(() => {
                   spellcheck="false"
                   :disabled="editBusy"
                 />
+              </label>
+              <label class="field">
+                <span class="field-label">权重</span>
+                <input
+                  v-model.number="editWeight"
+                  class="field-input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  :disabled="editBusy"
+                />
+                <span class="field-tip">书源排序权重（数字越大越靠前，随 saveBookSource 提交 weight 字段）</span>
               </label>
               <div class="rules-head">
                 <h3 class="rules-title">规则字段</h3>
@@ -2441,6 +2652,90 @@ onBeforeUnmount(() => {
 }
 .source-row.invalid .source-name {
   color: #cf4444;
+}
+
+/* ================= 多选模式（GAP 27）：行勾选 + 底部批量操作栏 ================= */
+.source-row.selected {
+  background: rgba(64, 158, 120, 0.05);
+}
+.select-box {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  background: none;
+  color: #fff;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s ease;
+}
+.select-box svg {
+  width: 12px;
+  height: 12px;
+}
+.select-box.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-float);
+}
+.batch-all {
+  padding: 6px 12px;
+}
+.batch-count {
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.batch-sep {
+  flex: 1;
+}
+.batch-btn {
+  padding: 6px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+.batch-btn:hover:not(:disabled) {
+  color: var(--text-1);
+  border-color: var(--border-strong);
+}
+.batch-btn.danger {
+  color: #cf4444;
+  border-color: rgba(207, 68, 68, 0.4);
+}
+.batch-btn.danger:hover:not(:disabled) {
+  background: rgba(207, 68, 68, 0.08);
+  border-color: #cf4444;
+}
+.batch-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ghost-btn.active {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 .source-badge {
   flex-shrink: 0;

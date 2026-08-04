@@ -444,7 +444,17 @@ async function doRename() {
     // 组合实现：读旧内容 → 写新路径 → 删旧文件（写失败则旧文件保留，不删除）
     const res = await getFile(target.path, home.value)
     await saveFile(newPath, res.data ?? '', home.value)
-    await deleteFile(target.path, home.value)
+    try {
+      await deleteFile(target.path, home.value)
+    } catch (err) {
+      // 新文件已写入但旧文件删除失败：回滚删除新文件，恢复原状（避免双份）
+      try {
+        await deleteFile(newPath, home.value)
+      } catch {
+        /* 回滚失败：保留现状并提示 */
+      }
+      throw err
+    }
     ElMessage.success('重命名成功')
     renameOpen.value = false
     selectedPath.value = null

@@ -175,6 +175,12 @@ const groupDialogRef = ref<HTMLElement | null>(null)
 const newGroupName = ref('')
 const groupSaving = ref(false)
 
+/* ================= GAP 12：书架统计（顶部「共 N 本 · M 组」） ================= */
+const shelfSummary = computed(() => ({
+  books: books.value.length,
+  groups: groups.value.length,
+}))
+
 /* ================= 分组管理：重命名 / 删除 ================= */
 const renamingId = ref<number | null>(null)
 const renameName = ref('')
@@ -371,9 +377,47 @@ function removeItem(i: number) {
   importItems.value.splice(i, 1)
 }
 
+/**
+ * GAP 126：导入去重——上传前 getBookshelf 检查同名书，命中则弹确认窗；
+ * 返回 true=继续导入 / false=用户取消。书架拉取失败不阻塞导入。
+ */
+async function checkImportDuplicates(): Promise<boolean> {
+  let shelf: Book[] = books.value
+  try {
+    const res = await getBookshelf()
+    shelf = res.data ?? []
+  } catch {
+    return true // 拉取失败不阻塞导入（错误提示由拦截器处理）
+  }
+  const shelfNames = new Set(shelf.map((b) => b.name.trim()).filter(Boolean))
+  const dups = new Set<string>()
+  for (const item of importItems.value) {
+    const name = (item.preview?.name || item.file.name.replace(/\.[^.]+$/, '')).trim()
+    if (name && shelfNames.has(name)) dups.add(name)
+  }
+  if (dups.size === 0) return true
+  const names = Array.from(dups).slice(0, 5)
+  const more = dups.size > 5 ? ` 等 ${dups.size} 本` : ''
+  try {
+    await ElMessageBox.confirm(
+      `书架中已有同名书：${names.join('、')}${more}。继续导入将新增重复条目，仍要导入吗？`,
+      '检测到同名书籍',
+      { confirmButtonText: '仍要导入', cancelButtonText: '取消', type: 'warning' },
+    )
+    return true
+  } catch {
+    return false // 用户取消
+  }
+}
+
 /** 逐个上传（每个文件一次 multipart POST），完成后自动刷新书架 */
 async function startUpload() {
   if (uploadBusy.value || importItems.value.length === 0) return
+  // GAP 126：同名书确认弹窗（取消则中止本次导入）
+  if (!(await checkImportDuplicates())) {
+    ElMessage.info('已取消导入')
+    return
+  }
   uploadBusy.value = true
   importDone.value = false
   let ok = 0
@@ -1242,7 +1286,7 @@ onMounted(() => {
       <!-- 标题区 -->
       <div class="section-head">
         <h1 class="section-title">我的书架</h1>
-        <span class="count">{{ books.length }} 本</span>
+        <span class="count" title="书架统计">共 {{ shelfSummary.books }} 本 · {{ shelfSummary.groups }} 组</span>
         <button
           class="manage-btn"
           type="button"

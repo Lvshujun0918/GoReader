@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { getBookshelf, deleteBook } from '@/api/bookshelf'
 import { getBookInfo, getBookToc, getBookContent } from '@/api/books'
+import { saveBook } from '@/api/bookshelf'
 import { getHttpTtsList } from '@/api/httpTts'
 import { get, post } from '@/api/request'
 import { loadReplaceRules } from '@/api/replaceRules'
@@ -1203,6 +1204,35 @@ async function loadContent(chapterUrl: string) {
   ttsReadingPara.value = -1
 }
 
+// 临时书（先读后入架）：离开时提醒加入书架
+onBeforeRouteLeave(async () => {
+  const b = shelfBook.value
+  if (!b || !(b as unknown as { isTemp?: boolean }).isTemp) return true
+  try {
+    await ElMessageBox.confirm(`《${b.name || '本书'}》要加入书架吗？加入后可保存阅读进度、续读更方便。`, '加入书架', {
+      confirmButtonText: '加入书架',
+      cancelButtonText: '暂不加入',
+      distinguishCancelAndClose: true,
+      type: 'info',
+    })
+    await saveBook({
+      bookUrl: b.bookUrl,
+      name: b.name,
+      author: b.author,
+      origin: b.origin,
+      originName: b.originName,
+      tocUrl: b.tocUrl,
+      intro: b.intro,
+      coverUrl: b.coverUrl,
+      group: 0,
+    } as Book)
+    ElMessage.success('已加入书架')
+  } catch {
+    /* 取消——不加入 */
+  }
+  return true
+})
+
 function goToChapter(idx: number) {
   const ch = chapters.value[idx]
   if (!ch || ch.isVolume) return
@@ -1223,6 +1253,63 @@ function nextChapter() {
   const fi = flatIndex.value
   if (fi < 0 || fi >= realChapters.value.length - 1) return
   goToChapter(chapters.value.indexOf(realChapters.value[fi + 1]))
+}
+
+/* ---------------- GAP 4：长按快进/快退（按住 250ms 后每 300ms 连续翻章；pointer 事件覆盖鼠标/触屏） ---------------- */
+
+interface HoldRepeat {
+  start: (e: PointerEvent) => void
+  stop: () => void
+  /** 长按已触发连翻时吞掉释放后的合成 click（避免多翻一章） */
+  swallowClick: () => boolean
+}
+
+function createHoldRepeat(fn: () => void): HoldRepeat {
+  let timer: number | undefined
+  let interval: number | undefined
+  let fired = false
+  function start(e: PointerEvent) {
+    // 仅响应主键（鼠标左键 / 触屏笔尖）
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    stop()
+    fired = false
+    timer = window.setTimeout(() => {
+      fired = true
+      fn()
+      interval = window.setInterval(fn, 300)
+    }, 250)
+  }
+  function stop() {
+    if (timer !== undefined) {
+      window.clearTimeout(timer)
+      timer = undefined
+    }
+    if (interval !== undefined) {
+      window.clearInterval(interval)
+      interval = undefined
+    }
+  }
+  function swallowClick(): boolean {
+    if (fired) {
+      fired = false
+      return true
+    }
+    return false
+  }
+  return { start, stop, swallowClick }
+}
+
+const prevHold = createHoldRepeat(prevChapter)
+const nextHold = createHoldRepeat(nextChapter)
+
+function onPrevClick() {
+  if (prevHold.swallowClick()) return
+  prevChapter()
+}
+
+function onNextClick() {
+  if (nextHold.swallowClick()) return
+  nextChapter()
 }
 
 function retry() {
@@ -1271,20 +1358,37 @@ async function init() {
     const shelfRes = await getBookshelf()
     const found = (shelfRes.data ?? []).find((b) => b.bookUrl === bookUrl.value)
     if (!found?.origin) {
-      notFound.value = true
-      return
+      // 非书架书（详情页「直接阅读」跳入）：用 query 构建临时书——先读后提示入架
+      const q = route.query as Record<string, string>
+      if (q.source) {
+        shelfBook.value = {
+          bookUrl: bookUrl.value,
+          origin: q.source,
+          originName: q.sourceName || '',
+          tocUrl: q.toc || bookUrl.value,
+          name: q.name || '未命名',
+          group: 0,
+        } as Book
+        shelfBook.value.isTemp = true as never
+        bookName.value = shelfBook.value.name
+      } else {
+        notFound.value = true
+        return
+      }
     }
     // 本地书 tocUrl 可能为空——用 bookUrl 兜底
-    if (!found.tocUrl) found.tocUrl = found.bookUrl
-    shelfBook.value = found
-    bookName.value = found.name
+    if (found && !found.tocUrl) found.tocUrl = found.bookUrl
+    if (found) {
+      shelfBook.value = found
+      bookName.value = found.name
+    }
     // 替换规则：进入阅读页时读取一次（localStorage 占位；后端就绪后走 GET /reader3/getReplaceRules）
     if (replaceEnabled.value) refreshReplaceRules()
 
     // 目录 + 详情并行拉取
     const [tocRes, infoRes] = await Promise.allSettled([
-      getBookToc(found.tocUrl, found.origin),
-      getBookInfo(found.bookUrl, found.origin, { silent: true }),
+      getBookToc(shelfBook.value!.tocUrl, shelfBook.value!.origin),
+      getBookInfo(shelfBook.value!.bookUrl, shelfBook.value!.origin, { silent: true }),
     ])
     if (tocRes.status === 'fulfilled' && tocRes.value.isSuccess) {
       chapters.value = tocRes.value.data ?? []
@@ -1305,18 +1409,18 @@ async function init() {
       Number.isInteger(qc) && qc >= 0 && qc < chapters.value.length && !chapters.value[qc].isVolume
         ? qc
         : -1
-    const srvIdx = found.durChapterIndex ?? -1
+    const srvIdx = shelfBook.value?.durChapterIndex ?? -1
     const serverSaved =
       typeof srvIdx === 'number' &&
       srvIdx >= 0 &&
       srvIdx < chapters.value.length &&
       !chapters.value[srvIdx].isVolume &&
-      (found.durChapterTime ?? 0) > 0
+      (shelfBook.value?.durChapterTime ?? 0 ?? 0) > 0
     if (queryChapter >= 0) {
       startIndex = queryChapter
     } else if (serverSaved) {
       startIndex = srvIdx
-      const srvPos = found.durChapterPos ?? 0
+      const srvPos = shelfBook.value?.durChapterPos ?? 0 ?? 0
       restoreScrollY = srvPos > 0 ? srvPos : 0
     } else {
       const saved = restoreProgress()
@@ -1452,6 +1556,8 @@ onBeforeUnmount(() => {
   window.clearTimeout(saveTimer)
   window.clearTimeout(removeTimer)
   window.clearTimeout(flashTimer)
+  prevHold.stop()
+  nextHold.stop()
   stopTts()
   stopAuto()
   saveProgress()
@@ -1622,12 +1728,32 @@ onBeforeUnmount(() => {
           </template>
         </article>
 
-        <!-- 底部极简导航 -->
+        <!-- 底部极简导航（长按快进/快退：按住 250ms 后每 300ms 连续翻章） -->
         <nav class="chapter-nav">
-          <button class="nav-btn" type="button" :disabled="!hasPrev" @click="prevChapter">
+          <button
+            class="nav-btn"
+            type="button"
+            :disabled="!hasPrev"
+            title="上一章（长按连续快退）"
+            @click="onPrevClick"
+            @pointerdown="prevHold.start"
+            @pointerup="prevHold.stop"
+            @pointerleave="prevHold.stop"
+            @pointercancel="prevHold.stop"
+          >
             上一章
           </button>
-          <button class="nav-btn" type="button" :disabled="!hasNext" @click="nextChapter">
+          <button
+            class="nav-btn"
+            type="button"
+            :disabled="!hasNext"
+            title="下一章（长按连续快进）"
+            @click="onNextClick"
+            @pointerdown="nextHold.start"
+            @pointerup="nextHold.stop"
+            @pointerleave="nextHold.stop"
+            @pointercancel="nextHold.stop"
+          >
             下一章
           </button>
         </nav>

@@ -63,6 +63,7 @@ function clearArticles() {
   articleMode.value = false
   readingArticle.value = null
   articleContent.value = ''
+  articleFilter.value = ''
 }
 
 async function loadSources(selectUrl?: string) {
@@ -98,6 +99,7 @@ async function selectSource(url: string) {
   articleMode.value = false
   readingArticle.value = null
   articleContent.value = ''
+  articleFilter.value = ''
   await loadArticles(1)
 }
 
@@ -127,6 +129,23 @@ async function loadArticles(page: number) {
 
 /** 未读计数（标题旁展示） */
 const unreadCount = computed(() => articles.value.filter((a) => !a.hasRead).length)
+
+/* ================= GAP 46：文章列表前端搜索/过滤（标题包含匹配，不请求后端） ================= */
+const articleFilter = ref('')
+
+const filteredArticles = computed(() => {
+  const kw = articleFilter.value.trim()
+  if (!kw) return articles.value
+  return articles.value.filter((a) => (a.title || '').includes(kw))
+})
+
+/** 列表计数：过滤时显示命中数 */
+const articleCountText = computed(() => {
+  const kw = articleFilter.value.trim()
+  const shown = filteredArticles.value.length
+  const total = articles.value.length
+  return kw ? `${shown} / ${total} 篇` : `共 ${total} 篇`
+})
 
 /* ================= 文章阅读 ================= */
 const articleMode = ref(false)
@@ -420,15 +439,39 @@ onBeforeUnmount(() => {
           <div class="col-head">
             <h2 class="col-title">{{ selectedSourceName || '文章' }}</h2>
             <span class="col-count"
-              >共 {{ articles.length }} 篇<span v-if="unreadCount"> · {{ unreadCount }} 未读</span></span
+              >{{ articleCountText }}<span v-if="!articleFilter.trim() && unreadCount"> · {{ unreadCount }} 未读</span></span
             >
+          </div>
+          <!-- GAP 46：文章标题前端过滤 -->
+          <div v-if="selectedUrl && articles.length" class="article-filter">
+            <svg class="article-filter-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+              <circle cx="11" cy="11" r="6.5" />
+              <path d="M20 20l-3.8-3.8" />
+            </svg>
+            <input
+              v-model="articleFilter"
+              class="article-filter-input"
+              type="text"
+              placeholder="过滤文章标题…"
+              spellcheck="false"
+            />
+            <button
+              v-if="articleFilter"
+              class="article-filter-clear"
+              type="button"
+              title="清除过滤"
+              @click="articleFilter = ''"
+            >
+              ×
+            </button>
           </div>
           <div v-if="loadingArticles" class="state-text loading">文章加载中…</div>
           <div v-else-if="!selectedUrl" class="state-text">请选择一个订阅源</div>
           <div v-else-if="articles.length === 0" class="state-text">暂无文章</div>
+          <div v-else-if="filteredArticles.length === 0" class="state-text">没有匹配「{{ articleFilter.trim() }}」的文章</div>
           <ul v-else ref="listEl" class="article-list">
             <li
-              v-for="a in articles"
+              v-for="a in filteredArticles"
               :key="a.url"
               class="article-item"
               :class="{ read: a.hasRead }"
@@ -672,6 +715,62 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 300;
   color: var(--text-3);
+}
+
+/* ================= GAP 46：文章过滤框 ================= */
+.article-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 6px 12px;
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  transition: border-color 0.2s ease;
+}
+.article-filter:focus-within {
+  border-color: var(--accent);
+}
+.article-filter-icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+.article-filter-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  outline: none;
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+}
+.article-filter-input::placeholder {
+  color: var(--text-3);
+}
+.article-filter-clear {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  color: var(--text-3);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.article-filter-clear:hover {
+  color: var(--text-1);
+  background: var(--hover);
 }
 
 /* 新增按钮（细描边圆形 +） */
