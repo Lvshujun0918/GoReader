@@ -31,6 +31,8 @@ pub struct AppConfig {
     pub invite_code: String,
     /// 最小密码长度
     pub min_user_password_length: i64,
+    /// token 有效期（天，GAP 118；<=0 表示永不过期）
+    pub token_ttl_days: i64,
     /// 前端静态资源根（构建产物 dist 目录）
     pub web_root: String,
     /// 默认新用户权限（legacy AppConfig 默认）
@@ -58,6 +60,7 @@ impl AppConfig {
             user_book_limit: env_i64("READER_APP_USERBOOKLIMIT", 500_000),
             invite_code: std::env::var("READER_APP_INVITECODE").unwrap_or_default(),
             min_user_password_length: env_i64("READER_APP_MINUSERPASSWORDLENGTH", 8),
+            token_ttl_days: env_i64("READER_TOKEN_TTL_DAYS", 30),
             web_root: std::env::var("READER_APP_WEB_ROOT").unwrap_or_else(|_| "web-ui/dist".to_string()),
             default_user_enable_webdav: env_flag("READER_APP_DEFAULTUSERENABLEWEBDAV"),
             default_user_enable_local_store: env_flag("READER_APP_DEFAULTUSERENABLELOCALSTORE"),

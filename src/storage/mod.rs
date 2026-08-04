@@ -117,7 +117,16 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
 
     let options = SqliteConnectOptions::new()
         .filename(&db_path)
-        .create_if_missing(true);
+        .create_if_missing(true)
+        // GAP 96：WAL 模式（并发读写不互斥——默认 DELETE journal 下读会阻塞写/写会阻塞读）
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        // GAP 96：busy_timeout（锁等待 5s，避免并发写瞬时 SQLITE_BUSY 报错）
+        .busy_timeout(std::time::Duration::from_secs(5))
+        // sqlx-sqlite 0.7.4 已知缺陷：语句缓存 + 建表/ALTER 类 DDL 并发时，
+        // sqlite 自动重准备后的列数（column_count）与缓存的列元数据不一致 →
+        // SqliteRow::current 越界 panic（row.rs:43，见 storage 测试偶发失败）。
+        // 本库规模下准备开销可忽略，禁用缓存彻底规避。
+        .statement_cache_capacity(0);
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
         .connect_with(options)
@@ -529,6 +538,16 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     };
     if let Err(e) = crate::storage::migrate::migrate_if_needed(&storage).await {
         tracing::error!("JSON→SQLite 迁移失败（服务继续启动，数据仍保留在 JSON）：{e}");
+    }
+    // WAL 快照刷新：WAL 模式下隐式读事务跨语句保持——建表/ALTER/重建期间
+    // 执行过 pragma 检查的池连接会持有 DDL 提交前的旧读快照，后续查询可能
+    // 读不到新表结构/新数据（sqlx-sqlite 0.7.4 下表现为 row.rs 越界 panic 或
+    // 查询返回空——storage 测试偶发）。BEGIN;COMMIT; 结束各连接的隐式读事务，
+    // 下次读取强制取新快照（无事务的连接上为安全 no-op；裸 COMMIT 会报错）。
+    let max_conns = 8; // 与上方 SqlitePoolOptions::max_connections(8) 一致
+    for _ in 0..max_conns {
+        let mut conn = storage.pool.acquire().await?;
+        sqlx::query("BEGIN; COMMIT;").execute(&mut *conn).await?;
     }
     Ok(storage)
 }
@@ -4982,6 +5001,81 @@ mod tests {
         assert_eq!(storage.delete_book_cache("https://ghost.com").await.unwrap(), 0);
 
         cleanup(storage, "bookcache").await;
+    }
+
+    /// GAP 96：连接初始化后 WAL 模式 + busy_timeout 生效（幂等：重复 init 不报错且保持 WAL）
+    #[tokio::test]
+    async fn test_wal_and_busy_timeout() {
+        let storage = test_storage("wal").await;
+        // journal_mode 返回当前模式字符串（wal 持久化于库文件头）
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "应启用 WAL 模式，实际 {mode}");
+        // busy_timeout 毫秒值
+        let timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(timeout, 5000, "busy_timeout 应为 5000ms");
+        // WAL 副作用文件存在（reader.db-wal 惰性创建——写一次触发）
+        storage
+            .save_chapters("local://waltest", &[("第一章".to_string(), "正文".to_string())])
+            .await
+            .unwrap();
+        let db_path = storage.config.storage_dir().join("reader.db");
+        assert!(db_path.exists());
+
+        // 幂等：关闭后重新 init 同一目录，仍为 WAL 且 busy_timeout 生效
+        let dir = storage.config.work_dir.clone();
+        storage.pool.close().await;
+        let mut config = AppConfig::from_env();
+        config.work_dir = dir.clone();
+        let reopened = init(&config).await.unwrap();
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&reopened.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "重开库应保持 WAL");
+        let timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&reopened.pool)
+            .await
+            .unwrap();
+        assert_eq!(timeout, 5000);
+        cleanup(reopened, "wal").await;
+    }
+
+    /// GAP 96 回归：WAL 模式下池连接不持有跨语句旧读快照——
+    /// 连接 A 建立读快照后，连接 B 写入，A 再次读取必须看到新数据
+    #[tokio::test]
+    async fn test_wal_no_stale_snapshot_across_connections() {
+        let storage = test_storage("snaprepro").await;
+        // 连接 A：先读一次（若 WAL 隐式读事务跨语句保持，此处建立旧快照）
+        let mut conn_a = storage.pool.acquire().await.unwrap();
+        let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM books")
+            .fetch_one(&mut *conn_a)
+            .await
+            .unwrap();
+        // 连接 B：写入
+        let mut conn_b = storage.pool.acquire().await.unwrap();
+        sqlx::query("INSERT INTO books (book_url, name, user_namespace) VALUES (?1, ?2, 'default')")
+            .bind("https://snap.com/a")
+            .bind("快照书")
+            .execute(&mut *conn_b)
+            .await
+            .unwrap();
+        drop(conn_b);
+        // 连接 A：再次读取——必须能看到写入（快照已刷新）
+        let found: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM books WHERE book_url = ?1 AND user_namespace = 'default'")
+                .bind("https://snap.com/a")
+                .fetch_optional(&mut *conn_a)
+                .await
+                .unwrap();
+        assert_eq!(found.map(|r| r.0), Some("快照书".to_string()), "WAL 下旧读快照导致跨连接读不到新数据");
+        drop(conn_a);
+        cleanup(storage, "snaprepro").await;
     }
 
     /// 全书搜索：LIKE 匹配 + 命中摘要（前后截取）+ %/_ 转义 + 章节序 + limit

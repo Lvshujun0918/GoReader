@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::model::BookSource;
+use crate::parser::js::JsBridge;
 use crate::parser::rule::{apply, parse_rule, RuleKind};
 use crate::service::crawler;
 
@@ -179,13 +180,14 @@ pub(crate) fn build_request_url(
     page: i64,
     base_url: &str,
     headers: &HashMap<String, String>,
+    bridge: &JsBridge,
 ) -> Result<(String, UrlSuffix)> {
     // 1) @js:/js: 前缀
     let raw = search_url.trim_start();
     let url = match raw.strip_prefix("@js:").or_else(|| raw.strip_prefix("js:")) {
         Some(code) => {
             let vars = js_vars(key, page, base_url, headers, "");
-            crate::parser::js::eval_js(code.trim(), &vars)?
+            crate::parser::js::eval_js_with_bridge(code.trim(), &vars, bridge)?
         }
         None => search_url.to_string(),
     };
@@ -194,7 +196,7 @@ pub(crate) fn build_request_url(
     let url = match suffix.js.take() {
         Some(js) => {
             let vars = js_vars(key, page, base_url, headers, "");
-            crate::parser::js::eval_js(&js, &vars)?
+            crate::parser::js::eval_js_with_bridge(&js, &vars, bridge)?
         }
         None => url_part,
     };
@@ -210,12 +212,13 @@ fn apply_body_js(
     page: i64,
     base_url: &str,
     headers: &HashMap<String, String>,
+    bridge: &JsBridge,
 ) -> Result<String> {
     let Some(js) = &suffix.body_js else {
         return Ok(body.to_string());
     };
     let vars = js_vars(key, page, base_url, headers, body);
-    crate::parser::js::eval_js(js, &vars)
+    crate::parser::js::eval_js_with_bridge(js, &vars, bridge)
 }
 
 /// 并发率（legado concurrentRate）：纯数字 = 每次请求前 sleep 该毫秒；
@@ -263,9 +266,14 @@ pub async fn search_one_source(
         .map(crawler::parse_header)
         .unwrap_or_default();
 
+    // 书源 JS 桥接（带用户命名空间：java.ajax / java.startBrowserAwait 自动携带
+    // 书源 cookie；同流程内多次 eval 共享 java.put/get / setContent 文档）
+    let bridge = JsBridge::new(&source.book_source_url, &source.book_source_name)
+        .with_namespace(ns);
+
     // 1) @js:/js: 前缀 + 2) `,{...}` 后缀（js 修改 URL）→ 最终请求 URL
     let (url, suffix) =
-        build_request_url(&search_url, key, page, &source.book_source_url, &headers)?;
+        build_request_url(&search_url, key, page, &source.book_source_url, &headers, &bridge)?;
 
     // 3) 并发率：数字 → 请求前 sleep 该毫秒
     let delay_ms = concurrent_rate_sleep_ms(source.concurrent_rate.as_deref());
@@ -280,6 +288,8 @@ pub async fn search_one_source(
             req_headers.insert(k.clone(), v.clone());
         }
     }
+    // 桥接同步请求头（JS 内 java.headerMap 可读/改写；eval 后 headers() 取回）
+    bridge.set_headers(req_headers.clone());
     // POST body 模板替换（{{key}}/{{page}}）
     let post_body = suffix.body.as_ref().map(|b| {
         b.replace("{{key}}", key)
@@ -296,8 +306,8 @@ pub async fn search_one_source(
     };
     let base = resp.url.clone();
     // bodyJs：对响应体执行 JS 后作为新响应体
-    let body = apply_body_js(&resp.body, &suffix, key, page, &source.book_source_url, &req_headers)?;
-    let books = analyze_book_list(&body, &base, source, &rule, &book_list_rule, key);
+    let body = apply_body_js(&resp.body, &suffix, key, page, &source.book_source_url, &req_headers, &bridge)?;
+    let books = analyze_book_list(&body, &base, source, &rule, &book_list_rule, key, &bridge);
 
     tracing::info!(
         "搜索 [{}] key={} → {} 条",
@@ -308,7 +318,7 @@ pub async fn search_one_source(
     Ok(books)
 }
 
-/// 发现页解析（无 key）
+/// 发现页解析（无 key；无书源桥接——发现流程暂不注入 cookie 上下文）
 pub(crate) fn analyze_book_list_for_explore(
     body: &str,
     base_url: &str,
@@ -316,7 +326,7 @@ pub(crate) fn analyze_book_list_for_explore(
     rule: &SearchRule,
     book_list_rule: &str,
 ) -> Vec<SearchBook> {
-    analyze_book_list_impl(body, base_url, source, rule, book_list_rule, "")
+    analyze_book_list_impl(body, base_url, source, rule, book_list_rule, "", None)
 }
 
 /// 解析书单（对齐 legacy BookList.analyzeBookList v1：无 JS/无变量）
@@ -327,8 +337,9 @@ fn analyze_book_list(
     rule: &SearchRule,
     book_list_rule: &str,
     _key: &str,
+    bridge: &JsBridge,
 ) -> Vec<SearchBook> {
-    analyze_book_list_impl(body, base_url, source, rule, book_list_rule, _key)
+    analyze_book_list_impl(body, base_url, source, rule, book_list_rule, _key, Some(bridge))
 }
 
 fn analyze_book_list_impl(
@@ -338,6 +349,7 @@ fn analyze_book_list_impl(
     rule: &SearchRule,
     book_list_rule: &str,
     _key: &str,
+    bridge: Option<&JsBridge>,
 ) -> Vec<SearchBook> {
     // bookList 规则类型检测
     let parsed = parse_rule(book_list_rule);
@@ -345,12 +357,12 @@ fn analyze_book_list_impl(
         RuleKind::Css => css_items(book_list_rule, body),
         RuleKind::JsonPath => apply(book_list_rule, body),
         RuleKind::Regex => apply(book_list_rule, body),
-        RuleKind::Js => js_book_list(book_list_rule, body, base_url),
+        RuleKind::Js => js_book_list(book_list_rule, body, base_url, bridge),
         _ => vec![],
     };
     // JS 规则（<js> 或 @js: 开头——eval 返回 JSON 书单数组）
     if items.is_empty() && (book_list_rule.contains("<js>") || book_list_rule.trim_start().starts_with("@js:")) {
-        items = js_book_list(book_list_rule, body, base_url);
+        items = js_book_list(book_list_rule, body, base_url, bridge);
     }
 
     items
@@ -365,20 +377,20 @@ fn analyze_book_list_impl(
                 ..Default::default()
             };
             // 字段规则（在每本书元素上下文中应用）
-            book.name = field(&item_html, rule.name.as_deref(), &book.name);
+            book.name = field_with_bridge(&item_html, rule.name.as_deref(), &book.name, bridge);
             if book.name.is_empty() {
                 return None;
             }
-            book.author = field(&item_html, rule.author.as_deref(), "");
-            book.kind = opt_field(&item_html, rule.kind.as_deref());
-            book.intro = opt_field(&item_html, rule.intro.as_deref());
+            book.author = field_with_bridge(&item_html, rule.author.as_deref(), "", bridge);
+            book.kind = opt_field_with_bridge(&item_html, rule.kind.as_deref(), bridge);
+            book.intro = opt_field_with_bridge(&item_html, rule.intro.as_deref(), bridge);
             book.cover_url = rule
                 .cover_url
                 .as_deref()
                 .map(|r| field_url(&item_html, Some(r), "", base_url))
                 .filter(|v| !v.is_empty());
-            book.word_count = opt_field(&item_html, rule.word_count.as_deref());
-            book.latest_chapter_title = opt_field(&item_html, rule.last_chapter.as_deref());
+            book.word_count = opt_field_with_bridge(&item_html, rule.word_count.as_deref(), bridge);
+            book.latest_chapter_title = opt_field_with_bridge(&item_html, rule.last_chapter.as_deref(), bridge);
             let book_url = field_url(&item_html, rule.book_url.as_deref(), "", base_url);
             if book_url.is_empty() {
                 return None;
@@ -398,7 +410,7 @@ fn analyze_book_list_impl(
 
 /// CSS 书单：链式 CSS（legado）→ 元素 html 列表
 /// JS 书单规则（legado `<js>代码</js>` 或 `@js:代码`——eval 返回 JSON 数组，每项为书对象）
-fn js_book_list(rule: &str, body: &str, base_url: &str) -> Vec<String> {
+fn js_book_list(rule: &str, body: &str, base_url: &str, bridge: Option<&JsBridge>) -> Vec<String> {
     // 提取 JS 代码
     let code = if rule.trim_start().starts_with("@js:") {
         rule.trim_start()[4..].to_string()
@@ -417,7 +429,12 @@ fn js_book_list(rule: &str, body: &str, base_url: &str) -> Vec<String> {
     vars.insert("key".to_string(), String::new());
     vars.insert("page".to_string(), "1".to_string());
     vars.insert("baseUrl".to_string(), base_url.to_string());
-    let Ok(result) = crate::parser::js::eval_js_json(&code, &vars) else {
+    // 带书源桥接执行（搜索流程：java.ajax/startBrowserAwait/setContent 等可用）
+    let result = match bridge {
+        Some(b) => crate::parser::js::eval_js_json_with_bridge(&code, &vars, b),
+        None => crate::parser::js::eval_js_json(&code, &vars),
+    };
+    let Ok(result) = result else {
         return vec![];
     };
     // 数组：每项书对象/字符串 → 上下文（JSON 文本）；单对象兼容
@@ -484,8 +501,18 @@ pub(crate) fn expand_embedded(rule: &str, context: &str) -> String {
     result
 }
 
-/// 字段规则应用（上下文为单本书元素 html）
+/// 字段规则应用（上下文为单本书元素 html；无书源桥接——每次 eval 独立空 bridge）
 pub(crate) fn field(context: &str, rule: Option<&str>, default: &str) -> String {
+    field_with_bridge(context, rule, default, None)
+}
+
+/// 字段规则应用（带书源桥接：搜索流程共享 ns bridge，java.* 可用）
+pub(crate) fn field_with_bridge(
+    context: &str,
+    rule: Option<&str>,
+    default: &str,
+    bridge: Option<&JsBridge>,
+) -> String {
     let Some(rule) = rule else { return default.to_string() };
     // legado 内嵌规则：{{$.xxx}} 从上下文提取替换（v1 支持 JSONPath 内嵌）
     let rule = expand_embedded(rule, context);
@@ -504,7 +531,11 @@ pub(crate) fn field(context: &str, rule: Option<&str>, default: &str) -> String 
             let first = extracted.into_iter().next().unwrap_or_default();
             let mut vars = std::collections::HashMap::new();
             vars.insert("result".to_string(), first);
-            if let Ok(s) = crate::parser::js::eval_js(js_code.trim(), &vars) {
+            let s = match bridge {
+                Some(b) => crate::parser::js::eval_js_with_bridge(js_code.trim(), &vars, b),
+                None => crate::parser::js::eval_js(js_code.trim(), &vars),
+            };
+            if let Ok(s) = s {
                 if !s.is_empty() {
                     return s;
                 }
@@ -545,7 +576,11 @@ pub(crate) fn field(context: &str, rule: Option<&str>, default: &str) -> String 
             vars.insert("result".to_string(), context.to_string());
             vars.insert("key".to_string(), String::new());
             vars.insert("page".to_string(), "1".to_string());
-            let s = crate::parser::js::eval_js(&r.body, &vars).unwrap_or_default();
+            let s = match bridge {
+                Some(b) => crate::parser::js::eval_js_with_bridge(&r.body, &vars, b),
+                None => crate::parser::js::eval_js(&r.body, &vars),
+            }
+            .unwrap_or_default();
             if s.is_empty() {
                 default.to_string()
             } else {
@@ -557,7 +592,15 @@ pub(crate) fn field(context: &str, rule: Option<&str>, default: &str) -> String 
 }
 
 pub(crate) fn opt_field(context: &str, rule: Option<&str>) -> Option<String> {
-    let v = field(context, rule, "");
+    opt_field_with_bridge(context, rule, None)
+}
+
+pub(crate) fn opt_field_with_bridge(
+    context: &str,
+    rule: Option<&str>,
+    bridge: Option<&JsBridge>,
+) -> Option<String> {
+    let v = field_with_bridge(context, rule, "", bridge);
     if v.is_empty() {
         None
     } else {
@@ -617,7 +660,7 @@ mod tests {
         let book_url = field(&items[0], Some("/novel/{{$.novelId}}?isSearch=1"), "");
         println!("field(bookUrl 内嵌) = {:?}", book_url);
         let src = BookSource { book_source_url: "http://api.jmlldsc.com".into(), ..Default::default() };
-        let books = analyze_book_list(&body, "http://api.jmlldsc.com", &src, &rule, "$.data[*]", "诡秘之主");
+        let books = analyze_book_list(&body, "http://api.jmlldsc.com", &src, &rule, "$.data[*]", "诡秘之主", &JsBridge::default());
         println!("真实 JSON 解析: {} 本", books.len());
         assert!(!books.is_empty(), "真实数据解析为空");
         assert_eq!(books[0].name, "诡秘之主");
@@ -636,7 +679,7 @@ mod tests {
             ..Default::default()
         };
         let src = BookSource { book_source_url: "https://a.com".into(), ..Default::default() };
-        let books = analyze_book_list(html, "https://a.com", &src, &rule, "div.book", "key");
+        let books = analyze_book_list(html, "https://a.com", &src, &rule, "div.book", "key", &JsBridge::default());
         assert_eq!(books.len(), 2);
         assert_eq!(books[0].name, "书名A");
         assert_eq!(books[0].author, "作者甲");
@@ -659,7 +702,7 @@ mod tests {
             ..Default::default()
         };
         let src = BookSource { book_source_url: "https://api.test".into(), ..Default::default() };
-        let books = analyze_book_list(&body, "https://api.test", &src, &rule, "@js:JSON.parse(result).data", "key");
+        let books = analyze_book_list(&body, "https://api.test", &src, &rule, "@js:JSON.parse(result).data", "key", &JsBridge::default());
         assert_eq!(books.len(), 2, "JS bookList 应解析出 2 本书");
         assert_eq!(books[0].name, "书A");
         assert_eq!(books[0].author, "作者甲");
@@ -677,7 +720,7 @@ mod tests {
             ..Default::default()
         };
         let src = BookSource { book_source_url: "https://api.test".into(), ..Default::default() };
-        let books = analyze_book_list("{}", "https://api.test", &src, &rule, "@js:[{name:'直A',url:'/a'},{name:'直B',url:'/b'}]", "");
+        let books = analyze_book_list("{}", "https://api.test", &src, &rule, "@js:[{name:'直A',url:'/a'},{name:'直B',url:'/b'}]", "", &JsBridge::default());
         assert_eq!(books.len(), 2);
         assert_eq!(books[0].name, "直A");
         assert_eq!(books[0].book_url, "https://api.test/a");
@@ -693,7 +736,7 @@ mod tests {
             ..Default::default()
         };
         let src = BookSource { book_source_url: "https://api.test".into(), ..Default::default() };
-        let books = analyze_book_list("{}", "https://api.test", &src, &rule, "@js:JSON.stringify([{name:'串A',url:'/s/a'}])", "");
+        let books = analyze_book_list("{}", "https://api.test", &src, &rule, "@js:JSON.stringify([{name:'串A',url:'/s/a'}])", "", &JsBridge::default());
         assert_eq!(books.len(), 1);
         assert_eq!(books[0].name, "串A");
     }
@@ -709,7 +752,7 @@ mod tests {
         };
         let body = r#"{"data":[{"name":"包A","url":"/w/1"}]}"#;
         let src = BookSource { book_source_url: "https://api.test".into(), ..Default::default() };
-        let books = analyze_book_list(body, "https://api.test", &src, &rule, "<js>JSON.parse(result).data</js>", "");
+        let books = analyze_book_list(body, "https://api.test", &src, &rule, "<js>JSON.parse(result).data</js>", "", &JsBridge::default());
         assert_eq!(books.len(), 1);
         assert_eq!(books[0].name, "包A");
     }
@@ -734,6 +777,7 @@ mod tests {
             2,
             "https://a.com",
             &headers,
+            &JsBridge::default(),
         )
         .unwrap();
         assert_eq!(url, "https://a.com/s?q=测试书&p=2");
@@ -750,6 +794,7 @@ mod tests {
             1,
             "https://a.com",
             &headers,
+            &JsBridge::default(),
         )
         .unwrap();
         assert_eq!(url, "https://a.com/s?h=yes");
@@ -765,6 +810,7 @@ mod tests {
             1,
             "https://a.com",
             &headers,
+            &JsBridge::default(),
         )
         .unwrap();
         assert_eq!(url, "https://a.com/mod?k=测试&p=1");
@@ -777,7 +823,7 @@ mod tests {
         // bodyJs：对响应体执行 JS 后作为新响应体（注入 result=原响应体）
         let suffix: UrlSuffix = serde_json::from_str(r#"{"bodyJs":"result.replace('A','B')"}"#).unwrap();
         let headers = HashMap::new();
-        let body = apply_body_js("AAA", &suffix, "k", 1, "https://a.com", &headers).unwrap();
+        let body = apply_body_js("AAA", &suffix, "k", 1, "https://a.com", &headers, &JsBridge::default()).unwrap();
         assert_eq!(body, "BAA");
     }
 
@@ -795,7 +841,7 @@ mod tests {
     fn test_url_without_suffix_unchanged() {
         let headers = HashMap::new();
         let (url, suffix) =
-            build_request_url("https://a.com/s?q={{key}}", "k", 1, "https://a.com", &headers)
+            build_request_url("https://a.com/s?q={{key}}", "k", 1, "https://a.com", &headers, &JsBridge::default())
                 .unwrap();
         assert_eq!(url, "https://a.com/s?q=k");
         assert!(suffix.js.is_none() && suffix.body_js.is_none());

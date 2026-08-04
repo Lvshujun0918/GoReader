@@ -8,6 +8,10 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// 串行化使用全局 COOKIE_STORAGE 注册的测试（register_cookie_storage 是进程级全局——
+/// 并行测试互相覆盖会导致存库断言竞态；非存储测试不受影响）
+static STORAGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// python 启动方式：直接可执行 或 经 cmd /C（Windows 下 pyenv 等 shim 是脚本/.bat，
 /// Rust Command 无法直接 spawn——需 cmd 解释）
 fn python_cmd() -> Option<Vec<&'static str>> {
@@ -191,6 +195,7 @@ async fn cf_challenge_solve_end_to_end() {
 /// 全链路：http_get → CF 检测 → 内置浏览器求解 → 响应正文 + cookies 按 name 合并存库（按用户）
 #[tokio::test]
 async fn http_get_solves_cf_and_stores_per_user() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !reader_dev::service::browser::is_browser_available() {
         eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过 CF 全链路集成测试");
         return;
@@ -247,4 +252,64 @@ async fn http_get_solves_cf_and_stores_per_user() {
     // UA 记录（与 cf_clearance 绑定）
     let (_, ua) = session.expect("应有会话行");
     assert!(!ua.is_empty(), "应记录浏览器 UA");
+}
+
+/// POST 重试链路（关键修复）：POST /search → 质询页 → 内置浏览器求解（cookie 合并存库）
+/// → **重试原 POST 请求**（新 cookie）→ 真实搜索结果（而非浏览器 GET 首页兜底）
+#[tokio::test]
+async fn http_post_retries_after_solve_and_gets_search_results() {
+    let _guard = STORAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !reader_dev::service::browser::is_browser_available() {
+        eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过 POST 重试集成测试");
+        return;
+    }
+    if python_cmd().is_none() {
+        eprintln!("SKIP: 未找到 python——跳过 POST 重试集成测试");
+        return;
+    }
+    std::env::remove_var("FLARESOLVERR_URL"); // 强制走内置浏览器路径
+
+    // 临时库（按用户存储）
+    let dir = std::env::temp_dir().join(format!("reader-cf-post-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut config = reader_dev::AppConfig::from_env();
+    config.work_dir = dir.to_string_lossy().into_owned();
+    let storage = reader_dev::storage::init(&config).await.expect("storage init");
+    reader_dev::service::crawler::register_cookie_storage(storage.clone());
+
+    let port = free_port();
+    let mut child = start_mock(port);
+    if !wait_mock_ready(port).await {
+        kill_mock(&mut child);
+        panic!("mock-cf-site.py 未在 10s 内就绪");
+    }
+    let url = format!("http://127.0.0.1:{port}/search");
+
+    let result = reader_dev::service::crawler::http_post(
+        "default",
+        &url,
+        &std::collections::HashMap::new(),
+        30,
+        Some("searchkey=诡秘"),
+        None,
+    )
+    .await;
+
+    // 先取回数据再收尾（避免断言失败时浏览器/mock 残留）
+    let resp = result.expect("http_post 应经质询求解 + 重试成功");
+    let stored = storage.get_cookie_by_base("default", &url).await.expect("读库");
+    reader_dev::service::browser::shutdown_cf_session().await;
+    kill_mock(&mut child);
+    reader_dev::service::crawler::clear_cookie_storage();
+    storage.pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // ① 重试 POST 拿到真实搜索结果（SEARCH_OK + 关键词回显——证明是重试结果而非
+    //    浏览器 GET 首页兜底）
+    assert_eq!(resp.status, 200, "重试 POST 应返回 200");
+    assert!(resp.body.contains("SEARCH_OK"), "应返回搜索结果页（实际: {}）", &resp.body[..resp.body.len().min(200)]);
+    assert!(resp.body.contains("诡秘"), "应回显搜索关键词（实际: {}）", &resp.body[..resp.body.len().min(200)]);
+    // ② 库中已合并 cf_clearance（重试凭它通过）
+    let stored = stored.expect("应按用户存下 cookie");
+    assert!(stored.contains("cf_clearance=mock-"), "库中应含 cf_clearance（实际: {stored}）");
 }

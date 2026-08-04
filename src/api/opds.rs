@@ -75,7 +75,7 @@ fn paginate<T: Clone>(items: &[T], start: usize, max: usize) -> (Vec<T>, usize) 
 /// OpenSearch 分页链接（first/prev/next），extra 为附加查询（如 &q=）
 fn pager_links_xml(base: &str, extra: &str, start: usize, max: usize, total: usize) -> String {
     let mut s = String::new();
-    let page_href = |s: usize| format!("{base}?startIndex={s}&maxItems={max}{extra}");
+    let page_href = |s: usize| abs_href(base, &format!("?startIndex={s}&maxItems={max}{extra}"));
     s.push_str(&format!(
         "    <link rel=\"first\" href=\"{}\" type=\"application/atom+xml;profile=opds-catalog;kind=acquisition\"/>\n",
         xml_escape(&page_href(0))
@@ -97,6 +97,44 @@ fn pager_links_xml(base: &str, extra: &str, start: usize, max: usize, total: usi
 }
 
 // ---------------- 工具 ----------------
+
+/// 相对 href → 绝对 URL（GAP 52：OPDS 链接需绝对地址供外部阅读器使用）：
+/// - 已是 http(s) 绝对地址 → 原样返回（封面等外链）
+/// - 以 / 开头 → {base}{href}
+/// - 其余（如 ?startIndex=...）→ {base}/{href}
+pub fn abs_href(base: &str, href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return href.to_string();
+    }
+    let base = base.trim_end_matches('/');
+    if href.starts_with('/') {
+        format!("{base}{href}")
+    } else if href.starts_with('?') {
+        // 查询串直接拼接到 base 末尾（pager 链接：{self}?startIndex=...）
+        format!("{base}{href}")
+    } else {
+        format!("{base}/{href}")
+    }
+}
+
+/// 自引用 base（GAP 52）：优先 Host 请求头（X-Forwarded-Proto 可切 https），
+/// Host 缺失时回退 http://localhost:{port}（与监听端口一致）。
+pub fn opds_base(headers: &axum::http::HeaderMap, default_port: u16) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
+        .filter(|s| s == "https" || s == "http")
+        .unwrap_or_else(|| "http".to_string());
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("localhost:{default_port}"));
+    format!("{scheme}://{host}")
+}
 
 /// bookUrl → base64url（URL 安全，无 / 等特殊字符——Path 单段可匹配）
 pub fn encode_id(s: &str) -> String {
@@ -296,27 +334,30 @@ const ATOM_CT: &str = "application/atom+xml;profile=opds-catalog;charset=utf-8";
 const NAV_CT: &str = "application/atom+xml;profile=opds-catalog;kind=navigation";
 
 /// feed 开头（含命名空间——xmlns:opds 为 OPDS 2010 catalog，dc/dcterms 元数据）
-fn feed_header(id: &str, title: &str, self_href: &str, kind: &str) -> String {
+fn feed_header(id: &str, title: &str, self_href: &str, kind: &str, base: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:opds=\"http://opds-spec.org/2010/catalog\" \
          xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\">\n\
          \x20 <id>{id}</id>\n  <title>{}</title>\n  <updated>{}</updated>\n  <author><name>reader-dev</name></author>\n\
          \x20 <link rel=\"self\" href=\"{}\" type=\"{}\"/>\n\
-         \x20 <link rel=\"start\" href=\"/opds\" type=\"{}\"/>\n\
-         \x20 <link rel=\"search\" href=\"/opds/opensearch.xml\" type=\"application/opensearchdescription+xml\"/>\n\
-         \x20 <link rel=\"search\" href=\"/opds/search?q={{searchTerms}}\" type=\"{}\"/>\n",
+         \x20 <link rel=\"start\" href=\"{}\" type=\"{}\"/>\n\
+         \x20 <link rel=\"search\" href=\"{}\" type=\"application/opensearchdescription+xml\"/>\n\
+         \x20 <link rel=\"search\" href=\"{}\" type=\"{}\"/>\n",
         xml_escape(title),
         now_rfc3339(),
-        xml_escape(self_href),
+        xml_escape(&abs_href(base, self_href)),
         kind,
+        xml_escape(&abs_href(base, "/opds")),
         NAV_CT,
+        xml_escape(&abs_href(base, "/opds/opensearch.xml")),
+        xml_escape(&abs_href(base, "/opds/search?q={searchTerms}")),
         ATOM_CT,
     )
 }
 
 /// 导航条目（根目录/分组/来源导航）
-fn nav_entry_xml(id_suffix: &str, title: &str, content: &str, href: &str) -> String {
+fn nav_entry_xml(id_suffix: &str, title: &str, content: &str, href: &str, base: &str) -> String {
     let mut s = String::from("  <entry>\n");
     s.push_str(&format!(
         "    <title>{}</title>\n    <id>urn:uuid:reader-dev-nav-{id_suffix}</id>\n    <updated>{}</updated>\n",
@@ -328,7 +369,7 @@ fn nav_entry_xml(id_suffix: &str, title: &str, content: &str, href: &str) -> Str
     }
     s.push_str(&format!(
         "    <link rel=\"subsection\" href=\"{}\" type=\"{}\"/>\n",
-        xml_escape(href),
+        xml_escape(&abs_href(base, href)),
         ATOM_CT
     ));
     s.push_str("  </entry>\n");
@@ -336,7 +377,7 @@ fn nav_entry_xml(id_suffix: &str, title: &str, content: &str, href: &str) -> Str
 }
 
 /// 根目录（导航入口：书架/最近阅读/全部分组/本地书/按来源 + OpenSearch）
-pub async fn root(storage: &Storage, ns: &str) -> Result<String> {
+pub async fn root(storage: &Storage, ns: &str, base: &str) -> Result<String> {
     let books = storage.list_books(ns).await?;
     let total = books.len();
     let recent = books.iter().filter(|b| b.dur_chapter_time > 0).count();
@@ -349,36 +390,42 @@ pub async fn root(storage: &Storage, ns: &str) -> Result<String> {
         "reader-dev 书架",
         "/opds",
         NAV_CT,
+        base,
     );
     xml.push_str(&nav_entry_xml(
         &format!("shelf-{ns}"),
         "书架",
         &format!("全部书籍（{total} 本）"),
         "/opds/shelf",
+        base,
     ));
     xml.push_str(&nav_entry_xml(
         &format!("recent-{ns}"),
         "最近阅读",
         &format!("有阅读进度的书籍（{recent} 本）"),
         "/opds/recent",
+        base,
     ));
     xml.push_str(&nav_entry_xml(
         &format!("groups-{ns}"),
         "全部分组",
         &format!("{} 个分组", groups.len()),
         "/opds/groups",
+        base,
     ));
     xml.push_str(&nav_entry_xml(
         &format!("local-{ns}"),
         "本地书",
         &format!("本地 TXT/EPUB 书籍（{local} 本）"),
         "/opds/local",
+        base,
     ));
     xml.push_str(&nav_entry_xml(
         &format!("source-{ns}"),
         "按来源",
         &format!("{} 个书源", sources.len()),
         "/opds/source",
+        base,
     ));
     // 分组直接入口（客户端可直达）
     for g in &groups {
@@ -387,6 +434,7 @@ pub async fn root(storage: &Storage, ns: &str) -> Result<String> {
             &g.name,
             &format!("{} 本", g.book_count),
             &format!("/opds/group/{}", g.id),
+            base,
         ));
     }
     xml.push_str("</feed>");
@@ -408,7 +456,7 @@ fn source_counts(books: &[Book]) -> Vec<(String, usize)> {
 }
 
 /// 书籍条目 XML（OPDS 1.2：id/title/author/updated/content/封面缩略图/acquisition/partial-save）
-fn book_entry_xml(storage: &Storage, ns: &str, book: &Book) -> String {
+fn book_entry_xml(storage: &Storage, ns: &str, book: &Book, base: &str) -> String {
     let id = encode_id(&book.book_url);
     let mut e = String::from("  <entry>\n");
     e.push_str(&format!(
@@ -440,36 +488,39 @@ fn book_entry_xml(storage: &Storage, ns: &str, book: &Book) -> String {
             xml_escape(kind)
         ));
     }
-    // 封面：缩略图 + 原图（OPDS 1.2 thumbnail relation）
+    // 封面：缩略图 + 原图（OPDS 1.2 thumbnail relation；相对路径补绝对前缀）
     if let Some(cover) = display_cover(book) {
         e.push_str(&format!(
             "    <link rel=\"http://opds-spec.org/cover/thumbnail\" href=\"{}\" type=\"image/jpeg\"/>\n",
-            xml_escape(&cover)
+            xml_escape(&abs_href(base, &cover))
         ));
         e.push_str(&format!(
             "    <link rel=\"http://opds-spec.org/cover\" href=\"{}\" type=\"image/jpeg\"/>\n",
-            xml_escape(&cover)
+            xml_escape(&abs_href(base, &cover))
         ));
     }
     // acquisition：获取正文文本
     e.push_str(&format!(
-        "    <link rel=\"http://opds-spec.org/acquisition\" href=\"/opds/acquire/{id}\" type=\"text/plain\" title=\"获取正文\"/>\n"
+        "    <link rel=\"http://opds-spec.org/acquisition\" href=\"{}\" type=\"text/plain\" title=\"获取正文\"/>\n",
+        xml_escape(&abs_href(base, &format!("/opds/acquire/{id}")))
     ));
     // acquisition：下载 TXT
     e.push_str(&format!(
-        "    <link rel=\"http://opds-spec.org/acquisition\" href=\"/opds/download/{id}?format=txt\" type=\"text/plain\" title=\"下载 TXT\"/>\n"
+        "    <link rel=\"http://opds-spec.org/acquisition\" href=\"{}\" type=\"text/plain\" title=\"下载 TXT\"/>\n",
+        xml_escape(&abs_href(base, &format!("/opds/download/{id}?format=txt")))
     ));
     // acquisition：本地书原文件（epub/zip）
     if let Some((ct, href)) = local_original_link(storage, ns, book) {
         e.push_str(&format!(
             "    <link rel=\"http://opds-spec.org/acquisition\" href=\"{}\" type=\"{}\" title=\"下载原文件\"/>\n",
-            xml_escape(&href),
+            xml_escape(&abs_href(base, &href)),
             xml_escape(&ct)
         ));
     }
     // OPDS-PSE：进度保存
     e.push_str(&format!(
-        "    <link rel=\"partial-save\" href=\"/opds/save/{id}\" type=\"application/atom+xml;type=entry;profile=opds-save\" title=\"保存进度\"/>\n"
+        "    <link rel=\"partial-save\" href=\"{}\" type=\"application/atom+xml;type=entry;profile=opds-save\" title=\"保存进度\"/>\n",
+        xml_escape(&abs_href(base, &format!("/opds/save/{id}")))
     ));
     e.push_str("  </entry>\n");
     e
@@ -486,20 +537,23 @@ async fn books_feed_xml(
     books: &[Book],
     start: usize,
     max: usize,
+    base: &str,
 ) -> Result<String> {
     let (page, total) = paginate(books, start, max);
+    let self_abs = abs_href(base, self_href);
     let mut xml = feed_header(
         &format!("urn:uuid:reader-dev-{id_suffix}-{ns}"),
         title,
         self_href,
         ATOM_CT,
+        base,
     );
     xml.push_str(&format!("  <opds:totalResults>{total}</opds:totalResults>\n"));
     xml.push_str(&format!("  <opds:startIndex>{start}</opds:startIndex>\n"));
     xml.push_str(&format!("  <opds:itemsPerPage>{max}</opds:itemsPerPage>\n"));
-    xml.push_str(&pager_links_xml(self_href, extra_query, start, max, total));
+    xml.push_str(&pager_links_xml(&self_abs, extra_query, start, max, total));
     for b in &page {
-        xml.push_str(&book_entry_xml(storage, ns, b));
+        xml.push_str(&book_entry_xml(storage, ns, b, base));
     }
     xml.push_str("</feed>");
     Ok(xml)
@@ -512,50 +566,52 @@ fn nav_feed_xml(
     id_suffix: &str,
     self_href: &str,
     entries: Vec<(String, String, String, String)>, // (id_suffix, title, content, href)
+    base: &str,
 ) -> String {
     let mut xml = feed_header(
         &format!("urn:uuid:reader-dev-{id_suffix}-{ns}"),
         title,
         self_href,
         NAV_CT,
+        base,
     );
     for (sid, t, c, href) in entries {
-        xml.push_str(&nav_entry_xml(&sid, &t, &c, &href));
+        xml.push_str(&nav_entry_xml(&sid, &t, &c, &href, base));
     }
     xml.push_str("</feed>");
     xml
 }
 
 /// 书架 feed（全部书籍）
-pub async fn shelf(storage: &Storage, ns: &str, start: usize, max: usize) -> Result<String> {
+pub async fn shelf(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
     let books = storage.list_books(ns).await?;
-    books_feed_xml(storage, ns, "书架", "shelf", "/opds/shelf", "", &books, start, max).await
+    books_feed_xml(storage, ns, "书架", "shelf", "/opds/shelf", "", &books, start, max, base).await
 }
 
 /// 最近阅读 feed（dur_chapter_time > 0，按最近阅读时间倒序——list_books 默认序）
-pub async fn recent(storage: &Storage, ns: &str, start: usize, max: usize) -> Result<String> {
+pub async fn recent(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
         .await?
         .into_iter()
         .filter(|b| b.dur_chapter_time > 0)
         .collect();
-    books_feed_xml(storage, ns, "最近阅读", "recent", "/opds/recent", "", &books, start, max).await
+    books_feed_xml(storage, ns, "最近阅读", "recent", "/opds/recent", "", &books, start, max, base).await
 }
 
 /// 本地书 feed
-pub async fn local(storage: &Storage, ns: &str, start: usize, max: usize) -> Result<String> {
+pub async fn local(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
         .await?
         .into_iter()
         .filter(|b| is_local_book(&b.book_url, &b.origin))
         .collect();
-    books_feed_xml(storage, ns, "本地书", "local", "/opds/local", "", &books, start, max).await
+    books_feed_xml(storage, ns, "本地书", "local", "/opds/local", "", &books, start, max, base).await
 }
 
 /// 分组导航 feed
-pub async fn groups(storage: &Storage, ns: &str) -> Result<String> {
+pub async fn groups(storage: &Storage, ns: &str, base: &str) -> Result<String> {
     let groups = storage.list_book_groups_with_count(ns).await?;
     let entries = groups
         .iter()
@@ -568,11 +624,11 @@ pub async fn groups(storage: &Storage, ns: &str) -> Result<String> {
             )
         })
         .collect();
-    Ok(nav_feed_xml(ns, "全部分组", "groups", "/opds/groups", entries))
+    Ok(nav_feed_xml(ns, "全部分组", "groups", "/opds/groups", entries, base))
 }
 
 /// 分组内书籍 feed
-pub async fn group(storage: &Storage, ns: &str, id: i64, start: usize, max: usize) -> Result<String> {
+pub async fn group(storage: &Storage, ns: &str, id: i64, start: usize, max: usize, base: &str) -> Result<String> {
     let groups = storage.list_book_groups(ns).await?;
     let name = groups
         .iter()
@@ -595,12 +651,13 @@ pub async fn group(storage: &Storage, ns: &str, id: i64, start: usize, max: usiz
         &books,
         start,
         max,
+        base,
     )
     .await
 }
 
 /// 按来源导航 feed
-pub async fn sources(storage: &Storage, ns: &str) -> Result<String> {
+pub async fn sources(storage: &Storage, ns: &str, base: &str) -> Result<String> {
     let books = storage.list_books(ns).await?;
     let entries = source_counts(&books)
         .into_iter()
@@ -613,7 +670,7 @@ pub async fn sources(storage: &Storage, ns: &str) -> Result<String> {
             )
         })
         .collect();
-    Ok(nav_feed_xml(ns, "按来源", "source", "/opds/source", entries))
+    Ok(nav_feed_xml(ns, "按来源", "source", "/opds/source", entries, base))
 }
 
 /// 某来源书籍 feed（name 为 base64url）
@@ -623,6 +680,7 @@ pub async fn source(
     name_b64: &str,
     start: usize,
     max: usize,
+    base: &str,
 ) -> Result<String> {
     let name = decode_id(name_b64);
     let books: Vec<Book> = storage
@@ -642,6 +700,7 @@ pub async fn source(
         &books,
         start,
         max,
+        base,
     )
     .await
 }
@@ -653,6 +712,7 @@ pub async fn search(
     q: &str,
     start: usize,
     max: usize,
+    base: &str,
 ) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
@@ -671,21 +731,24 @@ pub async fn search(
         &books,
         start,
         max,
+        base,
     )
     .await
 }
 
 /// OpenSearch 描述 XML
-pub fn open_search_xml() -> String {
+pub fn open_search_xml(base: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <OpenSearchDescription xmlns=\"http://a9.com/-/spec/opensearch/1.1/\">\n\
          \x20 <ShortName>reader-dev</ShortName>\n\
          \x20 <Description>reader-dev 书架搜索（书名/作者）</Description>\n\
          \x20 <Tags>book reader opds</Tags>\n\
-         \x20 <Url type=\"application/atom+xml;profile=opds-catalog;kind=acquisition\" template=\"/opds/search?q={{searchTerms}}\"/>\n\
-         \x20 <Url type=\"application/opds+json\" template=\"/opds/catalog/search?q={{searchTerms}}\"/>\n\
-         </OpenSearchDescription>\n"
+         \x20 <Url type=\"application/atom+xml;profile=opds-catalog;kind=acquisition\" template=\"{}\"/>\n\
+         \x20 <Url type=\"application/opds+json\" template=\"{}\"/>\n\
+         </OpenSearchDescription>\n",
+        xml_escape(&abs_href(base, "/opds/search?q={searchTerms}")),
+        xml_escape(&abs_href(base, "/opds/catalog/search?q={searchTerms}")),
     )
 }
 
@@ -714,27 +777,27 @@ fn nav_obj(title: &str, href: &str) -> serde_json::Value {
 }
 
 /// OPDS 2.0 根目录（navigation + facets + groups）
-pub async fn catalog_json(storage: &Storage, ns: &str) -> Result<String> {
+pub async fn catalog_json(storage: &Storage, ns: &str, base: &str) -> Result<String> {
     let books = storage.list_books(ns).await?;
     let groups = storage.list_book_groups_with_count(ns).await?;
     let sources = source_counts(&books);
     let total = books.len();
 
     let navigation = vec![
-        nav_obj("书架", "/opds/catalog/shelf"),
-        nav_obj("最近阅读", "/opds/catalog/recent"),
-        nav_obj("本地书", "/opds/catalog/local"),
-        nav_obj("全部分组", "/opds/catalog/groups"),
-        nav_obj("按来源", "/opds/catalog/source"),
+        nav_obj("书架", &abs_href(base, "/opds/catalog/shelf")),
+        nav_obj("最近阅读", &abs_href(base, "/opds/catalog/recent")),
+        nav_obj("本地书", &abs_href(base, "/opds/catalog/local")),
+        nav_obj("全部分组", &abs_href(base, "/opds/catalog/groups")),
+        nav_obj("按来源", &abs_href(base, "/opds/catalog/source")),
     ];
 
     let group_links: Vec<serde_json::Value> = groups
         .iter()
-        .map(|g| link_obj(&format!("/opds/catalog/group/{}", g.id), "application/opds+json", Some(&g.name), Some("subsection")))
+        .map(|g| link_obj(&abs_href(base, &format!("/opds/catalog/group/{}", g.id)), "application/opds+json", Some(&g.name), Some("subsection")))
         .collect();
     let source_links: Vec<serde_json::Value> = sources
         .iter()
-        .map(|(name, _)| link_obj(&format!("/opds/catalog/source/{}", encode_id(name)), "application/opds+json", Some(name), Some("subsection")))
+        .map(|(name, _)| link_obj(&abs_href(base, &format!("/opds/catalog/source/{}", encode_id(name))), "application/opds+json", Some(name), Some("subsection")))
         .collect();
     let facets = vec![
         json!({ "metadata": { "title": "分组" }, "links": group_links }),
@@ -746,7 +809,7 @@ pub async fn catalog_json(storage: &Storage, ns: &str) -> Result<String> {
         .map(|g| {
             json!({
                 "metadata": { "title": g.name, "numberOfItems": g.book_count },
-                "links": [ link_obj(&format!("/opds/catalog/group/{}", g.id), "application/opds+json", None, Some("self")) ],
+                "links": [ link_obj(&abs_href(base, &format!("/opds/catalog/group/{}", g.id)), "application/opds+json", None, Some("self")) ],
             })
         })
         .collect();
@@ -759,10 +822,10 @@ pub async fn catalog_json(storage: &Storage, ns: &str) -> Result<String> {
             "numberOfItems": total,
         },
         "links": [
-            link_obj("/opds/catalog", "application/opds+json", None, Some("self")),
-            link_obj("/opds/catalog", "application/opds+json", None, Some("start")),
-            link_obj("/opds/opensearch.xml", "application/opensearchdescription+xml", Some("OpenSearch 描述"), Some("search")),
-            link_obj("/opds/catalog/search?q={searchTerms}", "application/opds+json", None, Some("search")),
+            link_obj(&abs_href(base, "/opds/catalog"), "application/opds+json", None, Some("self")),
+            link_obj(&abs_href(base, "/opds/catalog"), "application/opds+json", None, Some("start")),
+            link_obj(&abs_href(base, "/opds/opensearch.xml"), "application/opensearchdescription+xml", Some("OpenSearch 描述"), Some("search")),
+            link_obj(&abs_href(base, "/opds/catalog/search?q={searchTerms}"), "application/opds+json", None, Some("search")),
         ],
         "navigation": navigation,
         "facets": facets,
@@ -772,7 +835,7 @@ pub async fn catalog_json(storage: &Storage, ns: &str) -> Result<String> {
 }
 
 /// 书籍 Publication 对象（OPDS 2.0：metadata + links + images）
-fn publication_json(storage: &Storage, ns: &str, book: &Book) -> serde_json::Value {
+fn publication_json(storage: &Storage, ns: &str, book: &Book, base: &str) -> serde_json::Value {
     let id = encode_id(&book.book_url);
     let mut metadata = serde_json::Map::new();
     metadata.insert("identifier".into(), json!(format!("urn:uuid:{id}")));
@@ -799,17 +862,18 @@ fn publication_json(storage: &Storage, ns: &str, book: &Book) -> serde_json::Val
     metadata.insert("updated".into(), json!(entry_updated(book)));
 
     let mut links = vec![
-        link_obj(&format!("/opds/acquire/{id}"), "text/plain", Some("获取正文"), Some("http://opds-spec.org/acquisition")),
-        link_obj(&format!("/opds/download/{id}?format=txt"), "text/plain", Some("下载 TXT"), Some("http://opds-spec.org/acquisition")),
-        link_obj(&format!("/opds-save?bookId={id}"), "application/atom+xml;type=entry;profile=opds-save", Some("保存进度"), Some("partial-save")),
+        link_obj(&abs_href(base, &format!("/opds/acquire/{id}")), "text/plain", Some("获取正文"), Some("http://opds-spec.org/acquisition")),
+        link_obj(&abs_href(base, &format!("/opds/download/{id}?format=txt")), "text/plain", Some("下载 TXT"), Some("http://opds-spec.org/acquisition")),
+        link_obj(&abs_href(base, &format!("/opds-save?bookId={id}")), "application/atom+xml;type=entry;profile=opds-save", Some("保存进度"), Some("partial-save")),
     ];
     let mut images: Vec<serde_json::Value> = Vec::new();
     if let Some(cover) = display_cover(book) {
-        links.push(link_obj(&cover, "image/jpeg", None, Some("http://opds-spec.org/cover")));
-        images.push(json!({ "href": cover, "type": "image/jpeg" }));
+        let cover_abs = abs_href(base, &cover);
+        links.push(link_obj(&cover_abs, "image/jpeg", None, Some("http://opds-spec.org/cover")));
+        images.push(json!({ "href": cover_abs, "type": "image/jpeg" }));
     }
     if let Some((ct, href)) = local_original_link(storage, ns, book) {
-        links.push(link_obj(&href, &ct, Some("下载原文件"), Some("http://opds-spec.org/acquisition")));
+        links.push(link_obj(&abs_href(base, &href), &ct, Some("下载原文件"), Some("http://opds-spec.org/acquisition")));
     }
 
     json!({
@@ -830,15 +894,17 @@ async fn feed_json(
     books: &[Book],
     start: usize,
     max: usize,
+    base: &str,
 ) -> Result<String> {
     let (page, total) = paginate(books, start, max);
+    let self_abs = abs_href(base, self_href);
     let mut links = vec![
-        link_obj(self_href, "application/opds+json", None, Some("self")),
-        link_obj("/opds/catalog", "application/opds+json", None, Some("start")),
-        link_obj("/opds/opensearch.xml", "application/opensearchdescription+xml", None, Some("search")),
-        link_obj("/opds/catalog/search?q={searchTerms}", "application/opds+json", None, Some("search")),
+        link_obj(&self_abs, "application/opds+json", None, Some("self")),
+        link_obj(&abs_href(base, "/opds/catalog"), "application/opds+json", None, Some("start")),
+        link_obj(&abs_href(base, "/opds/opensearch.xml"), "application/opensearchdescription+xml", None, Some("search")),
+        link_obj(&abs_href(base, "/opds/catalog/search?q={searchTerms}"), "application/opds+json", None, Some("search")),
     ];
-    let page_href = |s: usize| format!("{self_href}?startIndex={s}&maxItems={max}{extra_query}");
+    let page_href = |s: usize| abs_href(&self_abs, &format!("?startIndex={s}&maxItems={max}{extra_query}"));
     links.push(link_obj(&page_href(0), "application/opds+json", None, Some("first")));
     if start > 0 {
         links.push(link_obj(&page_href(start.saturating_sub(max)), "application/opds+json", None, Some("previous")));
@@ -855,70 +921,70 @@ async fn feed_json(
             "numberOfItems": total,
         },
         "links": links,
-        "publications": page.iter().map(|b| publication_json(storage, ns, b)).collect::<Vec<_>>(),
+        "publications": page.iter().map(|b| publication_json(storage, ns, b, base)).collect::<Vec<_>>(),
     });
     Ok(feed.to_string())
 }
 
 /// OPDS 2.0 导航 feed（分组/来源目录）
-fn nav_feed_json(ns: &str, title: &str, id_suffix: &str, self_href: &str, entries: Vec<(String, String)>) -> String {
+fn nav_feed_json(ns: &str, title: &str, id_suffix: &str, self_href: &str, entries: Vec<(String, String)>, base: &str) -> String {
     let navigation: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(name, href)| {
             json!({
                 "metadata": { "title": name },
-                "links": [ link_obj(&href, "application/opds+json", None, Some("subsection")) ],
+                "links": [ link_obj(&abs_href(base, &href), "application/opds+json", None, Some("subsection")) ],
             })
         })
         .collect();
     json!({
         "metadata": { "id": format!("urn:uuid:reader-dev-{id_suffix}-{ns}"), "title": title, "updated": now_rfc3339() },
-        "links": [ link_obj(self_href, "application/opds+json", None, Some("self")) ],
+        "links": [ link_obj(&abs_href(base, self_href), "application/opds+json", None, Some("self")) ],
         "navigation": navigation,
     })
     .to_string()
 }
 
 /// OPDS 2.0 书架 feed
-pub async fn shelf_json(storage: &Storage, ns: &str, start: usize, max: usize) -> Result<String> {
+pub async fn shelf_json(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
     let books = storage.list_books(ns).await?;
-    feed_json(storage, ns, "书架", "shelf", "/opds/catalog/shelf", "", &books, start, max).await
+    feed_json(storage, ns, "书架", "shelf", "/opds/catalog/shelf", "", &books, start, max, base).await
 }
 
 /// OPDS 2.0 最近阅读 feed
-pub async fn recent_json(storage: &Storage, ns: &str, start: usize, max: usize) -> Result<String> {
+pub async fn recent_json(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
         .await?
         .into_iter()
         .filter(|b| b.dur_chapter_time > 0)
         .collect();
-    feed_json(storage, ns, "最近阅读", "recent", "/opds/catalog/recent", "", &books, start, max).await
+    feed_json(storage, ns, "最近阅读", "recent", "/opds/catalog/recent", "", &books, start, max, base).await
 }
 
 /// OPDS 2.0 本地书 feed
-pub async fn local_json(storage: &Storage, ns: &str, start: usize, max: usize) -> Result<String> {
+pub async fn local_json(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
         .await?
         .into_iter()
         .filter(|b| is_local_book(&b.book_url, &b.origin))
         .collect();
-    feed_json(storage, ns, "本地书", "local", "/opds/catalog/local", "", &books, start, max).await
+    feed_json(storage, ns, "本地书", "local", "/opds/catalog/local", "", &books, start, max, base).await
 }
 
 /// OPDS 2.0 分组导航
-pub async fn groups_json(storage: &Storage, ns: &str) -> Result<String> {
+pub async fn groups_json(storage: &Storage, ns: &str, base: &str) -> Result<String> {
     let groups = storage.list_book_groups_with_count(ns).await?;
     let entries = groups
         .iter()
         .map(|g| (g.name.clone(), format!("/opds/catalog/group/{}", g.id)))
         .collect();
-    Ok(nav_feed_json(ns, "全部分组", "groups", "/opds/catalog/groups", entries))
+    Ok(nav_feed_json(ns, "全部分组", "groups", "/opds/catalog/groups", entries, base))
 }
 
 /// OPDS 2.0 分组内书籍 feed
-pub async fn group_json(storage: &Storage, ns: &str, id: i64, start: usize, max: usize) -> Result<String> {
+pub async fn group_json(storage: &Storage, ns: &str, id: i64, start: usize, max: usize, base: &str) -> Result<String> {
     let groups = storage.list_book_groups(ns).await?;
     let name = groups
         .iter()
@@ -941,18 +1007,19 @@ pub async fn group_json(storage: &Storage, ns: &str, id: i64, start: usize, max:
         &books,
         start,
         max,
+        base,
     )
     .await
 }
 
 /// OPDS 2.0 按来源导航
-pub async fn sources_json(storage: &Storage, ns: &str) -> Result<String> {
+pub async fn sources_json(storage: &Storage, ns: &str, base: &str) -> Result<String> {
     let books = storage.list_books(ns).await?;
     let entries = source_counts(&books)
         .into_iter()
         .map(|(name, _)| (name.clone(), format!("/opds/catalog/source/{}", encode_id(&name))))
         .collect();
-    Ok(nav_feed_json(ns, "按来源", "source", "/opds/catalog/source", entries))
+    Ok(nav_feed_json(ns, "按来源", "source", "/opds/catalog/source", entries, base))
 }
 
 /// OPDS 2.0 某来源书籍 feed
@@ -962,6 +1029,7 @@ pub async fn source_json(
     name_b64: &str,
     start: usize,
     max: usize,
+    base: &str,
 ) -> Result<String> {
     let name = decode_id(name_b64);
     let books: Vec<Book> = storage
@@ -981,6 +1049,7 @@ pub async fn source_json(
         &books,
         start,
         max,
+        base,
     )
     .await
 }
@@ -992,6 +1061,7 @@ pub async fn search_json(
     q: &str,
     start: usize,
     max: usize,
+    base: &str,
 ) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
@@ -1010,6 +1080,7 @@ pub async fn search_json(
         &books,
         start,
         max,
+        base,
     )
     .await
 }
@@ -1185,7 +1256,7 @@ pub async fn save_entry_json(storage: &Storage, ns: &str, book_id: &str) -> Resu
 }
 
 /// 当前进度 Atom entry（OPDS-PSE：entry + link rel=partial-save + content JSON）
-pub async fn save_entry_xml(storage: &Storage, ns: &str, book_id: &str) -> Result<String> {
+pub async fn save_entry_xml(storage: &Storage, ns: &str, book_id: &str, base: &str) -> Result<String> {
     let book = find_book(storage, ns, book_id).await?;
     let payload = save_entry_json(storage, ns, book_id).await?;
     let updated = if book.dur_chapter_time > 0 {
@@ -1206,8 +1277,8 @@ pub async fn save_entry_xml(storage: &Storage, ns: &str, book_id: &str) -> Resul
             xml_escape(&book.author)
         )
         + &format!(
-            "  <link rel=\"partial-save\" href=\"/opds/save/{}\" type=\"application/atom+xml;type=entry;profile=opds-save\"/>\n",
-            xml_escape(book_id)
+            "  <link rel=\"partial-save\" href=\"{}\" type=\"application/atom+xml;type=entry;profile=opds-save\"/>\n",
+            xml_escape(&abs_href(base, &format!("/opds/save/{book_id}")))
         )
         + &format!(
             "  <category term=\"http://opds-spec.org/save/progress\" label=\"阅读进度\"/>\n"
@@ -1275,6 +1346,9 @@ mod tests {
     use super::*;
     use crate::model::BookGroup;
 
+    /// 测试自引用 base（GAP 52：链接均为绝对 URL）
+    const TEST_BASE: &str = "http://reader.example.com";
+
     async fn test_state(tag: &str) -> (Storage, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "reader-opds-test-{}-{tag}",
@@ -1316,6 +1390,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_abs_href_and_opds_base() {
+        // abs_href：/ 开头拼接；? 查询拼接；http 原样；base 尾斜杠容忍
+        assert_eq!(abs_href("http://a.com", "/opds/shelf"), "http://a.com/opds/shelf");
+        assert_eq!(abs_href("http://a.com/", "/opds/shelf"), "http://a.com/opds/shelf");
+        assert_eq!(
+            abs_href("http://a.com/opds", "?startIndex=1&maxItems=50"),
+            "http://a.com/opds?startIndex=1&maxItems=50"
+        );
+        assert_eq!(
+            abs_href("http://a.com", "https://cdn.com/c.jpg"),
+            "https://cdn.com/c.jpg"
+        );
+        // opds_base：Host 头优先（默认 http）
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::HOST, "reader.example.com".parse().unwrap());
+        assert_eq!(opds_base(&h, 8080), "http://reader.example.com");
+        // X-Forwarded-Proto: https 切换 scheme
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(opds_base(&h, 8080), "https://reader.example.com");
+        // Host 缺失 → localhost:{port} 默认
+        assert_eq!(opds_base(&axum::http::HeaderMap::new(), 8080), "http://localhost:8080");
+    }
+
+    #[tokio::test]
     async fn test_root_navigation_structure() {
         let (storage, dir) = test_state("root").await;
         let ns = "default";
@@ -1324,20 +1422,24 @@ mod tests {
             book("local://1111", "本地书", "作者乙"),
         ])
         .await;
-        let xml = root(&storage, ns).await.unwrap();
+        let xml = root(&storage, ns, TEST_BASE).await.unwrap();
         // 命名空间 + 导航类型
         assert!(xml.contains("xmlns:opds=\"http://opds-spec.org/2010/catalog\""));
         assert!(xml.contains("kind=navigation"));
-        // 导航入口
+        // 导航入口（绝对 URL）
         for href in ["/opds/shelf", "/opds/recent", "/opds/groups", "/opds/local", "/opds/source"] {
-            assert!(xml.contains(&format!("href=\"{href}\"")), "缺少导航入口 {href}");
+            assert!(xml.contains(&format!("href=\"{TEST_BASE}{href}\"")), "缺少导航入口 {href}");
         }
-        // OpenSearch 链接 + 搜索模板
-        assert!(xml.contains("/opds/opensearch.xml"));
+        // OpenSearch 链接 + 搜索模板（绝对 URL）
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/opensearch.xml\"")));
         assert!(xml.contains("type=\"application/opensearchdescription+xml\""));
-        assert!(xml.contains("href=\"/opds/search?q={searchTerms}\""));
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/search?q={{searchTerms}}\"")));
+        // self / start 绝对
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds\"")));
         // 无书籍条目（导航 feed 不应出现 acquisition entry）
         assert!(!xml.contains("<link rel=\"http://opds-spec.org/acquisition\""));
+        // 不应残留相对链接（除 xmlns/type 外）
+        assert!(!xml.contains("href=\"/opds"), "链接应全部绝对化");
         cleanup(storage, dir).await;
     }
 
@@ -1358,7 +1460,7 @@ mod tests {
         b.latest_chapter_time = 1_700_100_000_000;
         seed(&storage, ns, vec![b]).await;
 
-        let xml = shelf(&storage, ns, 0, 50).await.unwrap();
+        let xml = shelf(&storage, ns, 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>1</opds:totalResults>"));
         assert!(xml.contains("<opds:startIndex>0</opds:startIndex>"));
         assert!(xml.contains("<opds:itemsPerPage>50</opds:itemsPerPage>"));
@@ -1369,15 +1471,15 @@ mod tests {
         assert!(xml.contains("<author><name>刘慈欣</name></author>"));
         assert!(xml.contains("文化大革命后期 &lt;地球往事&gt;"));
         assert!(xml.contains("<updated>2023-11-16T"));
-        // 封面缩略图
+        // 封面缩略图（相对路径 → 绝对 URL）
         assert!(xml.contains("rel=\"http://opds-spec.org/cover/thumbnail\""));
-        assert!(xml.contains("href=\"/assets/default/covers/1.jpg\""));
-        // acquisition：获取 + 下载 TXT
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/assets/default/covers/1.jpg\"")));
+        // acquisition：获取 + 下载 TXT（绝对 URL）
         let id = encode_id("https://a.com/1");
-        assert!(xml.contains(&format!("href=\"/opds/acquire/{id}\"")));
-        assert!(xml.contains(&format!("href=\"/opds/download/{id}?format=txt\"")));
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/acquire/{id}\"")));
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/download/{id}?format=txt\"")));
         // OPDS-PSE 链接
-        assert!(xml.contains(&format!("href=\"/opds/save/{id}\"")));
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/save/{id}\"")));
         assert!(xml.contains("rel=\"partial-save\""));
         // 元数据
         assert!(xml.contains("<dc:language>zh</dc:language>"));
@@ -1396,28 +1498,28 @@ mod tests {
             .collect();
         seed(&storage, ns, books).await;
 
-        // 第一页：50 条 + next
-        let xml = shelf(&storage, ns, 0, 50).await.unwrap();
+        // 第一页：50 条 + next（绝对 URL）
+        let xml = shelf(&storage, ns, 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>120</opds:totalResults>"));
         assert_eq!(xml.matches("  <entry>\n").count(), 50);
-        assert!(xml.contains("href=\"/opds/shelf?startIndex=50&amp;maxItems=50\""));
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/shelf?startIndex=50&amp;maxItems=50\"")));
         assert!(xml.contains("rel=\"first\""));
         assert!(!xml.contains("rel=\"previous\""));
 
         // 第二页：50 条，prev + next
-        let xml = shelf(&storage, ns, 50, 50).await.unwrap();
+        let xml = shelf(&storage, ns, 50, 50, TEST_BASE).await.unwrap();
         assert_eq!(xml.matches("  <entry>\n").count(), 50);
         assert!(xml.contains("rel=\"previous\""));
         assert!(xml.contains("rel=\"next\""));
 
         // 第三页：20 条，无 next
-        let xml = shelf(&storage, ns, 100, 50).await.unwrap();
+        let xml = shelf(&storage, ns, 100, 50, TEST_BASE).await.unwrap();
         assert_eq!(xml.matches("  <entry>\n").count(), 20);
         assert!(xml.contains("rel=\"previous\""));
         assert!(!xml.contains("rel=\"next\""));
 
         // 越界页：0 条
-        let xml = shelf(&storage, ns, 500, 50).await.unwrap();
+        let xml = shelf(&storage, ns, 500, 50, TEST_BASE).await.unwrap();
         assert_eq!(xml.matches("  <entry>\n").count(), 0);
         cleanup(storage, dir).await;
     }
@@ -1433,28 +1535,30 @@ mod tests {
         ])
         .await;
         // 搜书名
-        let xml = search(&storage, ns, "哈利", 0, 50).await.unwrap();
+        let xml = search(&storage, ns, "哈利", 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>1</opds:totalResults>"));
         assert!(xml.contains("哈利波特与魔法石"));
         assert!(!xml.contains("三体"));
         // 搜作者（ASCII 大小写不敏感）
-        let xml = search(&storage, ns, "j.k. rowling", 0, 50).await.unwrap();
+        let xml = search(&storage, ns, "j.k. rowling", 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>1</opds:totalResults>"));
         assert!(xml.contains("哈利波特与魔法石"));
         // 搜中文作者：命中两本
-        let xml = search(&storage, ns, "刘慈欣", 0, 50).await.unwrap();
+        let xml = search(&storage, ns, "刘慈欣", 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>2</opds:totalResults>"));
         assert!(xml.contains("三体"));
         assert!(xml.contains("乡村教师"));
         // 无结果
-        let xml = search(&storage, ns, "不存在", 0, 50).await.unwrap();
+        let xml = search(&storage, ns, "不存在", 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>0</opds:totalResults>"));
         assert!(!xml.contains("<entry>"));
-        // 搜索分页链接带 q
-        let xml = search(&storage, ns, "刘慈欣", 0, 1).await.unwrap();
-        assert!(xml.contains("startIndex=1&amp;maxItems=1&amp;q=%E5%88%98%E6%85%88%E6%AC%A3"));
+        // 搜索分页链接带 q（绝对 URL）
+        let xml = search(&storage, ns, "刘慈欣", 0, 1, TEST_BASE).await.unwrap();
+        assert!(xml.contains(&format!(
+            "{TEST_BASE}/opds/search?startIndex=1&amp;maxItems=1&amp;q=%E5%88%98%E6%85%88%E6%AC%A3"
+        )));
         // 特殊字符 q：feed title / 分页链接均需 XML 转义
-        let xml = search(&storage, ns, "<a&b>", 0, 50).await.unwrap();
+        let xml = search(&storage, ns, "<a&b>", 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("&lt;a&amp;b&gt;"));
         assert!(!xml.contains("<title>搜索：<a"));
         cleanup(storage, dir).await;
@@ -1478,21 +1582,21 @@ mod tests {
         b2.group = g2.id;
         seed(&storage, ns, vec![b1, b2]).await;
 
-        // 分组导航
-        let xml = groups(&storage, ns).await.unwrap();
-        assert!(xml.contains(&format!("href=\"/opds/group/{}\"", g1.id)));
-        assert!(xml.contains(&format!("href=\"/opds/group/{}\"", g2.id)));
+        // 分组导航（绝对 URL）
+        let xml = groups(&storage, ns, TEST_BASE).await.unwrap();
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/group/{}\"", g1.id)));
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/group/{}\"", g2.id)));
         assert!(xml.contains("玄幻"));
         assert!(xml.contains("言情"));
 
         // 分组 feed：只含本组书
-        let xml = group(&storage, ns, g1.id, 0, 50).await.unwrap();
+        let xml = group(&storage, ns, g1.id, 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>1</opds:totalResults>"));
         assert!(xml.contains("斗破苍穹"));
         assert!(!xml.contains("何以笙箫默"));
 
         // 未知分组：0 条
-        let xml = group(&storage, ns, 9999, 0, 50).await.unwrap();
+        let xml = group(&storage, ns, 9999, 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>0</opds:totalResults>"));
         cleanup(storage, dir).await;
     }
@@ -1515,34 +1619,38 @@ mod tests {
         ])
         .await;
         // 本地书 feed
-        let xml = local(&storage, ns, 0, 50).await.unwrap();
+        let xml = local(&storage, ns, 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>2</opds:totalResults>"));
         assert!(xml.contains("本地TXT"));
         assert!(xml.contains("旧本地书"));
         assert!(!xml.contains("网络书A"));
         // 来源导航（按 origin_name 分组）
-        let xml = sources(&storage, ns).await.unwrap();
-        assert!(xml.contains("href=\"/opds/source/"));
+        let xml = sources(&storage, ns, TEST_BASE).await.unwrap();
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/source/\"")));
         // 来源 feed（key = origin_name）
         let b64 = encode_id("源一");
-        let xml = source(&storage, ns, &b64, 0, 50).await.unwrap();
+        let xml = source(&storage, ns, &b64, 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>1</opds:totalResults>"));
         assert!(xml.contains("网络书A"));
         assert!(!xml.contains("网络书B"));
         // 来源 feed（无 origin_name 时回退 origin）
         let b64 = encode_id("https://s2.com");
-        let xml = source(&storage, ns, &b64, 0, 50).await.unwrap();
+        let xml = source(&storage, ns, &b64, 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>0</opds:totalResults>"));
         cleanup(storage, dir).await;
     }
 
     #[tokio::test]
     async fn test_open_search_description() {
-        let xml = open_search_xml();
+        let xml = open_search_xml(TEST_BASE);
         assert!(xml.contains("<OpenSearchDescription xmlns=\"http://a9.com/-/spec/opensearch/1.1/\">"));
         assert!(xml.contains("<ShortName>reader-dev</ShortName>"));
-        assert!(xml.contains("template=\"/opds/search?q={searchTerms}\""));
-        assert!(xml.contains("template=\"/opds/catalog/search?q={searchTerms}\""));
+        assert!(xml.contains(&format!(
+            "template=\"{TEST_BASE}/opds/search?q={{searchTerms}}\""
+        )));
+        assert!(xml.contains(&format!(
+            "template=\"{TEST_BASE}/opds/catalog/search?q={{searchTerms}}\""
+        )));
     }
 
     #[tokio::test]
@@ -1558,28 +1666,29 @@ mod tests {
         b.cover_url = Some("/assets/c.jpg".into());
         seed(&storage, ns, vec![b]).await;
 
-        let json_str = catalog_json(&storage, ns).await.unwrap();
+        let json_str = catalog_json(&storage, ns, TEST_BASE).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["metadata"]["title"], "reader-dev");
         assert_eq!(v["metadata"]["numberOfItems"], 1);
-        // navigation 5 项
+        // navigation 5 项（绝对 URL）
         let nav = v["navigation"].as_array().unwrap();
         assert_eq!(nav.len(), 5);
         assert_eq!(nav[0]["metadata"]["title"], "书架");
-        assert_eq!(nav[0]["links"][0]["href"], "/opds/catalog/shelf");
+        assert_eq!(nav[0]["links"][0]["href"], format!("{TEST_BASE}/opds/catalog/shelf"));
         // facets：分组 + 来源
         let facets = v["facets"].as_array().unwrap();
         assert_eq!(facets.len(), 2);
         assert_eq!(facets[0]["metadata"]["title"], "分组");
-        assert_eq!(facets[0]["links"][0]["href"], format!("/opds/catalog/group/{}", g.id));
+        assert_eq!(facets[0]["links"][0]["href"], format!("{TEST_BASE}/opds/catalog/group/{}", g.id));
         // groups：numberOfItems
         let groups = v["groups"].as_array().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0]["metadata"]["numberOfItems"], 1);
-        // links：opensearch + search 模板 + self
+        // links：opensearch + search 模板 + self（绝对 URL）
         let links = v["links"].as_array().unwrap();
-        assert!(links.iter().any(|l| l["href"] == "/opds/opensearch.xml"));
-        assert!(links.iter().any(|l| l["href"] == "/opds/catalog/search?q={searchTerms}"));
+        assert!(links.iter().any(|l| l["href"] == format!("{TEST_BASE}/opds/opensearch.xml")));
+        assert!(links.iter().any(|l| l["href"] == format!("{TEST_BASE}/opds/catalog/search?q={{searchTerms}}")));
+        assert!(links.iter().any(|l| l["rel"] == "self" && l["href"] == format!("{TEST_BASE}/opds/catalog")));
         cleanup(storage, dir).await;
     }
 
@@ -1592,7 +1701,7 @@ mod tests {
             .collect();
         seed(&storage, ns, books).await;
 
-        let json_str = shelf_json(&storage, ns, 0, 50).await.unwrap();
+        let json_str = shelf_json(&storage, ns, 0, 50, TEST_BASE).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["metadata"]["numberOfItems"], 120);
         assert_eq!(v["metadata"]["title"], "书架");
@@ -1603,18 +1712,21 @@ mod tests {
         assert!(p0["metadata"]["title"].as_str().unwrap().starts_with("书"));
         assert!(p0["metadata"]["identifier"].as_str().unwrap().starts_with("urn:uuid:"));
         assert_eq!(p0["metadata"]["authors"][0]["name"], "作者");
-        // links：acquisition（获取/下载）+ partial-save
+        // links：acquisition（获取/下载，绝对 URL）+ partial-save
         let links = p0["links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["rel"] == "http://opds-spec.org/acquisition"
             && l["type"] == "text/plain"
-            && l["href"].as_str().unwrap().starts_with("/opds/acquire/")));
-        assert!(links.iter().any(|l| l["rel"] == "partial-save"));
+            && l["href"].as_str().unwrap().starts_with(&format!("{TEST_BASE}/opds/acquire/"))));
+        assert!(links.iter().any(|l| l["rel"] == "partial-save"
+            && l["href"].as_str().unwrap().starts_with(&format!("{TEST_BASE}/opds-save?bookId="))));
         // images 数组（无封面书为空）
         assert!(p0["images"].is_array());
-        // 分页 next link
+        // 分页 next link（绝对 URL）
         let feed_links = v["links"].as_array().unwrap();
         assert!(feed_links.iter().any(|l| l["rel"] == "next"
-            && l["href"] == "/opds/catalog/shelf?startIndex=50&maxItems=50"));
+            && l["href"] == format!("{TEST_BASE}/opds/catalog/shelf?startIndex=50&maxItems=50")));
+        assert!(feed_links.iter().any(|l| l["rel"] == "self"
+            && l["href"] == format!("{TEST_BASE}/opds/catalog/shelf")));
         cleanup(storage, dir).await;
     }
 
@@ -1708,11 +1820,11 @@ mod tests {
         seed(&storage, ns, vec![b]).await;
         let id = encode_id("https://a.com/1");
 
-        // GET：Atom entry 结构
-        let xml = save_entry_xml(&storage, ns, &id).await.unwrap();
+        // GET：Atom entry 结构（partial-save 链接绝对 URL）
+        let xml = save_entry_xml(&storage, ns, &id, TEST_BASE).await.unwrap();
         assert!(xml.contains("<entry xmlns=\"http://www.w3.org/2005/Atom\""));
         assert!(xml.contains(&format!("<id>urn:uuid:{id}</id>")));
-        assert!(xml.contains(&format!("href=\"/opds/save/{id}\"")));
+        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/save/{id}\"")));
         assert!(xml.contains("rel=\"partial-save\""));
         assert!(xml.contains("type=\"application/atom+xml;type=entry;profile=opds-save\""));
         assert!(xml.contains("<content type=\"application/json\">"));

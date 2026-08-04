@@ -177,7 +177,10 @@ impl Browser {
             uuid::Uuid::new_v4().simple()
         ));
         let mut cmd = Command::new(&exe);
-        cmd.args([
+        // READER_CDP_HEADED=1 时移除 --headless=new（headless vs headed 过率对比实验用；
+        // 生产路径永远 headless——服务端静默，绝不弹浏览器给用户）
+        let headed = std::env::var("READER_CDP_HEADED").map(|v| v.trim() == "1").unwrap_or(false);
+        let mut args: Vec<&str> = vec![
             "--headless=new",
             "--remote-debugging-port=0",
             "--no-first-run",
@@ -186,8 +189,18 @@ impl Browser {
             "--disable-extensions",
             "--disable-dev-shm-usage",
             "--remote-allow-origins=*",
-            "--window-size=1280,900",
-        ])
+            // 反检测启动参数（验证码求解场景：隐藏 CDP 自动化指纹）
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--window-size=1280,800",
+            // UA 覆盖：headless 默认 UA 含 HeadlessChrome 标记——CF 风控直接命中；
+            // 用常规 Windows Chrome UA（与 cf_clearance 绑定，后续抓取需同 UA）
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        ];
+        if headed {
+            args.remove(0);
+        }
+        cmd.args(args)
         .arg(format!("--user-data-dir={}", user_data_dir.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -326,6 +339,21 @@ impl Browser {
         let _ = browser.command("Page.enable", json!({})).await;
         let _ = browser.command("Network.enable", json!({})).await;
         let _ = browser.command("Runtime.enable", json!({})).await;
+        // stealth 注入（反检测）：每次新文档加载前执行（webdriver 清除、plugins/vendor/
+        // languages/hardwareConcurrency/chrome.*/outer 尺寸/WebGL 厂商模拟——见 STEALTH_JS，
+        // puppeteer-extra-plugin-stealth 清单翻译）。测试钩子 READER_CDP_NO_STEALTH=1
+        // 可跳过注入（过率对比实验用）。
+        let stealth_enabled = std::env::var("READER_CDP_NO_STEALTH")
+            .map(|v| v.trim() != "1")
+            .unwrap_or(true);
+        if stealth_enabled {
+            let _ = browser
+                .command(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": STEALTH_JS }),
+                )
+                .await;
+        }
         Ok(browser)
     }
 
@@ -512,6 +540,8 @@ pub struct CfSolution {
     pub cookies: Vec<(String, String)>,
     /// 浏览器真实 UA（与 cf_clearance 绑定：后续抓取需带同一 UA）
     pub user_agent: String,
+    /// Turnstile 求解得到的 cf-turnstile-response token（非 Turnstile 质询为 None）
+    pub turnstile_token: Option<String>,
 }
 
 /// CF 质询状态检测 JS（质询等待循环每 500ms 求值一次）——challenge=true 表示仍在质询页
@@ -530,6 +560,150 @@ pub const CF_CHALLENGE_STATE_JS: &str = r#"
   } catch (e) { return { challenge: true, ready: 'error', url: '', bodyChildren: 0 }; }
 })()
 "#;
+
+/// stealth 注入 JS（puppeteer-extra-plugin-stealth 清单翻译）——每次新文档加载前执行：
+/// ① navigator.webdriver 清除（自动化最显著指纹）；② plugins 模拟（headless 常为空，
+/// 真实 Chrome 有 5 个 PDF 插件）；③ vendor/languages/hardwareConcurrency 模拟；
+/// ④ chrome.app/csi/loadTimes/runtime 存在性模拟；⑤ outer 尺寸固定（headless 默认 0）；
+/// ⑥ WebGL 渲染商模拟（UNMASKED_VENDOR_WEBGL——headless SwiftShader 指纹）
+pub const STEALTH_JS: &str = r#"
+(() => {
+  try {
+    // ① webdriver 标志清除
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    // ② plugins 模拟（headless 下 plugins 常为空数组——真实 Chrome 有 5 个 PDF 插件）
+    if (navigator.plugins.length === 0) {
+      var names = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer', 'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'];
+      var plugins = names.map(function (name) {
+        var p = { name: name, filename: name + '.dll', description: name, length: 1,
+                  item: function () { return null; }, namedItem: function () { return null; }, refresh: function () {} };
+        p[0] = { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' };
+        return p;
+      });
+      Object.defineProperty(navigator, 'plugins', { get: function () { return plugins; } });
+    }
+    // ③ vendor / languages / hardwareConcurrency
+    Object.defineProperty(navigator, 'vendor', { get: function () { return 'Google Inc.'; } });
+    Object.defineProperty(navigator, 'languages', { get: function () { return ['zh-CN', 'zh']; } });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: function () { return 8; } });
+    // ④ chrome 对象（app/csi/loadTimes/runtime 存在性——裸 headless 环境可能缺失）
+    if (!window.chrome) { window.chrome = {}; }
+    if (!window.chrome.runtime) { window.chrome.runtime = {}; }
+    if (!window.chrome.app) { window.chrome.app = {}; }
+    if (!window.chrome.csi) {
+      window.chrome.csi = function () { return { startE: 0, onloadT: 0, pageT: 0, tran: 0 }; };
+    }
+    if (!window.chrome.loadTimes) {
+      window.chrome.loadTimes = function () {
+        return { commitLoadTime: 0, firstPaintAfterLoadTime: 0, requestTime: 0, startLoadTime: 0,
+                 wasFetchedViaSpdy: true, wasNpnNegotiated: true, wasAlternateProtocolAvailable: true };
+      };
+    }
+    // ⑤ 窗口 outer 尺寸固定（headless 默认 0 是常见指纹）
+    if (window.outerWidth === 0 || window.outerHeight === 0) {
+      Object.defineProperty(window, 'outerWidth', { get: function () { return 1280; } });
+      Object.defineProperty(window, 'outerHeight', { get: function () { return 800; } });
+    }
+    // ⑥ WebGL 渲染商模拟（UNMASKED_VENDOR_WEBGL——headless SwiftShader 指纹）
+    if (window.WebGLRenderingContext) {
+      var origGetExt = WebGLRenderingContext.prototype.getExtension;
+      WebGLRenderingContext.prototype.getExtension = function (name) {
+        var ext = origGetExt.call(this, name);
+        if (name === 'WEBGL_debug_renderer_info' && ext) {
+          try {
+            Object.defineProperty(ext, 'UNMASKED_VENDOR_WEBGL', { get: function () { return 'Google Inc. (Intel)'; } });
+            Object.defineProperty(ext, 'UNMASKED_RENDERER_WEBGL', { get: function () { return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)'; } });
+          } catch (e) {}
+        }
+        return ext;
+      };
+    }
+  } catch (e) {}
+})();
+"#;
+
+/// Turnstile 质询检测 JS：页面含 iframe[src*=challenges.cloudflare.com]（widget 内嵌 iframe）
+/// 或 .cf-turnstile 容器或 [name=cf-turnstile-response] 隐藏 input 或 turnstile 脚本标签
+/// 或 title 含 Turnstile/Verifying → turnstile=true（附各特征标志，供点击/超时策略选择）
+pub const TURNSTILE_DETECT_JS: &str = r#"
+(function(){
+  try {
+    var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+    var iframeIsTurnstile = !!(iframe && /turnstile/.test(iframe.src || ''));
+    var container = document.querySelector('.cf-turnstile');
+    var input = document.querySelector('[name="cf-turnstile-response"]');
+    var script = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"], script[src*="turnstile/api.js"]');
+    var t = (document.title || '').toLowerCase();
+    var hasTitle = t.indexOf('turnstile') >= 0 || t.indexOf('verifying') >= 0;
+    return {
+      turnstile: !!(iframe || container || input || script || hasTitle),
+      hasContainer: !!container,
+      hasInput: !!input,
+      hasTitle: hasTitle,
+      iframeIsTurnstile: iframeIsTurnstile
+    };
+  } catch (e) { return { turnstile: false, hasContainer: false, hasInput: false, hasTitle: false, iframeIsTurnstile: false }; }
+})()
+"#;
+
+/// Turnstile 点击 JS：① .cf-turnstile 容器 element.click()（页面级回调——mock 等依赖
+/// click 事件的 widget）；② 同时返回 challenges.cloudflare.com iframe 的 bounding box
+/// 坐标（滚动到可视区后），由 CDP Input.dispatchMouseEvent 派发真实点击——真实 Turnstile
+/// 勾选发生在 iframe 内部，element.click() 无法穿透，坐标点击可直达。
+pub const TURNSTILE_CLICK_JS: &str = r#"
+(function(){
+  try {
+    var out = { ok: false, reason: 'no-element' };
+    var el = document.querySelector('.cf-turnstile');
+    if (el) {
+      try { el.click(); out = { ok: true, how: 'container' }; } catch (e) {}
+    }
+    var f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+    if (f) {
+      try { f.scrollIntoView({ block: 'center' }); } catch (e) {}
+      var r = f.getBoundingClientRect();
+      out = { ok: true, how: 'iframe', x: r.x + r.width * 0.3, y: r.y + r.height / 2, w: r.width, h: r.height };
+    }
+    return out;
+  } catch (e) { return { ok: false, reason: 'exception' }; }
+})()
+"#;
+
+/// Turnstile token 读取 JS：`[name=cf-turnstile-response]` 隐藏 input 的 value（等价于
+/// `document.querySelector('[name=cf-turnstile-response]')?.value`——不用可选链以兼容
+/// boa 冒烟解析）；widget API 兜底（真实站点页面未必有该 input——turnstile.getResponse()
+/// 等效）。
+pub const TURNSTILE_TOKEN_JS: &str = r#"
+(function(){
+  try {
+    var el = document.querySelector('[name="cf-turnstile-response"]');
+    if (el && el.value) { return el.value; }
+    if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+      var t = window.turnstile.getResponse();
+      if (t) { return t; }
+    }
+    return '';
+  } catch (e) { return ''; }
+})()
+"#;
+
+/// 不支持的验证码类型检测 JS（reCAPTCHA：g-recaptcha/recaptcha/api.js；
+/// hCaptcha：h-captcha/hcaptcha.com）——命中即返回明确错误（不自动求解）
+pub const UNSUPPORTED_CAPTCHA_DETECT_JS: &str = r#"
+(function(){
+  try {
+    var recaptcha = document.querySelector('.g-recaptcha, iframe[src*="recaptcha"], script[src*="recaptcha/api.js"], [class*="g-recaptcha"]');
+    var hcaptcha = document.querySelector('[class*="h-captcha"], iframe[src*="hcaptcha"], script[src*="hcaptcha"]');
+    return { recaptcha: !!recaptcha, hcaptcha: !!hcaptcha };
+  } catch (e) { return { recaptcha: false, hcaptcha: false }; }
+})()
+"#;
+
+/// Turnstile token 轮询间隔（任务要求每 800ms）
+const TURNSTILE_POLL_MS: u64 = 800;
+/// Turnstile token 轮询上限（任务要求最多 30s——仅对真 Turnstile widget 生效；
+/// 经典 CF 质询误命中 iframe 特征时不受此限，仍按调用方 max_wait_ms）
+const TURNSTILE_MAX_WAIT_MS: u64 = 30_000;
 
 /// 会话浏览器闲置回收时限（最后一次使用后 TTL 内无新请求 → 杀进程释放资源）
 const CF_SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
@@ -567,17 +741,48 @@ pub async fn shutdown_cf_session() {
 }
 
 /// 解 CF 质询（进程内浏览器 CDP；会话级浏览器实例——惰性启动/互斥/异常自动重启）。
+/// CF 专用入口（不含滑块分支——登录页滑块走 solve_captcha 或登录流程）。
 ///
 /// 流程：启动/复用会话浏览器（独立 user-data-dir，退出自动清理）→ Network.setCookies
 /// 注入 cookies → Page.navigate → 质询等待循环（每 500ms 求值 document：challenge 特征
 /// （#challenge-form/#cf-chl-*/iframe[src*=challenges.cloudflare]/title=="Just a moment"）
-/// 消失或 URL 变化到目标页；最多 max_wait_ms）→ 提取最终 HTML → Storage.getCookies
-/// （该站点全部，含 cf_clearance）→ {html, cookies, userAgent}。
-/// 超时返回明确错误；浏览器不可用/启动失败返回明确错误。
+/// 消失或 URL 变化到目标页；Turnstile 分支：点击容器 + 每 800ms 轮询 token（最多 30s）
+/// → 提取最终 HTML → Storage.getCookies（该站点全部，含 cf_clearance）→ {html, cookies,
+/// userAgent, turnstile_token}。超时/浏览器不可用返回明确错误。
+///
+/// 服务端静默语义：全程 headless（--headless=new），不弹任何窗口/不等待用户——
+/// 求解失败返回明确错误，由调用方（书源 JS 等）自行兜底。
 pub async fn solve_cf_challenge(
     url: &str,
     cookies: &[(String, String)],
     max_wait_ms: u64,
+) -> Result<CfSolution> {
+    solve_captcha_inner(url, cookies, max_wait_ms, false).await
+}
+
+/// 统一验证码求解入口（服务端静默 headless——不弹浏览器给用户）：一个函数覆盖全部验证码
+/// 类型——内部按检测分派：
+/// - CF JS 质询（challenge-platform/#challenge-form/"Just a moment"）→ 等待循环（JS 自解）
+/// - Turnstile（.cf-turnstile/[name=cf-turnstile-response]/challenges.cloudflare.com iframe）
+///   → 点击容器（element.click + iframe 中心坐标）→ 每 800ms 轮询 token（最多 30s）
+/// - 登录页滑块（DETECT_CAPTCHA_JS kind=slider）→ 贝塞尔轨迹拖拽（人类轨迹，与登录流程一致）
+/// - reCAPTCHA/hCaptcha → 明确错误（不支持自动求解）
+/// 会话管理/超时语义与 solve_cf_challenge 一致。书源 JS 的 java.startBrowserAwait shim
+/// 应路由到此入口（成功返回 body/cookies，失败返回明确错误）。
+pub async fn solve_captcha(
+    url: &str,
+    cookies: &[(String, String)],
+    max_wait_ms: u64,
+) -> Result<CfSolution> {
+    solve_captcha_inner(url, cookies, max_wait_ms, true).await
+}
+
+/// 统一求解内部实现（include_slider：solve_captcha 启用滑块分派，CF 专用入口不启用）
+async fn solve_captcha_inner(
+    url: &str,
+    cookies: &[(String, String)],
+    max_wait_ms: u64,
+    include_slider: bool,
 ) -> Result<CfSolution> {
     let mut guard = CF_SESSION.lock().await;
     // 惰性启动 / 复用（前次异常已在出错时弃用实例，这里自然重新 launch）
@@ -593,7 +798,7 @@ pub async fn solve_cf_challenge(
     let result = {
         let session = guard.as_mut().expect("just initialized");
         session.last_used = std::time::Instant::now();
-        solve_cf_with(&mut session.browser, url, cookies, max_wait_ms).await
+        solve_with(&mut session.browser, url, cookies, max_wait_ms, include_slider).await
     };
     match result {
         Ok(sol) => {
@@ -608,12 +813,24 @@ pub async fn solve_cf_challenge(
     }
 }
 
+/// 在会话浏览器当前页面执行 JS（求解完成后继续操作页面——如提交表单/页内 fetch，
+/// 69shuba 搜索场景：同源自动携带 cf_clearance）。无会话（未求解过）→ 错误。
+pub async fn evaluate_in_session(expression: &str) -> Result<Value> {
+    let mut guard = CF_SESSION.lock().await;
+    let Some(session) = guard.as_mut() else {
+        return Err(anyhow!("无浏览器会话——请先调用 solve_cf_challenge/solve_captcha"));
+    };
+    session.last_used = std::time::Instant::now();
+    session.browser.evaluate(expression).await
+}
+
 /// 单次求解（浏览器实例已由会话就绪）
-async fn solve_cf_with(
+async fn solve_with(
     browser: &mut Browser,
     url: &str,
     cookies: &[(String, String)],
     max_wait_ms: u64,
+    include_slider: bool,
 ) -> Result<CfSolution> {
     let parsed =
         url::Url::parse(url).map_err(|e| anyhow!("URL 解析失败（{url}）: {e}"))?;
@@ -630,15 +847,151 @@ async fn solve_cf_with(
     // ② 导航（navigate 内部已等 readyState==complete）
     browser.navigate(url).await?;
 
-    // ③ 质询等待循环：每 500ms 求值 document——challenge 特征消失 或 URL 变化到目标页
+    // ③ 质询等待循环（统一分派）：每 500ms 求值 document——challenge 特征消失 或 URL
+    //    变化到目标页；Turnstile 分支：检测 → 点击容器 → 每 800ms 轮询 token；
+    //    滑块分支（solve_captcha 入口）：检测到即拖拽；reCAPTCHA/hCaptcha → 明确错误。
     let deadline = std::time::Instant::now() + Duration::from_millis(max_wait_ms);
+    // Turnstile token 轮询上限（任务要求最多 30s——仅对真 Turnstile widget 生效；
+    // 经典 CF 质询误命中 iframe 特征时不受此限，仍按 max_wait_ms）
+    let turnstile_deadline = std::time::Instant::now()
+        + Duration::from_millis(max_wait_ms.min(TURNSTILE_MAX_WAIT_MS));
+    let mut turnstile_mode = false;
+    let mut turnstile_widget = false; // 页面确有 Turnstile widget（容器/input/标题/turnstile iframe）
+    let mut turnstile_clicked = false;
+    let mut turnstile_token: Option<String> = None;
+    let mut slider_dragged = false;
+    let mut saw_classic_challenge = false; // 经典 CF 质询特征曾出现（误判 Turnstile 时据此退出）
     loop {
-        if std::time::Instant::now() >= deadline {
+        let now = std::time::Instant::now();
+        let turnstile_timeout = turnstile_mode && turnstile_widget && now >= turnstile_deadline;
+        if now >= deadline || turnstile_timeout {
+            if turnstile_mode && turnstile_widget {
+                return Err(anyhow!(
+                    "Turnstile 验证超时（{}s）：{url}——未获取到 cf-turnstile-response token（可能需要人工验证）",
+                    TURNSTILE_MAX_WAIT_MS / 1000
+                ));
+            }
             return Err(anyhow!(
                 "CF 质询求解超时（{}s）：{url}——页面仍停留在质询页（challenge 特征未消失）",
                 max_wait_ms / 1000
             ));
         }
+
+        // ① 不支持的验证码类型（reCAPTCHA/hCaptcha）——明确错误（不自动求解）
+        if let Ok(u) = browser.evaluate(UNSUPPORTED_CAPTCHA_DETECT_JS).await {
+            if u.get("recaptcha").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Err(anyhow!("该验证码类型不支持（reCAPTCHA）——请手动完成验证或更换书源"));
+            }
+            if u.get("hcaptcha").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Err(anyhow!("该验证码类型不支持（hCaptcha）——请手动完成验证或更换书源"));
+            }
+        }
+
+        // ② Turnstile 检测（每次迭代刷新——widget 可能延迟渲染；script 标签先命中、容器后出现）
+        //    注意：turnstile_widget 只看页面级特征（.cf-turnstile 容器 / 隐藏 input / 标题）
+        //    ——iframe[src*=challenges.cloudflare.com] 单独命中不算 widget（经典 CF 质询页
+        //    也内嵌该 iframe，误判会触发 30s token 轮询上限并破坏经典质询等待循环）
+        if !turnstile_mode {
+            if let Ok(d) = browser.evaluate(TURNSTILE_DETECT_JS).await {
+                if d.get("turnstile").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    turnstile_mode = true;
+                    turnstile_widget = d.get("hasContainer").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || d.get("hasInput").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || d.get("hasTitle").and_then(|v| v.as_bool()).unwrap_or(false);
+                }
+            }
+        } else if !turnstile_widget {
+            // widget 标志升级（script 标签先命中、容器后渲染）
+            if let Ok(d) = browser.evaluate(TURNSTILE_DETECT_JS).await {
+                if d.get("hasContainer").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || d.get("hasInput").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || d.get("hasTitle").and_then(|v| v.as_bool()).unwrap_or(false)
+                {
+                    turnstile_widget = true;
+                }
+            }
+        }
+
+        // ③ Turnstile 流程：点击容器 → 轮询 token（每 800ms）——token 非空即通过
+        if turnstile_mode {
+            if !turnstile_clicked {
+                if click_turnstile(browser).await? {
+                    turnstile_clicked = true;
+                }
+                tokio::time::sleep(Duration::from_millis(TURNSTILE_POLL_MS)).await;
+                continue;
+            }
+            if let Ok(v) = browser.evaluate(TURNSTILE_TOKEN_JS).await {
+                if let Some(s) = v.as_str().filter(|s| !s.is_empty()) {
+                    turnstile_token = Some(s.to_string());
+                    break;
+                }
+            }
+            // 退出：URL 变化（表单提交/跳转）；或非 widget 命中（经典质询误判）且质询已清除
+            if let Ok(state) = browser.evaluate(CF_CHALLENGE_STATE_JS).await {
+                let challenge = state
+                    .get("challenge")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let cur_url = state
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ready = state
+                    .get("ready")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let body_children = state
+                    .get("bodyChildren")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if challenge {
+                    saw_classic_challenge = true;
+                }
+                let url_changed = !cur_url.is_empty() && cur_url != initial_url;
+                let page_loaded = ready == "complete" || (ready != "loading" && body_children > 0);
+                if turnstile_widget {
+                    // 仅 URL 规范化（http→https/trailing slash）不视为通过——需质询特征
+                    // 同时消失（表单提交跳转到目标页）
+                    if url_changed && !challenge {
+                        break;
+                    }
+                } else if (!challenge && url_changed)
+                    || (saw_classic_challenge && !challenge && page_loaded)
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(TURNSTILE_POLL_MS)).await;
+            continue;
+        }
+
+        // ④ 滑块（统一入口分派——登录页滑块自动拖拽；CF 专用入口不启用）
+        if include_slider && !slider_dragged {
+            if let Ok(det) = browser.evaluate(DETECT_CAPTCHA_JS).await {
+                if !det.is_null() && det.get("kind").and_then(|v| v.as_str()) == Some("slider") {
+                    let bx = det.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let by = det.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let bw = det.get("w").and_then(|v| v.as_f64()).unwrap_or(40.0);
+                    let track_w = det.get("trackW").and_then(|v| v.as_f64()).unwrap_or(300.0);
+                    let start_x = bx + bw / 2.0;
+                    let start_y = by + 12.0;
+                    // 目标距离随机化（轨道 55%~90%），避免固定轨迹被风控（与登录流程一致）
+                    let dist = (track_w - bw) * (0.55 + rand::random::<f64>() * 0.35);
+                    let end_x = bx + dist;
+                    let end_y = start_y + rand::random::<f64>() * 4.0 - 2.0;
+                    browser.mouse_drag(start_x, start_y, end_x, end_y).await?;
+                    slider_dragged = true;
+                    tokio::time::sleep(Duration::from_millis(CAPTCHA_SETTLE_MS)).await;
+                    continue;
+                }
+            }
+        }
+
+        // ⑤ 经典 CF 质询等待（非 Turnstile 页）：每 500ms 求值 document——challenge 特征
+        //    消失 或 URL 变化到目标页
         match browser.evaluate(CF_CHALLENGE_STATE_JS).await {
             Ok(state) => {
                 let challenge = state
@@ -704,7 +1057,63 @@ async fn solve_cf_with(
         html,
         cookies: cookies_out,
         user_agent,
+        turnstile_token,
     })
+}
+
+/// 点击 Turnstile widget：容器 element.click()（页面回调）＋ iframe 中心坐标真实点击
+/// （CDP Input.dispatchMouseEvent——穿透 iframe 直达勾选框；真实 Turnstile 勾选在
+/// iframe 内部，element.click() 无法穿透）。返回是否已执行点击；iframe 尚未布局
+/// （0 尺寸）→ false（下次迭代重试）。
+async fn click_turnstile(browser: &mut Browser) -> Result<bool> {
+    let r = match browser.evaluate(TURNSTILE_CLICK_JS).await {
+        Ok(r) => r,
+        Err(_) => return Ok(false), // 导航中执行上下文切换——下次迭代重试
+    };
+    let how = r.get("how").and_then(|v| v.as_str()).unwrap_or("");
+    if how != "iframe" {
+        return Ok(how == "container");
+    }
+    let x = r.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = r.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let w = r.get("w").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let h = r.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if w < 2.0 || h < 2.0 {
+        return Ok(false); // widget iframe 尚未布局——下次迭代重试
+    }
+    browser
+        .command(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none" }),
+        )
+        .await?;
+    browser
+        .command(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1 }),
+        )
+        .await?;
+    browser
+        .command(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1 }),
+        )
+        .await?;
+    Ok(true)
+}
+
+/// 不支持的验证码类型检测（HTML 特征字符串；与 UNSUPPORTED_CAPTCHA_DETECT_JS 镜像——
+/// 供单测断言/预检）：reCAPTCHA（g-recaptcha/recaptcha/api.js）→ Some("reCAPTCHA")；
+/// hCaptcha（h-captcha/hcaptcha.com）→ Some("hCaptcha")；未命中 → None
+pub fn unsupported_captcha_kind(body: &str) -> Option<&'static str> {
+    let b = body.to_lowercase();
+    if b.contains("g-recaptcha") || b.contains("recaptcha/api.js") {
+        return Some("reCAPTCHA");
+    }
+    if b.contains("h-captcha") || b.contains("hcaptcha.com") || b.contains("/hcaptcha") {
+        return Some("hCaptcha");
+    }
+    None
 }
 
 /// cookie domain 是否匹配目标主机（含父域 `.example.com` 形式；裸后缀 com 等不匹配）
@@ -882,6 +1291,39 @@ mod tests {
         let vars = std::collections::HashMap::new();
         let r = crate::parser::js::eval_js(CF_CHALLENGE_STATE_JS, &vars);
         assert!(r.is_ok(), "质询状态 JS 应可执行");
+    }
+
+    #[test]
+    fn test_turnstile_js_constants_shape() {
+        // 冒烟：Turnstile 检测/点击/token 读取/stealth 注入 JS 均可被 boa 解析执行
+        // （无 DOM 环境——检测返回 false、点击返回 no-element、token 返回空串）
+        let vars = std::collections::HashMap::new();
+        for (name, js) in [
+            ("TURNSTILE_DETECT_JS", TURNSTILE_DETECT_JS),
+            ("TURNSTILE_CLICK_JS", TURNSTILE_CLICK_JS),
+            ("TURNSTILE_TOKEN_JS", TURNSTILE_TOKEN_JS),
+            ("UNSUPPORTED_CAPTCHA_DETECT_JS", UNSUPPORTED_CAPTCHA_DETECT_JS),
+            ("STEALTH_JS", STEALTH_JS),
+        ] {
+            let r = crate::parser::js::eval_js(js, &vars);
+            assert!(r.is_ok(), "{name} 应可被 boa 解析执行");
+        }
+    }
+
+    #[test]
+    fn test_unsupported_captcha_kind() {
+        // reCAPTCHA：g-recaptcha 容器 / recaptcha/api.js 脚本
+        assert_eq!(unsupported_captcha_kind("<div class=\"g-recaptcha\" data-sitekey=\"x\"></div>"), Some("reCAPTCHA"));
+        assert_eq!(unsupported_captcha_kind("<script src=\"https://www.google.com/recaptcha/api.js\"></script>"), Some("reCAPTCHA"));
+        // hCaptcha：h-captcha 容器 / hcaptcha.com iframe
+        assert_eq!(unsupported_captcha_kind("<div class=\"h-captcha\" data-sitekey=\"x\"></div>"), Some("hCaptcha"));
+        assert_eq!(unsupported_captcha_kind("<iframe src=\"https://hcaptcha.com/\"></iframe>"), Some("hCaptcha"));
+        // 大小写不敏感
+        assert_eq!(unsupported_captcha_kind("<DIV CLASS=\"G-RECAPTCHA\">"), Some("reCAPTCHA"));
+        // 未命中（Turnstile/普通页）→ None
+        assert_eq!(unsupported_captcha_kind("<div class=\"cf-turnstile\"></div>"), None);
+        assert_eq!(unsupported_captcha_kind("<html>hello</html>"), None);
+        assert_eq!(unsupported_captcha_kind(""), None);
     }
 
     #[test]

@@ -6,6 +6,14 @@
 //!   - `java.put(key, val)` / `java.get(key)`：bridge 生命周期内的临时变量
 //!   - `java.log(msg)`：tracing 日志
 //!   - `java.headerMap.put/get/size`：请求头 Map（eval 后经 `JsBridge::headers()` 读取）
+//!   - `java.encodeURI(str, charset)`：URL 百分号编码（gbk/gb2312/utf-8，encoding_rs）
+//!   - `java.ajax(urlOrSpec)`：带书源 cookie 的同步请求（支持 `url,{...}` 后缀），返回响应文本
+//!   - `java.startBrowserAwait(url, title, isForeground)`：内置浏览器加载页面并等待完成，
+//!     返回 `{body: html, cookies: ["name=value",...], status: 200}`（后端接入
+//!     `browser::solve_captcha`——CF 质询/Turnstile/滑块统一求解）
+//!   - `java.setContent(html)` / `java.getString(rule)` / `java.getElements(rule)`：
+//!     设置当前解析文档 + css_chain 规则求值（文本 / outerHTML 数组）
+//!   - `java.getWebViewUA()`：固定浏览器 UA（`JS_WEBVIEW_UA`）
 //!   - `source.getKey()`（书源 URL）/ `source.getName()`（书源名）
 //!   - `source.put(key, val)` / `source.get(key)`：书源级变量，全局共享、按书源 key
 //!     隔离（跨搜索/详情调用可见，底层为全局 `Mutex<HashMap>`）
@@ -18,13 +26,25 @@
 //! - JsValue::to_string(&mut Context) 即规范 ToString（数字/布尔按 String() 语义）
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use boa_engine::object::builtins::JsArray;
 use boa_engine::object::ObjectInitializer;
 use boa_engine::property::{Attribute, PropertyKey};
-use boa_engine::{Context, JsArgs, JsObject, JsResult, JsString, JsValue, NativeFunction, Source};
+use boa_engine::{
+    Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsString, JsValue, NativeFunction,
+    Source,
+};
 use serde_json::{Map as JsonMap, Value as JsonValue};
+
+/// `java.getWebViewUA()` 返回的固定浏览器 UA（与爬虫默认 UA 同系 Chrome 120 内核；
+/// 内置浏览器求解（solve_cf_challenge / 待落地的 solve_captcha）返回真实 UA 时
+/// 以浏览器为准，此常量作为 JS 侧固定参考值）
+pub const JS_WEBVIEW_UA: &str =
+    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36";
 
 /// source.put/get 书源级变量存储：全局共享（跨搜索/详情调用），
 /// 外层 key 为书源 key（URL），内层为该书源的变量表（书源间隔离）
@@ -48,10 +68,15 @@ struct JsBridgeInner {
     source_key: String,
     /// 书源名称，`source.getName()` 返回
     source_name: String,
+    /// 用户命名空间（书源 cookie 按用户隔离；空 = 无 cookie 上下文，
+    /// `java.ajax`/`java.startBrowserAwait` 不带书源 cookie）
+    ns: String,
     /// 请求头：`java.headerMap` 的底层存储（JS 可改写）
     headers: Mutex<HashMap<String, String>>,
     /// `java.put/get` 临时变量（本 bridge 生命周期内共享）
     java_vars: Mutex<HashMap<String, String>>,
+    /// `java.setContent` 设置的当前解析文档（`java.getString/getElements` 的解析源）
+    doc: Mutex<Option<String>>,
 }
 
 impl JsBridge {
@@ -61,10 +86,36 @@ impl JsBridge {
             inner: Arc::new(JsBridgeInner {
                 source_key: source_key.into(),
                 source_name: source_name.into(),
+                ns: String::new(),
                 headers: Mutex::new(HashMap::new()),
                 java_vars: Mutex::new(HashMap::new()),
+                doc: Mutex::new(None),
             }),
         }
+    }
+
+    /// 设置用户命名空间（书源 cookie 按用户隔离；搜索/详情流程传入当前用户 ns）
+    pub fn with_namespace(mut self, ns: impl Into<String>) -> Self {
+        // 先取出旧 inner 的可克隆状态，避免借用与赋值冲突
+        let source_key = self.inner.source_key.clone();
+        let source_name = self.inner.source_name.clone();
+        let headers = self.inner.headers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let java_vars = self.inner.java_vars.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let doc = self.inner.doc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        self.inner = Arc::new(JsBridgeInner {
+            source_key,
+            source_name,
+            ns: ns.into(),
+            headers: Mutex::new(headers),
+            java_vars: Mutex::new(java_vars),
+            doc: Mutex::new(doc),
+        });
+        self
+    }
+
+    /// 用户命名空间
+    pub fn ns(&self) -> &str {
+        &self.inner.ns
     }
 
     /// 书源 key（URL）
@@ -253,7 +304,8 @@ fn build_bridge_objects(bridge: &JsBridge, context: &mut Context) -> (JsObject, 
         .function(bind(bridge, header_map_size), JsString::from("size"), 0);
     let header_map = header_map.build();
 
-    // java：put/get（临时变量）、log（tracing）、headerMap（请求头）
+    // java：put/get（临时变量）、log（tracing）、headerMap（请求头）、
+    // encodeURI/ajax/startBrowserAwait/setContent/getString/getElements/getWebViewUA（legacy shim）
     let mut java = ObjectInitializer::new(context);
     java.function(bind(bridge, java_put), JsString::from("put"), 2)
         .function(bind(bridge, java_get), JsString::from("get"), 1)
@@ -262,6 +314,13 @@ fn build_bridge_objects(bridge: &JsBridge, context: &mut Context) -> (JsObject, 
         .function(bind(bridge, java_toast), JsString::from("longToast"), 1)
         .function(bind(bridge, java_toast), JsString::from("shortToast"), 1)
         .function(unsafe { NativeFunction::from_closure(java_aes_decrypt) }, JsString::from("aesBase64DecodeToString"), 4)
+        .function(bind(bridge, java_encode_uri), JsString::from("encodeURI"), 2)
+        .function(bind(bridge, java_ajax), JsString::from("ajax"), 2)
+        .function(bind(bridge, java_start_browser_await), JsString::from("startBrowserAwait"), 3)
+        .function(bind(bridge, java_set_content), JsString::from("setContent"), 1)
+        .function(bind(bridge, java_get_string), JsString::from("getString"), 1)
+        .function(bind(bridge, java_get_elements), JsString::from("getElements"), 1)
+        .function(bind(bridge, java_get_webview_ua), JsString::from("getWebViewUA"), 0)
         .property(JsString::from("headerMap"), header_map, Attribute::all());
     let java = java.build();
 
@@ -333,6 +392,397 @@ fn java_log(_inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> 
     let msg = js_value_to_string(args.get_or_undefined(0), context);
     tracing::info!(target: "reader.js", "[java.log] {}", msg);
     Ok(JsValue::undefined())
+}
+
+// ---- legacy shim：encodeURI / ajax / startBrowserAwait / setContent / getString / getElements / getWebViewUA ----
+
+/// 构造 JS 异常（NativeFunction 内 throw，书源规则可 catch）
+fn js_native_error(msg: impl Into<String>) -> JsError {
+    JsNativeError::error().with_message(msg.into()).into()
+}
+
+/// 同步等待异步任务结果（boa 引擎为同步调用环境；`java.ajax`/`java.startBrowserAwait`
+/// 需要等待网络/浏览器结果）。
+///
+/// 阻塞说明：书源 JS 通常在 tokio 工作线程（axum handler）中执行，本函数用专用
+/// worker 线程 + 独立 current_thread tokio runtime 执行异步任务，当前线程经
+/// std mpsc `recv_timeout` 阻塞等待（最多 `timeout`）。不在 ambient runtime 上直接
+/// spawn——避免 current_thread runtime（如 `#[tokio::test]`）下「阻塞唯一 worker →
+/// 任务永不被轮询」的死锁；阻塞仅限当前执行 JS 的线程，多线程 runtime 的其他
+/// worker 不受影响。
+fn block_on_task<T: Send + 'static>(
+    fut: impl Future<Output = Result<T>> + Send + 'static,
+    timeout: Duration,
+    what: &str,
+) -> Result<T> {
+    let what = what.to_string();
+    let what_msg = what.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<T>>();
+    std::thread::Builder::new()
+        .name(format!("reader-js-{what}"))
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow!("{what_msg} 内部 runtime 创建失败: {e}")));
+                    return;
+                }
+            };
+            let _ = tx.send(rt.block_on(fut));
+        })
+        .map_err(|e| anyhow!("{what} worker 线程创建失败: {e}"))?;
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(anyhow!("{what} 超时（{}s）", timeout.as_secs()))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("{what} worker 异常退出"))
+        }
+    }
+}
+
+/// 内置浏览器可用性（`java.startBrowserAwait` 前置检查；测试钩子可强制覆盖）
+fn js_browser_available() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        match JS_BROWSER_AVAIL_OVERRIDE.load(Ordering::Relaxed) {
+            1 => return true,
+            -1 => return false,
+            _ => {}
+        }
+    }
+    crate::service::browser::is_browser_available()
+}
+
+/// 测试钩子：强制浏览器可用性（Some(true)/Some(false) 强制；None 恢复自动探测）
+#[cfg(test)]
+fn force_js_browser_available(v: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    JS_BROWSER_AVAIL_OVERRIDE.store(
+        match v {
+            Some(true) => 1,
+            Some(false) => -1,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+static JS_BROWSER_AVAIL_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(0);
+
+/// 测试注入：页面求解钩子（返回 (html, cookies, ua)）；None = 走真实浏览器
+#[cfg(test)]
+type SolveHook = dyn Fn(String, Vec<(String, String)>) -> Result<(String, Vec<(String, String)>, String)>
+    + Send
+    + Sync;
+
+#[cfg(test)]
+static JS_SOLVE_HOOK: LazyLock<Mutex<Option<Arc<SolveHook>>>> = LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+fn register_js_solve_hook(hook: Option<Arc<SolveHook>>) {
+    *JS_SOLVE_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
+/// 页面求解（`java.startBrowserAwait` 后端）：带书源 cookie 启动内置浏览器加载页面并
+/// 等待加载完成，返回 (html, cookies, user_agent)。
+///
+/// 接入 `browser::solve_captcha`（统一验证码求解入口：CF JS 质询 / Turnstile / 滑块
+/// 自动处理；进程内 CDP，会话级浏览器实例惰性启动/复用/异常自动重启）。
+async fn solve_page(
+    url: String,
+    cookies: Vec<(String, String)>,
+    _title: String,
+) -> Result<(String, Vec<(String, String)>, String)> {
+    #[cfg(test)]
+    {
+        let hook = JS_SOLVE_HOOK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(hook) = hook {
+            return hook(url, cookies);
+        }
+        // 测试环境：未注册求解钩子时直接报错——禁止测试路径启动真实浏览器
+        return Err(anyhow!("测试环境未注册页面求解钩子（不会启动真实浏览器）"));
+    }
+    #[cfg(not(test))]
+    {
+        let sol = crate::service::browser::solve_captcha(&url, &cookies, 60_000)
+            .await
+            .map_err(|e| anyhow!("浏览器加载失败（{url}）: {e:#}"))?;
+        return Ok((sol.html, sol.cookies, sol.user_agent));
+    }
+}
+
+/// `java.startBrowserAwait(url, title, isForeground)`：内置浏览器打开 url（vUrl 已含
+/// query）并等待加载完成，返回 JS 对象 `{body: 页面 html, cookies: ["name=value",...],
+/// status: 200}`（boa 对象构造）。
+/// - 带书源既有 cookie（按用户命名空间 + url base 匹配，与 crawler 一致）
+/// - headless 环境无前台概念，isForeground 仅兼容占位
+/// - 浏览器不可用 / 加载失败 / 超时（60s）→ 抛 JS 异常（书源规则可 catch）
+fn java_start_browser_await(
+    inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let url = js_value_to_string(args.get_or_undefined(0), context);
+    let title = js_value_to_string(args.get_or_undefined(1), context);
+    let _is_foreground = args.get_or_undefined(2).to_boolean();
+    if url.is_empty() {
+        return Err(js_native_error("java.startBrowserAwait: url 不能为空"));
+    }
+    if !js_browser_available() {
+        return Err(js_native_error(format!(
+            "java.startBrowserAwait 失败：未检测到 Chrome/Edge 浏览器（内置浏览器不可用）——请安装 Edge/Chrome 或设置 READER_CHROME_PATH（或配置 FLARESOLVERR_URL 走 FlareSolverr 路径）"
+        )));
+    }
+    let ns = inner.ns.clone();
+    let fut_url = url.clone();
+    let fut = async move {
+        // 书源既有 cookie（按用户命名空间；无注册/未命中 → 空）
+        let cookie_str =
+            crate::service::crawler::cookie_for(&ns, &fut_url).await.unwrap_or_default();
+        let cookies = crate::service::crawler::parse_cookie_string(&cookie_str);
+        solve_page(fut_url, cookies, title).await
+    };
+    let (html, cookies, _user_agent) =
+        match block_on_task(fut, Duration::from_secs(60), "java.startBrowserAwait") {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(js_native_error(format!(
+                    "java.startBrowserAwait 失败（{url}）: {e}"
+                )))
+            }
+        };
+    // JS 对象：{body: html, cookies: ["a=1", ...], status: 200}（先构造数组再建对象，
+    // 避免 ObjectInitializer 与 from_iter 同时可变借用 context）
+    let cookies_arr = JsArray::from_iter(
+        cookies
+            .into_iter()
+            .map(|(k, v)| JsValue::from(JsString::from(format!("{k}={v}")))),
+        context,
+    );
+    let mut obj = ObjectInitializer::new(context);
+    obj.property(
+        JsString::from("body"),
+        JsValue::from(JsString::from(html)),
+        Attribute::all(),
+    )
+    .property(JsString::from("cookies"), cookies_arr, Attribute::all())
+    .property(JsString::from("status"), JsValue::from(200), Attribute::all());
+    Ok(obj.build().into())
+}
+
+/// `java.encodeURI(str, charset)`：按 charset（默认 utf-8；gbk/gb2312 走 encoding_rs）
+/// 对字符串做 URL 百分号编码。encodeURI 语义：ASCII 字母数字与 `-_.!~*'()` 及
+/// `;/?:@&=+$,#` 保留不编码；其余字节逐个 `%XX`（大写）。
+fn java_encode_uri(_inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let s = js_value_to_string(args.get_or_undefined(0), context);
+    let charset = args
+        .get(1)
+        .map(|v| js_value_to_string(v, context))
+        .unwrap_or_default();
+    let encoding =
+        encoding_rs::Encoding::for_label(charset.trim().as_bytes()).unwrap_or(encoding_rs::UTF_8);
+    let (bytes, _, _) = encoding.encode(&s);
+    Ok(JsValue::from(JsString::from(percent_encode_uri(&bytes))))
+}
+
+/// encodeURI 语义百分号编码（保留 unreserved + `;/?:@&=+$,#`）
+fn percent_encode_uri(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_'
+                    | b'.'
+                    | b'!'
+                    | b'~'
+                    | b'*'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b','
+                    | b';'
+                    | b'/'
+                    | b'?'
+                    | b':'
+                    | b'@'
+                    | b'&'
+                    | b'='
+                    | b'+'
+                    | b'$'
+                    | b'#'
+            )
+        {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// `url,{...}` 后缀（同 crawler/search 解析：method/body/charset/headers）
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AjaxSuffix {
+    method: Option<String>,
+    body: Option<String>,
+    charset: Option<String>,
+    headers: Option<HashMap<String, String>>,
+}
+
+/// 切分 `url,{...}` 后缀：从最后一个「逗号后整段为合法 JSON」的位置切分
+/// （对齐 search::split_url_suffix）
+fn parse_ajax_suffix(url: &str) -> (String, AjaxSuffix) {
+    let mut split: Option<(usize, AjaxSuffix)> = None;
+    for (i, ch) in url.char_indices() {
+        if ch != ',' {
+            continue;
+        }
+        let rest = url[i + 1..].trim_start();
+        if !rest.starts_with('{') {
+            continue;
+        }
+        if let Ok(suffix) = serde_json::from_str::<AjaxSuffix>(rest) {
+            split = Some((i, suffix));
+        }
+    }
+    match split {
+        Some((i, suffix)) => (url[..i].to_string(), suffix),
+        None => (url.to_string(), AjaxSuffix::default()),
+    }
+}
+
+/// `java.ajax(urlOrSpec)`：带书源 cookie 的同步请求（阻塞等待结果），返回响应体文本。
+/// - 支持 `url,{...}` 后缀（method/body/charset/headers，同 crawler 解析）
+/// - 请求头基底为 `java.headerMap`（书源 header）+ 后缀 headers + 书源 cookie
+/// - 可选第 2 参：超时秒数（legado callTimeout 兼容；默认 15s，上限 60s）
+/// - 失败/超时 → 抛 JS 异常
+fn java_ajax(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let url_spec = js_value_to_string(args.get_or_undefined(0), context);
+    let timeout_secs = args
+        .get(1)
+        .and_then(|v| v.as_number())
+        .map(|n| (n as u64).clamp(1, 60))
+        .unwrap_or(15);
+    let (url, suffix) = parse_ajax_suffix(&url_spec);
+    if url.is_empty() {
+        return Err(js_native_error("java.ajax: url 不能为空"));
+    }
+    let ns = inner.ns.clone();
+    // 请求头基底：java.headerMap（书源 header，JS 可改写）——async 块前克隆（'static）
+    let headers_base = inner.headers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let fut_url = url.clone();
+    let fut = async move {
+        let mut headers = headers_base;
+        if let Some(extra) = &suffix.headers {
+            for (k, v) in extra {
+                headers.insert(k.clone(), v.clone());
+            }
+        }
+        // 书源 cookie（按用户命名空间；无注册/未命中 → 不带）
+        if let Some(cookie_str) = crate::service::crawler::cookie_for(&ns, &fut_url).await {
+            if !cookie_str.is_empty() {
+                headers.insert("Cookie".to_string(), cookie_str);
+            }
+        }
+        let method = suffix.method.as_deref().unwrap_or("GET");
+        let resp = crate::service::crawler::fetch(
+            &fut_url,
+            &headers,
+            timeout_secs,
+            method,
+            suffix.body.as_deref(),
+            suffix.charset.as_deref(),
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(resp.body)
+    };
+    let body = match block_on_task(fut, Duration::from_secs(60), "java.ajax") {
+        Ok(b) => b,
+        Err(e) => return Err(js_native_error(format!("java.ajax 失败（{url}）: {e}"))),
+    };
+    Ok(JsValue::from(JsString::from(body)))
+}
+
+/// `java.setContent(html)`：设置当前解析文档（后续 getString/getElements 的解析源）
+fn java_set_content(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let html = js_value_to_string(args.get_or_undefined(0), context);
+    *inner.doc.lock().unwrap_or_else(|e| e.into_inner()) = Some(html);
+    Ok(JsValue::undefined())
+}
+
+/// 当前文档（未 setContent → 明确错误提示）
+fn current_doc(inner: &JsBridgeInner) -> JsResult<String> {
+    inner
+        .doc
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or_else(|| js_native_error("尚未设置文档内容：请先调用 java.setContent(html)"))
+}
+
+/// 规则末段是否为属性/文本提取器（与 css_chain::is_attr_extractor 对齐）
+fn rule_ends_with_extractor(rule: &str) -> bool {
+    rule.split('@')
+        .last()
+        .map(|s| {
+            matches!(
+                s.trim(),
+                "text" | "textNodes" | "ownText" | "html" | "all" | "href" | "src" | "value"
+                    | "data-src" | "data-original" | "data-url"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// `java.getString(rule)`：对已存文档用 css_chain 规则求值，返回首个结果文本。
+/// 规则末段是 `@text/@href` 等提取器时返回提取值；否则结果是元素 outerHTML，
+/// 转文本（对齐 legado getString 的 getText 语义）；无匹配返回空串。
+fn java_get_string(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let rule = js_value_to_string(args.get_or_undefined(0), context);
+    let doc = current_doc(inner)?;
+    let results = crate::parser::css_chain::css_chain(&rule, &doc);
+    let text = match results.first() {
+        Some(first) => {
+            if rule_ends_with_extractor(&rule) {
+                first.clone()
+            } else {
+                // 元素 HTML → 文本（对齐 search::field 语义）
+                let f = scraper::Html::parse_fragment(first);
+                let t = f.root_element().text().collect::<String>().trim().to_string();
+                if t.is_empty() { first.clone() } else { t }
+            }
+        }
+        None => String::new(),
+    };
+    Ok(JsValue::from(JsString::from(text)))
+}
+
+/// `java.getElements(rule)`：对已存文档用 css_chain 规则求值，返回匹配元素
+/// outerHTML 的 JS 数组（规则带 `@` 提取器时返回提取值列表）
+fn java_get_elements(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let rule = js_value_to_string(args.get_or_undefined(0), context);
+    let doc = current_doc(inner)?;
+    let results = crate::parser::css_chain::css_chain(&rule, &doc);
+    let arr = JsArray::from_iter(
+        results.into_iter().map(|s| JsValue::from(JsString::from(s))),
+        context,
+    );
+    Ok(arr.into())
+}
+
+/// `java.getWebViewUA()`：固定浏览器 UA（见 `JS_WEBVIEW_UA`）
+fn java_get_webview_ua(
+    _inner: &JsBridgeInner,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsString::from(JS_WEBVIEW_UA)))
 }
 
 // ---- java.headerMap.* 实现（请求头 Map）----
@@ -779,6 +1229,294 @@ mod tests {
             .eval(boa_engine::Source::from_bytes(b"while(true){}".as_slice()))
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("loop iteration limit"));
+    }
+
+    // ---- legacy shim：java.encodeURI ----
+
+    #[test]
+    fn bridge_java_encode_uri_gbk_and_utf8() {
+        let bridge = JsBridge::new("", "");
+        let v = vars(&[]);
+        // GBK：中文 → GBK 字节百分号编码（中=D6D0 文=CEC4）
+        assert_eq!(
+            eval_js_with_bridge("java.encodeURI('中文', 'GBK')", &v, &bridge).unwrap(),
+            "%D6%D0%CE%C4"
+        );
+        // gb2312 别名等价
+        assert_eq!(
+            eval_js_with_bridge("java.encodeURI('中文', 'gb2312')", &v, &bridge).unwrap(),
+            "%D6%D0%CE%C4"
+        );
+        // 默认 utf-8：中=E4B8AD 文=E69687
+        assert_eq!(
+            eval_js_with_bridge("java.encodeURI('中文')", &v, &bridge).unwrap(),
+            "%E4%B8%AD%E6%96%87"
+        );
+        // 显式 utf-8 与空 charset 均回退默认
+        assert_eq!(
+            eval_js_with_bridge("java.encodeURI('中', 'utf-8')", &v, &bridge).unwrap(),
+            "%E4%B8%AD"
+        );
+        assert_eq!(
+            eval_js_with_bridge("java.encodeURI('中', '')", &v, &bridge).unwrap(),
+            "%E4%B8%AD"
+        );
+        // encodeURI 语义：ASCII 字母数字与保留集不编码；空格 → %20
+        assert_eq!(
+            eval_js_with_bridge("java.encodeURI(\"a b-c_.!~*'()/?:@&=+$,#\")", &v, &bridge).unwrap(),
+            "a%20b-c_.!~*'()/?:@&=+$,#"
+        );
+    }
+
+    // ---- legacy shim：java.setContent / getString / getElements ----
+
+    #[test]
+    fn bridge_java_set_content_get_string() {
+        let bridge = JsBridge::new("", "");
+        let v = vars(&[]);
+        let html = r#"<div class="book"><h2>书名A</h2><a href="/b/1">详情</a></div><div class="book"><h2>书名B</h2></div>"#;
+        let js_html = serde_json::to_string(html).unwrap();
+        // @text 提取器
+        assert_eq!(
+            eval_js_with_bridge(
+                &format!("java.setContent({js_html}); java.getString('div.book@h2@text')"),
+                &v,
+                &bridge
+            )
+            .unwrap(),
+            "书名A"
+        );
+        // 无 @ 提取器的选择器规则：元素 HTML → 文本
+        assert_eq!(
+            eval_js_with_bridge(
+                &format!("java.setContent({js_html}); java.getString('div.book@h2')"),
+                &v,
+                &bridge
+            )
+            .unwrap(),
+            "书名A"
+        );
+        // 索引选择器（.1 → 第 2 个）
+        assert_eq!(
+            eval_js_with_bridge(
+                &format!("java.setContent({js_html}); java.getString('div.book.1@h2@text')"),
+                &v,
+                &bridge
+            )
+            .unwrap(),
+            "书名B"
+        );
+        // 无匹配 → 空串
+        assert_eq!(
+            eval_js_with_bridge(
+                &format!("java.setContent({js_html}); java.getString('div.none@h2@text')"),
+                &v,
+                &bridge
+            )
+            .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn bridge_java_get_elements_returns_outer_html_array() {
+        let bridge = JsBridge::new("", "");
+        let html = r#"<div class="book"><h2>书名A</h2></div><div class="book"><h2>书名B</h2></div>"#;
+        let js_html = serde_json::to_string(html).unwrap();
+        let json = eval_js_json_with_bridge(
+            &format!("java.setContent({js_html}); java.getElements('div.book')"),
+            &vars(&[]),
+            &bridge,
+        )
+        .unwrap();
+        let arr = json.as_array().expect("getElements 应返回数组");
+        assert_eq!(arr.len(), 2, "应匹配 2 个 div.book");
+        assert!(
+            arr[0].as_str().unwrap().contains("<div class=\"book\"><h2>书名A</h2></div>"),
+            "元素应返回 outerHTML: {}",
+            arr[0]
+        );
+        assert!(arr[1].as_str().unwrap().contains("书名B"));
+    }
+
+    #[test]
+    fn bridge_java_doc_requires_set_content() {
+        let bridge = JsBridge::new("", "");
+        let v = vars(&[]);
+        let err = eval_js_with_bridge("java.getString('div@text')", &v, &bridge).unwrap_err();
+        assert!(
+            err.to_string().contains("setContent"),
+            "应提示先调用 setContent: {err}"
+        );
+        let err = eval_js_with_bridge("java.getElements('div')", &v, &bridge).unwrap_err();
+        assert!(err.to_string().contains("setContent"), "{err}");
+    }
+
+    #[test]
+    fn bridge_java_get_webview_ua() {
+        let bridge = JsBridge::new("", "");
+        let ua = eval_js_with_bridge("java.getWebViewUA()", &vars(&[]), &bridge).unwrap();
+        assert_eq!(ua, JS_WEBVIEW_UA);
+        assert!(ua.contains("Chrome/120"), "UA 应含 Chrome 标识: {ua}");
+    }
+
+    // ---- legacy shim：java.startBrowserAwait（缺浏览器明确报错 / 成功路径 / 求解失败）----
+
+    /// startBrowserAwait 测试串行化（全局求解钩子/浏览器可用性覆盖为共享状态，
+    /// 并行测试会互相踩踏——见 solve_error_propagates 钩子泄漏到 returns_js_object）
+    static SOLVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 浏览器不可用：返回明确错误（不启动浏览器、不发请求）
+    #[test]
+    fn bridge_java_start_browser_await_browser_unavailable() {
+        let _guard = SOLVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        force_js_browser_available(Some(false));
+        let bridge = JsBridge::new("https://src.test", "源").with_namespace("default");
+        let err = eval_js_with_bridge(
+            "java.startBrowserAwait('https://a.test/book/1', '标题', true)",
+            &vars(&[]),
+            &bridge,
+        )
+        .unwrap_err();
+        force_js_browser_available(None);
+        assert!(
+            err.to_string().contains("浏览器"),
+            "应提示浏览器不可用: {err}"
+        );
+    }
+
+    /// 成功路径（求解钩子注入）：返回 {body, cookies, status} JS 对象
+    #[test]
+    fn bridge_java_start_browser_await_returns_js_object() {
+        let _guard = SOLVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        force_js_browser_available(Some(true));
+        register_js_solve_hook(Some(Arc::new(|url, cookies| {
+            assert_eq!(url, "https://a.test/book/1?q=1");
+            assert!(cookies.is_empty(), "无 cookie 存储时应为空");
+            Ok((
+                "<html><body>hello-page</body></html>".to_string(),
+                vec![
+                    ("cf_clearance".to_string(), "xyz".to_string()),
+                    ("sid".to_string(), "1".to_string()),
+                ],
+                "Mozilla/5.0 test UA".to_string(),
+            ))
+        })));
+        let bridge = JsBridge::new("https://src.test", "源").with_namespace("default");
+        let r = eval_js_with_bridge(
+            "var w = java.startBrowserAwait('https://a.test/book/1?q=1', '标题', false); w.body + '|' + w.status + '|' + w.cookies.length + '|' + w.cookies[0]",
+            &vars(&[]),
+            &bridge,
+        );
+        register_js_solve_hook(None);
+        force_js_browser_available(None);
+        assert_eq!(
+            r.unwrap(),
+            "<html><body>hello-page</body></html>|200|2|cf_clearance=xyz"
+        );
+    }
+
+    /// 求解失败：错误信息透传（含 url 上下文）
+    #[test]
+    fn bridge_java_start_browser_await_solve_error_propagates() {
+        let _guard = SOLVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        force_js_browser_available(Some(true));
+        register_js_solve_hook(Some(Arc::new(|_, _| Err(anyhow!("模拟浏览器求解失败")))));
+        let bridge = JsBridge::new("", "").with_namespace("default");
+        let err = eval_js_with_bridge(
+            "java.startBrowserAwait('https://a.test/x', 't', true)",
+            &vars(&[]),
+            &bridge,
+        )
+        .unwrap_err();
+        register_js_solve_hook(None);
+        force_js_browser_available(None);
+        assert!(
+            err.to_string().contains("模拟浏览器求解失败"),
+            "求解错误应透传: {err}"
+        );
+    }
+
+    // ---- legacy shim：java.ajax（本地 HTTP 服务器端到端）----
+
+    /// 微型 HTTP 服务器：返回固定响应体；捕获收到的请求（方法/路径/body）
+    async fn serve_echo(
+        body: Vec<u8>,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..10 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                captured.lock().unwrap().push(req);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let mut resp = head.into_bytes();
+                resp.extend_from_slice(&body);
+                let _ = sock.write_all(&resp).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn bridge_java_ajax_get_returns_body() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let url = rt.block_on(serve_echo(b"hello-ajax".to_vec(), captured.clone()));
+        let bridge = JsBridge::new("", "").with_namespace("default");
+        let r = eval_js_with_bridge(
+            &format!("java.ajax('{url}/x?a=1')"),
+            &vars(&[]),
+            &bridge,
+        );
+        assert_eq!(r.unwrap(), "hello-ajax");
+        // 无 cookie 存储注册：请求不应带 Cookie 头
+        let req = captured.lock().unwrap()[0].to_lowercase();
+        assert!(!req.contains("cookie:"), "不应带 Cookie 头: {req}");
+    }
+
+    #[test]
+    fn bridge_java_ajax_post_suffix_gbk() {
+        // POST + `,{...}` 后缀（method/body/charset）：GBK 字节响应正确解码
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let gbk = {
+            let (bytes, _, _) = encoding_rs::GBK.encode("中文响应");
+            bytes.into_owned()
+        };
+        let url = rt.block_on(serve_echo(gbk, captured.clone()));
+        let bridge = JsBridge::new("", "").with_namespace("default");
+        let code = format!("java.ajax('{url}/p,{{\"method\":\"POST\",\"body\":\"k=v\",\"charset\":\"GBK\"}}')");
+        let r = eval_js_with_bridge(&code, &vars(&[]), &bridge);
+        assert_eq!(r.unwrap(), "中文响应", "GBK 响应应按 charset 解码");
+        let req = captured.lock().unwrap()[0].clone();
+        assert!(req.starts_with("POST /p"), "应 POST 到 /p: {req}");
+        assert!(req.contains("k=v"), "应携带 body: {req}");
+    }
+
+    /// 连接失败：明确报错（抛 JS 异常）
+    #[test]
+    fn bridge_java_ajax_error_propagates() {
+        let bridge = JsBridge::new("", "").with_namespace("default");
+        // 127.0.0.1:1 大概率无服务 → 快速连接失败
+        let err = eval_js_with_bridge(
+            "java.ajax('http://127.0.0.1:1/nope')",
+            &vars(&[]),
+            &bridge,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("java.ajax 失败"),
+            "应报 ajax 失败: {err}"
+        );
     }
 }
 

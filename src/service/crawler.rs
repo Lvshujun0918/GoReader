@@ -232,24 +232,59 @@ async fn http_fetch(
     // ② 直连
     let resp = fetch(url, &req_headers, timeout_secs, method, body, charset).await?;
 
-    // ③ CF 质询检测（503 + 特征 HTML）→ 解质询降级链：FlareSolverr（配置了 URL）→
-    //    内置浏览器（进程内 CDP，见 solve_cf_builtin）
+    // ③ CF 质询检测（503/403 + 特征 HTML）→ 解质询降级链：FlareSolverr（配置了 URL）→
+    //    内置浏览器（进程内 CDP，含 Turnstile 分支）→ 求解成功 cookie 合并存库后
+    //    **重试原请求**（原 method/body/headers + 新 cookie——POST 场景关键：浏览器求解
+    //    只会 GET 首页，重试才能让 POST（如 69shuba search.php 搜索）拿到真实结果）；
+    //    重试仍质询/失败 → 用求解结果（浏览器 HTML）兜底返回
     if is_cloudflare_challenge(resp.status, &resp.body) {
-        if let Some(fs) = flaresolverr_request(url, &cookie, method, body, timeout_secs).await? {
-            // FS 解成功：cookie 与用户原 cookie 按 name 合并后存库（按用户）+ UA 记录；
-            // 响应用 FS 返回的最终 URL/状态（CF 重定向后）
-            let fs_pairs: Vec<(String, String)> =
-                fs.cookies.iter().map(|c| (c.name.clone(), c.value.clone())).collect();
-            store_solution_session(ns, url, &cookie, &fs_pairs, &fs.user_agent).await;
-            return Ok(FetchResponse {
-                body: fs.response,
-                url: if fs.url.is_empty() { url.to_string() } else { fs.url },
-                headers: Vec::new(),
-                status: fs.status,
-            });
+        // 求解：返回兜底响应 + 合并后 cookie 串（内存直传重试——不依赖 storage 注册状态/
+        // 并发覆盖）+ 浏览器 UA
+        let (fallback, merged_cookie, solved_ua) =
+            if let Some(fs) = flaresolverr_request(url, &cookie, method, body, timeout_secs).await? {
+                // FS 解成功：cookie 与用户原 cookie 按 name 合并后存库（按用户）+ UA 记录
+                let fs_pairs: Vec<(String, String)> =
+                    fs.cookies.iter().map(|c| (c.name.clone(), c.value.clone())).collect();
+                let merged = store_solution_session(ns, url, &cookie, &fs_pairs, &fs.user_agent, None).await;
+                (
+                    FetchResponse {
+                        body: fs.response,
+                        url: if fs.url.is_empty() { url.to_string() } else { fs.url },
+                        headers: Vec::new(),
+                        status: fs.status,
+                    },
+                    merged,
+                    fs.user_agent,
+                )
+            } else {
+                // 未配置 FLARESOLVERR_URL → 内置浏览器求解（进程内 CDP，不依赖外部容器）
+                solve_cf_builtin(ns, url, &cookie).await?
+            };
+
+        // ④ 重试原请求（原 method/body/headers + 求解后的 cookie——POST 场景关键：
+        //    浏览器求解只会 GET 首页，重试才能让 POST（如 69shuba search.php）拿到真实
+        //    结果）：优先用内存中的合并 cookie（含 cf_clearance）；无合并结果时回退读库
+        let mut retry_cookie = merged_cookie.clone().unwrap_or_default();
+        if retry_cookie.is_empty() {
+            retry_cookie = session_for(ns, url).await.unwrap_or_default().0;
         }
-        // 未配置 FLARESOLVERR_URL → 内置浏览器求解（进程内 CDP，不依赖外部容器）
-        return solve_cf_builtin(ns, url, &cookie).await;
+        let mut retry_headers = headers.clone();
+        if !retry_cookie.is_empty() {
+            retry_headers.insert("Cookie".to_string(), retry_cookie);
+        }
+        if !solved_ua.is_empty()
+            && !retry_headers.contains_key("User-Agent")
+            && !retry_headers.contains_key("user-agent")
+        {
+            retry_headers.insert("User-Agent".to_string(), solved_ua);
+        }
+        if let Ok(retry) = fetch(url, &retry_headers, timeout_secs, method, body, charset).await {
+            if !is_cloudflare_challenge(retry.status, &retry.body) {
+                return Ok(retry); // 重试拿到真实内容（GET/POST 通用）
+            }
+            // 重试仍命中质询（cf_clearance 未生效/新质询）→ 兜底用求解结果
+        }
+        return Ok(fallback);
     }
     Ok(resp)
 }
@@ -276,9 +311,9 @@ async fn resolve_source_url(ns: &str, url: &str) -> Option<String> {
 
 // ==================== Cloudflare 质询检测 ====================
 
-/// Cloudflare 质询特征检测（503 + HTML 特征；未命中返回 false——零开销直连）
+/// Cloudflare 质询特征检测（503/403 + HTML 特征；未命中返回 false——零开销直连）
 pub fn is_cloudflare_challenge(status: u16, body: &str) -> bool {
-    if status != 503 {
+    if status != 503 && status != 403 {
         return false;
     }
     let body = body.to_lowercase();
@@ -290,6 +325,11 @@ pub fn is_cloudflare_challenge(status: u16, body: &str) -> bool {
         "just a moment",
         "cf_chl_opt",
         "challenge-running",
+        // Turnstile 验证码特征（challenges.cloudflare.com/turnstile 资源、.cf-turnstile
+        // 容器、turnstile/api.js 脚本）
+        "challenges.cloudflare.com/turnstile",
+        "cf-turnstile",
+        "turnstile/api.js",
     ]
     .iter()
     .any(|m| body.contains(m))
@@ -445,7 +485,12 @@ static CF_BROWSER_AVAIL_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomi
 /// - 浏览器不可用 → 明确错误（提示安装 Edge/Chrome 或配置 FLARESOLVERR_URL）
 /// - 成功：solution.html 作为响应正文；cookies 与用户 cookie 按 name 合并后存库（按用户）
 ///   + 浏览器 UA 记录（与 cf_clearance 绑定）
-async fn solve_cf_builtin(ns: &str, url: &str, user_cookie: &str) -> Result<FetchResponse> {
+/// 返回 (兜底响应, 合并后 cookie 串（含 turnstile_token 伪 cookie——重试直接用）, 浏览器 UA)
+async fn solve_cf_builtin(
+    ns: &str,
+    url: &str,
+    user_cookie: &str,
+) -> Result<(FetchResponse, Option<String>, String)> {
     if !cf_browser_available() {
         return Err(anyhow!("CF 质询需浏览器环境：安装 Edge/Chrome 或配置 FLARESOLVERR_URL"));
     }
@@ -453,49 +498,75 @@ async fn solve_cf_builtin(ns: &str, url: &str, user_cookie: &str) -> Result<Fetc
     let solution = crate::service::browser::solve_cf_challenge(url, &cookies, CF_SOLVE_MAX_WAIT_MS)
         .await
         .map_err(|e| anyhow!("内置浏览器解 CF 质询失败（{url}）: {e:#}"))?;
-    store_solution_session(ns, url, user_cookie, &solution.cookies, &solution.user_agent).await;
-    Ok(FetchResponse {
-        body: solution.html,
-        url: url.to_string(),
-        headers: Vec::new(),
-        status: 200,
-    })
+    let merged = store_solution_session(
+        ns,
+        url,
+        user_cookie,
+        &solution.cookies,
+        &solution.user_agent,
+        solution.turnstile_token.as_deref(),
+    )
+    .await;
+    Ok((
+        FetchResponse {
+            body: solution.html,
+            url: url.to_string(),
+            headers: Vec::new(),
+            status: 200,
+        },
+        merged,
+        solution.user_agent,
+    ))
 }
 
-/// 解质询成功后持久化（按用户）：cookies 与用户原 cookie 按 name 合并存库 + UA 记录。
-/// 两者都为空时跳过（无新信息）；存储失败仅告警（不影响本次响应）。
+/// 解质询成功后持久化（按用户）：cookies 与用户原 cookie 按 name 合并存库 + UA 记录 +
+/// Turnstile token 随 cookie 串存（书源级按用户）。返回合并后的 cookie 串
+/// （Some——调用方重试原请求直接用；None = 无新信息）。存储失败仅告警（不影响响应）。
 async fn store_solution_session(
     ns: &str,
     url: &str,
     user_cookie: &str,
     solution_cookies: &[(String, String)],
     user_agent: &str,
-) {
-    if solution_cookies.is_empty() && user_agent.is_empty() {
-        return;
+    turnstile_token: Option<&str>,
+) -> Option<String> {
+    if solution_cookies.is_empty() && user_agent.is_empty() && turnstile_token.is_none() {
+        return None;
     }
-    let storage_opt: Option<crate::storage::Storage> =
-        COOKIE_STORAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let Some(storage) = storage_opt else { return };
-    let Some(su) = resolve_source_url(ns, url).await else { return };
     let fs_cookies: Vec<FsCookie> = solution_cookies
         .iter()
         .map(|(n, v)| FsCookie { name: n.clone(), value: v.clone(), domain: None, path: None })
         .collect();
-    let merged = merge_fs_cookies(user_cookie, &fs_cookies);
-    if !merged.is_empty() {
-        let _ = storage.set_cookie(ns, &su, &merged).await;
+    let mut merged = merge_fs_cookies(user_cookie, &fs_cookies);
+    // Turnstile token 随 cookie 串存库（书源级按用户）——选择随 cookie 串而非新增表列：
+    // book_source_cookies 已按 (user_namespace, source_url) 隔离，伪 cookie 名
+    // cf_turnstile_token 不会与真实 cookie 冲突（服务端忽略未知 cookie）；token 短时效
+    // （约 5 分钟、单次有效）主要作求解记录，下次求解按 name 覆盖刷新。
+    if let Some(token) = turnstile_token.filter(|t| !t.trim().is_empty()) {
+        merged = merge_turnstile_token(&merged, token);
     }
-    // UA 与库中不同则一并记录（部分站点 UA 绑定 cookie）
-    if !user_agent.is_empty() {
-        let need_update = match storage.get_source_session(ns, &su).await {
-            Ok(Some((_, old_ua))) => old_ua != user_agent,
-            _ => true,
-        };
-        if need_update {
-            let _ = storage.set_cookie_user_agent(ns, &su, user_agent).await;
+    // 注意：先解引用再 clone 出 Storage（句柄 Clone 廉价）——MutexGuard 不能跨 await 存活
+    // （非 Send——router 的 tokio::spawn 会因此编译失败）
+    let storage_opt: Option<crate::storage::Storage> =
+        COOKIE_STORAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(storage) = storage_opt {
+        if let Some(su) = resolve_source_url(ns, url).await {
+            if !merged.is_empty() {
+                let _ = storage.set_cookie(ns, &su, &merged).await;
+            }
+            // UA 与库中不同则一并记录（部分站点 UA 绑定 cookie）
+            if !user_agent.is_empty() {
+                let need_update = match storage.get_source_session(ns, &su).await {
+                    Ok(Some((_, old_ua))) => old_ua != user_agent,
+                    _ => true,
+                };
+                if need_update {
+                    let _ = storage.set_cookie_user_agent(ns, &su, user_agent).await;
+                }
+            }
         }
     }
+    Some(merged)
 }
 
 // ==================== cookie 工具（合并策略见下） ====================
@@ -545,6 +616,21 @@ pub fn merge_fs_cookies(user_cookie: &str, fs_cookies: &[FsCookie]) -> String {
     order
         .into_iter()
         .filter_map(|k| map.get(&k).map(|v| format!("{k}={v}")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// 将 Turnstile token 作为伪 cookie（cf_turnstile_token）并入 cookie 串：
+/// 同名（上次求解残留）按 name 覆盖——token 单次有效，新求解必然刷新。
+pub fn merge_turnstile_token(cookie_str: &str, token: &str) -> String {
+    let mut pairs: Vec<(String, String)> = parse_cookie_string(cookie_str)
+        .into_iter()
+        .filter(|(k, _)| k != "cf_turnstile_token")
+        .collect();
+    pairs.push(("cf_turnstile_token".to_string(), token.to_string()));
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -617,7 +703,16 @@ mod tests {
             "<html>Just a moment...<script src=\"/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1\"></script>"
         ));
         assert!(is_cloudflare_challenge(503, "__cf_chl_opt_tKb6Qe=...; cf-browser-gesture"));
-        // 非 503 → false（即使含特征）
+        // 403 + 特征（69shuba 等强质询）→ true
+        assert!(is_cloudflare_challenge(403, "<title>Just a moment...</title> challenge-platform"));
+        // Turnstile 特征（challenges.cloudflare.com/turnstile、cf-turnstile、turnstile/api.js）
+        assert!(is_cloudflare_challenge(
+            503,
+            "<script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script>"
+        ));
+        assert!(is_cloudflare_challenge(503, "<div class=\"cf-turnstile\" data-sitekey=\"0x4AAAAAAA\"></div>"));
+        assert!(is_cloudflare_challenge(403, "turnstile/api.js"));
+        // 非 503/403 → false（即使含特征）
         assert!(!is_cloudflare_challenge(200, "Just a moment"));
         // 503 无特征 → false（零开销直连路径）
         assert!(!is_cloudflare_challenge(503, "<html>maintenance</html>"));
@@ -651,6 +746,20 @@ mod tests {
         assert_eq!(merge_fs_cookies("", &fs), "cf_clearance=xyz");
         assert_eq!(merge_fs_cookies("a=1", &[]), "a=1");
         assert_eq!(merge_fs_cookies("", &[]), "");
+    }
+
+    /// Turnstile token 伪 cookie 合并：追加 / 空串 / 同名覆盖（上次求解残留）
+    #[test]
+    fn test_merge_turnstile_token() {
+        assert_eq!(
+            merge_turnstile_token("sid=abc", "tok-1"),
+            "sid=abc; cf_turnstile_token=tok-1"
+        );
+        assert_eq!(merge_turnstile_token("", "tok-1"), "cf_turnstile_token=tok-1");
+        assert_eq!(
+            merge_turnstile_token("sid=abc; cf_turnstile_token=old", "new"),
+            "sid=abc; cf_turnstile_token=new"
+        );
     }
 
     #[test]
