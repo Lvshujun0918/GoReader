@@ -16,9 +16,11 @@ export function backupToWebdav(path?: string): Promise<ReturnData<{ path: string
 
 /**
  * 下载备份 zip：backupToWebdav 返回绝对路径，取其文件名，按「用户数据根（__HOME__）下
- * webdav/legado/」的相对路径走 GET /reader3/file/download（file/download 的 path 是 home 根下相对路径）。
+ * {dir}/」的相对路径走 GET /reader3/file/download（file/download 的 path 是 home 根下相对路径）。
+ * GAP 151：dir 默认 webdav/legado（后端当前固定目录）；传入备份路径配置后与 backupToWebdav(path) 对齐。
  */
-export function downloadBackupZip(absPath: string): Promise<Blob> {
+export function downloadBackupZip(absPath: string, dir = 'webdav/legado'): Promise<Blob> {
   const name = absPath.split(/[\\/]/).filter(Boolean).pop() || 'backup.zip'
-  return downloadFile(`webdav/legado/${name}`, '__HOME__')
+  const cleanDir = dir.trim().replace(/^\/+|\/+$/g, '')
+  return downloadFile(cleanDir ? `${cleanDir}/${name}` : name, '__HOME__')
 }

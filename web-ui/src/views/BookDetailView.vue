@@ -5,7 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { getBookInfo, getBookToc, searchBookSource, searchBookSourceSSE } from '@/api/books'
 import { getInvalidBookSources } from '@/api/sources'
-import { deleteBookCache, searchBookContent } from '@/api/cache'
+import { deleteBookCache, getShelfBookWithCacheInfo, searchBookContent } from '@/api/cache'
 import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export'
 import { cacheBookOnServer, cacheBookSSE, cancelCacheBook } from '@/api/cacheBook'
 import { uploadFile, mkdir } from '@/api/file'
@@ -33,6 +33,39 @@ const loadFailed = ref(false)
 const errorMsg = ref('')
 const coverFailed = ref(false)
 const saving = ref(false)
+
+/* ================= GAP 82：单书缓存信息（GET /reader3/getShelfBookWithCacheInfo，silent——后端已有；未实现降级隐藏） ================= */
+
+const shelfCache = ref<{ chapterCount: number; size: number } | null>(null)
+/** 接口不可用（404/网络失败）：永久隐藏状态区，不再重复探测 */
+const shelfCacheHidden = ref(false)
+
+function fmtCacheSize(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0 B'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+async function loadShelfCacheInfo() {
+  if (shelfCacheHidden.value) return
+  try {
+    const res = await getShelfBookWithCacheInfo(bookUrl.value)
+    const d = res.data
+    if (res.isSuccess && d && typeof d.cacheChapterCount === 'number') {
+      shelfCache.value = {
+        chapterCount: d.cacheChapterCount,
+        size: Number(d.cacheSize ?? 0),
+      }
+    } else {
+      shelfCache.value = null
+    }
+  } catch {
+    // 接口未实现（404）：静默隐藏状态区
+    shelfCache.value = null
+    shelfCacheHidden.value = true
+  }
+}
 
 /** 展示数据：实时详情优先，书架数据兜底；自定义封面（GAP 19）最优先；自定义简介（GAP 145）优先于书源解析 intro */
 const display = computed(() => ({
@@ -124,6 +157,8 @@ async function load() {
   } finally {
     loading.value = false
   }
+  // GAP 82：书架书 → 拉取单书缓存状态（silent；未实现隐藏）
+  if (shelfBook.value) void loadShelfCacheInfo()
 }
 
 /** 由详情信息组装完整 Book JSON（saveBook 入架 body：type/group 用默认值 0） */
@@ -147,13 +182,59 @@ function buildShelfBook(): Book {
   }
 }
 
-/** 加入书架（非书架书）：POST /reader3/saveBook，成功即视为书架书 */
+/**
+ * GAP 108：入架前同书多源去重（getBookshelf 检查）。
+ * ① 同 bookUrl 已在书架 → 提示「已在书架」（并同步本地书架态）；
+ * ② 同名不同源（bookUrl 不同）→ 弹窗「已有同名书（其他源）——保留 / 仍加入」；
+ * ③ 书架拉取失败不拦截（saveBook 自身会提示错误）。
+ */
+async function checkDupBeforeAdd(book: { bookUrl: string; name: string }): Promise<'ok' | 'exists' | 'same-name-cancel'> {
+  let list: Book[] = []
+  try {
+    const res = await getBookshelf()
+    list = res.data ?? []
+  } catch {
+    return 'ok' // 书架拉取失败：不拦截
+  }
+  const sameUrl = list.find((b) => b.bookUrl === book.bookUrl)
+  if (sameUrl) {
+    if (sameUrl.bookUrl === bookUrl.value) shelfBook.value = sameUrl
+    return 'exists'
+  }
+  const name = (book.name || '').trim()
+  const sameName = name ? list.find((b) => (b.name || '').trim() === name) : undefined
+  if (sameName) {
+    try {
+      await ElMessageBox.confirm(
+        `书架已有同名书《${sameName.name}》（${sameName.originName || sameName.origin || '其他书源'}）。仍要加入当前这本书吗？`,
+        '已有同名书（其他源）',
+        {
+          confirmButtonText: '仍加入',
+          cancelButtonText: '保留',
+          type: 'warning',
+        },
+      )
+    } catch {
+      return 'same-name-cancel' // 用户选择「保留」
+    }
+  }
+  return 'ok'
+}
+
+/** 加入书架（非书架书）：先查重（GAP 108）→ POST /reader3/saveBook，成功即视为书架书 */
 async function addToShelf() {
   if (saving.value || !info.value) return
+  const dup = await checkDupBeforeAdd({ bookUrl: bookUrl.value, name: info.value.name || '' })
+  if (dup === 'exists') {
+    ElMessage.info('已在书架')
+    return
+  }
+  if (dup === 'same-name-cancel') return
   saving.value = true
   try {
     await saveBook(buildShelfBook())
     shelfBook.value = buildShelfBook()
+    ElMessage.success('已加入书架')
   } catch {
     // 失败提示由 request.ts 统一 toast，按钮保持「加入书架」
   } finally {
@@ -793,6 +874,8 @@ async function clearBookCache() {
     const res = await deleteBookCache(b.bookUrl)
     const deleted = typeof res.data?.deleted === 'number' ? res.data.deleted : 0
     ElMessage.success(`已清除本书缓存（${deleted} 条）`)
+    // GAP 82：清除后刷新单书缓存状态
+    void loadShelfCacheInfo()
   } catch (err) {
     const e = err as { response?: { status?: number }; message?: string } | null | undefined
     if (e?.response?.status === 404 || e?.response?.status === 501) {
@@ -849,6 +932,8 @@ async function startCache() {
           cacheDone.value = true
           cacheMsg.value = '缓存完成，可随时离线/多端阅读'
           cacheMsgError.value = false
+          // GAP 82：缓存完成 → 刷新单书缓存状态
+          void loadShelfCacheInfo()
         }
       },
       onEnd: () => {
@@ -856,6 +941,8 @@ async function startCache() {
         if (!cacheMsg.value) {
           cacheDone.value = true
           cacheMsg.value = '缓存完成，可随时离线/多端阅读'
+          // GAP 82：缓存完成 → 刷新单书缓存状态
+          void loadShelfCacheInfo()
         }
       },
       onStreamError: (msg) => {
@@ -887,6 +974,7 @@ async function cancelCache() {
   }
   cacheMsg.value = '已取消缓存'
   cacheMsgError.value = false
+  void loadShelfCacheInfo()
 }
 
 /* ================= 简介展开/收起（超过 4 行显示「展开/收起」；展开移除 -webkit-line-clamp 限制） ================= */
@@ -932,8 +1020,14 @@ const relatedBooks = computed<RelatedBook[]>(() => {
   return Array.isArray(raw) ? (raw as RelatedBook[]) : []
 })
 
-/** 点击推荐书：组装 Book JSON 调 saveBook 加入书架（bookUrl 为主键，无需进入详情） */
+/** 点击推荐书：组装 Book JSON 调 saveBook 加入书架（bookUrl 为主键；GAP 108：入架前查重） */
 async function addRelated(r: RelatedBook) {
+  const dup = await checkDupBeforeAdd({ bookUrl: r.bookUrl, name: r.name || '' })
+  if (dup === 'exists') {
+    ElMessage.info('已在书架')
+    return
+  }
+  if (dup === 'same-name-cancel') return
   try {
     await saveBook({
       bookUrl: r.bookUrl,
@@ -1122,6 +1216,14 @@ onMounted(load)
             <button class="search-btn" type="button" @click="openExport">导出</button>
             <!-- 缓存本书（POST /reader3/cacheBookOnServer：SSE 进度条） -->
             <button class="search-btn" type="button" @click="openCache">缓存本书</button>
+            <!-- GAP 82：单书缓存状态（getShelfBookWithCacheInfo silent；后端未实现时隐藏） -->
+            <span
+              v-if="shelfBook && shelfCache"
+              class="cache-state"
+              :title="`已缓存 ${shelfCache.chapterCount} 章 · ${fmtCacheSize(shelfCache.size)}`"
+            >
+              已缓存 {{ shelfCache.chapterCount }} 章 · {{ fmtCacheSize(shelfCache.size) }}
+            </span>
             <!-- GAP 79：清除本书缓存（POST /reader3/deleteBookCache：删 book_chapters 该书行） -->
             <button v-if="shelfBook" class="search-btn" type="button" :disabled="cacheClearBusy" @click="clearBookCache">
               {{ cacheClearBusy ? '清理中…' : '清缓存' }}
@@ -1773,6 +1875,17 @@ onMounted(load)
   font-size: 12px;
   font-weight: 300;
   letter-spacing: 2px;
+}
+/* 单书缓存状态（GAP 82）：细字徽标，紧邻缓存本书按钮 */
+.cache-state {
+  padding: 2px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  font-variant-numeric: tabular-nums;
 }
 .read-btn {
   padding: 13px 44px;

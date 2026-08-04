@@ -547,8 +547,9 @@ pub(crate) fn field_with_bridge(
     let r = parse_rule(&rule);
     match r.kind {
         RuleKind::Css => {
-            // 链式 CSS（legado：class./tag./@text/@href 等）
-            let v = crate::parser::css_chain::css_chain(&r.body, context);
+            // 链式 CSS（legado：class./tag./@text/@href 等）；经 apply 执行以保留
+            // ##替换链 / <js> 链（apply_post：替换正则/替换串/### 首个匹配）
+            let v = crate::parser::rule::apply(&rule, context);
             if let Some(first) = v.first() {
                 // 无 @ 的单选择器规则：元素 HTML → 取文本（兼容旧书源写法）
                 if !r.body.contains('@') {
@@ -685,6 +686,27 @@ mod tests {
         assert_eq!(books[0].name, "书名A");
         assert_eq!(books[0].author, "作者甲");
         assert_eq!(books[0].book_url, "https://a.com/book/1");
+    }
+
+    /// 字段规则 ## 替换链（真实书源：class.title@tag.h2@text##《(.*)》##$1### 形态）：
+    /// 替换须在 field 层生效（此前 Css 分支绕过 apply_post 丢失替换）
+    #[test]
+    fn test_field_css_replace_chain() {
+        let html = r#"<div class="book"><h2 class="t">《测试书》</h2><p>作者甲</p></div>"#;
+        // 三段替换（去书名号）
+        let name = field(html, Some("class.t@text##《(.*)》##$1"), "");
+        assert_eq!(name, "测试书");
+        // 字段上下文为单本书元素：链式提取 + 替换
+        let el = crate::parser::css_chain::css_chain("div.book", html);
+        let name2 = field(&el[0], Some("class.t@text##《(.*)》##$1"), "");
+        assert_eq!(name2, "测试书");
+        // @js: 链字段（提取结果进 JS result 变量）
+        let name3 = field(&el[0], Some("class.t@text@js:result.replace('《','【').replace('》','】')"), "");
+        assert_eq!(name3, "【测试书】");
+        // 纯替换规则（### replaceFirst）——上下文仅含书名
+        let h2 = crate::parser::css_chain::css_chain("class.t", html);
+        let name4 = field(&h2[0], Some("##《(.*)》##[$1]###"), "");
+        assert_eq!(name4, "[测试书]");
     }
 
     /// bookList 修复：JS 返回 JSON.parse(result).data 数组 → 逐本书解析（此前 ToString

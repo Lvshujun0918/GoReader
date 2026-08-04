@@ -65,6 +65,14 @@ impl Regex {
             Inner::Fancy(re) => re.try_replacen(text, 0, rep).unwrap_or(Cow::Borrowed(text)),
         }
     }
+
+    /// 仅替换第一个匹配（legado `###` replaceFirst 语义；无匹配 → 原样返回）
+    pub fn replace_first<'t>(&'t self, text: &'t str, rep: &str) -> Cow<'t, str> {
+        match &self.inner {
+            Inner::Std(re) => re.replacen(text, 1, rep),
+            Inner::Fancy(re) => re.try_replacen(text, 1, rep).unwrap_or(Cow::Borrowed(text)),
+        }
+    }
 }
 
 /// 单次捕获（统一两引擎的 get(i) 语义）

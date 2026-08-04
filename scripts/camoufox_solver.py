@@ -26,6 +26,11 @@ cf-turnstile-response input 值非空 / challenge 特征消失 / 标题离开 Ju
 用法：python scripts/camoufox_solver.py [--port 8196] [--host 127.0.0.1]
 测试：python -m py_compile scripts/camoufox_solver.py
       GET /health；POST /solve 指向 scripts/mock-cf-site.py（8193）验证质询自动过
+
+69shuba 实测（2026-08-04）：camoufox 过 Cloudflare（首页直过、无质询）；但
+search.php 命中站点级 UA 门禁（"请使用新版本的Google Chrome"——camoufox 为
+Firefox 指纹，context user_agent 会被指纹注入脚本覆盖）——搜索链路仍不可全自动，
+需手动 Cookie 兜底（书源自带引导）。
 """
 import argparse
 import asyncio
@@ -85,7 +90,7 @@ def cookies_for_host(cookies, host):
     return out
 
 
-async def solve_once(browser, url, cookies, max_wait_ms):
+async def solve_once(browser, url, cookies, max_wait_ms, user_agent=None):
     """单次求解：新建指纹 context → 导航 → 质询等待循环 → 结果/诊断"""
     host = None
     try:
@@ -95,7 +100,12 @@ async def solve_once(browser, url, cookies, max_wait_ms):
     except Exception:
         host = ""
     diag = {"title": "", "hasInput": False, "url": url, "waitMs": 0, "clicks": 0}
-    context = await AsyncNewContext(browser, os="windows")
+    ctx_kwargs = {}
+    # 可选 UA 覆盖（部分站点 UA 门禁——如 69shuba 要求 Chrome；camoufox 指纹默认 Firefox UA）
+    if user_agent:
+        ctx_kwargs["user_agent"] = user_agent
+        diag["userAgent"] = user_agent
+    context = await AsyncNewContext(browser, os="windows", **ctx_kwargs)
     try:
         page = await context.new_page()
         # 书源既有 cookie 注入（domain 由目标主机推导）
@@ -213,11 +223,12 @@ async def handle_solve(reader):
         return 400, {"error": "url 不能为空"}
     cookies = payload.get("cookies") or []
     max_wait_ms = int(payload.get("maxWaitMs") or DEFAULT_MAX_WAIT_MS)
+    user_agent = str(payload.get("userAgent") or "") or None
     try:
         browser = await get_browser()
     except Exception as e:
         return 502, {"error": f"camoufox 浏览器启动失败: {e}（请先执行 camoufox fetch 下载浏览器）"}
-    result, diag = await solve_once(browser, url, cookies, max_wait_ms)
+    result, diag = await solve_once(browser, url, cookies, max_wait_ms, user_agent)
     result["diagnostics"] = diag
     return 200, result
 

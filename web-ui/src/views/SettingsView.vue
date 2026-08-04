@@ -27,6 +27,7 @@ import {
   type PageMode,
 } from '@/utils/readerConfig'
 import { applyUiTheme, loadUiTheme, uiThemeFromServer, uiThemeToServer, type UiTheme } from '@/utils/uiTheme'
+import { DAILY_STATS_KEY, last7Days, parseDailyStats } from '@/utils/dailyStats'
 import { useUserStore } from '@/stores/user'
 import { downloadBlob } from '@/utils/download'
 import type { CacheClearType, CacheInfo, HttpTts, SystemInfo, TxtTocRule } from '@/types'
@@ -622,7 +623,36 @@ function startOfWeek(d: Date): number {
   return day0 - offset * 86400000
 }
 
-/** 本地降级：从 reader-progress-{bookUrl} 汇总近似统计（name 经书架映射） */
+/** GAP 110：近 7 天每日时长柱状图数据（本机 reader_daily_stats 累计；纯 CSS div 高度，无图表库） */
+interface DailyBar {
+  label: string
+  seconds: number
+  heightPct: number
+}
+
+function readDailyStatsLocal(): Record<string, number> {
+  try {
+    return parseDailyStats(localStorage.getItem(DAILY_STATS_KEY))
+  } catch {
+    return {}
+  }
+}
+
+const dailyBars = computed<DailyBar[]>(() => {
+  const map = readDailyStatsLocal()
+  const days = last7Days(map)
+  const max = Math.max(...days.map((x) => x.seconds), 0)
+  return days.map((x) => ({
+    label: x.date.slice(5), // MM-DD
+    seconds: x.seconds,
+    // 有值日至少 8% 高度（可见）；零值日 0（CSS min-height 留 2px 占位）
+    heightPct: max > 0 && x.seconds > 0 ? Math.max(8, Math.round((x.seconds / max) * 100)) : 0,
+  }))
+})
+/** 近 7 天有实际时长才显示柱状图 */
+const dailyHasData = computed(() => dailyBars.value.some((b) => b.seconds > 0))
+
+/** 本地降级：从 reader-progress-{bookUrl} 汇总近似统计（name 经书架映射；GAP 110：今日/近 7 天秒数取自本机每日累计） */
 function localStats(nameMap: Map<string, string>): StatsView {
   const day0 = startOfDay(new Date())
   const week0 = startOfWeek(new Date())
@@ -643,9 +673,13 @@ function localStats(nameMap: Map<string, string>): StatsView {
   }
   const countSince = (t: number) => entries.filter((e) => e.updatedAt >= t).length
   const top = [...entries].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 5)
+  // GAP 110：每日时长（本机累计）→ 今日/近 7 天秒数（与柱状图一致）
+  const days = last7Days(readDailyStatsLocal())
+  const weekSeconds = days.reduce((s, x) => s + x.seconds, 0)
+  const todaySeconds = days[days.length - 1]?.seconds ?? 0
   return {
-    today: { seconds: 0, count: countSince(day0) },
-    week: { seconds: 0, count: countSince(week0) },
+    today: { seconds: todaySeconds, count: countSince(day0) },
+    week: { seconds: weekSeconds, count: countSince(week0) },
     total: { seconds: 0, count: entries.length },
     top: top.map((e) => ({ name: e.name, count: 1 })),
   }
@@ -939,14 +973,14 @@ async function runBackup() {
   }
 }
 
-/** 下载备份 zip：返回绝对路径 → 取其文件名拼 __HOME__/webdav/legado 相对路径 → file/download */
+/** 下载备份 zip：返回绝对路径 → 取其文件名拼 __HOME__/{备份路径} 相对路径 → file/download */
 async function downloadBackup() {
   if (backupDownloadBusy.value) return
   const abs = backupPath.value
   if (!abs) return
   backupDownloadBusy.value = true
   try {
-    const blob = await downloadBackupZip(abs)
+    const blob = await downloadBackupZip(abs, backupDir.value.trim() || 'webdav/legado')
     const name = abs.split(/[\\/]/).filter(Boolean).pop() || 'backup.zip'
     await downloadBlob(blob, name)
   } catch {
@@ -1308,7 +1342,7 @@ async function runExportData() {
         </div>
         <div class="row">
           <span class="row-label">导出数据</span>
-          <span class="row-value">备份为 zip 并直接下载（webdav/legado 目录）</span>
+          <span class="row-value">备份为 zip 并直接下载（{{ backupDir.trim() || 'webdav/legado' }} 目录）</span>
           <button class="row-action" type="button" :disabled="exportBusy" @click="runExportData">
             {{ exportBusy ? '导出中…' : '导出数据' }}
           </button>
@@ -1733,14 +1767,14 @@ async function runExportData() {
               <p v-if="statsFromLocal" class="field-tip">{{ statsMsg }}</p>
               <div class="stats-grid">
                 <div class="stats-cell">
-                  <span class="stats-num">{{ stats.today.count > 0 ? stats.today.count : fmtMinutes(stats.today.seconds) || '0' }}</span>
+                  <span class="stats-num">{{ stats.today.seconds > 0 ? fmtMinutes(stats.today.seconds) : stats.today.count > 0 ? stats.today.count : '0' }}</span>
                   <span class="stats-label">今日</span>
-                  <span class="stats-sub">{{ stats.today.count > 0 ? fmtMinutes(stats.today.seconds) || '阅读' : '阅读' }}</span>
+                  <span class="stats-sub">{{ stats.today.seconds > 0 ? '时长' : stats.today.count > 0 ? fmtMinutes(stats.today.seconds) || '阅读' : '阅读' }}</span>
                 </div>
                 <div class="stats-cell">
-                  <span class="stats-num">{{ stats.week.count > 0 ? stats.week.count : fmtMinutes(stats.week.seconds) || '0' }}</span>
+                  <span class="stats-num">{{ stats.week.seconds > 0 ? fmtMinutes(stats.week.seconds) : stats.week.count > 0 ? stats.week.count : '0' }}</span>
                   <span class="stats-label">本周</span>
-                  <span class="stats-sub">{{ stats.week.count > 0 ? fmtMinutes(stats.week.seconds) || '阅读' : '阅读' }}</span>
+                  <span class="stats-sub">{{ stats.week.seconds > 0 ? '时长' : stats.week.count > 0 ? fmtMinutes(stats.week.seconds) || '阅读' : '阅读' }}</span>
                 </div>
                 <div class="stats-cell">
                   <span class="stats-num">{{ stats.total.count > 0 ? stats.total.count : fmtMinutes(stats.total.seconds) || '0' }}</span>
@@ -1748,6 +1782,19 @@ async function runExportData() {
                   <span class="stats-sub">{{ stats.total.count > 0 ? fmtMinutes(stats.total.seconds) || '阅读' : '阅读' }}</span>
                 </div>
               </div>
+              <!-- GAP 110：近 7 天每日时长柱状图（本机累计——纯 CSS div 高度，无图表库） -->
+              <div v-if="dailyHasData" class="stats-chart" role="img" aria-label="近 7 天每日阅读时长柱状图">
+                <div
+                  v-for="b in dailyBars"
+                  :key="b.label"
+                  class="chart-col"
+                  :title="`${b.label} · ${fmtMinutes(b.seconds) || '0 分钟'}`"
+                >
+                  <div class="chart-bar" :class="{ zero: b.heightPct === 0 }" :style="{ height: b.heightPct + '%' }"></div>
+                  <span class="chart-label">{{ b.label }}</span>
+                </div>
+              </div>
+              <p v-if="dailyHasData" class="field-tip chart-tip">近 7 天每日阅读时长（本机统计——阅读页自动累计）</p>
               <template v-if="stats.top.length">
                 <p class="stats-top-title">书籍 TOP{{ stats.top.length }}</p>
                 <ul class="stats-top-list">
@@ -2537,6 +2584,49 @@ async function runExportData() {
   font-weight: 400;
   letter-spacing: 1px;
   color: var(--text-3);
+}
+/* GAP 110：近 7 天每日时长柱状图（纯 CSS div 高度） */
+.stats-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  height: 110px;
+  margin: 14px 0 2px;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--border);
+}
+.chart-col {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.chart-bar {
+  width: 100%;
+  max-width: 24px;
+  min-height: 2px;
+  border-radius: 3px 3px 0 0;
+  background: var(--accent);
+  opacity: 0.85;
+  transition: height 0.25s ease;
+}
+.chart-bar.zero {
+  background: var(--border-strong);
+  opacity: 0.55;
+}
+.chart-label {
+  font-size: 10.5px;
+  font-weight: 300;
+  color: var(--text-3);
+  letter-spacing: 0.5px;
+  font-variant-numeric: tabular-nums;
+}
+.chart-tip {
+  margin-top: 8px;
 }
 .stats-top-list {
   list-style: none;

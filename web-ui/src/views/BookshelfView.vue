@@ -15,12 +15,13 @@ import {
 } from '@/api/bookshelf'
 import { getBookmarks, deleteBookmark } from '@/api/bookmarks'
 import { uploadLocalBook, importBookPreview } from '@/api/upload'
+import { searchBookContent } from '@/api/cache'
 import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export'
 import { probeSecureMode } from '@/api/users'
 import { downloadBlob } from '@/utils/download'
 import { canRescanBook } from '@/utils/localBook'
 import { useUserStore } from '@/stores/user'
-import type { Book, BookGroup, Bookmark, ImportPreview } from '@/types'
+import type { Book, BookGroup, Bookmark, ContentSearchHit, ImportPreview } from '@/types'
 
 const router = useRouter()
 const store = useUserStore()
@@ -88,6 +89,9 @@ const books = ref<Book[]>([])
 const loading = ref(true)
 const refreshing = ref(false)
 const keyword = ref('')
+watch(keyword, (k) => {
+  if (searchMode.value === 'full') triggerContentSearch(k)
+})
 const failedCovers = ref<Set<string>>(new Set())
 
 /* ================= 多选模式 ================= */
@@ -113,8 +117,55 @@ let wrapObserver: ResizeObserver | undefined
  *  简化实现：本地匹配书名/作者/简介，并标注「全书搜索后端待实现」） */
 const searchMode = ref<'name' | 'full'>('name')
 const searchPlaceholder = computed(() =>
-  searchMode.value === 'full' ? '搜索书名 / 作者 / 简介' : '搜索书名 / 作者',
+  searchMode.value === 'full' ? '搜索正文内容（本地书）…' : '搜索书名 / 作者',
 )
+
+/* ================= 全书内容搜索（GET /reader3/searchBookContent——逐本地书并发聚合） ================= */
+const contentResults = ref<{ book: Book; hits: ContentSearchHit[] }[]>([])
+const contentSearching = ref(false)
+const contentSearchDone = ref(false)
+let contentSearchTimer: number | undefined
+let contentSearchSeq = 0
+function triggerContentSearch(kw: string) {
+  if (contentSearchTimer !== undefined) window.clearTimeout(contentSearchTimer)
+  const seq = ++contentSearchSeq
+  if (!kw.trim()) {
+    contentResults.value = []
+    contentSearching.value = false
+    contentSearchDone.value = false
+    return
+  }
+  contentSearchTimer = window.setTimeout(async () => {
+    if (seq !== contentSearchSeq) return
+    contentSearching.value = true
+    contentSearchDone.value = false
+    const localBooks = books.value.filter(
+      (b) => b.origin === 'loc_book' || b.origin === 'local' || (b.bookUrl ?? '').startsWith('local://'),
+    )
+    const agg: { book: Book; hits: ContentSearchHit[] }[] = []
+    await Promise.all(
+      localBooks.map(async (b) => {
+        try {
+          const res = await searchBookContent(kw, b.bookUrl)
+          const hits = (res.data ?? []).slice(0, 10)
+          if (hits.length) agg.push({ book: b, hits })
+        } catch {
+          /* 单书失败跳过 */
+        }
+      }),
+    )
+    if (seq !== contentSearchSeq) return
+    contentResults.value = agg.sort((a, b) => b.hits.length - a.hits.length)
+    contentSearching.value = false
+    contentSearchDone.value = true
+  }, 600)
+}
+watch(searchMode, (m) => {
+  if (m !== 'full') {
+    contentResults.value = []
+    contentSearchDone.value = false
+  }
+})
 
 /* ================= 书架排序（前端排序 books.value 副本——不改服务端顺序；localStorage: reader_shelf_sort） ================= */
 
@@ -631,7 +682,7 @@ const filtered = computed(() => {
     if (gid !== null && b.group !== gid) return false
     if (!kw) return true
     if (searchMode.value === 'full') {
-      // 全书模式（简化实现）：书名/作者/简介本地匹配；全书内容搜索后端待实现（GET /reader3/searchBookContent）
+      // 全书模式：本地书正文内容搜索（并发逐本）——书名/作者匹配兜底
       return (
         b.name.toLowerCase().includes(kw) ||
         b.author.toLowerCase().includes(kw) ||
@@ -1585,13 +1636,13 @@ onMounted(() => {
             class="search-mode-btn"
             :class="{ active: searchMode === 'full' }"
             type="button"
-            title="全书内容搜索（后端待实现，当前匹配书名/作者/简介）"
+            title="全书内容搜索（本地书正文）"
             @click="searchMode = 'full'"
           >
             全书
           </button>
           <span v-if="searchMode === 'full'" class="search-note">
-            全书内容搜索后端待实现（GET /reader3/searchBookContent）· 当前仅匹配书名/作者/简介
+            全书内容搜索（本地书正文——输入后自动搜索）
           </span>
         </div>
       </div>

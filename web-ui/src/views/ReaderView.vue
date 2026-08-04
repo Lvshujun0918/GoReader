@@ -10,6 +10,7 @@ import { get, post } from '@/api/request'
 import { loadReplaceRules } from '@/api/replaceRules'
 import { getTtsVoices, synthesizeTts, type TtsVoice } from '@/api/tts'
 import { applyHan, getHanMode, setHanMode, type HanMode } from '@/utils/chinese'
+import { DAILY_STATS_KEY, accumulateDaily, parseDailyStats } from '@/utils/dailyStats'
 import type { Book, BookChapter, Bookmark, HttpTts, ReplaceRule } from '@/types'
 
 const route = useRoute()
@@ -459,6 +460,8 @@ function fmtBookmarkTime(ts: number): string {
 /** 按段落序号滚动恢复（含图片撑高后的二次校正） */
 async function applyRestoreParagraph() {
   if (restoreParagraphIdx == null) return
+  // GAP 155：目标段未渲染时先逐块加载（书签跨段跳转）
+  await ensureParagraphRendered(restoreParagraphIdx)
   await nextTick()
   await settleFrames()
   scrollToParagraph(restoreParagraphIdx)
@@ -539,18 +542,20 @@ function runChapterSearch() {
   searchResults.value = hits
 }
 
-/** 点击结果：跳转该段并短暂高亮 */
+/** 点击结果：跳转该段并短暂高亮（GAP 155：目标段未渲染时先加载对应块） */
 function jumpToSearchResult(idx: number) {
   searchOpen.value = false
   searchKeyword.value = ''
   searchSearched.value = false
   searchResults.value = []
-  scrollToParagraph(idx)
-  flashParaIdx.value = idx
-  window.clearTimeout(flashTimer)
-  flashTimer = window.setTimeout(() => {
-    flashParaIdx.value = -1
-  }, 1600)
+  void ensureParagraphRendered(idx).then(() => {
+    scrollToParagraph(idx)
+    flashParaIdx.value = idx
+    window.clearTimeout(flashTimer)
+    flashTimer = window.setTimeout(() => {
+      flashParaIdx.value = -1
+    }, 1600)
+  })
 }
 
 /* ---------------- 5. 简繁转换（legacy chinese.js 移植） ---------------- */
@@ -567,6 +572,8 @@ const detectTraditional = (text: string): boolean => detectTraditionalFn(text)
 import { detectTraditional as detectTraditionalFn } from '@/utils/chinese'
 watch(content, (c) => {
   if (hanMode.value === 'auto') hanTrad.value = detectTraditional(c)
+  // GAP 155：正文变化 → 分段渲染重置为首块
+  resetSegments()
 })
 function toggleHan() {
   // 三态循环：自动 → 简 → 繁 → 自动
@@ -1012,6 +1019,8 @@ function autoTick() {
   if (loading.value || loadError.value || !currentChapter.value) return
   const doc = document.documentElement
   if (doc.scrollHeight - window.innerHeight <= 0) return
+  // GAP 155：长章还有未渲染段且已近底——先加载下一块，不切章
+  if (maybeLoadMoreChunk()) return
   const atBottom = window.scrollY + window.innerHeight >= doc.scrollHeight - AUTO_BOTTOM_GAP
   if (atBottom) {
     if (hasNext.value) nextChapter()
@@ -1250,6 +1259,40 @@ const paragraphs = computed(() =>
     .filter(Boolean)
     .map((p) => applyReplace(hanConvert(p))),
 )
+
+/* ---------------- GAP 155：长章分段渲染（>200 段按 200 段/块渐进渲染——滚动到底加载下一块，防超长章 DOM 过大） ---------------- */
+
+const SEGMENT_SIZE = 200
+/** 已渲染段数（resetSegments 初始化 / 滚动到底 +200；始终 ≤ paragraphs.length） */
+const renderedCount = ref(0)
+const visibleParagraphs = computed(() => paragraphs.value.slice(0, renderedCount.value))
+/** 与 visibleParagraphs 对齐的图片标注（GAP 102 单图段落） */
+const visibleParaImgs = computed(() => paraImgs.value.slice(0, renderedCount.value))
+const hasMoreParagraphs = computed(() => renderedCount.value < paragraphs.value.length)
+
+/** 换章/正文变化时重置为首块 */
+function resetSegments() {
+  renderedCount.value = Math.min(SEGMENT_SIZE, paragraphs.value.length)
+}
+
+/** 滚动近底（600px）时加载下一块；返回是否加载了新块 */
+function maybeLoadMoreChunk(): boolean {
+  if (!hasMoreParagraphs.value) return false
+  if (loading.value || loadError.value) return false
+  const doc = document.documentElement
+  if (doc.scrollHeight - window.innerHeight - window.scrollY > 600) return false
+  renderedCount.value = Math.min(renderedCount.value + SEGMENT_SIZE, paragraphs.value.length)
+  return true
+}
+
+/** 确保第 idx 段已渲染（书签/搜索跳转/滚动恢复前逐块加载直到覆盖目标） */
+async function ensureParagraphRendered(idx: number) {
+  while (renderedCount.value <= idx && hasMoreParagraphs.value) {
+    renderedCount.value = Math.min(renderedCount.value + SEGMENT_SIZE, paragraphs.value.length)
+    await nextTick()
+    await settleFrames()
+  }
+}
 const displayBookName = computed(() => hanConvert(bookName.value))
 const displayChapterTitle = computed(() => (currentChapter.value ? hanConvert(currentChapter.value.title) : ''))
 /** 目录项（含卷标题）统一按当前简繁模式转换 */
@@ -1282,6 +1325,33 @@ function saveProgress() {
     /* ignore */
   }
   syncServerProgress()
+}
+
+/* ---------------- GAP 110：每日阅读时长累计（本机——统计弹窗近 7 天柱状图数据源） ---------------- */
+
+/** 累计周期（秒）：每 30s 向当日桶 +30s；仅页面可见且正文就绪时累计 */
+const DAILY_TICK_SECONDS = 30
+let dailyTimer: number | undefined
+
+function startDailyTracker() {
+  stopDailyTracker()
+  dailyTimer = window.setInterval(() => {
+    if (document.visibilityState !== 'visible') return
+    if (loading.value || loadError.value || !currentChapter.value) return
+    try {
+      const map = parseDailyStats(localStorage.getItem(DAILY_STATS_KEY))
+      localStorage.setItem(DAILY_STATS_KEY, JSON.stringify(accumulateDaily(map, DAILY_TICK_SECONDS)))
+    } catch {
+      /* ignore */
+    }
+  }, DAILY_TICK_SECONDS * 1000)
+}
+
+function stopDailyTracker() {
+  if (dailyTimer !== undefined) {
+    window.clearInterval(dailyTimer)
+    dailyTimer = undefined
+  }
 }
 
 /** 进度服务端同步（POST /reader3/saveBookProgress；失败静默，不影响本地阅读） */
@@ -1336,6 +1406,14 @@ function imagesReady(): Promise<void> {
 
 async function applyRestoreScroll() {
   if (restoreScrollY == null) return
+  // GAP 155：恢复目标超出当前已渲染高度时，先逐块加载直到可滚动到目标位置
+  while (hasMoreParagraphs.value) {
+    const doc = document.documentElement
+    if (doc.scrollHeight - window.innerHeight >= restoreScrollY) break
+    renderedCount.value = Math.min(renderedCount.value + SEGMENT_SIZE, paragraphs.value.length)
+    await nextTick()
+    await settleFrames()
+  }
   await nextTick()
   await settleFrames()
   window.scrollTo(0, restoreScrollY)
@@ -1700,6 +1778,8 @@ function onKeydown(e: KeyboardEvent) {
 function onScroll() {
   updateScrollFrac()
   hideSelBar()
+  // GAP 155：滚动近底时渐进加载下一段
+  maybeLoadMoreChunk()
   window.clearTimeout(saveTimer)
   saveTimer = window.setTimeout(saveProgress, 300)
 }
@@ -1725,6 +1805,8 @@ onMounted(() => {
     window.addEventListener('touchmove', onTouchMove, { passive: false })
     window.addEventListener('touchend', onTouchEnd, { passive: true })
   }
+  // GAP 110：每日阅读时长累计（本机）
+  startDailyTracker()
   void init()
 })
 
@@ -1750,6 +1832,7 @@ onBeforeUnmount(() => {
   nextHold.stop()
   stopTts()
   stopAuto()
+  stopDailyTracker()
   saveProgress()
 })
 </script>
@@ -1917,15 +2000,15 @@ onBeforeUnmount(() => {
             textAlign,
           }"
         >
-          <template v-for="(para, i) in paragraphs" :key="i">
+          <template v-for="(para, i) in visibleParagraphs" :key="i">
             <!-- 单张图片段落（GAP 102）：渲染图片，点击全屏查看 -->
             <img
-              v-if="paraImgs[i]"
-              v-lazy="paraImgs[i] as string"
+              v-if="visibleParaImgs[i]"
+              v-lazy="visibleParaImgs[i] as string"
               class="reader-img"
               :alt="`正文图片 ${i + 1}`"
               loading="lazy"
-              @click="openImgViewer(paraImgs[i] as string)"
+              @click="openImgViewer(visibleParaImgs[i] as string)"
             />
             <p
               v-else

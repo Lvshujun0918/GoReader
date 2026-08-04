@@ -42,3 +42,22 @@ export function deleteBookCache(bookUrl: string): Promise<ReturnData<{ deleted?:
 export function searchBookContent(key: string, bookUrl: string): Promise<ReturnData<ContentSearchHit[]>> {
   return get<ContentSearchHit[]>('/searchBookContent', { key, bookUrl }, { silent: true })
 }
+
+/**
+ * GAP 82：GET /reader3/getShelfBookWithCacheInfo：书架单书 + 缓存信息（后端已有）。
+ * 返回书架书全字段 + cacheChapterCount（已缓存章数）+ cacheSize（缓存正文大小，字节）。
+ * 以 silent 调用：接口未实现/书不在书架时由调用方降级（隐藏状态区）。
+ */
+export interface ShelfBookCacheInfo {
+  bookUrl?: string
+  name?: string
+  /** 已缓存章节数（后端 book_cache_info） */
+  cacheChapterCount?: number
+  /** 缓存正文大小（字节） */
+  cacheSize?: number
+  [key: string]: unknown
+}
+
+export function getShelfBookWithCacheInfo(url: string): Promise<ReturnData<ShelfBookCacheInfo>> {
+  return get<ShelfBookCacheInfo>('/getShelfBookWithCacheInfo', { url }, { silent: true })
+}

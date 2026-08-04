@@ -378,20 +378,11 @@ async fn debug_toc(
         };
         let base = resp.url.clone();
 
-        // chapterList 提取
+        // chapterList 提取（与生产 analyze_toc 同源 toc_items——含 <js>/@js: 兜底，
+        // 保证 JS 规则确实执行、失败可被 attach_js_error 捕获）
         let mut step = DebugStep::new(format!("chapterList 提取（第 {} 页）", page + 1));
         let started = Instant::now();
-        let items: Vec<String> = match parsed.kind {
-            crate::parser::rule::RuleKind::Css => crate::parser::css_chain::css_chain(&list_rule, &resp.body),
-            crate::parser::rule::RuleKind::JsonPath | crate::parser::rule::RuleKind::Regex => {
-                crate::parser::rule::apply(&list_rule, &resp.body)
-            }
-            // JS chapterList（JSON 数组递归转换——与 analyze_toc 同源；含 <js> 包裹兜底）
-            _ if list_rule.contains("<js>") || list_rule.trim_start().starts_with("@js:") => {
-                crate::service::book::toc_items(&list_rule, &resp.body)
-            }
-            _ => vec![],
-        };
+        let items: Vec<String> = crate::service::book::toc_items(&list_rule, &resp.body);
         step.elapsed_ms = started.elapsed().as_millis() as i64;
         step.result_len = items.len();
         step.detail = json!({ "count": items.len() });
