@@ -143,6 +143,74 @@ book_groups(id, group_name, order_num, user_namespace)
 4. 服务端 H3（quinn+h3 监听，TLS 模式）
 5. QUIC/TLS 指纹细化
 
+## 6.9 验证码/反爬 bypass 架构（已实现）
+
+### 总览（一页图式）
+
+```
+                    ┌────────────────────────────────────────────┐
+                    │       书源抓取统一入口 http_fetch          │
+                    │   （GET/POST——搜索/目录/正文/探索全走此路）  │
+                    └────────────────────────────────────────────┘
+                                      │
+               ① 会话注入：书源 cookie + 记录 UA（按用户命名空间）
+                                      │
+                                      ▼
+               ② 直连（reqwest HTTP/3→2→1.1，浏览器头保序）
+                                      │
+                                      ▼
+               ③ 质询检测 is_cloudflare_challenge
+                  （503/403 + cf-browser-gesture / challenge-platform /
+                    __cf_chl / just a moment / Turnstile 特征）
+                                      │
+                          命中？──否──→ 正常返回（零开销直连）
+                                      │ 是
+                                      ▼
+        ┌─────────────── 解质询降级链（二选一） ────────────────┐
+        │                                                      │
+        │  A. 外部 FlareSolverr（仅当配置 FLARESOLVERR_URL）    │
+        │     POST /v1 request.get/post（带书源 cookie 数组，  │
+        │     保持会话连续性；60s 超时）                        │
+        │                                                      │
+        │  B. 进程内专精浏览器（默认——零外部依赖）              │
+        │     ① 浏览器发现：READER_CHROME_PATH → Windows 自动  │
+        │        检测 Edge/Chrome → 不可用则明确报错（提示安装  │
+        │        或配置 FLARESOLVERR_URL）                      │
+        │     ② stealth 注入：puppeteer-extra-plugin-stealth   │
+        │        清单翻译——webdriver 清除 / plugins/vendor /   │
+        │        chrome 对象修复（每次新文档加载前执行）        │
+        │     ③ UA 覆盖：去 HeadlessChrome 标记（headless 默认 │
+        │        UA 会被 CF 风控直接命中）                      │
+        │     ④ 质询分型：                                    │
+        │        - 经典 CF 质询 → 执行 JS 质询 → 等待           │
+        │          cf_clearance cookie 写入                    │
+        │        - Turnstile 质询 → iframe(challenges.cloudflare│
+        │          .com) / .cf-turnstile 检测 → 点击 widget →   │
+        │          读取 cf-turnstile-response token             │
+        │     ⑤ 超时/失败 → 明确错误（不静默吞掉）              │
+        └───────────────────────┬──────────────────────────────┘
+                                │
+               ④ cookie 按 name 合并（求解结果 ∪ 用户原 cookie）
+                  → 按用户命名空间存 book_source_cookies + UA 记录
+                                │
+                                ▼
+               ⑤ 质询重试：原 method/body/headers + 新 cookie 重发
+                  （POST 场景关键——浏览器求解只会 GET 首页，重试才能
+                   让 POST（如 69shuba search.php 搜索）拿到真实结果）
+                                │
+                  重试成功？──是──→ 返回真实内容
+                  否（仍质询/失败）→ 兜底返回求解 HTML
+```
+
+### 关键设计点
+
+1. **零开销直连**：未命中质询特征时完全不经过浏览器——检测先行，日常抓取无浏览器开销。
+2. **cookie 复用**：`cf_clearance`/`cf-turnstile-response` 按 name 与用户原 cookie 合并后存库（`book_source_cookies`，按用户命名空间隔离），同源后续请求自动携带——避免重复求解；UA 一并记录（部分站点校验 UA 与 cookie 绑定）。
+3. **POST 保真**：求解阶段浏览器只会 GET 首页；必须以**原 method/body/headers + 新 cookie** 重试原请求，才能让 POST 场景（69shuba search.php 等）拿到真实结果；重试仍质询才兜底返回求解 HTML。
+4. **真实站点验证**：`scripts/69shuba.json`（真实书源）驱动集成测试（tests/cf_solve.rs / turnstile_solve.rs / captcha_matrix.rs），另配 mock 站点（mock-cf-site.py / mock-slider-site.py / mock-turnstile-site.py）。
+5. **JS 规则共享同一浏览器**：`java.startBrowserAwait(url, title, isForeground)` shim 走与验证码求解相同的进程内 CDP 浏览器流（含 stealth/UA 覆盖），书源 JS 规则可直接打开页面取 DOM。
+6. **降级次序固定**：直连 → FlareSolverr（配置了才启用）→ 内置浏览器 → 明确报错；任一环节解出即返回，不重复消耗。
+
 ## 7. 产物策略
 
 - **scratch 镜像**（musl 静态编译，系统层 CVE=0）+ **裸静态二进制**（Release 附件 + systemd 示例）
