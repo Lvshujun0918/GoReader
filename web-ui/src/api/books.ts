@@ -1,4 +1,6 @@
 import { get } from './request'
+import { useUserStore } from '@/stores/user'
+import { openSSEPost } from './sse'
 import type { BookChapter, BookContent, BookInfo, ReturnData, SearchBook } from '@/types'
 
 /** GET /reader3/getBookInfo：书籍详情（参数 url + bookSource=book.origin） */
@@ -22,6 +24,38 @@ export function searchBookSource(
 /** GET /reader3/getBookToc：章节目录（tocUrl=info.tocUrl + bookSource） */
 export function getBookToc(tocUrl: string, bookSource: string): Promise<ReturnData<BookChapter[]>> {
   return get<BookChapter[]>('/getBookToc', { tocUrl, bookSource })
+}
+
+/* ================= GAP 81：换源 SSE 流式（/reader3/searchBookSourceSSE） ================= */
+
+export interface SourceSSECallbacks {
+  /** 单个书源结果到达（data 可能为空数组；lastIndex 为该源序号） */
+  onBooks: (lastIndex: number, books: SearchBook[]) => void
+  /** 流正常结束（event: end） */
+  onEnd: (lastIndex: number, isEnd: boolean) => void
+  /** 服务端业务错误（event: error，data 为 ReturnData） */
+  onErrorEvent: (ret: ReturnData) => void
+  /** 流中途中断（连接断开，非用户取消） */
+  onStreamError?: (msg: string) => void
+}
+
+/**
+ * POST /reader3/searchBookSourceSSE：流式换源（后端逐书源 event: book → event: end；
+ * 与普通 searchBookSource 同契约 SearchBook[]，增量推送）。
+ * 传输层失败 reject → 调用方降级普通 searchBookSource。
+ */
+export function searchBookSourceSSE(
+  url: string,
+  bookSource: string,
+  cbs: SourceSSECallbacks,
+): Promise<{ abort: () => void }> {
+  const token = useUserStore().accessToken
+  return openSSEPost(
+    '/reader3/searchBookSourceSSE',
+    { url, bookSource },
+    { onBooks: cbs.onBooks, onEnd: cbs.onEnd, onErrorEvent: cbs.onErrorEvent, onStreamError: cbs.onStreamError },
+    token,
+  )
 }
 
 /** GET /reader3/getBookContent：章节正文（chapterUrl + bookSource，正文在 data.content） */

@@ -93,6 +93,12 @@ pub fn spawn_local_sync(storage: Storage) {
 /// notify 文件监听：storage/data 递归 + env READER_LOCAL_BOOK_DIR（可选，映射
 /// default 命名空间——secure 多用户模式下该环境目录统一归 default，需注意）。
 /// 事件路径 → 命名空间 → mpsc 上报（去抖循环消费）。
+/// notify watcher 全局保活：RecommendedWatcher Drop 即停止投递事件——
+/// 部署测试发现 spawn_watcher 的局部 watcher 在函数返回时被 Drop（双轨仓监听运行时失效）。
+/// 存 static 保活（进程生命周期），事件泵线程独立于 watcher。
+static KEEPALIVE_WATCHERS: std::sync::Mutex<Vec<notify::RecommendedWatcher>> =
+    std::sync::Mutex::new(Vec::new());
+
 fn spawn_watcher(storage: &Storage, event_tx: tokio::sync::mpsc::UnboundedSender<String>) {
     use notify::Watcher as _;
     let data_dir = storage.config.storage_dir().join("data");
@@ -123,6 +129,12 @@ fn spawn_watcher(storage: &Storage, event_tx: tokio::sync::mpsc::UnboundedSender
         };
         if let Err(e) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
             tracing::warn!("本地书监听目录失败（{}）: {e}", root.display());
+            continue;
+        }
+        // 保活：watcher 移入 static（函数返回不 Drop——否则 notify 停止投递，监听失效）
+        if let Ok(mut keep) = KEEPALIVE_WATCHERS.lock() {
+            keep.push(watcher);
+        } else {
             continue;
         }
         let root2 = root.clone();

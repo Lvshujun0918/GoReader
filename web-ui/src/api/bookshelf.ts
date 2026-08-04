@@ -11,6 +11,19 @@ export function saveBook(book: Book): Promise<ReturnData<null>> {
   return post<null>('/saveBook', book)
 }
 
+/**
+ * GAP 78：POST /reader3/refreshLocalBook：重扫本地书（local:// 重解析原文件；
+ * loc_book/storage 文件书重解析）——书架长按菜单「重新扫描」入口。
+ */
+export function refreshLocalBook(
+  url: string,
+): Promise<ReturnData<{ bookUrl?: string; name?: string; chapterCount?: number; totalChapterNum?: number } | null>> {
+  return post<{ bookUrl?: string; name?: string; chapterCount?: number; totalChapterNum?: number } | null>(
+    '/refreshLocalBook',
+    { url },
+  )
+}
+
 /** POST /reader3/deleteBook：移出书架（bookUrl） */
 export function deleteBook(bookUrl: string): Promise<ReturnData<null>> {
   return post<null>('/deleteBook', { bookUrl })

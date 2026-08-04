@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
-import { getBookInfo, getBookToc, searchBookSource } from '@/api/books'
+import { getBookInfo, getBookToc, searchBookSource, searchBookSourceSSE } from '@/api/books'
 import { getInvalidBookSources } from '@/api/sources'
-import { searchBookContent } from '@/api/cache'
+import { deleteBookCache, searchBookContent } from '@/api/cache'
 import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export'
 import { cacheBookOnServer, cacheBookSSE, cancelCacheBook } from '@/api/cacheBook'
 import { uploadFile, mkdir } from '@/api/file'
+import { post } from '@/api/request'
 import { downloadBlob } from '@/utils/download'
+import { relocateChapterIndex } from '@/utils/progressRelocate'
 import { useUserStore } from '@/stores/user'
 import type { Book, BookChapter, BookInfo, ContentSearchHit, SearchBook } from '@/types'
 
@@ -392,6 +394,10 @@ const sourceResults = ref<SearchBook[]>([])
 const sourceMsg = ref('')
 const sourceMsgError = ref(false)
 const currentOrigin = ref('')
+/** GAP 81：SSE 已返回结果的书源数（流式进度展示） */
+const sourceDoneCount = ref(0)
+/** 当前换源 SSE 句柄（关闭弹层时中止） */
+let sourceSSEHandle: { abort: () => void } | null = null
 /** 失效书源 URL 集合（GAP 20：getInvalidBookSources 探测，失败静默 → 空集不标注） */
 const invalidSourceUrls = ref<Set<string>>(new Set())
 
@@ -417,8 +423,41 @@ function openSource() {
 
 function closeSource() {
   if (sourceBusy.value || sourceSwitching.value) return
+  sourceSSEHandle?.abort()
+  sourceSSEHandle = null
   sourceOpen.value = false
   document.body.style.overflow = ''
+}
+
+/** GAP 20：结果排序——当前源置顶 → 其余按 originName 升序（失效源沉底，带「失效」标注） */
+function sortSourceResults(list: SearchBook[]): SearchBook[] {
+  const cur = list.filter((r) => r.origin === currentOrigin.value)
+  const rest = list.filter((r) => r.origin !== currentOrigin.value)
+  const invalid = rest.filter((r) => invalidSourceUrls.value.has(r.origin))
+  const valid = rest.filter((r) => !invalidSourceUrls.value.has(r.origin))
+  const byName = (a: SearchBook, c: SearchBook) =>
+    (a.originName || a.origin || '').localeCompare(c.originName || c.origin || '')
+  return [...cur, ...valid.sort(byName), ...invalid.sort(byName)]
+}
+
+/** 按书源去重后追加（同一源多条结果只留首个） */
+function appendSourceResults(books: SearchBook[]) {
+  const seen = new Set(sourceResults.value.map((r) => r.origin || r.originName))
+  for (const r of books) {
+    const k = r.origin || r.originName
+    if (!k || seen.has(k)) continue
+    seen.add(k)
+    sourceResults.value = [...sourceResults.value, r]
+  }
+}
+
+/** 流结束收尾：排序 + 空态文案 */
+function finalizeSourceResults() {
+  sourceResults.value = sortSourceResults(sourceResults.value)
+  if (sourceResults.value.length === 0) {
+    sourceMsg.value = '未找到其他书源'
+    sourceMsgError.value = false
+  }
 }
 
 /** 搜索同书其他书源：url=当前书 bookUrl + bookSource=当前源 */
@@ -429,6 +468,7 @@ async function runSourceSearch() {
   sourceResults.value = []
   sourceMsg.value = ''
   sourceMsgError.value = false
+  sourceDoneCount.value = 0
   currentOrigin.value = b.origin
   invalidSourceUrls.value = new Set()
   try {
@@ -439,32 +479,51 @@ async function runSourceSearch() {
     } catch {
       invalidSourceUrls.value = new Set()
     }
-    const res = await searchBookSource(b.bookUrl, b.origin, { silent: true })
-    // 按书源去重（同一源多条结果只留首个）
-    const seen = new Set<string>()
-    const list = (res.data ?? []).filter((r) => {
-      const k = r.origin || r.originName
-      if (!k || seen.has(k)) return false
-      seen.add(k)
-      return true
-    })
-    // GAP 20：当前源置顶 → 其余按 originName 升序（失效源沉底，带「失效」标注）
-    const cur = list.filter((r) => r.origin === currentOrigin.value)
-    const rest = list.filter((r) => r.origin !== currentOrigin.value)
-    const invalid = rest.filter((r) => invalidSourceUrls.value.has(r.origin))
-    const valid = rest.filter((r) => !invalidSourceUrls.value.has(r.origin))
-    const byName = (a: SearchBook, c: SearchBook) =>
-      (a.originName || a.origin || '').localeCompare(c.originName || c.origin || '')
-    sourceResults.value = [...cur, ...valid.sort(byName), ...invalid.sort(byName)]
-    if (sourceResults.value.length === 0) {
-      sourceMsg.value = '未找到其他书源'
-      sourceMsgError.value = false
+    // GAP 81：优先 SSE 流式换源（逐书源增量推送；连接失败降级普通接口）
+    let sseFailed = false
+    try {
+      const handle = await searchBookSourceSSE(b.bookUrl, b.origin, {
+        onBooks: (_lastIndex, books) => {
+          appendSourceResults(books)
+          sourceDoneCount.value += 1
+        },
+        onEnd: () => {
+          sourceBusy.value = false
+          finalizeSourceResults()
+        },
+        onErrorEvent: (ret) => {
+          sourceMsg.value = ret.errorMsg || '换源搜索失败'
+          sourceMsgError.value = true
+          sourceBusy.value = false
+        },
+        onStreamError: () => {
+          // 流中途断开：保留已收结果（若一个都没到则走降级提示）
+          sourceBusy.value = false
+          if (sourceResults.value.length === 0) {
+            sourceMsg.value = '流式换源中断，请重试'
+            sourceMsgError.value = true
+          } else {
+            finalizeSourceResults()
+          }
+        },
+      })
+      sourceSSEHandle = handle
+    } catch {
+      sseFailed = true
+    }
+    if (sseFailed) {
+      // 降级：普通 searchBookSource 全量拉取
+      const res = await searchBookSource(b.bookUrl, b.origin, { silent: true })
+      appendSourceResults(res.data ?? [])
+      finalizeSourceResults()
+      sourceBusy.value = false
     }
   } catch (err) {
     sourceMsg.value = isNotImplemented(err)
       ? '换源搜索接口后端暂未提供（GET /reader3/searchBookSource）'
       : `换源搜索失败：${err instanceof Error ? err.message : '请稍后重试'}`
     sourceMsgError.value = true
+    sourceBusy.value = false
   } finally {
     sourceBusy.value = false
   }
@@ -497,12 +556,48 @@ async function switchSource(r: SearchBook) {
     } catch {
       // 详情刷新失败：书架数据兜底展示
     }
+    // GAP 6：换源后阅读位置保留——新源章节目录索引可能失效，拉新目录重定位 durChapterIndex
+    // （标题跨源匹配优先，越界就近钳制；重定位后写回服务端进度，阅读器续读不丢位置）
+    await relocateProgressAfterSwitch(r)
     ElMessage.success(`已切换到「${r.originName || r.origin}」`)
     closeSource()
   } catch {
     // 失败提示由 request.ts 统一 toast（saveBook 非 silent）
   } finally {
     sourceSwitching.value = false
+  }
+}
+
+/**
+ * GAP 6：换源成功后重定位阅读进度。
+ * 旧源 durChapterIndex 在新源目录中可能越界/指向卷标行——拉新目录后
+ * 用 relocateChapterIndex（标题匹配 → 就近钳制）算新索引，并 POST saveBookProgress
+ * 写回服务端（失败静默——阅读器内还有范围守卫兜底）。
+ */
+async function relocateProgressAfterSwitch(r: SearchBook) {
+  const b = shelfBook.value
+  if (!b) return
+  const oldIdx = typeof b.durChapterIndex === 'number' ? b.durChapterIndex : -1
+  if (oldIdx < 0) return // 无进度不处理
+  try {
+    const tocRes = await getBookToc(r.tocUrl || b.tocUrl, r.origin)
+    const toc = tocRes.isSuccess ? (tocRes.data ?? []) : []
+    const newIdx = relocateChapterIndex(oldIdx, b.durChapterTitle, toc)
+    if (newIdx < 0) return // 目录为空等异常：不动服务端进度
+    const newTitle = toc[newIdx]?.title ?? b.durChapterTitle ?? ''
+    b.durChapterIndex = newIdx
+    b.durChapterTitle = newTitle
+    await post('/saveBookProgress', {
+      bookUrl: b.bookUrl,
+      durChapterIndex: newIdx,
+      durChapterPos: 0,
+      durChapterTime: Date.now(),
+      durChapterTitle: newTitle,
+    }).catch(() => {
+      /* 写回失败静默——阅读器内有范围守卫 */
+    })
+  } catch {
+    // 新目录拉取失败：不动服务端进度（阅读器内范围守卫兜底）
   }
 }
 
@@ -674,6 +769,40 @@ function openCache() {
   cacheMsgError.value = false
   document.body.style.overflow = 'hidden'
   void startCache()
+}
+
+/* ================= GAP 79：清除本书缓存（POST /reader3/deleteBookCache） ================= */
+
+const cacheClearBusy = ref(false)
+
+/** 确认后删除单书缓存（正文/目录缓存——删后下次打开重新拉取；接口 404 时提示后端待实现） */
+async function clearBookCache() {
+  const b = shelfBook.value
+  if (!b || cacheClearBusy.value) return
+  try {
+    await ElMessageBox.confirm('清除本书缓存后，正文/目录将重新从书源拉取。确定清除？', '清除缓存', {
+      confirmButtonText: '清除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch {
+    return // 用户取消
+  }
+  cacheClearBusy.value = true
+  try {
+    const res = await deleteBookCache(b.bookUrl)
+    const deleted = typeof res.data?.deleted === 'number' ? res.data.deleted : 0
+    ElMessage.success(`已清除本书缓存（${deleted} 条）`)
+  } catch (err) {
+    const e = err as { response?: { status?: number }; message?: string } | null | undefined
+    if (e?.response?.status === 404 || e?.response?.status === 501) {
+      ElMessage.warning('清除单书缓存接口后端暂未提供（POST /reader3/deleteBookCache）')
+    } else {
+      ElMessage.error(`清除缓存失败：${err instanceof Error ? err.message : '请稍后重试'}`)
+    }
+  } finally {
+    cacheClearBusy.value = false
+  }
 }
 
 function closeCache() {
@@ -993,6 +1122,10 @@ onMounted(load)
             <button class="search-btn" type="button" @click="openExport">导出</button>
             <!-- 缓存本书（POST /reader3/cacheBookOnServer：SSE 进度条） -->
             <button class="search-btn" type="button" @click="openCache">缓存本书</button>
+            <!-- GAP 79：清除本书缓存（POST /reader3/deleteBookCache：删 book_chapters 该书行） -->
+            <button v-if="shelfBook" class="search-btn" type="button" :disabled="cacheClearBusy" @click="clearBookCache">
+              {{ cacheClearBusy ? '清理中…' : '清缓存' }}
+            </button>
           </div>
         </div>
       </div>
@@ -1064,7 +1197,7 @@ onMounted(load)
         </div>
       </Transition>
     </Teleport>
-    <!-- 换源弹层（GET /reader3/searchBookSource：搜索同书其他书源，点击切换） -->
+    <!-- 换源弹层（GAP 81：优先 /reader3/searchBookSourceSSE 流式——逐源增量；连接失败降级 GET /reader3/searchBookSource） -->
     <Teleport to="body">
       <Transition name="dlg">
         <div v-if="sourceOpen" class="dlg-overlay" @click.self="closeSource">
@@ -1087,16 +1220,17 @@ onMounted(load)
             <div class="source-body">
               <p class="field-tip">搜索《{{ display.name }}》的其他书源（当前：{{ currentOrigin || '—' }}），点击结果即可切换。</p>
 
-              <!-- 搜索中 -->
+              <!-- 搜索中（GAP 81：SSE 流式——实时显示已返回源数） -->
               <div v-if="sourceBusy" class="source-busy">
                 <svg class="mini-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
                   <path d="M21 12a9 9 0 1 1-6.2-8.56" />
                 </svg>
-                <span>正在搜索其他书源…</span>
+                <span v-if="sourceDoneCount > 0">正在搜索其他书源…（已返回 {{ sourceDoneCount }} 个源）</span>
+                <span v-else>正在搜索其他书源…</span>
               </div>
 
-              <!-- 结果列表：当前源置顶 + originName 排序 + 失效标注（GAP 20） -->
-              <ul v-else-if="sourceResults.length" class="source-list">
+              <!-- 结果列表：当前源置顶 + originName 排序 + 失效标注（GAP 20；SSE 增量到达实时追加） -->
+              <ul v-if="sourceResults.length" class="source-list">
                 <li v-for="(r, i) in sourceResults" :key="i">
                   <button
                     class="source-row"
@@ -1114,8 +1248,8 @@ onMounted(load)
                 </li>
               </ul>
 
-              <!-- 空 / 失败提示 -->
-              <template v-else>
+              <!-- 空 / 失败提示（搜索结束后仍无结果时） -->
+              <template v-else-if="!sourceBusy">
                 <p v-if="sourceMsg" class="search-msg" :class="{ error: sourceMsgError }">{{ sourceMsg }}</p>
                 <div v-if="sourceMsgError" class="source-retry">
                   <button class="ghost-btn" type="button" @click="runSourceSearch">重试</button>

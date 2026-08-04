@@ -8,6 +8,7 @@ import {
   deleteBookGroup,
   getBookGroups,
   getBookshelf,
+  refreshLocalBook,
   saveBookGroup,
   saveBookGroupOrder,
   updateBookGroupId,
@@ -17,6 +18,7 @@ import { uploadLocalBook, importBookPreview } from '@/api/upload'
 import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export'
 import { probeSecureMode } from '@/api/users'
 import { downloadBlob } from '@/utils/download'
+import { canRescanBook } from '@/utils/localBook'
 import { useUserStore } from '@/stores/user'
 import type { Book, BookGroup, Bookmark, ImportPreview } from '@/types'
 
@@ -589,6 +591,37 @@ function togglePin() {
   persistPinned()
   ElMessage.success(isPinned(book) ? '已置顶（排序优先）' : '已取消置顶')
   closeMenu()
+}
+
+/* ================= GAP 78：重新扫描本地书（POST /reader3/refreshLocalBook） ================= */
+
+const rescanBusy = ref(false)
+
+/** 书卡菜单「重新扫描」：重解析本地书原文件（local:// 双轨书 / loc_book 文件书）→ 刷新书架 */
+async function rescanBook() {
+  const book = menuBook.value
+  if (!book || rescanBusy.value) return
+  rescanBusy.value = true
+  closeMenu()
+  try {
+    const res = await refreshLocalBook(book.bookUrl)
+    const count = res.data?.totalChapterNum ?? res.data?.chapterCount
+    ElMessage.success(
+      count !== undefined
+        ? `已重新扫描「${book.name}」（${count} 章）`
+        : `已重新扫描「${book.name}」`,
+    )
+    await load(true)
+  } catch (err) {
+    const e = err as { response?: { status?: number }; message?: string } | null | undefined
+    if (e?.response?.status === 404 || e?.response?.status === 501) {
+      ElMessage.warning('重新扫描接口后端暂未提供（POST /reader3/refreshLocalBook）')
+    } else {
+      ElMessage.error(`重新扫描失败：${err instanceof Error ? err.message : '请稍后重试'}`)
+    }
+  } finally {
+    rescanBusy.value = false
+  }
 }
 
 const filtered = computed(() => {
@@ -2032,6 +2065,14 @@ onMounted(() => {
                   <path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15" />
                 </svg>
                 导出
+              </button>
+              <!-- GAP 78：重新扫描（仅本地书：local:// 双轨书 / loc_book 文件书——重解析原文件刷新章节） -->
+              <button v-if="menuBook && canRescanBook(menuBook)" class="ctx-item" type="button" :disabled="rescanBusy" @click="rescanBook">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                  <path d="M21 3v6h-6" />
+                </svg>
+                重新扫描
               </button>
               <button class="ctx-item danger" type="button" :disabled="menuBusy" @click="removeFromShelf">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
