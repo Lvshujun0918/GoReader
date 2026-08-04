@@ -102,6 +102,13 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/tts", get(tts_synthesize).post(tts_synthesize))
         // F-39 手动备份到 WebDAV（书架数据 zip）
         .route("/reader3/backupToWebdav", post(backup_to_webdav))
+        // F-55 备份恢复（zip 上传 / webdav 目录内 zip）
+        .route(
+            "/reader3/restoreFromZip",
+            post(restore_from_zip)
+                .layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
+        .route("/reader3/restoreFromWebdav", post(restore_from_webdav))
         // F-38 文件管理（home 语义对齐 legacy FileController）
         .route("/reader3/file/list", get(crate::api::files::list))
         .route("/reader3/file/get", get(crate::api::files::get))
@@ -3595,6 +3602,116 @@ async fn backup_to_webdav(
         Err(e) => {
             tracing::error!("backupToWebdav 失败 [{namespace}]: {e}");
             Json(ReturnData::err("备份失败"))
+        }
+    }
+}
+
+/// F-55：POST /reader3/restoreFromZip：从备份 zip 恢复（multipart：file=zip + overwrite 字段）
+///
+/// 返回 {restored: {sources, books, groups, rules, txtRules, rss, config, tts, bookmarks},
+///        skipped: {...}}——逐项幂等：已存在且 overwrite=false 时跳过。
+async fn restore_from_zip(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut overwrite = params.get("overwrite").map(|v| v == "true" || v == "1").unwrap_or(false);
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name() {
+            Some("file") => {
+                if let Ok(b) = field.bytes().await {
+                    bytes = b.to_vec();
+                }
+            }
+            Some("overwrite") => {
+                if let Ok(v) = field.text().await {
+                    overwrite = v == "true" || v == "1";
+                }
+            }
+            _ => {}
+        }
+    }
+    if bytes.is_empty() {
+        return Json(ReturnData::err("请上传备份文件"));
+    }
+    match state.storage.restore_backup_zip(&namespace, &bytes, overwrite).await {
+        Ok(report) => {
+            Json(ReturnData::ok(serde_json::to_value(report).unwrap_or(json!(null))))
+        }
+        Err(e) => {
+            tracing::error!("restoreFromZip 失败 [{namespace}]: {e}");
+            Json(ReturnData::err(format!("恢复失败：{e}")))
+        }
+    }
+}
+
+/// F-55：POST /reader3/restoreFromWebdav：从 webdav 目录读备份 zip 恢复（body {path, overwrite}）
+/// path 相对当前用户 webdav 根（如 legado/backup-2024-01-01-120000.zip）；复用 restore_backup_zip 核心
+async fn restore_from_webdav(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    if state.storage.config.secure {
+        let user = match state.storage.find_user(&namespace).await {
+            Ok(Some(u)) => u,
+            _ => return Json(ReturnData::err("请登录后使用")),
+        };
+        if !user.enable_webdav {
+            return Json(ReturnData::err("未开启webdav功能"));
+        }
+    }
+    let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let path = param_of(&params, body_json.as_ref(), "path");
+    if path.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    let mut overwrite = params.get("overwrite").map(|v| v == "true" || v == "1").unwrap_or(false);
+    if let Some(v) = body_json
+        .as_ref()
+        .and_then(|b| b.get("overwrite"))
+        .and_then(|v| v.as_bool())
+    {
+        overwrite = v;
+    }
+    let webdav_root = state
+        .storage
+        .config
+        .storage_dir()
+        .join("data")
+        .join(&namespace)
+        .join("webdav");
+    let Some(file) = crate::api::files::resolve_secure_path(&webdav_root, &path) else {
+        return Json(ReturnData::err("参数错误"));
+    };
+    if !file.is_file() {
+        return Json(ReturnData::err("路径不存在"));
+    }
+    let bytes = match tokio::fs::read(&file).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("restoreFromWebdav 读取失败 [{}]: {e}", file.display());
+            return Json(ReturnData::err("读取失败"));
+        }
+    };
+    match state.storage.restore_backup_zip(&namespace, &bytes, overwrite).await {
+        Ok(report) => {
+            Json(ReturnData::ok(serde_json::to_value(report).unwrap_or(json!(null))))
+        }
+        Err(e) => {
+            tracing::error!("restoreFromWebdav 失败 [{namespace}] {path}: {e}");
+            Json(ReturnData::err(format!("恢复失败：{e}")))
         }
     }
 }
@@ -9321,6 +9438,248 @@ mod tests {
         let alice = state.storage.find_user("alice").await.unwrap().unwrap();
         assert_eq!(gen_encrypted_password("新密码123", &alice.salt), alice.password, "新密码应可校验");
         assert!(alice.token.is_empty(), "旧 token 应失效");
+
+        cleanup(state, dir).await;
+    }
+
+    /// 测试用最小备份 zip 构造（条目名 → 内容）
+    fn make_test_zip(entries: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut buf);
+        for (name, content) in entries {
+            writer
+                .start_file(*name, zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+        drop(writer);
+        buf.into_inner()
+    }
+
+    /// F-55：restoreFromZip（multipart file=zip + overwrite 字段）——handler 全链路
+    #[tokio::test]
+    async fn test_restore_from_zip_api() {
+        let (state, dir) = test_state("restorezip").await;
+        // 预置一条书源 + 一本书（overwrite=false 恢复时应跳过）
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: "https://s1.com".into(),
+                    book_source_name: "旧源".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://b1.com".into(),
+                    name: "旧书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let zip = make_test_zip(&[
+            (
+                "bookSource.json",
+                r#"[{"bookSourceUrl":"https://s1.com","bookSourceName":"新源"},{"bookSourceUrl":"https://s2.com","bookSourceName":"源2"}]"#,
+            ),
+            ("bookshelf.json", r#"[{"bookUrl":"https://b1.com","name":"书1"}]"#),
+        ]);
+
+        let boundary = "----reader-restore-boundary-9f8e7d6c";
+        // ① overwrite 缺省（false）：已存在跳过、新增恢复
+        let mut mp: Vec<u8> = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"backup.zip\"\r\nContent-Type: application/zip\r\n\r\n"
+        )
+        .into_bytes();
+        mp.extend_from_slice(&zip);
+        mp.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(axum::body::Body::from(mp))
+            .unwrap();
+        use axum::extract::FromRequest;
+        let multipart = axum::extract::Multipart::from_request(req, &()).await.unwrap();
+        let ret = restore_from_zip(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            multipart,
+        )
+        .await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["restored"]["sources"], 1, "仅 s2 新增");
+        assert_eq!(ret.0.data["skipped"]["sources"], 1, "s1 已存在跳过");
+        assert_eq!(ret.0.data["skipped"]["books"], 1, "b1 已存在跳过");
+        // 未覆盖：s1 仍是旧源
+        let src = state
+            .storage
+            .find_book_source("default", "https://s1.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(src.book_source_name, "旧源");
+
+        // ② overwrite=true（表单字段）→ 全部恢复/覆盖
+        let mut mp2: Vec<u8> = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"backup.zip\"\r\nContent-Type: application/zip\r\n\r\n"
+        )
+        .into_bytes();
+        mp2.extend_from_slice(&zip);
+        mp2.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\ntrue\r\n--{boundary}--\r\n"
+            )
+            .as_bytes(),
+        );
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(axum::body::Body::from(mp2))
+            .unwrap();
+        let multipart = axum::extract::Multipart::from_request(req, &()).await.unwrap();
+        let ret = restore_from_zip(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            multipart,
+        )
+        .await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["restored"]["sources"], 2);
+        assert_eq!(ret.0.data["restored"]["books"], 1);
+        assert_eq!(ret.0.data["skipped"]["sources"], 0);
+        // 覆盖生效：s1 被“新源”覆盖；书入架（namespace=default）
+        let src = state
+            .storage
+            .find_book_source("default", "https://s1.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(src.book_source_name, "新源");
+        let book = state
+            .storage
+            .find_book("default", "https://b1.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(book.name, "书1");
+        assert_eq!(book.user_namespace, "default");
+
+        // 无 file 字段 → 参数错误
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(axum::body::Body::from(format!("--{boundary}--\r\n")))
+            .unwrap();
+        let multipart = axum::extract::Multipart::from_request(req, &()).await.unwrap();
+        let ret = restore_from_zip(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            multipart,
+        )
+        .await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "请上传备份文件");
+
+        // 非法 zip → 恢复失败
+        let mut mp3 = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bad.zip\"\r\nContent-Type: application/zip\r\n\r\n"
+        );
+        mp3.push_str("not a zip file");
+        mp3.push_str(&format!("\r\n--{boundary}--\r\n"));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(axum::body::Body::from(mp3))
+            .unwrap();
+        let multipart = axum::extract::Multipart::from_request(req, &()).await.unwrap();
+        let ret = restore_from_zip(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            multipart,
+        )
+        .await;
+        assert!(!ret.0.is_success);
+        assert!(ret.0.error_msg.contains("恢复失败"));
+
+        cleanup(state, dir).await;
+    }
+
+    /// F-55：restoreFromWebdav（body {path, overwrite}）——zip 放 webdav 目录 → 恢复；
+    /// 路径不存在/穿越拒绝；secure 未开启 webdav 拒绝
+    #[tokio::test]
+    async fn test_restore_from_webdav_api() {
+        let (mut state, dir) = test_state("restoredav").await;
+        let zip = make_test_zip(&[
+            ("bookSource.json", r#"[{"bookSourceUrl":"https://w1.com","bookSourceName":"网源"}]"#),
+            ("bookshelf.json", r#"[{"bookUrl":"https://wb1.com","name":"网书"}]"#),
+        ]);
+        let webdav = state
+            .storage
+            .config
+            .storage_dir()
+            .join("data/default/webdav/legado");
+        std::fs::create_dir_all(&webdav).unwrap();
+        std::fs::write(webdav.join("backup-test.zip"), &zip).unwrap();
+
+        // 恢复成功 + overwrite 参数（body JSON）
+        let body = Bytes::from(json!({ "path": "legado/backup-test.zip", "overwrite": true }).to_string());
+        let ret = restore_from_webdav(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["restored"]["sources"], 1);
+        assert_eq!(ret.0.data["restored"]["books"], 1);
+        assert_eq!(ret.0.data["restored"]["groups"], 0);
+        assert_eq!(state.storage.get_book_sources("default").await.unwrap()[0].book_source_name, "网源");
+
+        // 路径不存在
+        let body = Bytes::from(json!({ "path": "legado/ghost.zip" }).to_string());
+        let ret = restore_from_webdav(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "路径不存在");
+
+        // 路径穿越 → 参数错误
+        let body = Bytes::from(json!({ "path": "../secret.zip" }).to_string());
+        let ret = restore_from_webdav(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "参数错误");
+
+        // 非 zip 文件 → 恢复失败
+        std::fs::write(webdav.join("bad.zip"), b"not a zip").unwrap();
+        let body = Bytes::from(json!({ "path": "legado/bad.zip" }).to_string());
+        let ret = restore_from_webdav(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert!(ret.0.error_msg.contains("恢复失败"));
+
+        // secure：未开启 webdav → 拒绝
+        state.storage.config.secure = true;
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "t1".into(),
+                enable_webdav: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let params: HashMap<String, String> = [("accessToken".into(), "alice:t1".into())].into_iter().collect();
+        let body = Bytes::from(json!({ "path": "legado/backup-test.zip" }).to_string());
+        let ret = restore_from_webdav(AxumState(state.clone()), Query(params), HeaderMap::new(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "未开启webdav功能");
 
         cleanup(state, dir).await;
     }

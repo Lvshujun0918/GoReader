@@ -2386,6 +2386,431 @@ impl Storage {
         tracing::info!("备份完成 [{ns}]: {}", zip_path.display());
         Ok(zip_path.to_string_lossy().into_owned())
     }
+
+    // ---------------- F-55 备份恢复（restoreFromZip / restoreFromWebdav 共用核心） ----------------
+
+    /// F-55：从备份 zip 字节恢复（restoreFromZip/restoreFromWebdav 共用核心）
+    ///
+    /// 结构探测：条目在 zip 根 或 config/ 目录下（兼容 legacy 备份 zip 两种布局）；
+    /// 书架文件兼容 bookshelf.json / books.json 两个命名。
+    ///
+    /// 逐项幂等：已存在时 overwrite=true 覆盖、否则跳过（计数进 skipped）；
+    /// namespace 一律为当前用户（备份内 user_namespace 不生效）。
+    pub async fn restore_backup_zip(
+        &self,
+        ns: &str,
+        zip_bytes: &[u8],
+        overwrite: bool,
+    ) -> Result<RestoreReport> {
+        let cursor = std::io::Cursor::new(zip_bytes.to_vec());
+        let mut archive = zip::ZipArchive::new(cursor)
+            .map_err(|e| anyhow::anyhow!("备份文件不是有效的 zip：{e}"))?;
+        // 预读全部条目到内存（zip 读取是同步 IO，避免跨 await 持有 archive）
+        let mut entries: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        use std::io::Read;
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i)?;
+            let name = f.name().to_string();
+            let mut bytes = Vec::new();
+            f.read_to_end(&mut bytes)?;
+            entries.insert(name, bytes);
+        }
+
+        // 条目读取：根 或 config/ 前缀（legacy 两种布局）
+        let entry = |name: &str| -> Option<&Vec<u8>> {
+            entries
+                .get(name)
+                .or_else(|| entries.get(&format!("config/{name}")))
+        };
+
+        // 结构探测：一个识别条目都没有 → 拒绝（避免把任意 zip 当备份）
+        let recognized = [
+            "bookSource.json",
+            "bookshelf.json",
+            "books.json",
+            "bookGroup.json",
+            "replaceRule.json",
+            "txtTocRule.json",
+            "rssSources.json",
+            "userConfig.json",
+            "httpTTS.json",
+            "bookmark.json",
+        ];
+        if !recognized.iter().any(|n| entry(n).is_some()) {
+            return Err(anyhow::anyhow!("备份文件中没有可恢复的数据"));
+        }
+
+        let mut report = RestoreReport::default();
+
+        // 书源（按 bookSourceUrl 覆盖或跳过）
+        if let Some(bytes) = entry("bookSource.json") {
+            match serde_json::from_slice::<Vec<crate::model::BookSource>>(bytes) {
+                Ok(items) => {
+                    for s in items {
+                        if s.book_source_url.trim().is_empty() {
+                            report.skipped.sources += 1;
+                            continue;
+                        }
+                        if !overwrite
+                            && self
+                                .table_exists(
+                                    "SELECT 1 FROM book_sources WHERE user_namespace = ?1 AND book_source_url = ?2",
+                                    ns,
+                                    &s.book_source_url,
+                                )
+                                .await?
+                        {
+                            report.skipped.sources += 1;
+                        } else {
+                            self.save_book_source(ns, &s).await?;
+                            report.restored.sources += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("restore [{ns}] bookSource.json 解析失败: {e}");
+                    report.skipped.sources += 1;
+                }
+            }
+        }
+
+        // 书架（按 book_url upsert，namespace=当前用户；bookshelf.json / books.json 兼容）
+        if let Some(bytes) = entry("bookshelf.json").or_else(|| entry("books.json")) {
+            match serde_json::from_slice::<Vec<Book>>(bytes) {
+                Ok(items) => {
+                    for mut b in items {
+                        if b.book_url.trim().is_empty() {
+                            report.skipped.books += 1;
+                            continue;
+                        }
+                        b.user_namespace = ns.to_string();
+                        if !overwrite
+                            && self
+                                .table_exists(
+                                    "SELECT 1 FROM books WHERE user_namespace = ?1 AND book_url = ?2",
+                                    ns,
+                                    &b.book_url,
+                                )
+                                .await?
+                        {
+                            report.skipped.books += 1;
+                        } else {
+                            self.upsert_book(ns, &b).await?;
+                            report.restored.books += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("restore [{ns}] bookshelf.json 解析失败: {e}");
+                    report.skipped.books += 1;
+                }
+            }
+        }
+
+        // 书架分组（按 id 覆盖或跳过；id<=0 时自增新建）
+        if let Some(bytes) = entry("bookGroup.json") {
+            match serde_json::from_slice::<Vec<crate::model::BookGroup>>(bytes) {
+                Ok(items) => {
+                    for g in items {
+                        if g.name.trim().is_empty() {
+                            report.skipped.groups += 1;
+                            continue;
+                        }
+                        if !overwrite && g.id > 0 {
+                            let exists: bool = sqlx::query_scalar::<_, i64>(
+                                "SELECT 1 FROM book_groups WHERE user_namespace = ?1 AND id = ?2",
+                            )
+                            .bind(ns)
+                            .bind(g.id)
+                            .fetch_optional(&self.pool)
+                            .await?
+                            .is_some();
+                            if exists {
+                                report.skipped.groups += 1;
+                                continue;
+                            }
+                        }
+                        self.save_book_group(ns, &g).await?;
+                        report.restored.groups += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("restore [{ns}] bookGroup.json 解析失败: {e}");
+                    report.skipped.groups += 1;
+                }
+            }
+        }
+
+        // 替换规则（按 id）
+        if let Some(bytes) = entry("replaceRule.json") {
+            match serde_json::from_slice::<Vec<crate::model::ReplaceRule>>(bytes) {
+                Ok(items) => {
+                    for mut r in items {
+                        if r.id.trim().is_empty() {
+                            r.id = uuid::Uuid::new_v4().simple().to_string();
+                        }
+                        if r.name.trim().is_empty() {
+                            report.skipped.rules += 1;
+                            continue;
+                        }
+                        if !overwrite
+                            && self
+                                .table_exists(
+                                    "SELECT 1 FROM replace_rules WHERE user_namespace = ?1 AND id = ?2",
+                                    ns,
+                                    &r.id,
+                                )
+                                .await?
+                        {
+                            report.skipped.rules += 1;
+                        } else {
+                            self.save_replace_rule(ns, &r).await?;
+                            report.restored.rules += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("restore [{ns}] replaceRule.json 解析失败: {e}");
+                    report.skipped.rules += 1;
+                }
+            }
+        }
+
+        // 自定义 TXT 目录规则（按 id）
+        if let Some(bytes) = entry("txtTocRule.json") {
+            match serde_json::from_slice::<Vec<crate::model::TxtTocRule>>(bytes) {
+                Ok(items) => {
+                    for mut r in items {
+                        if r.id.trim().is_empty() {
+                            r.id = uuid::Uuid::new_v4().simple().to_string();
+                        }
+                        if r.name.trim().is_empty() || r.rule.trim().is_empty() {
+                            report.skipped.txt_rules += 1;
+                            continue;
+                        }
+                        if !overwrite
+                            && self
+                                .table_exists(
+                                    "SELECT 1 FROM txt_toc_rules WHERE user_namespace = ?1 AND id = ?2",
+                                    ns,
+                                    &r.id,
+                                )
+                                .await?
+                        {
+                            report.skipped.txt_rules += 1;
+                        } else {
+                            self.save_txt_toc_rule(ns, &r).await?;
+                            report.restored.txt_rules += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("restore [{ns}] txtTocRule.json 解析失败: {e}");
+                    report.skipped.txt_rules += 1;
+                }
+            }
+        }
+
+        // RSS 源（按 sourceUrl；raw_json 存条目原文，未知字段不丢）
+        if let Some(bytes) = entry("rssSources.json") {
+            match serde_json::from_slice::<serde_json::Value>(bytes) {
+                Ok(serde_json::Value::Array(arr)) => {
+                    for v in arr {
+                        let mut s: crate::model::RssSource = match serde_json::from_value(v.clone()) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                report.skipped.rss += 1;
+                                continue;
+                            }
+                        };
+                        if s.source_url.trim().is_empty() || s.source_name.trim().is_empty() {
+                            report.skipped.rss += 1;
+                            continue;
+                        }
+                        s.raw_json = Some(v.to_string());
+                        if !overwrite
+                            && self
+                                .table_exists(
+                                    "SELECT 1 FROM rss_sources WHERE user_namespace = ?1 AND rss_source_url = ?2",
+                                    ns,
+                                    &s.source_url,
+                                )
+                                .await?
+                        {
+                            report.skipped.rss += 1;
+                        } else {
+                            self.save_rss_source(ns, &s).await?;
+                            report.restored.rss += 1;
+                        }
+                    }
+                }
+                Ok(_) => report.skipped.rss += 1,
+                Err(e) => {
+                    tracing::warn!("restore [{ns}] rssSources.json 解析失败: {e}");
+                    report.skipped.rss += 1;
+                }
+            }
+        }
+
+        // 用户配置（userConfig.json = {键: 值} 对象；或 [{key, value}] 数组）
+        if let Some(bytes) = entry("userConfig.json") {
+            match serde_json::from_slice::<serde_json::Value>(bytes) {
+                Ok(serde_json::Value::Object(map)) => {
+                    for (k, v) in map {
+                        let raw = match &v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        if !overwrite && self.get_user_config(ns, &k).await?.is_some() {
+                            report.skipped.config += 1;
+                        } else {
+                            self.save_user_config(ns, &k, &raw).await?;
+                            report.restored.config += 1;
+                        }
+                    }
+                }
+                Ok(serde_json::Value::Array(arr)) => {
+                    for v in arr {
+                        let Some(k) = v.get("key").and_then(|x| x.as_str()) else {
+                            report.skipped.config += 1;
+                            continue;
+                        };
+                        let raw = match v.get("value") {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(other) => other.to_string(),
+                            None => String::new(),
+                        };
+                        if !overwrite && self.get_user_config(ns, k).await?.is_some() {
+                            report.skipped.config += 1;
+                        } else {
+                            self.save_user_config(ns, k, &raw).await?;
+                            report.restored.config += 1;
+                        }
+                    }
+                }
+                Ok(_) => report.skipped.config += 1,
+                Err(e) => {
+                    tracing::warn!("restore [{ns}] userConfig.json 解析失败: {e}");
+                    report.skipped.config += 1;
+                }
+            }
+        }
+
+        // HttpTTS 听书源（按 url）
+        if let Some(bytes) = entry("httpTTS.json") {
+            match serde_json::from_slice::<Vec<crate::model::HttpTts>>(bytes) {
+                Ok(items) => {
+                    for t in items {
+                        if t.url.trim().is_empty() || t.name.trim().is_empty() {
+                            report.skipped.tts += 1;
+                            continue;
+                        }
+                        if !overwrite
+                            && self
+                                .table_exists(
+                                    "SELECT 1 FROM http_tts_list WHERE user_namespace = ?1 AND url = ?2",
+                                    ns,
+                                    &t.url,
+                                )
+                                .await?
+                        {
+                            report.skipped.tts += 1;
+                        } else {
+                            self.save_http_tts(ns, &t).await?;
+                            report.restored.tts += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("restore [{ns}] httpTTS.json 解析失败: {e}");
+                    report.skipped.tts += 1;
+                }
+            }
+        }
+
+        // 书签（按 bookUrl+title）——备份 zip 含 bookmark.json，一并恢复
+        if let Some(bytes) = entry("bookmark.json") {
+            match serde_json::from_slice::<Vec<crate::model::Bookmark>>(bytes) {
+                Ok(items) => {
+                    for bm in items {
+                        if bm.book_url.trim().is_empty() || bm.title.trim().is_empty() {
+                            report.skipped.bookmarks += 1;
+                            continue;
+                        }
+                        let exists: bool = sqlx::query_scalar::<_, i64>(
+                            "SELECT 1 FROM bookmarks WHERE user_namespace = ?1 AND book_url = ?2 AND title = ?3",
+                        )
+                        .bind(ns)
+                        .bind(&bm.book_url)
+                        .bind(&bm.title)
+                        .fetch_optional(&self.pool)
+                        .await?
+                        .is_some();
+                        if !overwrite && exists {
+                            report.skipped.bookmarks += 1;
+                        } else {
+                            self.save_bookmark(ns, &bm).await?;
+                            report.restored.bookmarks += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("restore [{ns}] bookmark.json 解析失败: {e}");
+                    report.skipped.bookmarks += 1;
+                }
+            }
+        }
+
+        tracing::info!(
+            "恢复完成 [{ns}] overwrite={overwrite}: restored={:?} skipped={:?}",
+            report.restored,
+            report.skipped
+        );
+        Ok(report)
+    }
+
+    /// 表存在性探测（幂等判断共用；两参版本）
+    async fn table_exists(&self, sql: &str, a: &str, b: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(sql)
+            .bind(a)
+            .bind(b)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+}
+
+/// 各类目恢复计数（restored/skipped 共用）
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreCounts {
+    /// 书源（按 bookSourceUrl）
+    pub sources: u64,
+    /// 书架书（按 book_url）
+    pub books: u64,
+    /// 书架分组（按 id）
+    pub groups: u64,
+    /// 替换规则（按 id）
+    pub rules: u64,
+    /// 自定义 TXT 目录规则（按 id）
+    #[serde(rename = "txtRules")]
+    pub txt_rules: u64,
+    /// RSS 源（按 sourceUrl）
+    pub rss: u64,
+    /// 用户配置（按配置键）
+    pub config: u64,
+    /// HttpTTS 听书源（按 url）
+    pub tts: u64,
+    /// 书签（按 bookUrl+title）
+    pub bookmarks: u64,
+}
+
+/// 恢复报告（restoreFromZip / restoreFromWebdav 返回：restored/skipped 各类目计数）
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreReport {
+    pub restored: RestoreCounts,
+    pub skipped: RestoreCounts,
 }
 
 /// zip 单条目写入（F-39）
@@ -3605,6 +4030,230 @@ mod tests {
         assert!(content.contains("源A"), "bookSource.json 应含书源");
 
         cleanup(storage, "backup").await;
+    }
+
+    /// 测试用最小备份 zip 构造（条目名 → 内容）
+    fn make_backup_zip(entries: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut buf);
+        for (name, content) in entries {
+            writer
+                .start_file(*name, zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+        drop(writer);
+        buf.into_inner()
+    }
+
+    /// F-55：备份 zip 恢复（最小备份 zip → 各表断言；幂等 skip / overwrite）
+    #[tokio::test]
+    async fn test_restore_backup_zip() {
+        let storage = test_storage("restore").await;
+        let zip = make_backup_zip(&[
+            (
+                "bookSource.json",
+                r#"[{"bookSourceUrl":"https://s1.com","bookSourceName":"源1","bookSourceGroup":"小说"}]"#,
+            ),
+            (
+                "bookshelf.json",
+                r#"[{"bookUrl":"https://b1.com","name":"书1","author":"甲","origin":"https://s1.com","group":3}]"#,
+            ),
+            (
+                "bookGroup.json",
+                r#"[{"id":3,"name":"我的分组","order":1}]"#,
+            ),
+            (
+                "replaceRule.json",
+                r#"[{"id":"r1","name":"规则1","find":"甲","replace":"乙","enabled":true,"order":0}]"#,
+            ),
+            (
+                "txtTocRule.json",
+                r#"[{"id":"t1","name":"TXT规则","rule":"^第.*章","serialNumber":1}]"#,
+            ),
+            (
+                "rssSources.json",
+                r#"[{"sourceUrl":"https://rss.com/feed","sourceName":"RSS源","header":"UA:1"}]"#,
+            ),
+            (
+                "userConfig.json",
+                r#"{"theme":"dark","fontSize":"18"}"#,
+            ),
+            (
+                "httpTTS.json",
+                r#"[{"url":"https://tts.com/api","name":"TTS源","type":0}]"#,
+            ),
+            (
+                "bookmark.json",
+                r#"[{"bookUrl":"https://b1.com","title":"书签1","chapterIndex":2,"paragraphIndex":10}]"#,
+            ),
+        ]);
+
+        // 首次恢复：全部 restored
+        let report = storage.restore_backup_zip("default", &zip, false).await.unwrap();
+        assert_eq!(report.restored.sources, 1);
+        assert_eq!(report.restored.books, 1);
+        assert_eq!(report.restored.groups, 1);
+        assert_eq!(report.restored.rules, 1);
+        assert_eq!(report.restored.txt_rules, 1);
+        assert_eq!(report.restored.rss, 1);
+        assert_eq!(report.restored.config, 2);
+        assert_eq!(report.restored.tts, 1);
+        assert_eq!(report.restored.bookmarks, 1);
+        assert_eq!(report.skipped.sources, 0);
+
+        // 各表断言
+        let sources = storage.get_book_sources("default").await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].book_source_name, "源1");
+        assert_eq!(sources[0].book_source_group.as_deref(), Some("小说"));
+        assert_eq!(sources[0].user_namespace, "default");
+        let books = storage.list_books("default").await.unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].name, "书1");
+        assert_eq!(books[0].group, 3, "分组 id 应原样恢复");
+        assert_eq!(books[0].user_namespace, "default");
+        let groups = storage.list_book_groups("default").await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, 3);
+        assert_eq!(groups[0].name, "我的分组");
+        let rules = storage.get_replace_rules("default").await.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].find, "甲");
+        let txt_rules = storage.get_txt_toc_rules("default").await.unwrap();
+        assert_eq!(txt_rules.len(), 1);
+        assert_eq!(txt_rules[0].rule, "^第.*章");
+        let rss = storage.get_rss_sources("default").await.unwrap();
+        assert_eq!(rss.len(), 1);
+        assert_eq!(rss[0].source_name, "RSS源");
+        assert_eq!(
+            rss[0].raw_json.as_deref().map(|r| r.contains("\"header\"")),
+            Some(true),
+            "RSS raw_json 应保留未知字段"
+        );
+        assert_eq!(
+            storage.get_user_config("default", "theme").await.unwrap().as_deref(),
+            Some("dark")
+        );
+        assert_eq!(
+            storage.get_user_config("default", "fontSize").await.unwrap().as_deref(),
+            Some("18")
+        );
+        let tts = storage.get_http_tts_list("default").await.unwrap();
+        assert_eq!(tts.len(), 1);
+        assert_eq!(tts[0].url, "https://tts.com/api");
+        let bookmarks = storage.list_bookmarks("default", "https://b1.com").await.unwrap();
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].chapter_index, 2);
+
+        // 幂等：overwrite=false 再恢复 → 全部 skipped
+        let report = storage.restore_backup_zip("default", &zip, false).await.unwrap();
+        assert_eq!(report.restored.sources, 0);
+        assert_eq!(report.skipped.sources, 1);
+        assert_eq!(report.skipped.books, 1);
+        assert_eq!(report.skipped.groups, 1);
+        assert_eq!(report.skipped.rules, 1);
+        assert_eq!(report.skipped.txt_rules, 1);
+        assert_eq!(report.skipped.rss, 1);
+        assert_eq!(report.skipped.config, 2);
+        assert_eq!(report.skipped.tts, 1);
+        assert_eq!(report.skipped.bookmarks, 1);
+        assert_eq!(report.restored.config, 0);
+
+        // overwrite=true → 全部覆盖 restored
+        let report = storage.restore_backup_zip("default", &zip, true).await.unwrap();
+        assert_eq!(report.restored.sources, 1);
+        assert_eq!(report.restored.books, 1);
+        assert_eq!(report.restored.groups, 1);
+        assert_eq!(report.restored.rules, 1);
+        assert_eq!(report.restored.txt_rules, 1);
+        assert_eq!(report.restored.rss, 1);
+        assert_eq!(report.restored.config, 2);
+        assert_eq!(report.restored.tts, 1);
+        assert_eq!(report.restored.bookmarks, 1);
+        assert_eq!(report.skipped.sources, 0);
+        assert_eq!(storage.get_book_sources("default").await.unwrap().len(), 1, "覆盖不应产生重复行");
+
+        // 命名空间隔离：恢复进 alice 命名空间互不影响 default
+        // （book_sources 表主键为 book_source_url（全局），跨用户恢复需用不同 URL）
+        storage.insert_user(&User {
+            username: "alice".into(),
+            ..Default::default()
+        }).await.unwrap();
+        let zip_alice = make_backup_zip(&[
+            (
+                "bookSource.json",
+                r#"[{"bookSourceUrl":"https://s5.com","bookSourceName":"源5"}]"#,
+            ),
+            ("bookshelf.json", r#"[{"bookUrl":"https://b5.com","name":"书5"}]"#),
+        ]);
+        let report = storage.restore_backup_zip("alice", &zip_alice, false).await.unwrap();
+        assert_eq!(report.restored.sources, 1);
+        assert_eq!(report.restored.books, 1);
+        assert_eq!(storage.get_book_sources("alice").await.unwrap().len(), 1);
+        assert_eq!(storage.get_book_sources("default").await.unwrap().len(), 1, "default 不受影响");
+        assert_eq!(storage.list_books("default").await.unwrap().len(), 1, "default 书架不受影响");
+
+        cleanup(storage, "restore").await;
+    }
+
+    /// F-55：legacy 布局兼容——config/ 目录 + books.json 命名；非法 zip / 无识别条目报错
+    #[tokio::test]
+    async fn test_restore_backup_zip_legacy_layout() {
+        let storage = test_storage("restorelegacy").await;
+        let zip = make_backup_zip(&[
+            (
+                "config/bookSource.json",
+                r#"[{"bookSourceUrl":"https://s2.com","bookSourceName":"源2"}]"#,
+            ),
+            (
+                "config/books.json",
+                r#"[{"bookUrl":"https://b2.com","name":"书2"}]"#,
+            ),
+            (
+                "config/bookGroup.json",
+                r#"[{"id":7,"name":"legacy分组","order":0}]"#,
+            ),
+        ]);
+        let report = storage.restore_backup_zip("default", &zip, false).await.unwrap();
+        assert_eq!(report.restored.sources, 1);
+        assert_eq!(report.restored.books, 1);
+        assert_eq!(report.restored.groups, 1);
+        let books = storage.list_books("default").await.unwrap();
+        assert_eq!(books[0].name, "书2");
+        let groups = storage.list_book_groups("default").await.unwrap();
+        assert_eq!(groups[0].id, 7);
+
+        // 条目同时存在于根与 config/ 时优先根（当前布局覆盖 legacy）
+        let zip2 = make_backup_zip(&[
+            ("bookSource.json", r#"[{"bookSourceUrl":"https://s3.com","bookSourceName":"根源"}]"#),
+            ("config/bookSource.json", r#"[{"bookSourceUrl":"https://s4.com","bookSourceName":"config源"}]"#),
+        ]);
+        let report = storage.restore_backup_zip("default", &zip2, true).await.unwrap();
+        assert_eq!(report.restored.sources, 1);
+        assert_eq!(storage.get_book_sources("default").await.unwrap()[0].book_source_url, "https://s3.com");
+
+        // 无效条目（空 url/空名）计入 skipped
+        let zip3 = make_backup_zip(&[
+            ("bookSource.json", r#"[{"bookSourceName":"没URL"},{"bookSourceUrl":"https://ok.com","bookSourceName":"OK"}]"#),
+            ("bookshelf.json", r#"[{"name":"没URL"}]"#),
+            ("httpTTS.json", r#"[{"name":"没URL"}]"#),
+        ]);
+        let report = storage.restore_backup_zip("default", &zip3, false).await.unwrap();
+        assert_eq!(report.restored.sources, 1);
+        assert_eq!(report.skipped.sources, 1);
+        assert_eq!(report.skipped.books, 1);
+        assert_eq!(report.skipped.tts, 1);
+
+        // 非 zip 字节 → Err
+        assert!(storage.restore_backup_zip("default", b"not a zip file", false).await.is_err());
+        // 合法 zip 但无识别条目 → Err
+        let empty = make_backup_zip(&[("readme.txt", "hi")]);
+        assert!(storage.restore_backup_zip("default", &empty, false).await.is_err());
+
+        cleanup(storage, "restorelegacy").await;
     }
 
     /// F-35：定时任务主循环（本地书/无书源书跳过；网络书源缺失时静默跳过不报错）
