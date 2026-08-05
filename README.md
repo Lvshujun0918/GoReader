@@ -2,7 +2,7 @@
 
 # Reader Dev
 
-**自托管 Web 阅读服务 —— 书源搜索 · 本地书仓 · OPDS · WebDAV · 多用户**
+**自托管 Web 阅读服务（v1.0.0） —— 书源搜索 · 本地书仓 · OPDS · WebDAV · 多用户**
 
 Rust + Vue 3 实现的现代化阅读服务器，API 与数据兼容 legacy 分支（Kotlin），支持多书源规则引擎、7 种本地书格式、OPDS 1.2/2.0 与 PSE、书源登录与反爬（内嵌浏览器 + FlareSolverr 能力）、多用户隔离。
 
@@ -157,6 +157,47 @@ server {
 - 服务端：监听为 TCP（`axum::serve`）——**入站 QUIC/HTTP3 未启用**；如需对公网提供 HTTP/3，请在反向代理（如 Caddy/nginx quic）处终止 QUIC 并回源 HTTP/1.1。
 
 ---
+
+## 🔄 从 legacy（Kotlin）Docker 迁移到 Rust 版
+
+### 方式一：只换镜像（数据零改动）
+```bash
+# 1. 备份（保险）
+docker exec <旧容器> tar czf /tmp/backup.tar.gz /storage
+docker cp <旧容器>:/tmp/backup.tar.gz .
+
+# 2. 停旧容器（保留数据卷）
+docker stop <旧容器>
+# 数据卷不动（挂载路径保持不变——默认 /storage）
+
+# 3. 起新容器（同一数据卷）
+docker pull ghcr.io/warpdotsys/reader-dev:latest
+docker run -d --name reader-dev-rust   -v <同一数据卷>:/storage   -p 8080:8080   -e READER_APP_WORKDIR=/storage   -e READER_APP_SECURE=true   ghcr.io/warpdotsys/reader-dev:latest
+
+# 4. 启动时自动迁移（JSON → SQLite——书/书源/书签/替换规则/TXT 规则/HttpTTS/分组/用户配置/RSS 全量，raw_json 保底）
+#    原 JSON 文件保留在 storage/data/（不删除——可回退）
+docker logs -f reader-dev-rust   # 看到「JSON→SQLite 迁移完成」即成功
+```
+
+### 方式二：直接跑 Rust 二进制
+```bash
+# Linux（release 资产下载 reader-dev-linux-x64）
+chmod +x reader-dev-linux-x64
+READER_APP_WORKDIR=/storage READER_APP_SECURE=true ./reader-dev-linux-x64
+# 首次启动同样自动迁移 legacy JSON 数据
+```
+
+### 迁移覆盖
+| 数据 | 说明 |
+|---|---|
+| 用户 / 书架（含进度）/ 书源 / RSS | ✅ 全量 |
+| 书签 / 替换规则 / TXT 目录规则 / HttpTTS / 分组 / 用户配置 | ✅ 全量（本次补全） |
+| 原 JSON 文件 | 保留（可回退） |
+
+### 直接跑 Rust 的能力说明（分层）
+- **本地直跑**：CDP + stealth 反检测（系统 Edge/Chrome——Windows 几乎必有）——覆盖 CF JS 质询/Turnstile 基础/滑块
+- **Docker 镜像**：内置 chromium + python + camoufox（强质询兜底——69shuba 级）
+- **强质询边界**：数据中心 IP 会被 Turnstile 风控（400030）——需住宅代理（camoufox 支持 per-context proxy，配置 `READER_PROXY_URL` 或书源代理字段）
 
 ## 📖 使用指南
 
