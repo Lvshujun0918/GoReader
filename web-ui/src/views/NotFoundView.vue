@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
+import { t } from '@/utils/i18n'
 
 const router = useRouter()
 </script>
@@ -7,8 +8,8 @@ const router = useRouter()
 <template>
   <div class="nf-page">
     <p class="nf-code">404</p>
-    <p class="nf-text">页面不存在或已失效</p>
-    <button class="nf-btn" type="button" @click="router.replace('/')">返回书架</button>
+    <p class="nf-text">{{ t('notFound.text') }}</p>
+    <button class="nf-btn" type="button" @click="router.replace('/')">{{ t('notFound.back') }}</button>
   </div>
 </template>
 

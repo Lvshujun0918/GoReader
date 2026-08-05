@@ -44,7 +44,7 @@
 /* ---------- 主题变量体系 ----------
    界面主题：浅色（默认 :root）/ 深色 两档，由 html[data-theme] 挂载
    （设置页「外观」+ utils/uiTheme.ts，跟随系统时解析为 light/dark）。
-   阅读内容主题（浅色/深色/纸色）见下方 .reader-page[data-reader-theme] 块。 */
+   阅读内容主题（浅色/深色/暖色）见下方 .reader-page[data-reader-theme] 块。 */
 html[data-theme='dark'] {
   color-scheme: dark;
   --bg: #1a1a1a;

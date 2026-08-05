@@ -1,0 +1,48 @@
+{
+   "action": {
+      "default_icon": {
+         "128": "images/ico.app.disabled.128.png",
+         "16": "images/ico.app.disabled.16.png",
+         "24": "images/ico.app.disabled.24.png",
+         "32": "images/ico.app.disabled.32.png",
+         "48": "images/ico.app.disabled.48.png",
+         "64": "images/ico.app.disabled.64.png",
+         "72": "images/ico.app.disabled.72.png",
+         "96": "images/ico.app.disabled.96.png"
+      },
+      "default_popup": "popup/index.html"
+   },
+   "background": {
+      "service_worker": "background.js"
+   },
+   "content_scripts": [ {
+      "all_frames": true,
+      "js": [ "libs/jquery-3.4.1.min.js", "content.js" ],
+      "matches": [ "http://*/*", "https://*/*", "ftp://*/*", "file:///*" ],
+      "run_at": "document_end"
+   } ],
+   "default_locale": "en",
+   "description": "__MSG_ExtensionDescription__",
+   "host_permissions": [ "http://*/*", "https://*/*" ],
+   "icons": {
+      "128": "images/ico.app.128.png",
+      "16": "images/ico.app.16.png",
+      "24": "images/ico.app.24.png",
+      "32": "images/ico.app.32.png",
+      "48": "images/ico.app.48.png",
+      "64": "images/ico.app.64.png",
+      "72": "images/ico.app.72.png",
+      "96": "images/ico.app.96.png"
+   },
+   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA+HVBYL/ahhdo/sSDDJ5SeJ8IXPMpXsj4v11rJaPVEcgXEzuOc8yLvxjQblmTawXz4iTXJwrHKY29dMACKEDQTjg13yadIJqRUFJmPu3gMs+GZBe2jNWm4dp7x/ErjqrdBT9cOxQpP3c1ORzav9svo1H7kmQPk2k+Wr5NVGynUDEFStl1r0DvgwqgZhG/E6D4PCwZJoFD2EKO4gltA7/CbpHU5icSm9vuFS1cKHZvxURni76PiuRAqvVSFdN61YCwYSkNSpkZ3QniqNVAYl6bWki9OO9oTAuqygEa8BPf87Klpi3HR1kgVm/I7HeyIyg7hh3awlAlNA8giYdjkQMbOwIDAQAB",
+   "manifest_version": 3,
+   "minimum_chrome_version": "88.0",
+   "name": "PDF-XChange",
+   "permissions": [ "pageCapture", "nativeMessaging", "contextMenus", "storage", "tabs", "scripting" ],
+   "update_url": "https://clients2.google.com/service/update2/crx",
+   "version": "1.4.3",
+   "web_accessible_resources": [ {
+      "matches": [ "\u003Call_urls>" ],
+      "resources": [ "menu-iframe/index.html", "frame.html", "native-part-is-not-installed.html" ]
+   } ]
+}

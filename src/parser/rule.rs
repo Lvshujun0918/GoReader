@@ -526,7 +526,9 @@ fn tokenize_json_path(path: &str) -> Vec<JSeg> {
                 } else {
                     i += 1;
                     let (name, ni) = read_name(path, i);
-                    segs.push(JSeg::Key(name));
+                    if !name.is_empty() {
+                        segs.push(JSeg::Key(name));
+                    }
                     i = ni;
                 }
             }

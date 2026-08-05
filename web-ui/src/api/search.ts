@@ -4,16 +4,18 @@ import { openSSEPost } from './sse'
 import type { ReturnData, SearchBook } from '@/types'
 
 /**
- * POST /reader3/searchBookMulti：多书源并发搜索（body {key, maxSources, page}；signal 可中止请求）
+ * POST /reader3/searchBookMulti：多书源并发搜索（body {key, maxSources, page, exact}；signal 可中止请求）
  * page 从 1 开始——普通（非 SSE）搜索分页场景（GAP 100：批量模式「加载更多」逐页累加）。
+ * exact=true 时后端按书名/作者等值过滤（大小写/全半角忽略）。
  */
 export function searchBookMulti(
   key: string,
   maxSources = 50,
   signal?: AbortSignal,
   page = 1,
+  exact = false,
 ): Promise<ReturnData<SearchBook[]>> {
-  return post<SearchBook[]>('/searchBookMulti', { key, maxSources, page }, { signal })
+  return post<SearchBook[]>('/searchBookMulti', { key, maxSources, page, exact: exact ? 1 : 0 }, { signal })
 }
 
 /* ================= SSE 流式搜索（/reader3/searchBookMultiSSE） ================= */
@@ -28,6 +30,8 @@ export interface SearchSSEParams {
   searchSize?: number
   /** 并发数 */
   concurrentCount?: number
+  /** 精确匹配（exact=1：书名/作者等值，忽略大小写/全半角；缺省模糊 contains） */
+  exact?: boolean
 }
 
 export interface SearchSSECallbacks {
@@ -61,6 +65,7 @@ export function searchBookMultiSSE(
   if (params.lastIndex !== undefined) body.lastIndex = params.lastIndex
   if (params.searchSize !== undefined) body.searchSize = params.searchSize
   if (params.concurrentCount !== undefined) body.concurrentCount = params.concurrentCount
+  if (params.exact !== undefined) body.exact = params.exact ? 1 : 0
 
   return openSSEPost('/reader3/searchBookMultiSSE', body, cbs, token)
 }

@@ -604,7 +604,12 @@ mod tests {
         let mut config = AppConfig::from_env();
         config.work_dir = dir.to_string_lossy().into_owned();
         let storage = crate::storage::init(&config).await.unwrap();
-        (AppState { storage }, dir)
+        // 图片代理磁盘缓存：独立临时目录 + 固定 1MB 容量（不受宿主 env READER_IMAGE_CACHE_MB 影响）
+        let image_cache = crate::service::image_cache::ImageCache::with_capacity(
+            dir.join("storage").join("cache").join("images"),
+            1024 * 1024,
+        );
+        (AppState { storage, image_cache }, dir)
     }
 
     async fn cleanup(state: AppState, dir: std::path::PathBuf) {

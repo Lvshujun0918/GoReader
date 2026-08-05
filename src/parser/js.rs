@@ -31,7 +31,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use base64::Engine as _;
 use boa_engine::object::builtins::JsArray;
+use boa_engine::object::FunctionObjectBuilder;
 use boa_engine::object::ObjectInitializer;
 use boa_engine::property::{Attribute, PropertyKey};
 use boa_engine::{
@@ -39,6 +41,8 @@ use boa_engine::{
     Source,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
+
+use crate::model::BookSource;
 
 /// `java.getWebViewUA()` 返回的固定浏览器 UA（与爬虫默认 UA 同系 Chrome 120 内核；
 /// 内置浏览器求解（solve_cf_challenge / 待落地的 solve_captcha）返回真实 UA 时
@@ -68,6 +72,12 @@ struct JsBridgeInner {
     source_key: String,
     /// 书源名称，`source.getName()` 返回
     source_name: String,
+    /// 书源登录 URL（JS 代码），`source.loginUrl` 返回（`eval(String(source.loginUrl))` 模式）
+    login_url: String,
+    /// 书源变量（`source.getVariable()`，legado 书源变量配置）
+    source_variable: String,
+    /// 书源 header（`source.header`，JSON 文本）
+    source_header: String,
     /// 用户命名空间（书源 cookie 按用户隔离；空 = 无 cookie 上下文，
     /// `java.ajax`/`java.startBrowserAwait` 不带书源 cookie）
     ns: String,
@@ -79,6 +89,26 @@ struct JsBridgeInner {
     doc: Mutex<Option<String>>,
 }
 
+/// 手动 Clone（Mutex 无 Clone——快照当前内容；`Arc::try_unwrap` 多引用兜底路径用）
+impl Clone for JsBridgeInner {
+    fn clone(&self) -> Self {
+        let lock = |m: &Mutex<HashMap<String, String>>| {
+            Mutex::new(m.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        };
+        Self {
+            source_key: self.source_key.clone(),
+            source_name: self.source_name.clone(),
+            login_url: self.login_url.clone(),
+            source_variable: self.source_variable.clone(),
+            source_header: self.source_header.clone(),
+            ns: self.ns.clone(),
+            headers: lock(&self.headers),
+            java_vars: lock(&self.java_vars),
+            doc: Mutex::new(self.doc.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+        }
+    }
+}
+
 impl JsBridge {
     /// 创建书源桥接
     pub fn new(source_key: impl Into<String>, source_name: impl Into<String>) -> Self {
@@ -86,6 +116,9 @@ impl JsBridge {
             inner: Arc::new(JsBridgeInner {
                 source_key: source_key.into(),
                 source_name: source_name.into(),
+                login_url: String::new(),
+                source_variable: String::new(),
+                source_header: String::new(),
                 ns: String::new(),
                 headers: Mutex::new(HashMap::new()),
                 java_vars: Mutex::new(HashMap::new()),
@@ -94,17 +127,38 @@ impl JsBridge {
         }
     }
 
+    /// 从书源创建桥接（source.loginUrl/getVariable/header 等扩展字段可用）
+    pub fn from_source(source: &BookSource, ns: impl Into<String>) -> Self {
+        let bridge = Self::new(&source.book_source_url, &source.book_source_name);
+        let mut inner = Arc::try_unwrap(bridge.inner).unwrap_or_else(|arc| (*arc).clone());
+        inner.login_url = source.login_url.clone().unwrap_or_default();
+        inner.source_variable = source
+            .variable
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| source.variable_comment.clone().unwrap_or_default());
+        inner.source_header = source.header.clone().unwrap_or_default();
+        inner.ns = ns.into();
+        Self { inner: Arc::new(inner) }
+    }
+
     /// 设置用户命名空间（书源 cookie 按用户隔离；搜索/详情流程传入当前用户 ns）
     pub fn with_namespace(mut self, ns: impl Into<String>) -> Self {
         // 先取出旧 inner 的可克隆状态，避免借用与赋值冲突
         let source_key = self.inner.source_key.clone();
         let source_name = self.inner.source_name.clone();
+        let login_url = self.inner.login_url.clone();
+        let source_variable = self.inner.source_variable.clone();
+        let source_header = self.inner.source_header.clone();
         let headers = self.inner.headers.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let java_vars = self.inner.java_vars.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let doc = self.inner.doc.lock().unwrap_or_else(|e| e.into_inner()).clone();
         self.inner = Arc::new(JsBridgeInner {
             source_key,
             source_name,
+            login_url,
+            source_variable,
+            source_header,
             ns: ns.into(),
             headers: Mutex::new(headers),
             java_vars: Mutex::new(java_vars),
@@ -218,8 +272,10 @@ fn eval_js_with_bridge_limited(
     loop_limit: u64,
 ) -> Result<String> {
     let mut context = context_with_limit(loop_limit);
+    install_globals(&mut context, bridge)?;
     inject_vars(&mut context, vars)?;
     install_bridge(&mut context, bridge)?;
+    auto_set_content(vars, bridge);
     let result = context
         .eval(Source::from_bytes(code.as_bytes()))
         .map_err(map_js_error)?;
@@ -266,8 +322,10 @@ fn eval_js_json_with_bridge_limited(
     loop_limit: u64,
 ) -> Result<JsonValue> {
     let mut context = context_with_limit(loop_limit);
+    install_globals(&mut context, bridge)?;
     inject_vars(&mut context, vars)?;
     install_bridge(&mut context, bridge)?;
+    auto_set_content(vars, bridge);
     let result = context
         .eval(Source::from_bytes(code.as_bytes()))
         .map_err(map_js_error)?;
@@ -277,6 +335,7 @@ fn eval_js_json_with_bridge_limited(
 /// 执行 JS 表达式并返回 JsValue（供内部使用）
 pub fn eval_js_value(code: &str, vars: &HashMap<String, String>) -> Result<JsValue> {
     let mut context = context_with_limit(JS_LOOP_ITERATION_LIMIT);
+    install_globals(&mut context, &JsBridge::default())?;
     inject_vars(&mut context, vars)?;
     context
         .eval(Source::from_bytes(code.as_bytes()))
@@ -309,6 +368,316 @@ fn install_bridge(context: &mut Context, bridge: &JsBridge) -> Result<()> {
     Ok(())
 }
 
+/// 规则 JS 求值前自动 setContent（legado AnalyzeByJS 语义：注入 result 的 JS 规则
+/// 自动把 result 设为当前解析文档——`java.getString/getElements` 无需先手动 setContent）
+fn auto_set_content(vars: &HashMap<String, String>, bridge: &JsBridge) {
+    if let Some(result) = vars.get("result") {
+        if !result.is_empty() {
+            *bridge.inner.doc.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
+        }
+    }
+}
+
+/// 全局 shim（每个 eval 上下文安装一次，先于 vars 注入——vars 同名覆盖）：
+/// - JS prelude：`Map()` 无 new 调用兼容（legado Rhino 允许；boa 0.19 报错）、
+///   `cache` 内存对象、`unescape/escape`
+/// - 默认全局变量：baseUrl/base_url/src/type/urlIP（缺省值，避免 ReferenceError）
+/// - 全局对象/函数：cookie（removeCookie/getCookie/setCookie）、org.jsoup（Jsoup.parse）、
+///   xGorgon（stub）、getWbiEnc（bilibili wbi 签名）、Reload（拉取远程 JS 文本）
+fn install_globals(context: &mut Context, bridge: &JsBridge) -> Result<()> {
+    let prelude = r#"
+(function () {
+  // Map() 无 new：legado Rhino 允许（boa 0.19 报 TypeError）——包装为可无 new 调用
+  var NativeMap = Map;
+  function MapShim(iterable) {
+    var m = new NativeMap();
+    if (iterable != null && typeof iterable[Symbol.iterator] === 'function') {
+      var it = iterable[Symbol.iterator]();
+      var step;
+      while (!(step = it.next()).done) { m.set(step.value[0], step.value[1]); }
+    }
+    return m;
+  }
+  MapShim.prototype = NativeMap.prototype;
+  try { globalThis.Map = MapShim; } catch (e) {}
+  // cache：内存 KV（legado cache 全局）
+  if (typeof cache === 'undefined') {
+    globalThis.cache = (function () {
+      var store = new NativeMap();
+      return {
+        get: function (k) { return store.get(k); },
+        set: function (k, v) { store.set(k, v); },
+        getFromMemory: function (k) { return store.get(k); },
+        putToMemory: function (k, v) { store.set(k, v); },
+        deleteMemory: function (k) { store.delete(k); },
+        clear: function () { store.clear(); }
+      };
+    })();
+  }
+  if (typeof unescape !== 'function') {
+    globalThis.unescape = function (s) { return decodeURIComponent(String(s)); };
+    globalThis.escape = function (s) { return encodeURIComponent(String(s)); };
+  }
+})();
+"#;
+    context
+        .eval(Source::from_bytes(prelude.as_bytes()))
+        .map_err(map_js_error)?;
+
+    // 默认全局变量（vars 注入同名覆盖——URL 构造/规则 eval 的显式 baseUrl 优先）
+    let key = bridge.inner.source_key.clone();
+    let host = url::Url::parse(&key)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    for (name, value) in [
+        ("baseUrl", key.clone()),
+        ("base_url", key.clone()),
+        ("src", key),
+        ("type", String::new()),
+        ("urlIP", host),
+    ] {
+        context
+            .register_global_property(
+                JsString::from(name),
+                JsValue::from(JsString::from(value)),
+                Attribute::all(),
+            )
+            .map_err(|e| anyhow!("JS 全局注入失败 [{name}]: {e}"))?;
+    }
+
+    // cookie 对象（书源 cookie 由爬虫层按用户命名空间管理——shim 为无操作接口）
+    let cookie = ObjectInitializer::new(context)
+        .function(
+            unsafe { NativeFunction::from_closure(cookie_remove) },
+            JsString::from("removeCookie"),
+            1,
+        )
+        .function(
+            unsafe { NativeFunction::from_closure(cookie_get) },
+            JsString::from("getCookie"),
+            1,
+        )
+        .function(
+            unsafe { NativeFunction::from_closure(cookie_set) },
+            JsString::from("setCookie"),
+            3,
+        )
+        .function(
+            unsafe { NativeFunction::from_closure(cookie_clear) },
+            JsString::from("clearCookie"),
+            1,
+        )
+        .build();
+    context
+        .register_global_property(JsString::from("cookie"), cookie, Attribute::all())
+        .map_err(|e| anyhow!("cookie 对象注册失败: {e}"))?;
+
+    // org.jsoup.Jsoup.parse(html)：Document/Elements shim（scraper 后端）
+    let jsoup = ObjectInitializer::new(context)
+        .function(
+            unsafe { NativeFunction::from_closure(jsoup_parse) },
+            JsString::from("parse"),
+            1,
+        )
+        .build();
+    let org = ObjectInitializer::new(context)
+        .property(JsString::from("jsoup"), jsoup, Attribute::all())
+        .build();
+    context
+        .register_global_property(JsString::from("org"), org, Attribute::all())
+        .map_err(|e| anyhow!("org 对象注册失败: {e}"))?;
+
+    // xGorgon：字节系签名 stub（真实算法不可用——返回空串，避免 ReferenceError）
+    register_global_fn(context, "xGorgon", xgorgon_stub, 1)?;
+    // getWbiEnc：bilibili wbi 签名（真实实现——nav 密钥 + mixinKey + wts/w_rid）
+    register_global_fn(context, "getWbiEnc", get_wbi_enc, 1)?;
+    // Reload(url)：拉取远程文本（书源远程 JS 加载模式）
+    register_global_fn(context, "Reload", reload_fetch, 1)?;
+    Ok(())
+}
+
+/// 注册全局函数
+fn register_global_fn(
+    context: &mut Context,
+    name: &str,
+    f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+    len: usize,
+) -> Result<()> {
+    let func = FunctionObjectBuilder::new(
+        context.realm(),
+        unsafe { NativeFunction::from_closure(f) },
+    )
+    .name(name)
+    .length(len)
+    .build();
+    context
+        .register_global_property(JsString::from(name), func, Attribute::all())
+        .map_err(|e| anyhow!("JS 全局函数注册失败 [{name}]: {e}"))
+}
+
+/// cookie.removeCookie(url)：书源 cookie 由爬虫层管理，shim 无操作（返回 undefined）
+fn cookie_remove(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+/// cookie.getCookie(url)：返回空串（无 cookie 上下文）
+fn cookie_get(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsString::from("")))
+}
+
+/// cookie.setCookie(url, key, value)：无操作
+fn cookie_set(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+/// cookie.clearCookie(url)：无操作
+fn cookie_clear(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+/// xGorgon(...)：字节系请求签名 stub（无法复现——返回空串）
+fn xgorgon_stub(_this: &JsValue, _args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsString::from("")))
+}
+
+/// Reload(url)：拉取远程内容（书源远程 JS 加载：`eval(String(Reload('...')))`）
+fn reload_fetch(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let url = js_value_to_string(args.get_or_undefined(0), context);
+    if url.is_empty() {
+        return Err(js_native_error("Reload: url 不能为空"));
+    }
+    let fut_url = url.clone();
+    let fut = async move {
+        crate::service::crawler::fetch(&fut_url, &HashMap::new(), 15, "GET", None, None)
+            .await
+            .map(|r| r.body)
+    };
+    match block_on_task(fut, Duration::from_secs(60), "Reload") {
+        Ok(body) => Ok(JsValue::from(JsString::from(body))),
+        Err(e) => Err(js_native_error(format!("Reload 失败（{url}）: {e}"))),
+    }
+}
+
+// ---- bilibili wbi 签名（getWbiEnc） ----
+
+/// mixinKey 重排表（bilibili wbi 算法公开常量）
+const WBI_MIXIN_KEY_ENC_TAB: [usize; 64] = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19,
+    29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+];
+
+/// wbi 密钥缓存（img_key + sub_key + 获取时间戳；1 小时刷新）
+static WBI_KEYS: LazyLock<Mutex<Option<(String, String, u64)>>> = LazyLock::new(|| Mutex::new(None));
+
+/// 取 wbi 密钥（nav 接口；带缓存；失败 → None）
+fn wbi_keys() -> Option<(String, String)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    {
+        let cache = WBI_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((img, sub, ts)) = cache.as_ref() {
+            if now - *ts < 3600 {
+                return Some((img.clone(), sub.clone()));
+            }
+        }
+    }
+    let fut = async {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "User-Agent".to_string(),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0".to_string(),
+        );
+        let resp = crate::service::crawler::fetch(
+            "https://api.bilibili.com/x/web-interface/nav",
+            &headers,
+            10,
+            "GET",
+            None,
+            None,
+        )
+        .await
+        .ok()?;
+        let json: JsonValue = serde_json::from_str(&resp.body).ok()?;
+        let img = json.pointer("/data/wbi_img/img_url").and_then(|v| v.as_str())?;
+        let sub = json.pointer("/data/wbi_img/sub_url").and_then(|v| v.as_str())?;
+        Some((wbi_key_of(img), wbi_key_of(sub)))
+    };
+    let fetched = block_on_task(
+        async move { Ok::<_, anyhow::Error>(fut.await) },
+        Duration::from_secs(20),
+        "getWbiEnc-nav",
+    )
+    .ok()
+    .flatten();
+    if let Some((img, sub)) = fetched {
+        *WBI_KEYS.lock().unwrap_or_else(|e| e.into_inner()) = Some((img.clone(), sub.clone(), now));
+        return Some((img, sub));
+    }
+    None
+}
+
+/// wbi 图片 URL → 密钥（去目录/扩展名）
+fn wbi_key_of(url: &str) -> String {
+    url.rsplit('/')
+        .next()
+        .unwrap_or(url)
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// mixinKey = 按重排表取 32 位
+fn wbi_mixin_key(orig: &str) -> String {
+    let bytes: Vec<char> = orig.chars().collect();
+    WBI_MIXIN_KEY_ENC_TAB
+        .iter()
+        .take(32)
+        .filter_map(|&i| bytes.get(i))
+        .collect()
+}
+
+/// getWbiEnc(paramsObj)：bilibili wbi 签名 → 返回带 wts/w_rid 的 query 串
+/// （密钥获取失败 → 返回排序 query + wts，不带 w_rid——不抛异常）
+fn get_wbi_enc(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let params = match js_value_to_json(args.get_or_undefined(0), context) {
+        Ok(JsonValue::Object(map)) => map,
+        _ => return Err(js_native_error("getWbiEnc: 参数须为对象")),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut sorted: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (k, v) in params {
+        let s = match v {
+            JsonValue::String(s) => s,
+            JsonValue::Number(n) => n.to_string(),
+            JsonValue::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        if !s.is_empty() {
+            sorted.insert(k, s);
+        }
+    }
+    sorted.insert("wts".to_string(), now.to_string());
+    let query = sorted
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    if let Some((img, sub)) = wbi_keys() {
+        let mixin = wbi_mixin_key(&format!("{img}{sub}"));
+        let w_rid = crate::util::md5::md5_encode(&format!("{query}{mixin}"));
+        return Ok(JsValue::from(JsString::from(format!("{query}&w_rid={w_rid}"))));
+    }
+    Ok(JsValue::from(JsString::from(query)))
+}
+
 /// 构建 java / source 对象（ObjectInitializer：function 注册方法、property 挂子对象）
 fn build_bridge_objects(bridge: &JsBridge, context: &mut Context) -> (JsObject, JsObject) {
     // java.headerMap：请求头 Map（底层为 bridge.headers，eval 后可读取）
@@ -321,6 +690,8 @@ fn build_bridge_objects(bridge: &JsBridge, context: &mut Context) -> (JsObject, 
 
     // java：put/get（临时变量）、log（tracing）、headerMap（请求头）、
     // encodeURI/ajax/startBrowserAwait/setContent/getString/getElements/getWebViewUA（legacy shim）
+    // + 签名/编码/转换 shim：md5Encode/HMacHex/randomUUID/androidId/base64Encode/base64DecodeToString/
+    //   hexDecodeToString/t2s/s2t/desEncodeToBase64String/get(url)/connect/head
     let mut java = ObjectInitializer::new(context);
     java.function(bind(bridge, java_put), JsString::from("put"), 2)
         .function(bind(bridge, java_get), JsString::from("get"), 1)
@@ -336,16 +707,45 @@ fn build_bridge_objects(bridge: &JsBridge, context: &mut Context) -> (JsObject, 
         .function(bind(bridge, java_get_string), JsString::from("getString"), 1)
         .function(bind(bridge, java_get_elements), JsString::from("getElements"), 1)
         .function(bind(bridge, java_get_webview_ua), JsString::from("getWebViewUA"), 0)
+        // 签名/编码 shim（legado java.* 常见缺项——按报错消息逐项补齐）
+        .function(bind(bridge, java_md5_encode), JsString::from("md5Encode"), 1)
+        .function(bind(bridge, java_hmac_hex), JsString::from("HMacHex"), 3)
+        .function(bind(bridge, java_random_uuid), JsString::from("randomUUID"), 0)
+        .function(bind(bridge, java_android_id), JsString::from("androidId"), 0)
+        .function(bind(bridge, java_base64_encode), JsString::from("base64Encode"), 1)
+        .function(bind(bridge, java_base64_decode), JsString::from("base64DecodeToString"), 1)
+        .function(bind(bridge, java_hex_decode), JsString::from("hexDecodeToString"), 1)
+        .function(bind(bridge, java_t2s), JsString::from("t2s"), 1)
+        .function(bind(bridge, java_s2t), JsString::from("s2t"), 1)
+        .function(bind(bridge, java_des_encode), JsString::from("desEncodeToBase64String"), 4)
+        .function(bind(bridge, java_connect), JsString::from("connect"), 1)
+        .function(bind(bridge, java_head), JsString::from("head"), 2)
         .property(JsString::from("headerMap"), header_map, Attribute::all());
     let java = java.build();
 
     // source：getKey（书源 URL）/ getName（书源名）/ put/get（书源级变量）
+    // + key/url（URL 别名）/ loginUrl（登录 JS）/ header（header 文本）/ getVariable（书源变量）
+    let key = JsValue::from(JsString::from(bridge.inner.source_key.as_str()));
     let mut source = ObjectInitializer::new(context);
     source
         .function(bind(bridge, source_get_key), JsString::from("getKey"), 0)
         .function(bind(bridge, source_get_name), JsString::from("getName"), 0)
         .function(bind(bridge, source_put), JsString::from("put"), 2)
-        .function(bind(bridge, source_get), JsString::from("get"), 1);
+        .function(bind(bridge, source_get), JsString::from("get"), 1)
+        .function(bind(bridge, source_get_variable), JsString::from("getVariable"), 0)
+        .property(JsString::from("key"), key.clone(), Attribute::all())
+        .property(JsString::from("url"), key.clone(), Attribute::all())
+        .property(JsString::from("bookSourceUrl"), key, Attribute::all())
+        .property(
+            JsString::from("loginUrl"),
+            JsValue::from(JsString::from(bridge.inner.login_url.as_str())),
+            Attribute::all(),
+        )
+        .property(
+            JsString::from("header"),
+            JsValue::from(JsString::from(bridge.inner.source_header.as_str())),
+            Attribute::all(),
+        );
     let source = source.build();
 
     (java, source)
@@ -383,9 +783,14 @@ fn java_put(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> J
     Ok(JsValue::undefined())
 }
 
-/// java.get(key)：读取临时变量，缺失返回 undefined
+/// java.get(key)：读取临时变量，缺失返回 undefined。
+/// java.get(url, opts) / java.get(httpUrl)：HTTP GET（legado jsHelp 兼容：
+/// 无忧书城 `java.get(su,{}).headers('Location')`）——返回响应对象
 fn java_get(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let key = js_value_to_string(args.get_or_undefined(0), context);
+    if args.len() > 1 || key.starts_with("http://") || key.starts_with("https://") {
+        return java_http_fetch(inner, &key, "GET", context);
+    }
     let value = inner
         .java_vars
         .lock()
@@ -677,6 +1082,7 @@ fn parse_ajax_suffix(url: &str) -> (String, AjaxSuffix) {
 
 /// `java.ajax(urlOrSpec)`：带书源 cookie 的同步请求（阻塞等待结果），返回响应体文本。
 /// - 支持 `url,{...}` 后缀（method/body/charset/headers，同 crawler 解析）
+/// - url 为空 → 用书源 URL（baseUrl）兜底（legado 语义；兼容 `java.ajax(source.key)` 类写法）
 /// - 请求头基底为 `java.headerMap`（书源 header）+ 后缀 headers + 书源 cookie
 /// - 可选第 2 参：超时秒数（legado callTimeout 兼容；默认 15s，上限 60s）
 /// - 失败/超时 → 抛 JS 异常
@@ -687,9 +1093,10 @@ fn java_ajax(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> 
         .and_then(|v| v.as_number())
         .map(|n| (n as u64).clamp(1, 60))
         .unwrap_or(15);
-    let (url, suffix) = parse_ajax_suffix(&url_spec);
+    let (mut url, suffix) = parse_ajax_suffix(&url_spec);
     if url.is_empty() {
-        return Err(js_native_error("java.ajax: url 不能为空"));
+        // 空 url 兜底：书源 URL（legado：java.ajax 空参/undefined → 书源地址）
+        url = inner.source_key.clone();
     }
     let ns = inner.ns.clone();
     // 请求头基底：java.headerMap（书源 header，JS 可改写）——async 块前克隆（'static）
@@ -781,17 +1188,22 @@ fn java_get_string(inner: &JsBridgeInner, args: &[JsValue], context: &mut Contex
     Ok(JsValue::from(JsString::from(text)))
 }
 
-/// `java.getElements(rule)`：对已存文档用 css_chain 规则求值，返回匹配元素
-/// outerHTML 的 JS 数组（规则带 `@` 提取器时返回提取值列表）
+/// `java.getElements(rule)`：对已存文档用 css_chain 规则求值。
+/// - 规则带 `@` 提取器（@text/@href 等）→ 返回提取值字符串数组（原语义）
+/// - 纯选择器规则 → 返回元素对象数组（jsoup 语义：`el.select(css)`/`el.text()`/`el.attr(name)`）
 fn java_get_elements(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let rule = js_value_to_string(args.get_or_undefined(0), context);
     let doc = current_doc(inner)?;
     let results = crate::parser::css_chain::css_chain(&rule, &doc);
-    let arr = JsArray::from_iter(
-        results.into_iter().map(|s| JsValue::from(JsString::from(s))),
-        context,
-    );
-    Ok(arr.into())
+    if rule_ends_with_extractor(&rule) {
+        let arr = JsArray::from_iter(
+            results.into_iter().map(|s| JsValue::from(JsString::from(s))),
+            context,
+        );
+        return Ok(arr.into());
+    }
+    // 元素对象数组（jsoup Elements：select/text/attr/first/get/size/eachAttr/eachText/html/val）
+    jsoup_elements_from_htmls(results, context)
 }
 
 /// `java.getWebViewUA()`：固定浏览器 UA（见 `JS_WEBVIEW_UA`）
@@ -801,6 +1213,839 @@ fn java_get_webview_ua(
     _context: &mut Context,
 ) -> JsResult<JsValue> {
     Ok(JsValue::from(JsString::from(JS_WEBVIEW_UA)))
+}
+
+// ---- 签名/编码/转换 shim（legado java.* 常见缺项） ----
+
+/// java.md5Encode(str)：md5 十六进制（小写）
+fn java_md5_encode(
+    _inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let s = js_value_to_string(args.get_or_undefined(0), context);
+    Ok(JsValue::from(JsString::from(crate::util::md5::md5_encode(&s))))
+}
+
+/// java.HMacHex(data, algo, key)：HMAC 十六进制（HmacMD5/HmacSHA1/HmacSHA256/HmacSHA512）
+fn java_hmac_hex(
+    _inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let data = js_value_to_string(args.get_or_undefined(0), context);
+    let algo = js_value_to_string(args.get_or_undefined(1), context);
+    let key = js_value_to_string(args.get_or_undefined(2), context);
+    use hmac::{Mac, SimpleHmac};
+    let out: String = match algo.to_lowercase().as_str() {
+        "hmacmd5" => hex::encode(
+            SimpleHmac::<md5::Md5>::new_from_slice(key.as_bytes())
+                .map_err(|_| js_native_error("HMacHex: 密钥长度非法"))?
+                .chain_update(data.as_bytes())
+                .finalize()
+                .into_bytes(),
+        ),
+        "hmacsha1" => hex::encode(
+            SimpleHmac::<sha1::Sha1>::new_from_slice(key.as_bytes())
+                .map_err(|_| js_native_error("HMacHex: 密钥长度非法"))?
+                .chain_update(data.as_bytes())
+                .finalize()
+                .into_bytes(),
+        ),
+        "hmacsha256" => hex::encode(
+            SimpleHmac::<sha2::Sha256>::new_from_slice(key.as_bytes())
+                .map_err(|_| js_native_error("HMacHex: 密钥长度非法"))?
+                .chain_update(data.as_bytes())
+                .finalize()
+                .into_bytes(),
+        ),
+        "hmacsha512" => hex::encode(
+            SimpleHmac::<sha2::Sha512>::new_from_slice(key.as_bytes())
+                .map_err(|_| js_native_error("HMacHex: 密钥长度非法"))?
+                .chain_update(data.as_bytes())
+                .finalize()
+                .into_bytes(),
+        ),
+        other => return Err(js_native_error(format!("HMacHex: 不支持的算法 {other}"))),
+    };
+    Ok(JsValue::from(JsString::from(out)))
+}
+
+/// java.randomUUID()：UUID v4 对象（toString() → 连字符小写）
+fn java_random_uuid(
+    _inner: &JsBridgeInner,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let u = uuid::Uuid::new_v4().to_string();
+    let mut obj = ObjectInitializer::new(context);
+    obj.function(
+        unsafe {
+            NativeFunction::from_closure(move |_this, _args, _ctx| {
+                Ok(JsValue::from(JsString::from(u.clone())))
+            })
+        },
+        JsString::from("toString"),
+        0,
+    );
+    Ok(obj.build().into())
+}
+
+/// java.androidId()：稳定设备 ID（legado Android 环境常量）
+fn java_android_id(
+    _inner: &JsBridgeInner,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsString::from("9774d56d682e549c")))
+}
+
+/// java.base64Encode(str)
+fn java_base64_encode(
+    _inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let s = js_value_to_string(args.get_or_undefined(0), context);
+    Ok(JsValue::from(JsString::from(
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes()),
+    )))
+}
+
+/// java.base64DecodeToString(str)
+fn java_base64_decode(
+    _inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let s = js_value_to_string(args.get_or_undefined(0), context);
+    match base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
+        Ok(bytes) => Ok(JsValue::from(JsString::from(
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ))),
+        Err(_) => Err(js_native_error("java.base64DecodeToString: base64 解码失败")),
+    }
+}
+
+/// java.hexDecodeToString(str)：十六进制 → 文本
+fn java_hex_decode(
+    _inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let s = js_value_to_string(args.get_or_undefined(0), context);
+    match hex::decode(s.trim()) {
+        Ok(bytes) => Ok(JsValue::from(JsString::from(
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ))),
+        Err(_) => Err(js_native_error("java.hexDecodeToString: 十六进制解码失败")),
+    }
+}
+
+/// java.t2s(str)：繁体 → 简体（zhconv 表）
+fn java_t2s(
+    _inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let s = js_value_to_string(args.get_or_undefined(0), context);
+    Ok(JsValue::from(JsString::from(zhconv::zhconv(&s, zhconv::Variant::ZhHans))))
+}
+
+/// java.s2t(str)：简体 → 繁体
+fn java_s2t(
+    _inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let s = js_value_to_string(args.get_or_undefined(0), context);
+    Ok(JsValue::from(JsString::from(zhconv::zhconv(&s, zhconv::Variant::ZhHant))))
+}
+
+/// java.desEncodeToBase64String(data, key, mode, iv)：DES/ECB/PKCS5 加密 → base64
+/// （仅支持 ECB 模式；key 取前 8 字节）
+fn java_des_encode(
+    _inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let data = js_value_to_string(args.get_or_undefined(0), context);
+    let key = js_value_to_string(args.get_or_undefined(1), context);
+    let mode = js_value_to_string(args.get_or_undefined(2), context);
+    if !mode.to_uppercase().contains("ECB") {
+        return Err(js_native_error("java.desEncodeToBase64String: 仅支持 DES/ECB 模式"));
+    }
+    let mut key_bytes = key.as_bytes().to_vec();
+    key_bytes.resize(8, 0);
+    use des::cipher::{Block, BlockCipherEncrypt, KeyInit};
+    let cipher = des::Des::new_from_slice(&key_bytes[..8])
+        .map_err(|e| js_native_error(format!("java.desEncodeToBase64String: {e}")))?;
+    // PKCS5/7 padding
+    let mut padded = data.as_bytes().to_vec();
+    let pad = 8 - (padded.len() % 8);
+    padded.extend(std::iter::repeat(pad as u8).take(pad));
+    let mut out = Vec::with_capacity(padded.len());
+    for chunk in padded.chunks(8) {
+        let mut block = Block::<des::Des>::clone_from_slice(chunk);
+        cipher.encrypt_block(&mut block);
+        out.extend_from_slice(&block);
+    }
+    Ok(JsValue::from(JsString::from(
+        base64::engine::general_purpose::STANDARD.encode(out),
+    )))
+}
+
+/// 同步 HTTP 请求（java.get(url)/connect(url)/head(url) 共用）：返回响应对象
+fn java_http_fetch(
+    inner: &JsBridgeInner,
+    url: &str,
+    method: &str,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let url = url.to_string();
+    if url.is_empty() {
+        return Err(js_native_error("java HTTP 请求: url 不能为空"));
+    }
+    let ns = inner.ns.clone();
+    let headers_base = inner.headers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let method = method.to_string();
+    let fut_method = method.clone();
+    let fut_url = url.clone();
+    let fut = async move {
+        let mut headers = headers_base;
+        if let Some(cookie_str) = crate::service::crawler::cookie_for(&ns, &fut_url).await {
+            if !cookie_str.is_empty() {
+                headers.insert("Cookie".to_string(), cookie_str);
+            }
+        }
+        crate::service::crawler::fetch(&fut_url, &headers, 15, &fut_method, None, None).await
+    };
+    let resp = match block_on_task(fut, Duration::from_secs(60), "java-http") {
+        Ok(r) => r,
+        Err(e) => return Err(js_native_error(format!("java {method} 失败（{url}）: {e}"))),
+    };
+    http_response_object(resp, context)
+}
+
+/// 构造 HTTP 响应 JS 对象（legado okhttp 语义子集）：
+/// raw() → {request(){url()}, code()}；header(name)；headers(name)→数组；body()/html()；
+/// json()；code()；url()；cookies()→{}；toString() → body
+fn http_response_object(resp: crate::service::crawler::FetchResponse, context: &mut Context) -> JsResult<JsValue> {
+    let body = resp.body.clone();
+    let final_url = resp.url.clone();
+    let status = resp.status;
+    let headers: Vec<(String, String)> = resp.headers.clone();
+    let headers_arc = Arc::new(headers);
+
+    let mut raw = ObjectInitializer::new(context);
+    {
+        let url = final_url.clone();
+        let code = status;
+        raw.function(
+            unsafe {
+                NativeFunction::from_closure(move |_this, _args, ctx| {
+                    let mut req = ObjectInitializer::new(ctx);
+                    let u = url.clone();
+                    req.function(
+                        unsafe {
+                            NativeFunction::from_closure(move |_t, _a, _c| {
+                                Ok(JsValue::from(JsString::from(u.clone())))
+                            })
+                        },
+                        JsString::from("url"),
+                        0,
+                    );
+                    let c = code;
+                    req.function(
+                        unsafe {
+                            NativeFunction::from_closure(move |_t, _a, _c| Ok(JsValue::from(c)))
+                        },
+                        JsString::from("code"),
+                        0,
+                    );
+                    Ok(req.build().into())
+                })
+            },
+            JsString::from("request"),
+            0,
+        );
+    }
+    raw.function(
+        unsafe {
+            NativeFunction::from_closure(move |_t, _a, _c| Ok(JsValue::from(status)))
+        },
+        JsString::from("code"),
+        0,
+    );
+    let raw = raw.build();
+
+    let mut obj = ObjectInitializer::new(context);
+    obj.property(JsString::from("raw"), raw, Attribute::all());
+    {
+        let headers = Arc::clone(&headers_arc);
+        obj.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, args, ctx| {
+                    let name = js_value_to_string(args.get_or_undefined(0), ctx).to_lowercase();
+                    let v = headers
+                        .iter()
+                        .find(|(k, _)| k == &name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    Ok(JsValue::from(JsString::from(v)))
+                })
+            },
+            JsString::from("header"),
+            1,
+        );
+    }
+    {
+        let headers = Arc::clone(&headers_arc);
+        obj.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, args, ctx| {
+                    let name = js_value_to_string(args.get_or_undefined(0), ctx).to_lowercase();
+                    let vals: Vec<JsValue> = headers
+                        .iter()
+                        .filter(|(k, _)| k == &name)
+                        .map(|(_, v)| JsValue::from(JsString::from(v.clone())))
+                        .collect();
+                    Ok(JsArray::from_iter(vals, ctx).into())
+                })
+            },
+            JsString::from("headers"),
+            1,
+        );
+    }
+    {
+        let body = body.clone();
+        obj.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, _c| {
+                    Ok(JsValue::from(JsString::from(body.clone())))
+                })
+            },
+            JsString::from("body"),
+            0,
+        );
+    }
+    {
+        let body = body.clone();
+        obj.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, _c| {
+                    Ok(JsValue::from(JsString::from(body.clone())))
+                })
+            },
+            JsString::from("html"),
+            0,
+        );
+    }
+    {
+        let body = body.clone();
+        obj.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, ctx| {
+                    match serde_json::from_str::<JsonValue>(&body) {
+                        Ok(json) => JsValue::from_json(&json, ctx)
+                            .map_err(|e| js_native_error(format!("json(): {e}"))),
+                        Err(_) => Err(js_native_error("json(): 响应体不是合法 JSON")),
+                    }
+                })
+            },
+            JsString::from("json"),
+            0,
+        );
+    }
+    {
+        let url = final_url.clone();
+        obj.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, _c| {
+                    Ok(JsValue::from(JsString::from(url.clone())))
+                })
+            },
+            JsString::from("url"),
+            0,
+        );
+    }
+    obj.function(
+        unsafe {
+            NativeFunction::from_closure(move |_t, _a, _c| {
+                // cookies()：空对象（cookie 由爬虫层管理）
+                Ok(ObjectInitializer::new(_c).build().into())
+            })
+        },
+        JsString::from("cookies"),
+        0,
+    );
+    {
+        let body = body.clone();
+        obj.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, _c| {
+                    Ok(JsValue::from(JsString::from(body.clone())))
+                })
+            },
+            JsString::from("toString"),
+            0,
+        );
+    }
+    Ok(obj.build().into())
+}
+
+/// java.connect(url)：HTTP GET（legado okhttp 连接对象——raw().request().url() 链）
+fn java_connect(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let url = js_value_to_string(args.get_or_undefined(0), context);
+    java_http_fetch(inner, &url, "GET", context)
+}
+
+/// java.head(url, headers)：HTTP HEAD（cookies() 兼容）
+fn java_head(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let url = js_value_to_string(args.get_or_undefined(0), context);
+    java_http_fetch(inner, &url, "HEAD", context)
+}
+
+// ---- org.jsoup shim（scraper 后端） ----
+
+/// org.jsoup.Jsoup.parse(html)：Document 对象（select/text/title/html/toString）
+fn jsoup_parse(_this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let html = js_value_to_string(_args.get_or_undefined(0), context);
+    jsoup_document(&html, context)
+}
+
+/// Document 对象
+fn jsoup_document(html: &str, context: &mut Context) -> JsResult<JsValue> {
+    let html = html.to_string();
+    let mut doc = ObjectInitializer::new(context);
+    {
+        let h = html.clone();
+        doc.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, args, ctx| {
+                    let css = js_value_to_string(args.get_or_undefined(0), ctx);
+                    jsoup_select(&h, &css, ctx)
+                })
+            },
+            JsString::from("select"),
+            1,
+        );
+    }
+    {
+        let h = html.clone();
+        doc.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, ctx| {
+                    let parsed = scraper::Html::parse_document(&h);
+                    let txt = parsed.root_element().text().collect::<String>();
+                    Ok(JsValue::from(JsString::from(txt)))
+                })
+            },
+            JsString::from("text"),
+            0,
+        );
+    }
+    {
+        let h = html.clone();
+        doc.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, ctx| {
+                    let parsed = scraper::Html::parse_document(&h);
+                    let title = scraper::Selector::parse("title")
+                        .ok()
+                        .and_then(|sel| parsed.select(&sel).next())
+                        .map(|e| e.text().collect::<String>())
+                        .unwrap_or_default();
+                    Ok(JsValue::from(JsString::from(title)))
+                })
+            },
+            JsString::from("title"),
+            0,
+        );
+    }
+    {
+        let h = html.clone();
+        doc.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, _c| {
+                    Ok(JsValue::from(JsString::from(h.clone())))
+                })
+            },
+            JsString::from("toString"),
+            0,
+        );
+    }
+    Ok(doc.build().into())
+}
+
+/// Elements 选择（css 选择器 → 元素对象数组 + jsoup 方法）
+fn jsoup_select(html: &str, css: &str, context: &mut Context) -> JsResult<JsValue> {
+    let parsed = scraper::Html::parse_fragment(html);
+    let Ok(selector) = scraper::Selector::parse(css) else {
+        return Ok(JsArray::new(context).into()); // 非法选择器 → 空 Elements（不抛错）
+    };
+    let htmls: Vec<String> = parsed.select(&selector).map(|e| e.html()).collect();
+    jsoup_elements_from_htmls(htmls, context)
+}
+
+/// 由元素 HTML 列表构建 jsoup Elements（数组 + attr/text/first/get/size/eachAttr/eachText/html/val）
+fn jsoup_elements_from_htmls(htmls: Vec<String>, context: &mut Context) -> JsResult<JsValue> {
+    let mut arr = JsArray::new(context);
+    for h in &htmls {
+        let el = jsoup_element(h, context)?;
+        arr.push(el, context)?;
+    }
+    let htmls = Arc::new(htmls);
+    // attr(name)：首元素属性
+    {
+        let htmls = Arc::clone(&htmls);
+        arr.set(
+            JsString::from("attr"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, args, ctx| {
+                        let name = js_value_to_string(args.get_or_undefined(0), ctx);
+                        Ok(JsValue::from(JsString::from(first_attr(&htmls, &name))))
+                    })
+                },
+            )
+            .name("attr")
+            .length(1)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    // text()：首元素文本
+    {
+        let htmls = Arc::clone(&htmls);
+        arr.set(
+            JsString::from("text"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, _a, ctx| {
+                        Ok(JsValue::from(JsString::from(first_text(&htmls))))
+                    })
+                },
+            )
+            .name("text")
+            .length(0)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    // first()：首元素对象（无 → null）
+    {
+        let htmls = Arc::clone(&htmls);
+        arr.set(
+            JsString::from("first"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, _a, ctx| match htmls.first() {
+                        Some(h) => jsoup_element(h, ctx),
+                        None => Ok(JsValue::null()),
+                    })
+                },
+            )
+            .name("first")
+            .length(0)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    // get(i)：第 i 个元素对象（越界 → null）
+    {
+        let htmls = Arc::clone(&htmls);
+        arr.set(
+            JsString::from("get"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, args, ctx| {
+                        let i = args.get_or_undefined(0).to_i32(ctx).unwrap_or(0);
+                        match htmls.get(i.max(0) as usize) {
+                            Some(h) => jsoup_element(h, ctx),
+                            None => Ok(JsValue::null()),
+                        }
+                    })
+                },
+            )
+            .name("get")
+            .length(1)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    // size()：数量
+    {
+        let n = htmls.len() as i32;
+        arr.set(
+            JsString::from("size"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, _a, _c| Ok(JsValue::from(n)))
+                },
+            )
+            .name("size")
+            .length(0)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    // eachAttr(name)：各元素属性值数组
+    {
+        let htmls = Arc::clone(&htmls);
+        arr.set(
+            JsString::from("eachAttr"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, args, ctx| {
+                        let name = js_value_to_string(args.get_or_undefined(0), ctx);
+                        let vals: Vec<JsValue> = htmls
+                            .iter()
+                            .map(|h| {
+                                JsValue::from(JsString::from(attr_of(h, &name)))
+                            })
+                            .collect();
+                        Ok(JsArray::from_iter(vals, ctx).into())
+                    })
+                },
+            )
+            .name("eachAttr")
+            .length(1)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    // eachText()：各元素文本数组
+    {
+        let htmls = Arc::clone(&htmls);
+        arr.set(
+            JsString::from("eachText"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, _a, ctx| {
+                        let vals: Vec<JsValue> = htmls
+                            .iter()
+                            .map(|h| JsValue::from(JsString::from(text_of(h))))
+                            .collect();
+                        Ok(JsArray::from_iter(vals, ctx).into())
+                    })
+                },
+            )
+            .name("eachText")
+            .length(0)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    // html()：首元素 innerHTML
+    {
+        let htmls = Arc::clone(&htmls);
+        arr.set(
+            JsString::from("html"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, _a, ctx| {
+                        Ok(JsValue::from(JsString::from(inner_html_of(
+                            htmls.first().map(String::as_str).unwrap_or(""),
+                        ))))
+                    })
+                },
+            )
+            .name("html")
+            .length(0)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    // val()：首元素 value 属性/文本
+    {
+        let htmls = Arc::clone(&htmls);
+        arr.set(
+            JsString::from("val"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, _a, ctx| {
+                        let v = htmls
+                            .first()
+                            .map(|h| {
+                                let a = attr_of(h, "value");
+                                if a.is_empty() {
+                                    text_of(h)
+                                } else {
+                                    a
+                                }
+                            })
+                            .unwrap_or_default();
+                        Ok(JsValue::from(JsString::from(v)))
+                    })
+                },
+            )
+            .name("val")
+            .length(0)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    // toString()/outerHtml()：全部元素 HTML 拼接
+    {
+        let htmls = Arc::clone(&htmls);
+        arr.set(
+            JsString::from("toString"),
+            FunctionObjectBuilder::new(
+                context.realm(),
+                unsafe {
+                    NativeFunction::from_closure(move |_t, _a, _c| {
+                        Ok(JsValue::from(JsString::from(htmls.join(""))))
+                    })
+                },
+            )
+            .name("toString")
+            .length(0)
+            .build(),
+            true,
+            context,
+        )?;
+    }
+    Ok(arr.into())
+}
+
+/// jsoup 元素对象（select/attr/text/html/val/ownText/toString）
+fn jsoup_element(html: &str, context: &mut Context) -> JsResult<JsValue> {
+    let html = html.to_string();
+    let mut el = ObjectInitializer::new(context);
+    {
+        let h = html.clone();
+        el.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, args, ctx| {
+                    let css = js_value_to_string(args.get_or_undefined(0), ctx);
+                    jsoup_select(&h, &css, ctx)
+                })
+            },
+            JsString::from("select"),
+            1,
+        );
+    }
+    {
+        let h = html.clone();
+        el.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, args, ctx| {
+                    let name = js_value_to_string(args.get_or_undefined(0), ctx);
+                    Ok(JsValue::from(JsString::from(attr_of(&h, &name))))
+                })
+            },
+            JsString::from("attr"),
+            1,
+        );
+    }
+    {
+        let h = html.clone();
+        el.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, _c| {
+                    Ok(JsValue::from(JsString::from(text_of(&h))))
+                })
+            },
+            JsString::from("text"),
+            0,
+        );
+    }
+    {
+        let h = html.clone();
+        el.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, _c| {
+                    Ok(JsValue::from(JsString::from(inner_html_of(&h))))
+                })
+            },
+            JsString::from("html"),
+            0,
+        );
+    }
+    {
+        let h = html.clone();
+        el.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, _c| {
+                    let v = attr_of(&h, "value");
+                    Ok(JsValue::from(JsString::from(if v.is_empty() {
+                        text_of(&h)
+                    } else {
+                        v
+                    })))
+                })
+            },
+            JsString::from("val"),
+            0,
+        );
+    }
+    {
+        let h = html.clone();
+        el.function(
+            unsafe {
+                NativeFunction::from_closure(move |_t, _a, _c| {
+                    Ok(JsValue::from(JsString::from(h.clone())))
+                })
+            },
+            JsString::from("toString"),
+            0,
+        );
+    }
+    Ok(el.build().into())
+}
+
+/// 元素 HTML → 首个元素属性值
+fn attr_of(html: &str, name: &str) -> String {
+    let parsed = scraper::Html::parse_fragment(html);
+    parsed
+        .root_element()
+        .attr(name)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 元素 HTML → 文本
+fn text_of(html: &str) -> String {
+    let parsed = scraper::Html::parse_fragment(html);
+    parsed.root_element().text().collect::<String>().trim().to_string()
+}
+
+/// 元素 HTML → innerHTML
+fn inner_html_of(html: &str) -> String {
+    let parsed = scraper::Html::parse_fragment(html);
+    parsed.root_element().inner_html()
+}
+
+/// 首个元素属性值（Elements.attr）
+fn first_attr(htmls: &[String], name: &str) -> String {
+    htmls
+        .first()
+        .map(|h| attr_of(h, name))
+        .unwrap_or_default()
+}
+
+/// 首个元素文本（Elements.text）
+fn first_text(htmls: &[String]) -> String {
+    htmls.first().map(|h| text_of(h)).unwrap_or_default()
 }
 
 // ---- java.headerMap.* 实现（请求头 Map）----
@@ -894,6 +2139,15 @@ fn source_get(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) ->
         .get(&inner.source_key)
         .and_then(|m| m.get(&key).cloned());
     Ok(value.map_or_else(JsValue::undefined, |s| JsValue::from(JsString::from(s))))
+}
+
+/// source.getVariable()：书源变量（legado 书源变量配置；无 → 空串）
+fn source_get_variable(
+    inner: &JsBridgeInner,
+    _args: &[JsValue],
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::from(JsString::from(inner.source_variable.as_str())))
 }
 
 /// JsValue → 字符串（对齐 String() 语义：数字/布尔 → 字面量；
@@ -1349,12 +2603,28 @@ mod tests {
         .unwrap();
         let arr = json.as_array().expect("getElements 应返回数组");
         assert_eq!(arr.len(), 2, "应匹配 2 个 div.book");
+        // 新语义：无提取器时返回元素对象（jsoup Elements 风格——可调 .html()/.text()）
         assert!(
-            arr[0].as_str().unwrap().contains("<div class=\"book\"><h2>书名A</h2></div>"),
-            "元素应返回 outerHTML: {}",
+            arr[0].is_object(),
+            "元素应为对象（含 html/text 等方法）: {}",
             arr[0]
         );
-        assert!(arr[1].as_str().unwrap().contains("书名B"));
+        // 带 @html 提取器 → 字符串数组（outerHTML）
+        let js_html2 = serde_json::to_string(html).unwrap();
+        let json2 = eval_js_json_with_bridge(
+            &format!("java.setContent({js_html2}); java.getElements('div.book@html')"),
+            &vars(&[]),
+            &bridge,
+        )
+        .unwrap();
+        let arr2 = json2.as_array().expect("应返回数组");
+        assert_eq!(arr2.len(), 2);
+        assert!(
+            arr2[0].as_str().unwrap().contains("<div class=\"book\"><h2>书名A</h2></div>"),
+            "元素应返回 outerHTML: {}",
+            arr2[0]
+        );
+        assert!(arr2[1].as_str().unwrap().contains("书名B"));
     }
 
     #[test]

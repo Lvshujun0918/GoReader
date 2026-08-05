@@ -77,6 +77,8 @@ export interface BookChapter {
   url: string
   isVolume: boolean
   index: number
+  /** 本章字数（后端仅本地书返回；书源书省略 → 前端从已缓存正文估算） */
+  chapterWordCount?: number
   [key: string]: unknown
 }
 
@@ -241,6 +243,48 @@ export interface SystemInfo {
   freeMemory?: string
   totalMemory?: string
   maxMemory?: string
+  [key: string]: unknown
+}
+
+/** 服务监控（GET /reader3/getServerStats → data；内存/CPU/请求量/在线/书源成功率） */
+export interface ServerStats {
+  version: string
+  port: number
+  timestamp: number
+  uptimeSeconds: number
+  memory: {
+    totalMb: number
+    availableMb: number
+    usedMb: number
+    processMb: number
+    /** 已用内存占比 0..=100 */
+    percent: number
+  }
+  cpu: {
+    /** 短采样使用率 0..=100 */
+    percent: number
+    /** 逻辑核心数 */
+    cores: number
+  }
+  requests: {
+    total: number
+    today: number
+    topEndpoints: { path: string; count: number }[]
+  }
+  online: {
+    /** 活跃 token 会话数 */
+    sessions: number
+  }
+  bookSource: {
+    total: number
+    ok: number
+    failed: number
+    /** 0..=1；从未检测时为 null */
+    successRate: number | null
+    checkedAt: number | null
+    namespace: string
+    note: string
+  }
   [key: string]: unknown
 }
 

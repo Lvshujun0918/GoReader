@@ -82,6 +82,13 @@ function bookProgress(book: Book): number | null {
   return Math.min(100, Math.round((cur / total) * 100))
 }
 
+/** 悬浮预览简介（桌面 hover 浮层：customIntro 优先，截取前 120 字；无简介返回 null 不显示浮层） */
+function hoverPreview(book: Book): string | null {
+  const intro = (book.customIntro || book.intro || '').trim()
+  if (!intro) return null
+  return intro.length > 120 ? `${intro.slice(0, 120)}…` : intro
+}
+
 /** 后端 secure 模式（用户管理入口仅 secure 模式显示，探测见 api/users.ts） */
 const secureMode = ref(false)
 
@@ -169,9 +176,10 @@ watch(searchMode, (m) => {
 
 /* ================= 书架排序（前端排序 books.value 副本——不改服务端顺序；localStorage: reader_shelf_sort） ================= */
 
-type SortMode = 'recent' | 'name' | 'author' | 'source' | 'group'
+type SortMode = 'recent' | 'added' | 'name' | 'author' | 'source' | 'group'
 const SORT_OPTIONS: { value: SortMode; label: string }[] = [
   { value: 'recent', label: '最近阅读' },
+  { value: 'added', label: '最近添加' },
   { value: 'name', label: '书名' },
   { value: 'author', label: '作者' },
   { value: 'source', label: '来源' },
@@ -694,6 +702,15 @@ const filtered = computed(() => {
   // 前端排序 books 副本（不改变服务端 books.value 顺序）
   const sorted = [...list]
   switch (sortMode.value) {
+    case 'added':
+      // 最近添加：优先按 rowid（入库序）倒序；后端 getBookshelf 未透出 rowid/created_at 时
+      // 保持服务端列表顺序（list_books 按 dur_chapter_time DESC, rowid DESC），标注「按入库顺序」
+      if (list.some((b) => typeof (b as { rowid?: unknown }).rowid === 'number')) {
+        sorted.sort(
+          (a, b) => ((b as { rowid?: number }).rowid ?? 0) - ((a as { rowid?: number }).rowid ?? 0),
+        )
+      }
+      break
     case 'name':
       sorted.sort((a, b) => a.name.localeCompare(b.name, 'zh') || a.author.localeCompare(b.author, 'zh'))
       break
@@ -731,6 +748,20 @@ const emptyText = computed(() => {
   if (activeGroup.value !== null) return '该分组下暂无书籍'
   return '书架空空如也，去搜索添加第一本书吧'
 })
+
+/* ================= GAP 199：最近添加标注（后端未透出 rowid/created_at → 按服务端列表顺序近似） ================= */
+const addedSortNote = computed(() => {
+  if (sortMode.value !== 'added') return ''
+  return books.value.some((b) => typeof (b as { rowid?: unknown }).rowid === 'number')
+    ? '按入库时间'
+    : '按入库顺序'
+})
+const addedSortTip = computed(() =>
+  sortMode.value === 'added' &&
+  !books.value.some((b) => typeof (b as { rowid?: unknown }).rowid === 'number')
+    ? '后端 books 表未透出 created_at/rowid：按服务端当前列表顺序近似'
+    : '',
+)
 
 /* ================= 多选模式 ================= */
 function toggleManage() {
@@ -1534,6 +1565,68 @@ async function moveToGroup(groupId: number) {
   }
 }
 
+/* ================= 拖拽移组（分组模式：书卡拖到分组标题/未分组 → updateBookGroupId；开关防误拖） ================= */
+const dragMoveMode = ref(false)
+const dragBookUrl = ref<string | null>(null)
+const dragOverGroupId = ref<number | null>(null)
+
+watch(sortMode, (v) => {
+  if (v !== 'group') dragMoveMode.value = false
+})
+
+function onBookDragStart(book: Book, e: DragEvent) {
+  if (!dragMoveMode.value) return
+  dragBookUrl.value = book.bookUrl
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', book.bookUrl)
+  }
+}
+
+function onBookDragEnd() {
+  dragBookUrl.value = null
+  dragOverGroupId.value = null
+}
+
+function onGroupHeadDragOver(gid: number, e: DragEvent) {
+  if (dragBookUrl.value === null) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+  dragOverGroupId.value = gid
+}
+
+function onGroupHeadDragLeave(e: DragEvent) {
+  const cur = e.currentTarget as HTMLElement | null
+  if (!cur || !cur.contains(e.relatedTarget as Node | null)) {
+    dragOverGroupId.value = null
+  }
+}
+
+/** 放下书卡到分组标题：调 updateBookGroupId 移组 */
+async function onGroupHeadDrop(gid: number, e: DragEvent) {
+  e.preventDefault()
+  const url = e.dataTransfer?.getData('text/plain') || dragBookUrl.value
+  dragBookUrl.value = null
+  dragOverGroupId.value = null
+  if (!url) return
+  const book = books.value.find((x) => x.bookUrl === url)
+  if (!book) return
+  if (book.group === gid) {
+    ElMessage.info(`《${book.name}》已在「${groupName(gid)}」`)
+    return
+  }
+  try {
+    await updateBookGroupId(url, gid)
+    book.group = gid
+    invalidateGroupCounts()
+    ElMessage.success(
+      gid === 0 ? `已将《${book.name}》移出分组` : `已将《${book.name}》移动到「${groupName(gid)}」`,
+    )
+  } catch {
+    // 错误提示已由拦截器统一处理
+  }
+}
+
 async function removeFromShelf() {
   const book = menuBook.value
   if (!book || menuBusy.value) return
@@ -1658,6 +1751,7 @@ onMounted(() => {
         <button class="nav-link" type="button" @click="router.push('/rss')">RSS</button>
         <button class="nav-link" type="button" @click="router.push('/files')">文件</button>
         <button class="nav-link" type="button" title="共享书仓（storage/localStore，浏览并批量导入书架）" @click="router.push('/store')">书仓</button>
+        <button class="nav-link" type="button" title="服务监控（内存/CPU/请求量/在线会话）" @click="router.push('/server-stats')">监控</button>
         <button class="nav-link" type="button" title="OPDS 服务器（外部阅读器连接）" @click="openOpds">OPDS</button>
         <button v-if="secureMode" class="nav-link" type="button" @click="router.push('/users')">用户</button>
         <span class="user-chip">{{ store.username || '未登录' }}</span>
@@ -1738,6 +1832,7 @@ onMounted(() => {
         >
           {{ opt.label }}
         </button>
+        <span v-if="addedSortNote" class="sort-note" :title="addedSortTip">{{ addedSortNote }}</span>
       </div>
 
       <!-- 显示设置：网格密度（GAP 11，localStorage: reader_card_density）+ 网格/列表切换（GAP 103，localStorage: reader_shelf_view） -->
@@ -1808,6 +1903,20 @@ onMounted(() => {
           </svg>
           <span>管理</span>
         </button>
+        <button
+          class="group-manage"
+          :class="{ active: dragMoveMode }"
+          type="button"
+          :disabled="sortMode !== 'group'"
+          :title="sortMode !== 'group' ? '需先切换排序为「分组」' : (dragMoveMode ? '退出拖拽移组' : '拖拽移组：把书卡拖到分组标题即可移动分组（开关防止误拖）')"
+          @click="dragMoveMode = !dragMoveMode"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 6h.01M16 6h.01M8 12h.01M16 12h.01M8 18h.01M16 18h.01" />
+            <path d="M11 6h2M11 12h2M11 18h2" />
+          </svg>
+          <span>拖拽移组</span>
+        </button>
       </div>
 
       <!-- 加载骨架（浅灰静置块） -->
@@ -1837,9 +1946,13 @@ onMounted(() => {
             <div v-if="row.kind === 'header'" class="group-head-row">
               <button
                 class="group-head"
+                :class="{ 'drop-target': dragMoveMode && dragOverGroupId === row.groupId }"
                 type="button"
-                :title="groupCollapsed(row.groupId) ? '展开该组' : '折叠该组'"
+                :title="dragMoveMode ? `拖放书卡到此移入「${row.name}」` : (groupCollapsed(row.groupId) ? '展开该组' : '折叠该组')"
                 @click="toggleGroupCollapsed(row.groupId)"
+                @dragover="onGroupHeadDragOver(row.groupId, $event)"
+                @dragleave="onGroupHeadDragLeave"
+                @drop="onGroupHeadDrop(row.groupId, $event)"
               >
                 <span class="group-caret" :class="{ open: !groupCollapsed(row.groupId) }">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -1855,12 +1968,15 @@ onMounted(() => {
                 v-for="book in row.books"
                 :key="book.bookUrl"
                 class="book-card"
-                :class="{ managing: manageMode, selected: selected.has(book.bookUrl) }"
+                :class="{ managing: manageMode, selected: selected.has(book.bookUrl), dragging: dragBookUrl === book.bookUrl }"
+                :draggable="dragMoveMode"
                 @click="onCardClick(book)"
                 @contextmenu="onCardMenu(book, $event)"
                 @touchstart.passive="onCardTouchStart(book, $event)"
                 @touchend="onCardTouchEnd"
                 @touchcancel="onCardTouchEnd"
+                @dragstart="onBookDragStart(book, $event)"
+                @dragend="onBookDragEnd"
               >
             <span class="select-dot" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
@@ -1919,6 +2035,15 @@ onMounted(() => {
               <p v-if="book.latestChapterTitle" class="book-chapter" :title="book.latestChapterTitle">
                 {{ book.latestChapterTitle }}
               </p>
+            </div>
+            <!-- 悬浮简介预览（桌面 hover：卡片上方浮层，鼠标移出关闭；touch 无 hover 不启用） -->
+            <div v-if="hoverPreview(book)" class="hover-preview">
+              <p class="hp-name" :title="book.name">{{ book.name }}</p>
+              <p class="hp-author">{{ book.author || '佚名' }}</p>
+              <p v-if="book.latestChapterTitle" class="hp-chapter" :title="book.latestChapterTitle">
+                最新章：{{ book.latestChapterTitle }}
+              </p>
+              <p class="hp-intro">{{ hoverPreview(book) }}</p>
             </div>
             </div>
           </template>
@@ -2885,6 +3010,10 @@ onMounted(() => {
 .book-card:hover {
   transform: translateY(-4px);
 }
+.book-card.dragging {
+  opacity: 0.55;
+  transform: scale(0.97);
+}
 
 .detail-btn {
   position: absolute;
@@ -3006,6 +3135,74 @@ onMounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ================= 悬浮简介预览（桌面 hover：卡片上方浮层；touch 无 hover 不启用） ================= */
+.hover-preview {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 10px);
+  transform: translateX(-50%);
+  z-index: 10;
+  width: max-content;
+  max-width: min(280px, calc(100vw - 24px));
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.12);
+  text-align: left;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 0.15s ease,
+    visibility 0.15s ease;
+}
+.book-card:hover .hover-preview {
+  opacity: 1;
+  visibility: visible;
+}
+.hp-name {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hp-author {
+  margin: 3px 0 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.hp-chapter {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hp-intro {
+  margin: 8px 0 0;
+  font-size: 12px;
+  font-weight: 300;
+  line-height: 1.7;
+  color: var(--text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* touch 设备（无 hover 概念）不启用悬浮预览 */
+@media (hover: none), (pointer: coarse) {
+  .hover-preview {
+    display: none;
+  }
 }
 
 /* ================= 骨架屏（浅灰静置 + GAP 72 shimmer 扫光） ================= */
@@ -3448,10 +3645,13 @@ onMounted(() => {
   border-color: var(--accent);
   color: var(--accent);
 }
-.sort-capsule.active {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: var(--accent-soft);
+.sort-note {
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+  border-bottom: 1px dashed var(--border);
+  cursor: help;
 }
 
 /* ================= 显示设置：密度 + 视图切换（GAP 11 / GAP 103） ================= */
@@ -3513,6 +3713,14 @@ onMounted(() => {
   transition: color 0.2s ease;
 }
 .group-head:hover {
+  color: var(--accent);
+}
+.group-head.drop-target {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 6px;
+}
+.group-head.drop-target .group-head-name {
   color: var(--accent);
 }
 .group-caret {
@@ -3679,6 +3887,15 @@ onMounted(() => {
 .group-manage:hover {
   color: var(--accent);
   border-color: var(--accent);
+}
+.group-manage.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.group-manage:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .group-manage svg {
   width: 12px;

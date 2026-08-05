@@ -210,8 +210,8 @@ async fn debug_search(
         .unwrap_or_default();
     let started = Instant::now();
     // 书源桥接（带用户命名空间：URL 构造 JS 内 java.* 可用）
-    let bridge = crate::parser::js::JsBridge::new(&source.book_source_url, &source.book_source_name)
-        .with_namespace(ns);
+    let bridge =
+        crate::parser::js::JsBridge::from_source(source, ns);
     let (url, suffix) = match crate::service::search::build_request_url(
         &search_url,
         key,

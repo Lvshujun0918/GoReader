@@ -13,6 +13,7 @@ use crate::model::BookSource;
 use crate::parser::js::JsBridge;
 use crate::parser::rule::{apply, parse_rule, RuleKind};
 use crate::service::crawler;
+use crate::storage::Storage;
 
 /// 搜索结果（兼容 legacy SearchBook 字段）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -242,8 +243,9 @@ fn concurrent_rate_sleep_ms(rate: Option<&str>) -> u64 {
     0
 }
 
-/// 执行单个书源搜索
+/// 执行单个书源搜索；搜索成功（命中 ≥1 条）时记录书源使用统计（use_count+1）
 pub async fn search_one_source(
+    storage: &Storage,
     ns: &str,
     source: &BookSource,
     key: &str,
@@ -309,6 +311,14 @@ pub async fn search_one_source(
     // bodyJs：对响应体执行 JS 后作为新响应体
     let body = apply_body_js(&resp.body, &suffix, key, page, &source.book_source_url, &req_headers, &bridge)?;
     let books = analyze_book_list(&body, &base, source, &rule, &book_list_rule, key, &bridge);
+
+    // 书源使用统计：搜索命中（结果非空）→ use_count+1 / use_ts 刷新；
+    // 计数失败仅记 debug 日志，不影响搜索流程（搜索/换源共用此入口）
+    if !books.is_empty() {
+        if let Err(e) = storage.bump_book_source_use(ns, &source.book_source_url).await {
+            tracing::debug!("书源使用计数失败 [{}]: {e}", source.book_source_name);
+        }
+    }
 
     tracing::info!(
         "搜索 [{}] key={} → {} 条",
@@ -410,6 +420,36 @@ fn analyze_book_list_impl(
             Some(book)
         })
         .collect()
+}
+
+/// 精确匹配文本归一化：去首尾空白 + 全角 ASCII → 半角（U+FF01..U+FF5E → U+21..U+7E，
+/// 全角空格 U+3000 → 半角空格）+ 小写。用于「精确」搜索：大小写/全半角差异不敏感。
+pub(crate) fn normalize_search_text(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| match c {
+            '\u{3000}' => ' ',
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            _ => c,
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// 单本是否精确命中：书名或作者与 key 严格等值（归一化后；作者为空不参与匹配）
+pub(crate) fn exact_match(book: &SearchBook, key: &str) -> bool {
+    let q = normalize_search_text(key);
+    if q.is_empty() {
+        return true;
+    }
+    let name = normalize_search_text(&book.name);
+    let author = normalize_search_text(&book.author);
+    name == q || (!author.is_empty() && author == q)
+}
+
+/// 精确搜索过滤：书源规则解析后，仅保留书名/作者等值命中的结果（模糊模式不做此过滤）
+pub(crate) fn filter_exact(books: Vec<SearchBook>, key: &str) -> Vec<SearchBook> {
+    books.into_iter().filter(|b| exact_match(b, key)).collect()
 }
 
 /// CSS 书单：链式 CSS（legado）→ 元素 html 列表
@@ -670,6 +710,59 @@ mod tests {
         assert!(!books.is_empty(), "真实数据解析为空");
         assert_eq!(books[0].name, "诡秘之主");
         assert!(books[0].book_url.contains("bY7oM0"), "bookUrl 内嵌规则: {}", books[0].book_url);
+    }
+
+    #[test]
+    fn test_normalize_search_text() {
+        // 全角 ASCII → 半角 + 小写 + 去首尾空白
+        assert_eq!(normalize_search_text(" ＡＢＣ１２３ "), "abc123");
+        assert_eq!(normalize_search_text("ＦｕｌｌＷｉｄｔｈ"), "fullwidth");
+        assert_eq!(normalize_search_text("AbC"), "abc");
+        // 全角空格 U+3000 → 半角空格；首尾空白（含全角）被 trim 去除
+        assert_eq!(normalize_search_text("　全角　空格　"), "全角 空格");
+        // 中文与混合内容原样保留（小写化对中文无影响）
+        assert_eq!(normalize_search_text("诡秘之主"), "诡秘之主");
+    }
+
+    #[test]
+    fn test_filter_exact() {
+        let mk = |name: &str, author: &str| SearchBook {
+            name: name.into(),
+            author: author.into(),
+            ..Default::default()
+        };
+        let books = vec![
+            mk("诡秘之主", "爱潜水的乌贼"),
+            mk("诡秘之主2", "爱潜水的乌贼"),
+            mk("ＧＭＴ", "测试作者"),
+            mk("凡人修仙传", "忘语"),
+            mk("Book ABC", ""),
+        ];
+        // 书名等值命中（大小写不敏感）
+        let hit = filter_exact(books.clone(), "诡秘之主");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].name, "诡秘之主");
+        // 包含但不等值（模糊命中）→ 精确下不命中
+        let hit = filter_exact(books.clone(), "诡秘");
+        assert!(hit.is_empty());
+        // 全角书名 + 半角 key：全半角忽略等值命中
+        let hit = filter_exact(books.clone(), "gmt");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].name, "ＧＭＴ");
+        // 半角书名 + 全角 key
+        let hit = filter_exact(books.clone(), "ＢＯＯＫ ａｂｃ");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].name, "Book ABC");
+        // 作者等值命中
+        let hit = filter_exact(books.clone(), "忘语");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].name, "凡人修仙传");
+        // 作者为空：不因空作者误命中；空 key 不过滤
+        let hit = filter_exact(books.clone(), "");
+        assert_eq!(hit.len(), books.len());
+        // 无命中
+        let hit = filter_exact(books, "不存在的书");
+        assert!(hit.is_empty());
     }
 
     #[test]

@@ -10,6 +10,8 @@
 //! - `READER_CAMOUFOX_URL`：服务地址（默认 http://127.0.0.1:8196）
 //! - `READER_CAMOUFOX_DISABLE=1`：禁用 camoufox 兜底
 //! - `READER_CAMOUFOX_FIRST=1`：camoufox 优先（CDP 前先试——配置启用场景）
+//! - `READER_CAMOUFOX_UA`：求解用 UA（默认 Chrome/131 Windows——与 CDP 路径一致；
+//!   69shuba 等站点有 UA 门禁，Firefox UA 会被 "请使用新版本的Google Chrome" 拦截）
 //!
 //! 求解成功后的 cookie 合并/存库/UA 记录复用 crawler::store_solution_session
 //! （与 CDP 路径同构——本模块返回与 browser::CfSolution 相同结构）。
@@ -18,6 +20,20 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use crate::service::browser::CfSolution;
+
+/// 默认求解 UA：Chrome/131 Windows——与内置 CDP 路径（browser.rs --user-agent）一致；
+/// 69shuba 实测：camoufox 默认 Firefox wire UA 会命中站点 UA 门禁，Chrome wire UA 直过。
+const DEFAULT_SOLVE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/// 求解用 UA：`READER_CAMOUFOX_UA` 显式配置优先，默认 Chrome/131 Windows
+pub fn solve_ua() -> String {
+    std::env::var("READER_CAMOUFOX_UA")
+        .map(|v| v.trim().to_string())
+        .into_iter()
+        .filter(|v| !v.is_empty())
+        .next()
+        .unwrap_or_else(|| DEFAULT_SOLVE_UA.to_string())
+}
 
 /// camoufox 服务地址：`READER_CAMOUFOX_URL`（默认 http://127.0.0.1:8196，尾斜杠去除）
 pub fn server_url() -> String {
@@ -62,6 +78,7 @@ pub async fn solve(
         "url": url,
         "cookies": cookies.iter().map(|(n, v)| json!({"name": n, "value": v})).collect::<Vec<_>>(),
         "maxWaitMs": max_wait_ms,
+        "userAgent": solve_ua(),
     });
     // 超时：求解上限 + 20s 余量（导航/提取），封顶 120s——服务不可达时连接拒绝立即返回
     let timeout = std::time::Duration::from_secs(max_wait_ms.saturating_add(20).min(120));
@@ -184,6 +201,19 @@ mod tests {
         std::env::set_var("READER_CAMOUFOX_FIRST", "1");
         assert!(first_mode());
         std::env::remove_var("READER_CAMOUFOX_FIRST");
+    }
+
+    #[test]
+    fn test_solve_ua_default_and_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("READER_CAMOUFOX_UA");
+        let d = solve_ua();
+        assert!(d.contains("Chrome/"), "默认 UA 应为 Chrome: {d}");
+        std::env::set_var("READER_CAMOUFOX_UA", "Mozilla/5.0 (X11; Linux x86_64) Firefox/143.0");
+        assert_eq!(solve_ua(), "Mozilla/5.0 (X11; Linux x86_64) Firefox/143.0");
+        std::env::set_var("READER_CAMOUFOX_UA", "  ");
+        assert!(solve_ua().contains("Chrome/"), "空白 env 回退默认");
+        std::env::remove_var("READER_CAMOUFOX_UA");
     }
 
     #[test]

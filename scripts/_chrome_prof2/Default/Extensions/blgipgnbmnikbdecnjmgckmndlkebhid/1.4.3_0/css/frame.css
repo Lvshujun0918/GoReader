@@ -1,0 +1,123 @@
+body {
+	margin: 0;
+	font-family: Helvetica Neue, Myriad Pro, sans-serif;
+	font-size: 13px;
+	font-weight: 400;
+	color: #454545;
+	padding: 3px;
+	overflow: hidden
+}
+
+.close-dialog {
+	background-image: url(../images/ico.close.18.png);
+	background-repeat: no-repeat;
+	float: right;
+}
+
+.MainDiv {
+	display: block;
+	width: 265px;
+	margin: 0;
+	border-radius: 5px 5px;
+}
+
+.do-editor-icon {
+	background-image: url(../images/ico.app.24.png);
+	background-repeat: no-repeat;
+	background-color: transparent;
+	width: 24px;
+	height: 24px;
+	margin: 0 0 0 10px;
+}
+
+.actions {
+	background: linear-gradient(to right, #4273f0, #269e8b, #4273f0);
+	background-size: 200% auto;
+	transition: all 0.3s cubic-bezier(.25,.8,.25,1);
+	
+	padding: 7px 0;
+	width: 100%;
+	overflow: auto;
+	color: #fff;
+	box-shadow: 0px 0px 2px 0px rgba(0,0,0,0.75);
+	border: 1px solid rgba(0, 0, 0, 0.2);
+	border-radius: 5px 5px;
+}
+.actions:hover {
+	background-position: right center;
+}
+
+.actions input[type=button] {
+	color: #000;
+	border: 1px solid transparent;
+	border-radius: 2px;
+	background-color: transparent;
+	cursor: pointer;
+	height: auto;
+	width: 80%;
+	text-align: left;
+	font-size: 14px;
+	font-weight: 100;
+	text-overflow: ellipsis;
+	overflow: hidden;
+	margin-top: 3px
+}
+
+input[type=button].close-dialog {
+	float: right;
+	width: 20px;
+	height: 20px;
+	position: relative;
+	margin-top: 0;
+	margin-right: 3px;
+	cursor: pointer;
+	border: 1px solid transparent;
+	background-color: transparent;
+	padding: 0
+}
+
+.click-area {
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	float: left;
+}
+
+.click-area div.label {
+	margin-left: 10px;
+}
+
+/* PROGRESS */
+#progress-container {
+	clear: both;
+	padding: 5px;
+	margin-top: 4px;
+	width: 95%;
+	display: none;
+}
+.progress {
+	display: flex;
+	height: 1rem;
+	overflow: hidden;
+	line-height: 0;
+	font-size: .75rem;
+	background-color: #e9ecef;
+	border-radius: 0.25rem;
+}
+
+.progress-bar {
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	overflow: hidden;
+	color: #fff;
+	text-align: center;
+	white-space: nowrap;
+	background-color: #3e454c;
+	transition: width .6s ease;
+}
+#indeterminated-progress-container {
+	text-align: center;
+	display: none;
+}
+/* //PROGRESS */

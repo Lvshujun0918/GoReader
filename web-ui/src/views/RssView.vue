@@ -10,6 +10,7 @@ import {
   markRssArticleRead,
   saveRssSource,
 } from '@/api/rss'
+import { t } from '@/utils/i18n'
 import type { RssArticle, RssSource } from '@/types'
 
 const router = useRouter()
@@ -330,10 +331,10 @@ onBeforeUnmount(() => {
         <span class="brand-name">夜读<span class="brand-dot">.</span></span>
       </div>
       <nav class="nav-area">
-        <button class="nav-link" type="button" @click="router.push('/')">书架</button>
-        <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
-        <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
-        <button class="nav-link active" type="button" @click="router.push('/rss')">RSS</button>
+        <button class="nav-link" type="button" @click="router.push('/')">{{ t('nav.bookshelf') }}</button>
+        <button class="nav-link" type="button" @click="router.push('/search')">{{ t('nav.search') }}</button>
+        <button class="nav-link" type="button" @click="router.push('/sources')">{{ t('nav.sources') }}</button>
+        <button class="nav-link active" type="button" @click="router.push('/rss')">{{ t('nav.rss') }}</button>
       </nav>
     </header>
 
@@ -341,13 +342,13 @@ onBeforeUnmount(() => {
       <!-- 左栏：订阅源（分组胶囊 + 列表） -->
       <aside class="source-col">
         <div class="col-head">
-          <h2 class="col-title">订阅源</h2>
+          <h2 class="col-title">{{ t('rss.title') }}</h2>
           <span class="col-count">{{ enabledCount }}/{{ sources.length }}</span>
           <button
             class="add-btn refresh-all-btn"
             type="button"
             :disabled="refreshingAll"
-            :title="refreshingAll ? `正在刷新 ${refreshAllIndex}/${refreshAllTotal}` : '刷新全部（逐源重新抓取 feed）'"
+            :title="refreshingAll ? t('rss.refreshing', { i: refreshAllIndex, t: refreshAllTotal }) : t('rss.refreshAll')"
             @click="refreshAll"
           >
             <svg v-if="!refreshingAll" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -358,7 +359,7 @@ onBeforeUnmount(() => {
               <path d="M21 12a9 9 0 1 1-6.2-8.56" />
             </svg>
           </button>
-          <button class="add-btn" type="button" title="新增订阅" @click="openAdd">
+          <button class="add-btn" type="button" :title="t('rss.addTip')" @click="openAdd">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
               <path d="M12 5v14M5 12h14" />
             </svg>
@@ -373,7 +374,7 @@ onBeforeUnmount(() => {
             :class="{ active: activeGroup === '全部' }"
             @click="activeGroup = '全部'"
           >
-            全部
+            {{ t('common.all') }}
           </button>
           <button
             v-for="g in groups"
@@ -387,9 +388,9 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <div v-if="loadingSources" class="col-state">加载中…</div>
+        <div v-if="loadingSources" class="col-state">{{ t('common.loading') }}</div>
         <div v-else-if="filteredSources.length === 0" class="col-state">
-          {{ sources.length === 0 ? '还没有订阅源，点右上角 + 添加' : '该分组暂无订阅源' }}
+          {{ sources.length === 0 ? t('rss.empty') : t('rss.emptyGroup') }}
         </div>
         <ul v-else class="source-list">
           <li
@@ -401,7 +402,7 @@ onBeforeUnmount(() => {
           >
             <span class="source-dot" :class="{ on: s.enabled }"></span>
             <span class="source-name" :title="s.rssSourceName">{{ s.rssSourceName }}</span>
-            <button class="source-del" type="button" title="删除订阅源" @click.stop="askDelete(s)">
+            <button class="source-del" type="button" :title="t('rss.deleteTip')" @click.stop="askDelete(s)">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
                 <path d="M6 6l12 12M18 6L6 18" />
               </svg>
@@ -418,9 +419,9 @@ onBeforeUnmount(() => {
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
               <path d="M15 18l-6-6 6-6" />
             </svg>
-            <span>返回列表</span>
+            <span>{{ t('rss.backList') }}</span>
           </button>
-          <h1 class="article-title">{{ readingArticle?.title || '无标题' }}</h1>
+          <h1 class="article-title">{{ readingArticle?.title || t('rss.noTitle') }}</h1>
           <p class="article-meta">
             <span>{{ readingArticle?.author || selectedSourceName }}</span>
             <template v-if="fmtTime(readingArticle?.time)">
@@ -428,17 +429,17 @@ onBeforeUnmount(() => {
               <span>{{ fmtTime(readingArticle?.time) }}</span>
             </template>
           </p>
-          <div v-if="loadingArticle" class="state-text loading">正文加载中…</div>
-          <div v-else-if="!articleContent" class="state-text">正文为空</div>
+          <div v-if="loadingArticle" class="state-text loading">{{ t('rss.articleLoading') }}</div>
+          <div v-else-if="!articleContent" class="state-text">{{ t('rss.articleEmpty') }}</div>
           <div v-else class="rss-content" v-html="articleContent"></div>
         </div>
 
         <!-- 列表模式 -->
         <template v-else>
           <div class="col-head">
-            <h2 class="col-title">{{ selectedSourceName || '文章' }}</h2>
+            <h2 class="col-title">{{ selectedSourceName || t('rss.articles') }}</h2>
             <span class="col-count"
-              >{{ articleCountText }}<span v-if="!articleFilter.trim() && unreadCount"> · {{ unreadCount }} 未读</span></span
+              >{{ articleCountText }}<span v-if="!articleFilter.trim() && unreadCount"> · {{ t('rss.unread', { n: unreadCount }) }}</span></span
             >
           </div>
           <!-- GAP 46：文章标题前端过滤 -->
@@ -451,23 +452,23 @@ onBeforeUnmount(() => {
               v-model="articleFilter"
               class="article-filter-input"
               type="text"
-              placeholder="过滤文章标题…"
+              :placeholder="t('rss.filterPlaceholder')"
               spellcheck="false"
             />
             <button
               v-if="articleFilter"
               class="article-filter-clear"
               type="button"
-              title="清除过滤"
+              :title="t('rss.clearFilter')"
               @click="articleFilter = ''"
             >
               ×
             </button>
           </div>
-          <div v-if="loadingArticles" class="state-text loading">文章加载中…</div>
-          <div v-else-if="!selectedUrl" class="state-text">请选择一个订阅源</div>
-          <div v-else-if="articles.length === 0" class="state-text">暂无文章</div>
-          <div v-else-if="filteredArticles.length === 0" class="state-text">没有匹配「{{ articleFilter.trim() }}」的文章</div>
+          <div v-if="loadingArticles" class="state-text loading">{{ t('rss.articlesLoading') }}</div>
+          <div v-else-if="!selectedUrl" class="state-text">{{ t('rss.pleaseSelect') }}</div>
+          <div v-else-if="articles.length === 0" class="state-text">{{ t('rss.noArticles') }}</div>
+          <div v-else-if="filteredArticles.length === 0" class="state-text">{{ t('rss.noMatch', { k: articleFilter.trim() }) }}</div>
           <ul v-else ref="listEl" class="article-list">
             <li
               v-for="a in filteredArticles"
@@ -476,7 +477,7 @@ onBeforeUnmount(() => {
               :class="{ read: a.hasRead }"
               @click="openArticle(a)"
             >
-              <p class="article-item-title" :title="a.title">{{ a.title || '无标题' }}</p>
+              <p class="article-item-title" :title="a.title">{{ a.title || t('rss.noTitle') }}</p>
               <p class="article-item-meta">
                 <span>{{ a.author || selectedSourceName }}</span>
                 <template v-if="fmtTime(a.time)">
@@ -493,7 +494,7 @@ onBeforeUnmount(() => {
               :disabled="loadingMore"
               @click="loadArticles(articlePage + 1)"
             >
-              {{ loadingMore ? '加载中…' : '加载更多' }}
+              {{ loadingMore ? t('common.loading') : t('common.loadMore') }}
             </button>
           </div>
         </template>
@@ -513,7 +514,7 @@ onBeforeUnmount(() => {
             @keydown.esc="closeAdd"
           >
             <div class="dlg-head">
-              <h2 class="dlg-title">新增订阅</h2>
+              <h2 class="dlg-title">{{ t('rss.add') }}</h2>
               <button class="dlg-close" type="button" title="关闭" :disabled="addBusy" @click="closeAdd">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
                   <path d="M6 6l12 12M18 6L6 18" />

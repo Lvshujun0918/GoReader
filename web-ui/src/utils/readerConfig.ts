@@ -4,10 +4,14 @@
  * 设置页经此模块汇总为一份 JSON 上传 / 下发合并（服务器优先）。
  */
 
+import { parsePageMode, type PageMode } from './readerPageMode'
+
+export type { PageMode }
+
 export type HanMode = 'auto' | 'simp' | 'trad'
-export type Theme = 'light' | 'dark' | 'warm' | 'system'
+/** 阅读内容主题（custom=自定义——颜色见 reader_theme_custom，仅阅读页可配置） */
+export type Theme = 'light' | 'dark' | 'warm' | 'system' | 'custom'
 export type TextAlign = 'left' | 'justify'
-export type PageMode = 'scroll' | 'slide'
 export type FontKind =
   | 'system'
   | 'song'
@@ -26,7 +30,7 @@ export type FontKind =
 export interface ReaderConfig {
   /** 简繁模式：auto=自动 / simp=简体 / trad=繁体（reader_han_mode） */
   hanMode: HanMode
-  /** 主题：light/dark/warm/system（reader_theme；旧值 paper 已迁移为 warm） */
+  /** 主题：light/dark/warm/system/custom（reader_theme；旧值 paper 已迁移为 warm） */
   theme: Theme
   /** 正文字号（reader_font_size，14-22） */
   fontSize: number
@@ -104,7 +108,7 @@ export function loadReaderConfig(): ReaderConfig {
     hanMode: raw === 'simp' || raw === 'trad' ? raw : 'auto',
     // 旧值 paper（纸色）→ 迁移为 warm（暖色）
     theme:
-      themeRaw === 'dark' || themeRaw === 'warm' || themeRaw === 'system'
+      themeRaw === 'dark' || themeRaw === 'warm' || themeRaw === 'system' || themeRaw === 'custom'
         ? themeRaw
         : themeRaw === 'paper'
           ? 'warm'
@@ -121,7 +125,7 @@ export function loadReaderConfig(): ReaderConfig {
     letterSpacing: num(ls(KEY_MAP.letterSpacing), 0, 2, 0, 0.5),
     textIndent: ls(KEY_MAP.textIndent) === '0' ? false : true,
     textAlign: ls(KEY_MAP.textAlign) === 'justify' ? 'justify' : 'left',
-    pageMode: ls(KEY_MAP.pageMode) === 'slide' ? 'slide' : 'scroll',
+    pageMode: parsePageMode(ls(KEY_MAP.pageMode)),
   }
 }
 
@@ -191,6 +195,7 @@ export function fromServerConfig(raw: unknown): Partial<ReaderConfig> {
     o.reader_theme === 'dark' ||
     o.reader_theme === 'warm' ||
     o.reader_theme === 'system' ||
+    o.reader_theme === 'custom' ||
     // 旧值 paper → 迁移为 warm
     o.reader_theme === 'paper'
   )
@@ -215,6 +220,12 @@ export function fromServerConfig(raw: unknown): Partial<ReaderConfig> {
   if (o.reader_text_indent === '1') out.textIndent = true
   else if (o.reader_text_indent === '0') out.textIndent = false
   if (o.reader_text_align === 'left' || o.reader_text_align === 'justify') out.textAlign = o.reader_text_align
-  if (o.reader_page_mode === 'scroll' || o.reader_page_mode === 'slide') out.pageMode = o.reader_page_mode
+  if (
+    o.reader_page_mode === 'scroll' ||
+    o.reader_page_mode === 'slide' ||
+    o.reader_page_mode === 'hslide' ||
+    o.reader_page_mode === 'flip'
+  )
+    out.pageMode = o.reader_page_mode
   return out
 }

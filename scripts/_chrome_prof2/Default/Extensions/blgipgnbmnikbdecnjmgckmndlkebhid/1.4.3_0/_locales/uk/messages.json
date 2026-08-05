@@ -1,0 +1,44 @@
+{
+   "ConvertToPDFCommand": {
+      "message": "Конвертувати в PDF..."
+   },
+   "DownloadingPDFDocument": {
+      "message": "Завантаження PDF файлу"
+   },
+   "Error_ceErrCode": {
+      "message": "Код помилки"
+   },
+   "Error_ceErrFailed": {
+      "message": "Невдача"
+   },
+   "Error_ceErrUndefined": {
+      "message": "Undefined failure"
+   },
+   "ExtensionDescription": {
+      "message": "Конвертує веб сторінки в PDF файли"
+   },
+   "HTMLToPDFConverting": {
+      "message": "Конвертація вебсторінки у PDF"
+   },
+   "NativePartNotInstalled": {
+      "message": "PDF-XChange нативна частина не проінсталльована.\u003Cbr /> Ви можете скачати її з"
+   },
+   "OpenPDFCommand": {
+      "message": "Відкрити в PDF-XChange Editor"
+   },
+   "PreferencesCommand": {
+      "message": "Налаштування..."
+   },
+   "ShowOpenPDFFrame": {
+      "message": "Показувати \"Відкрити в PDF-XChange Editor\""
+   },
+   "UpdateAppPromptLinkText": {
+      "message": "Перевірити останній реліз PDF-XChange Editor"
+   },
+   "UpdateAppPromptMsg": {
+      "message": "Ви не можете поки що використовувати цю команду для відкриття локальних файлів. Вона буде доступна починаючи з версії 10 PDF-XChange Editor"
+   },
+   "UpdateAppPromptTitle": {
+      "message": "Можливіть недоступна"
+   }
+}

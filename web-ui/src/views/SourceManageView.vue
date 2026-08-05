@@ -15,6 +15,7 @@ import {
   type CaptchaProbe,
 } from '@/api/sourceLogin'
 import { downloadBlob } from '@/utils/download'
+import { t } from '@/utils/i18n'
 import { hanText, syncHanMode } from '@/utils/hanMode'
 import type { BookSource, SourceSub } from '@/types'
 
@@ -495,6 +496,94 @@ function toggleSelectAll() {
     for (const s of filtered.value) set.add(s.bookSourceUrl)
   }
   selectedSources.value = set
+}
+
+/* ================= 排序模式（书源行拖拽排序——手柄列 HTML5 drag；保存 = 按新顺序重排 weight 递减） ================= */
+const sortMode = ref(false)
+const sortDirty = ref(false)
+const sortSaving = ref(false)
+const dragSourceUrl = ref<string | null>(null)
+const dragOverUrl = ref<string | null>(null)
+
+/** 拖拽开始（排序模式下手柄 draggable；事件冒泡到行） */
+function onSourceDragStart(s: BookSource, e: DragEvent) {
+  dragSourceUrl.value = s.bookSourceUrl
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', s.bookSourceUrl)
+  }
+}
+
+/** 经过其他行：阻止默认（允许放下）并高亮目标行 */
+function onSourceDragOver(s: BookSource, e: DragEvent) {
+  if (dragSourceUrl.value === null || dragSourceUrl.value === s.bookSourceUrl) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+  dragOverUrl.value = s.bookSourceUrl
+}
+
+/** 放下：把拖拽书源移到目标书源位置（本地重排 sources；保存栏出现） */
+function onSourceDrop(s: BookSource, e: DragEvent) {
+  e.preventDefault()
+  const from = dragSourceUrl.value
+  dragSourceUrl.value = null
+  dragOverUrl.value = null
+  if (from === null || from === s.bookSourceUrl) return
+  const list = sources.value.slice()
+  const fromIdx = list.findIndex((x) => x.bookSourceUrl === from)
+  const toIdx = list.findIndex((x) => x.bookSourceUrl === s.bookSourceUrl)
+  if (fromIdx < 0 || toIdx < 0) return
+  const [moved] = list.splice(fromIdx, 1)
+  list.splice(toIdx, 0, moved)
+  sources.value = list
+  sortDirty.value = true
+}
+
+function onSourceDragEnd() {
+  dragSourceUrl.value = null
+  dragOverUrl.value = null
+}
+
+/** 保存排序：按新顺序分配 weight（递减——越靠前越大）→ 批量 saveBookSources 优先；批量接口未实现（404）时逐源 saveBookSource */
+async function saveSourceOrder() {
+  if (sortSaving.value) return
+  const ordered = sources.value.map((s, i) => ({ ...s, weight: sources.value.length - i }))
+  sortSaving.value = true
+  try {
+    const res = await saveBookSources(ordered)
+    sortDirty.value = false
+    ElMessage.success(`书源排序已保存（${res.data?.count ?? ordered.length} 个书源）`)
+  } catch (err) {
+    if (isNotImplemented(err)) {
+      // 批量保存接口未就绪：降级逐源 saveBookSource 更新 weight
+      let ok = 0
+      for (const s of ordered) {
+        try {
+          await saveBookSource(s)
+          ok++
+        } catch {
+          // 单源失败跳过
+        }
+      }
+      if (ok > 0) {
+        sortDirty.value = false
+        ElMessage.success(`书源排序已保存（${ok}/${ordered.length} 个书源）`)
+      } else {
+        ElMessage.error('保存排序失败，请重试')
+      }
+    }
+    // 其余错误（网络/后端失败）已由请求拦截器提示
+  } finally {
+    sortSaving.value = false
+  }
+}
+
+/** 切换排序模式：退出时若有未保存排序自动保存（防丢失） */
+function toggleSortMode() {
+  sortMode.value = !sortMode.value
+  dragSourceUrl.value = null
+  dragOverUrl.value = null
+  if (!sortMode.value && sortDirty.value) void saveSourceOrder()
 }
 
 /**
@@ -1023,6 +1112,55 @@ async function clearLoginCookie() {
   }
 }
 
+/* ================= 书源 Cookie 管理（GAP 196：已登录书源列表 + 清除；后端无 Cookie 读取接口 → 摘要标注未就绪） ================= */
+
+const cookieMgrOpen = ref(false)
+const cookieMgrBusy = ref<Set<string>>(new Set())
+
+/** 已登录书源列表：本地登录态 localStorage reader_src_login_{url}（cookie 本体存服务端，无 getCookie 接口 → 摘要未就绪） */
+const loggedSources = computed(() =>
+  sources.value.filter((s) => loggedUrls.value.has(s.bookSourceUrl)),
+)
+
+/** 域名提取（cookie 作用域按源 URL host） */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
+}
+
+function openCookieMgr() {
+  syncLoggedUrls() // 打开时重扫 localStorage，避免其他标签页变更未同步
+  cookieMgrOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeCookieMgr() {
+  cookieMgrOpen.value = false
+  document.body.style.overflow = ''
+}
+
+/** 清除 Cookie：POST /reader3/setBookSourceCookie（空 cookie = 清除）→ 同步移除本地登录态 */
+async function clearSourceCookie(s: BookSource) {
+  if (cookieMgrBusy.value.has(s.bookSourceUrl)) return
+  cookieMgrBusy.value = new Set(cookieMgrBusy.value).add(s.bookSourceUrl)
+  try {
+    const res = await setBookSourceCookie(s.bookSourceUrl, '')
+    if (res.data?.success) {
+      markLoggedOut(s.bookSourceUrl)
+      ElMessage.success(`已清除「${s.bookSourceName}」的 Cookie`)
+    }
+  } catch {
+    // 拦截器已提示
+  } finally {
+    const next = new Set(cookieMgrBusy.value)
+    next.delete(s.bookSourceUrl)
+    cookieMgrBusy.value = next
+  }
+}
+
 async function confirmEdit() {
   if (editBusy.value) return
   const base = editSource.value
@@ -1125,6 +1263,31 @@ async function doExport() {
       const blob = await exportBookSources()
       await downloadBlob(blob, 'bookSource.json')
     }
+  } catch {
+    // 请求层已提示
+  } finally {
+    exporting.value = false
+  }
+}
+
+/** 导出当前分组：按组过滤书源构造 bookSource.json（blob 下载，与勾选导出同构） */
+async function doExportGroup() {
+  const g = activeGroup.value
+  if (exporting.value || g === '全部') return
+  exporting.value = true
+  try {
+    const list = sources.value.filter((s) =>
+      (s.bookSourceGroup ?? '').split(/\s+/).includes(g),
+    )
+    if (list.length === 0) {
+      ElMessage.warning(`分组「${g}」暂无书源`)
+      return
+    }
+    const blob = new Blob([JSON.stringify(list, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    })
+    await downloadBlob(blob, 'bookSource.json')
+    ElMessage.success(`已导出「${g}」分组 ${list.length} 个书源`)
   } catch {
     // 请求层已提示
   } finally {
@@ -1497,6 +1660,23 @@ onBeforeUnmount(() => {
           >
             {{ manageMode ? '完成' : '多选' }}
           </button>
+          <button
+            class="ghost-btn"
+            type="button"
+            :class="{ active: sortMode }"
+            :title="sortMode ? '退出排序模式（未保存的排序将自动保存）' : '排序模式：拖动手柄调整书源顺序，保存到权重（越大越靠前）'"
+            @click="toggleSortMode"
+          >
+            {{ sortMode ? '完成' : '排序' }}
+          </button>
+          <button
+            class="ghost-btn"
+            type="button"
+            title="Cookie 管理：已登录书源列表 + 清除登录态（POST /reader3/setBookSourceCookie）"
+            @click="openCookieMgr"
+          >
+            Cookie 管理
+          </button>
           <button class="accent-outline-btn" type="button" @click="openAdd">新增书源</button>
           <input
             ref="localFileInput"
@@ -1536,6 +1716,16 @@ onBeforeUnmount(() => {
             {{ g }}
           </button>
         </div>
+        <button
+          v-if="activeGroup !== '全部'"
+          class="group-export-btn"
+          type="button"
+          :disabled="exporting"
+          :title="`导出「${activeGroup}」组内全部书源（bookSource.json）`"
+          @click="doExportGroup"
+        >
+          {{ exporting ? t('common.exporting') : `导出本组（${activeGroup}）` }}
+        </button>
         <div class="filter-box">
           <svg class="filter-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
             <circle cx="11" cy="11" r="6.5" />
@@ -1577,7 +1767,32 @@ onBeforeUnmount(() => {
 
       <!-- 书源列表 -->
       <ul v-else class="source-list">
-        <li v-for="s in filtered" :key="s.bookSourceUrl" class="source-row" :class="{ invalid: invalidSources.has(s.bookSourceUrl), selected: selectedSources.has(s.bookSourceUrl) }">
+        <li
+          v-for="s in filtered"
+          :key="s.bookSourceUrl"
+          class="source-row"
+          :class="{ invalid: invalidSources.has(s.bookSourceUrl), selected: selectedSources.has(s.bookSourceUrl), sorting: sortMode, 'drag-over': dragOverUrl === s.bookSourceUrl }"
+          @dragover="onSourceDragOver(s, $event)"
+          @drop="onSourceDrop(s, $event)"
+        >
+          <!-- 排序模式：拖拽手柄列（仅手柄可拖，避免误拖） -->
+          <span
+            v-if="sortMode"
+            class="source-drag"
+            draggable="true"
+            title="拖拽调整顺序（越靠前权重越大；松手后点「保存排序」）"
+            @dragstart="onSourceDragStart(s, $event)"
+            @dragend="onSourceDragEnd"
+          >
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <circle cx="9" cy="6" r="1.4" />
+              <circle cx="15" cy="6" r="1.4" />
+              <circle cx="9" cy="12" r="1.4" />
+              <circle cx="15" cy="12" r="1.4" />
+              <circle cx="9" cy="18" r="1.4" />
+              <circle cx="15" cy="18" r="1.4" />
+            </svg>
+          </span>
           <button
             v-if="manageMode"
             class="select-box"
@@ -1648,6 +1863,21 @@ onBeforeUnmount(() => {
           </button>
         </li>
       </ul>
+
+      <!-- 排序模式：拖拽保存栏（拖拽后出现「保存排序」；顺序变动 → 按新顺序重排 weight） -->
+      <div v-if="sortMode" class="sort-save-bar">
+        <span class="sort-save-tip">拖动手柄调整书源顺序 · 越靠前权重越大（保存后影响搜索/探索排序）</span>
+        <button
+          v-if="sortDirty"
+          class="accent-btn"
+          type="button"
+          :disabled="sortSaving"
+          @click="saveSourceOrder"
+        >
+          {{ sortSaving ? '保存中…' : '保存排序' }}
+        </button>
+        <span v-else class="sort-save-idle">顺序未变动</span>
+      </div>
 
       <!-- 多选模式批量操作栏（GAP 27：批量启用/禁用/删除 + 勾选导出） -->
       <div v-if="manageMode" class="batch-bar">
@@ -2196,6 +2426,57 @@ onBeforeUnmount(() => {
         </div>
       </Transition>
     </Teleport>
+    <!-- 书源 Cookie 管理弹窗（GAP 196：已登录书源列表；登录态来自本地 localStorage reader_src_login_*；后端无 Cookie 读取接口 → 摘要标注未就绪；清除走 setBookSourceCookie 空 cookie） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="cookieMgrOpen" class="dlg-overlay" @click.self="closeCookieMgr">
+          <div
+            class="dlg dlg-cookie"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Cookie 管理"
+            tabindex="-1"
+            @keydown.esc="closeCookieMgr"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">Cookie 管理</h2>
+              <button class="dlg-close" type="button" title="关闭" @click="closeCookieMgr">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+
+            <p class="cookie-mgr-note">
+              已登录书源 {{ loggedSources.length }} 个。登录态来自本地缓存（reader_src_login_*）；Cookie 本体存于服务端，后端暂无读取接口——每项摘要暂标注「未就绪」。清除后该书源登录态失效。
+            </p>
+
+            <ul v-if="loggedSources.length" class="cookie-list">
+              <li v-for="s in loggedSources" :key="s.bookSourceUrl" class="cookie-row">
+                <span class="cookie-name" :title="s.bookSourceUrl">{{ s.bookSourceName }}</span>
+                <span class="cookie-domain" :title="s.bookSourceUrl">{{ hostOf(s.bookSourceUrl) }}</span>
+                <span class="cookie-summary" title="后端无 Cookie 读取接口（getCookie 未暴露）">未就绪</span>
+                <button
+                  class="danger-btn"
+                  type="button"
+                  :disabled="cookieMgrBusy.has(s.bookSourceUrl)"
+                  @click="clearSourceCookie(s)"
+                >
+                  {{ cookieMgrBusy.has(s.bookSourceUrl) ? '清除中…' : '清除' }}
+                </button>
+              </li>
+            </ul>
+            <div v-else class="state-row">
+              <span class="state-text">暂无已登录书源——书源行「登录」成功或粘贴 Cookie 后会出现在这里</span>
+            </div>
+
+            <div class="dlg-actions dlg-foot">
+              <button class="ghost-btn" type="button" @click="closeCookieMgr">关闭</button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -2375,6 +2656,34 @@ onBeforeUnmount(() => {
   border-color: var(--accent);
   background: var(--accent-soft);
   font-weight: 400;
+}
+/* 分组胶囊旁「导出本组」按钮 */
+.group-export-btn {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.group-export-btn:hover:not(:disabled) {
+  color: var(--accent-deep);
+  border-color: var(--accent-deep);
+  background: var(--accent-soft);
+}
+.group-export-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 /* ================= GAP 28：分组胶囊右键/长按菜单 ================= */
@@ -2826,6 +3135,57 @@ onBeforeUnmount(() => {
 .ghost-btn.active {
   color: var(--accent);
   border-color: var(--accent);
+}
+
+/* ================= 排序模式（书源行拖拽排序） ================= */
+.source-drag {
+  flex-shrink: 0;
+  width: 20px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  cursor: grab;
+}
+.source-drag:active {
+  cursor: grabbing;
+}
+.source-drag svg {
+  width: 14px;
+  height: 14px;
+}
+.source-row.sorting {
+  cursor: default;
+}
+.source-row.drag-over {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.source-row.drag-over .source-name {
+  color: var(--accent);
+}
+.sort-save-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-float);
+}
+.sort-save-tip {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+}
+.sort-save-idle {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
 }
 .source-badge {
   flex-shrink: 0;
@@ -3283,6 +3643,68 @@ onBeforeUnmount(() => {
 /* ================= 书源登录弹窗 ================= */
 .dlg-login {
   width: min(440px, 100%);
+}
+/* Cookie 管理弹窗（GAP 196） */
+.dlg-cookie {
+  width: min(560px, 100%);
+}
+.cookie-mgr-note {
+  margin: 0 0 14px;
+  font-size: 12px;
+  font-weight: 300;
+  line-height: 1.7;
+  color: var(--text-3);
+}
+.cookie-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.cookie-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.cookie-row:last-child {
+  border-bottom: none;
+}
+.cookie-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cookie-domain {
+  flex-shrink: 0;
+  max-width: 160px;
+  font-size: 11.5px;
+  font-weight: 300;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cookie-summary {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  cursor: help;
 }
 /* 状态区 */
 .login-status {

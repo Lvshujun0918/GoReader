@@ -14,6 +14,9 @@ import { setGlobalHanMode } from '@/utils/hanMode'
 import { DAILY_STATS_KEY, accumulateDaily, parseDailyStats } from '@/utils/dailyStats'
 import { useUserStore } from '@/stores/user'
 import { loadBookConfig, saveBookConfig, clearBookConfig } from '@/utils/bookConfig'
+import { t } from '@/utils/i18n'
+import { requestWakeLock, releaseWakeLock } from '@/utils/wakeLock'
+import { parsePageMode, type PageMode } from '@/utils/readerPageMode'
 import {
   loadBgMode,
   loadBgImagePath,
@@ -21,6 +24,14 @@ import {
   bgImageUrl as bgImageUrlOf,
   type BgMode,
 } from '@/utils/readerBg'
+import {
+  loadCustomTheme,
+  saveCustomTheme,
+  customThemeVars,
+  customThemeIsDark,
+  CUSTOM_THEME_DEFAULTS,
+  type ReaderCustomTheme,
+} from '@/utils/readerTheme'
 import type { Book, BookChapter, Bookmark, HttpTts, ReplaceRule } from '@/types'
 
 const route = useRoute()
@@ -83,12 +94,11 @@ const isFileBook = computed(() => bookType.value === 3)
 const isVideoBook = computed(() => bookType.value === 4)
 const isNonTextBook = computed(() => bookType.value !== 0)
 
-/* ---------------- 1. 主题（亮/暗/暖/跟随系统） ---------------- */
+/* ---------------- 1. 主题（亮/暗/暖/跟随系统/自定义） ---------------- */
 
-type Theme = 'light' | 'dark' | 'warm' | 'system'
+type Theme = 'light' | 'dark' | 'warm' | 'system' | 'custom'
 const THEME_KEY = 'reader_theme'
-const THEME_ORDER: Theme[] = ['light', 'dark', 'warm', 'system']
-const THEME_LABEL: Record<Theme, string> = { light: '亮', dark: '暗', warm: '暖', system: '系统' }
+const THEME_ORDER: Theme[] = ['light', 'dark', 'warm', 'system', 'custom']
 const theme = ref<Theme>('light')
 /** 阅读页根元素（主题只作用于阅读页内，与界面主题 html[data-theme] 分离） */
 const pageRef = ref<HTMLElement | null>(null)
@@ -98,8 +108,14 @@ let mediaQuery: MediaQueryList | null = null
 const systemTheme = (): Theme => (systemDark.value ? 'dark' : 'light')
 function applyTheme(t: Theme) {
   // 阅读内容主题仅作用于 .reader-page（变量覆盖见 styles/main.css），不影响书架/设置等界面
+  // 自定义主题：基座按背景明暗取 dark/light（color-scheme/滚动条），三色变量经内联样式注入
+  if (!pageRef.value) return
+  if (t === 'custom') {
+    pageRef.value.dataset.readerTheme = customThemeIsDark(customTheme.value) ? 'dark' : 'light'
+    return
+  }
   const real = t === 'system' ? systemTheme() : t
-  if (pageRef.value) pageRef.value.dataset.readerTheme = real
+  pageRef.value.dataset.readerTheme = real
 }
 function onSystemThemeChange(e: MediaQueryListEvent) {
   systemDark.value = e.matches
@@ -112,9 +128,34 @@ watch(theme, (t) => {
 function cycleTheme() {
   const i = THEME_ORDER.indexOf(theme.value)
   theme.value = THEME_ORDER[(i + 1) % THEME_ORDER.length]
+  // 循环落到「自定义」：顺带打开颜色弹层（第 5 档需配置三色）
+  if (theme.value === 'custom') customOpen.value = true
 }
 
-/* ---------------- GAP 5：纸纹（细噪点 radial-gradient 微纹理叠在阅读页背景上；3 主题通用，纸色主题最佳） ---------------- */
+/* ---------------- 1.1 自定义主题（第 5 档——背景色/文字色/强调色弹层；localStorage reader_theme_custom） ---------------- */
+
+const customTheme = ref<ReaderCustomTheme>(loadCustomTheme())
+const customOpen = ref(false)
+watch(customTheme, (v) => saveCustomTheme(v), { deep: true })
+// 自定义主题下改色：基座明暗可能翻转（浅↔深）→ 重刷 data-reader-theme
+watch(
+  customTheme,
+  () => {
+    if (theme.value === 'custom') applyTheme('custom')
+  },
+  { deep: true },
+)
+/** 主题选择（设置面板 seg）：选中「自定义」时顺带打开颜色弹层 */
+function selectTheme(th: Theme) {
+  theme.value = th
+  if (th === 'custom') customOpen.value = true
+}
+/** 恢复默认三色（CUSTOM_THEME_DEFAULTS：米白纸色 + 深褐文字 + 棕金强调） */
+function resetCustomTheme() {
+  customTheme.value = { ...CUSTOM_THEME_DEFAULTS }
+}
+
+/* ---------------- GAP 5：纸纹（细噪点 radial-gradient 微纹理叠在阅读页背景上；3 主题通用，暖色主题最佳） ---------------- */
 
 const TEXTURE_KEY = 'reader_texture'
 const paperTexture = ref(false)
@@ -236,11 +277,35 @@ function resetTypography() {
   brightness.value = 1
 }
 
-/* ---------------- 3. 翻页模式（滚动 / 滑动=整页节流） ---------------- */
+/* ---------------- 3. 翻页模式（滚动 / 上下翻页 / 左右滑动翻章 / 仿真翻页） ---------------- */
 
-type PageMode = 'scroll' | 'slide'
 const pageMode = ref<PageMode>('scroll')
 watch(pageMode, (m) => saveSetting('reader_page_mode', m))
+
+/** 切章方向：1=下一章（新正文自右滑入）/ -1=上一章（自左滑入）；hslide 模式切章过渡动画用 */
+const chapterDir = ref<1 | -1>(1)
+/** hslide 模式切章过渡动画类（正文重新挂载时播放一次） */
+const chapterAnimClass = computed(() =>
+  pageMode.value !== 'hslide'
+    ? {}
+    : chapterDir.value === 1
+      ? { 'chapter-slide-in-right': true }
+      : { 'chapter-slide-in-left': true },
+)
+/** 正文样式（flip 模式叠加多栏分页：列宽 = 容器宽，一列一页） */
+const contentStyle = computed(() => ({
+  fontSize: `${fontSize.value}px`,
+  lineHeight: `${lineHeight.value}`,
+  fontWeight: `${fontWeight.value}`,
+  fontFamily: fontFamilyStyle.value || undefined,
+  letterSpacing: letterSpacing.value > 0 ? `${letterSpacing.value}px` : undefined,
+  textAlign: textAlign.value,
+  ...(pageMode.value === 'flip' && flipColWidth.value > 0
+    ? { columnWidth: `${flipColWidth.value}px`, columnGap: `${FLIP_GAP}px`, height: '100%' }
+    : {}),
+}))
+
+/* ---- 上下翻页（slide）：滚轮/触屏纵向手势/浮动按钮逐屏滚动 ---- */
 
 let slideAcc = 0
 let slideCooldown = false
@@ -260,15 +325,28 @@ function isInsideOverlay(el: EventTarget | null): boolean {
   return el instanceof HTMLElement && !!el.closest('.drawer-mask, .pop-mask, .sel-bar')
 }
 function onWheel(e: WheelEvent) {
-  if (pageMode.value !== 'slide' || isInsideOverlay(e.target)) return
-  e.preventDefault()
-  slideAcc += e.deltaY
-  if (slideAcc >= SLIDE_THRESHOLD) {
-    slideAcc = 0
-    slideFlip(1)
-  } else if (slideAcc <= -SLIDE_THRESHOLD) {
-    slideAcc = 0
-    slideFlip(-1)
+  if (isInsideOverlay(e.target)) return
+  if (pageMode.value === 'slide') {
+    e.preventDefault()
+    slideAcc += e.deltaY
+    if (slideAcc >= SLIDE_THRESHOLD) {
+      slideAcc = 0
+      slideFlip(1)
+    } else if (slideAcc <= -SLIDE_THRESHOLD) {
+      slideAcc = 0
+      slideFlip(-1)
+    }
+  } else if (pageMode.value === 'flip' && isTextBook.value) {
+    // 仿真翻页：纵向/横向滚轮增量都折算为翻页
+    e.preventDefault()
+    slideAcc += e.deltaY + e.deltaX
+    if (slideAcc >= SLIDE_THRESHOLD) {
+      slideAcc = 0
+      flipPage(1)
+    } else if (slideAcc <= -SLIDE_THRESHOLD) {
+      slideAcc = 0
+      flipPage(-1)
+    }
   }
 }
 function onTouchStart(e: TouchEvent) {
@@ -285,21 +363,109 @@ function onTouchEnd(e: TouchEvent) {
   if (dy >= SLIDE_THRESHOLD) slideFlip(1)
   else if (dy <= -SLIDE_THRESHOLD) slideFlip(-1)
 }
+
+/* ---- 仿真翻页（flip）：CSS 多栏分页（列高 = 视口高，一列一页）+ 横向平滑页过渡 ---- */
+
+/** 分页容器（flip 模式下正文横向分页滚动；其余模式为普通包裹层） */
+const flipViewRef = ref<HTMLElement | null>(null)
+/** 当前列宽（= 容器内容宽，进入 flip/窗口尺寸/内容宽度变化时重测） */
+const flipColWidth = ref(0)
+/** 当前所在页（0 基；初始 -1 表示尚未分页，用于禁用上一页按钮） */
+const flipPageIdx = ref(-1)
+/** 列间距（px） */
+const FLIP_GAP = 48
+const flipStep = () => flipColWidth.value + FLIP_GAP
+
+function isFlipMode(): boolean {
+  return pageMode.value === 'flip' && isTextBook.value
+}
+
+/** 重测分页列宽（容器宽度变化/进入 flip 模式/换章渲染后调用） */
+function measureFlipColumns() {
+  const v = flipViewRef.value
+  if (!v) return
+  flipColWidth.value = v.clientWidth
+  flipPageIdx.value = 0
+}
+
+/** flip 模式当前横向位置（列轴 px；进度存取用） */
+function flipScrollLeft(): number {
+  return flipViewRef.value?.scrollLeft ?? 0
+}
+
+/** 平滑翻到指定页（越界自动钳制；无分页容器时为空操作） */
+function flipGo(page: number) {
+  const v = flipViewRef.value
+  if (!v) return
+  const step = flipStep()
+  if (step <= 0) return
+  const maxPage = Math.max(0, Math.ceil(v.scrollWidth / step) - 1)
+  const target = Math.min(maxPage, Math.max(0, page))
+  v.scrollTo({ left: target * step, behavior: 'smooth' })
+}
+
+/** 翻一页（dir：1=下一页 / -1=上一页） */
+function flipPage(dir: 1 | -1) {
+  const v = flipViewRef.value
+  if (!v) return
+  const step = flipStep()
+  if (step <= 0) return
+  flipGo(Math.round(v.scrollLeft / step) + dir)
+}
+
+/** flip 模式滚动同步：页号/进度/定时保存；近尾（最后 1.5 页）加载下一段并重测分页 */
+function onFlipScroll() {
+  const v = flipViewRef.value
+  if (!v) return
+  const step = flipStep()
+  flipPageIdx.value = step > 0 ? Math.round(v.scrollLeft / step) : 0
+  updateScrollFrac()
+  hideSelBar()
+  window.clearTimeout(saveTimer)
+  saveTimer = window.setTimeout(saveProgress, 300)
+  if (v.scrollLeft + v.clientWidth >= v.scrollWidth - step * 1.5) {
+    if (maybeLoadMoreChunk()) {
+      void nextTick(() => measureFlipColumns())
+    }
+  }
+}
+
+/** 窗口尺寸变化：flip 模式重测列宽 + 刷新进度 */
+function onResize() {
+  if (isFlipMode()) measureFlipColumns()
+  updateScrollFrac()
+}
+
 watch(pageMode, (mode, old) => {
-  if (mode === 'slide') {
+  const needWheel = mode === 'slide' || mode === 'flip'
+  const hadWheel = old === 'slide' || old === 'flip'
+  if (needWheel && !hadWheel) {
     window.addEventListener('wheel', onWheel, { passive: false })
     window.addEventListener('touchstart', onTouchStart, { passive: true })
     window.addEventListener('touchmove', onTouchMove, { passive: false })
     window.addEventListener('touchend', onTouchEnd, { passive: true })
-  } else if (old === 'slide') {
+  } else if (!needWheel && hadWheel) {
     window.removeEventListener('wheel', onWheel)
     window.removeEventListener('touchstart', onTouchStart)
     window.removeEventListener('touchmove', onTouchMove)
     window.removeEventListener('touchend', onTouchEnd)
   }
+  if (mode === 'flip' && isTextBook.value) {
+    // 进入仿真翻页：回到章首并重测分页
+    window.scrollTo(0, 0)
+    void nextTick(() => measureFlipColumns())
+  } else if (old === 'flip' && isTextBook.value) {
+    // 离开仿真翻页：列轴位置换算为纵向位置（同为距章首 px，直接沿用）
+    window.scrollTo(0, flipScrollLeft())
+  }
 })
 
-/* ---------------- GAP 85：移动端左右滑动翻章（touchstart/touchend deltaX 阈值 60px；横向主导才触发，不干扰纵向滚动） ---------------- */
+/** 正文内容宽度变化（720/900/1080）→ flip 模式重测列宽 */
+watch(contentWidth, () => {
+  if (isFlipMode()) void nextTick(() => measureFlipColumns())
+})
+
+/* ---- 左右滑动（hslide）：横向滑动手势/浮动按钮 → 章节级翻页（GAP 85 手势复用 + 切章过渡动画） ---- */
 
 let swipeStartX = 0
 let swipeStartY = 0
@@ -318,7 +484,7 @@ function onSwipeTouchStart(e: TouchEvent) {
 function onSwipeTouchEnd(e: TouchEvent) {
   if (!swipeTracking) return
   swipeTracking = false
-  // 任一弹层/抽屉/划词工具条打开时不翻章
+  // 任一弹层/抽屉/划词工具条打开时不翻页/翻章
   if (
     selOpen.value ||
     drawerOpen.value ||
@@ -328,6 +494,7 @@ function onSwipeTouchEnd(e: TouchEvent) {
     jumpOpen.value ||
     searchOpen.value ||
     brightnessOpen.value ||
+    customOpen.value ||
     imgViewerOpen.value
   ) {
     return
@@ -336,12 +503,40 @@ function onSwipeTouchEnd(e: TouchEvent) {
   if (!t) return
   const dx = t.clientX - swipeStartX
   const dy = t.clientY - swipeStartY
-  // 横向主导（|dx|>=60 且明显大于 |dy|）→ 翻章；纵向滚动/划词选择不处理
+  // 横向主导（|dx|>=60 且明显大于 |dy|）→ 仿真翻页翻页 / 其余模式翻章；纵向滚动/划词选择不处理
   if (Math.abs(dx) < SWIPE_THRESHOLD) return
   if (Math.abs(dy) > Math.abs(dx) * 1.2) return
   if ((window.getSelection()?.toString().trim() ?? '') !== '') return
+  if (isFlipMode()) {
+    if (dx < 0) flipPage(1)
+    else flipPage(-1)
+    return
+  }
   if (dx < 0) nextChapter()
   else prevChapter()
+}
+
+/* ---------------- 屏幕常亮（Wake Lock：进入阅读页且页面可见时请求；切后台/离开释放；不支持环境静默跳过） ---------------- */
+
+const WAKE_LOCK_KEY = 'reader_wake_lock'
+/** 默认开启；localStorage 存 '0' 关闭 */
+const wakeLockEnabled = ref(localStorage.getItem(WAKE_LOCK_KEY) !== '0')
+watch(wakeLockEnabled, (v) => {
+  persist(WAKE_LOCK_KEY, v ? '1' : '0')
+  if (v) {
+    if (document.visibilityState === 'visible') void requestWakeLock()
+  } else {
+    void releaseWakeLock()
+  }
+})
+
+/** 页面可见性变化：可见 → 重新请求常亮；隐藏 → 释放 */
+function onWakeVisibilityChange() {
+  if (document.visibilityState === 'visible') {
+    if (wakeLockEnabled.value) void requestWakeLock()
+  } else {
+    void releaseWakeLock()
+  }
 }
 
 /* ---------------- 4. 进度显示 + 章节跳转 ---------------- */
@@ -351,6 +546,12 @@ const jumpOpen = ref(false)
 const jumpNum = ref('')
 
 function updateScrollFrac() {
+  const v = flipViewRef.value
+  if (isFlipMode() && v) {
+    const max = v.scrollWidth - v.clientWidth
+    scrollFrac.value = max > 0 ? Math.min(1, Math.max(0, v.scrollLeft / max)) : 0
+    return
+  }
   const max = document.documentElement.scrollHeight - window.innerHeight
   scrollFrac.value = max > 0 ? Math.min(1, Math.max(0, window.scrollY / max)) : 0
 }
@@ -483,7 +684,16 @@ async function applyRestoreParagraph() {
 }
 function scrollToParagraph(idx: number) {
   const p = document.querySelectorAll<HTMLElement>('.reader-content .reader-para')[idx]
-  const top = p ? Math.max(0, p.getBoundingClientRect().top + window.scrollY - 64) : 0
+  if (!p) return
+  if (isFlipMode()) {
+    // 仿真翻页：滚动到该段所在列（换算为容器滚动坐标）
+    const v = flipViewRef.value
+    if (!v) return
+    const target = p.getBoundingClientRect().left - v.getBoundingClientRect().left + v.scrollLeft
+    v.scrollTo({ left: Math.max(0, target), behavior: 'smooth' })
+    return
+  }
+  const top = Math.max(0, p.getBoundingClientRect().top + window.scrollY - 64)
   window.scrollTo(0, top)
 }
 
@@ -662,7 +872,11 @@ function toggleHan() {
 }
 const hanConvert = (text: string) => applyHan(text, hanMode.value)
 const hanTargetLabel = computed(() =>
-  hanMode.value === 'auto' ? '自动' : hanMode.value === 'trad' ? '简' : '繁'
+  hanMode.value === 'auto'
+    ? t('han.auto')
+    : hanMode.value === 'trad'
+      ? t('reader.hanToSimp')
+      : t('reader.hanToTrad'),
 )
 
 /* ---------------- GAP 6：本书设置（per-book 覆盖 12 项——localStorage reader_book_config_{bookUrl}，本书优先于全局） ---------------- */
@@ -709,7 +923,7 @@ function loadGlobalIntoRefs() {
   const rawTheme = localStorage.getItem(THEME_KEY)
   // 旧值 paper（纸色）→ 迁移为 warm（暖色）
   theme.value =
-    rawTheme === 'dark' || rawTheme === 'warm' || rawTheme === 'system'
+    rawTheme === 'dark' || rawTheme === 'warm' || rawTheme === 'system' || rawTheme === 'custom'
       ? rawTheme
       : rawTheme === 'paper'
         ? 'warm'
@@ -725,7 +939,7 @@ function loadGlobalIntoRefs() {
   letterSpacing.value = loadSetting('reader_letter_spacing', 0, 2, 0, 0.5)
   textIndent.value = localStorage.getItem('reader_text_indent') !== '0'
   textAlign.value = localStorage.getItem('reader_text_align') === 'justify' ? 'justify' : 'left'
-  pageMode.value = localStorage.getItem('reader_page_mode') === 'slide' ? 'slide' : 'scroll'
+  pageMode.value = parsePageMode(localStorage.getItem('reader_page_mode'))
   const hm = localStorage.getItem('reader_han_mode')
   hanMode.value = hm === 'simp' || hm === 'trad' ? hm : 'auto'
 }
@@ -736,7 +950,7 @@ function applyBookOverridesToRefs() {
   const get = (k: string) => o[k]
   const t = get(THEME_KEY)
   // 旧值 paper → 迁移为 warm
-  if (t === 'light' || t === 'dark' || t === 'warm' || t === 'system') theme.value = t
+  if (t === 'light' || t === 'dark' || t === 'warm' || t === 'system' || t === 'custom') theme.value = t
   else if (t === 'paper') theme.value = 'warm'
   const fs = Number(get(FONT_KEY))
   if (fs >= MIN_FONT && fs <= MAX_FONT) fontSize.value = fs
@@ -758,7 +972,7 @@ function applyBookOverridesToRefs() {
   const ta = get('reader_text_align')
   if (ta === 'left' || ta === 'justify') textAlign.value = ta
   const pm = get('reader_page_mode')
-  if (pm === 'scroll' || pm === 'slide') pageMode.value = pm
+  pageMode.value = parsePageMode(pm)
   const hm = get('reader_han_mode')
   if (hm === 'auto' || hm === 'simp' || hm === 'trad') hanMode.value = hm
 }
@@ -792,24 +1006,35 @@ const bgMode = ref<BgMode>(loadBgMode())
 const bgImagePath = ref(loadBgImagePath())
 /** 背景图 URL（file/download + accessToken；路径为空返回 ''） */
 const bgImageUrl = computed(() => bgImageUrlOf(bgImagePath.value, store.accessToken))
-/** 图片背景遮罩（按当前阅读主题取色，保证文字可读） */
+/** 图片背景遮罩（按当前阅读主题取色，保证文字可读；custom 由 bgStyle 按背景明暗动态取 dark/light） */
 const BG_OVERLAY: Record<Theme, string> = {
   light: 'rgba(250, 250, 250, 0.86)',
   dark: 'rgba(17, 17, 20, 0.88)',
   warm: 'rgba(247, 240, 230, 0.88)',
   system: 'rgba(250, 250, 250, 0.86)',
+  custom: 'rgba(250, 250, 250, 0.86)',
 }
 /** 图片背景样式：遮罩渐变叠在图上（cover 铺满 + 固定），失败时回退 var(--bg) */
 const bgStyle = computed(() => {
   if (bgMode.value !== 'image' || !bgImageUrl.value) return undefined
-  const real = theme.value === 'system' ? systemTheme() : theme.value
-  const overlay = BG_OVERLAY[real] ?? BG_OVERLAY.light
+  let overlay: string
+  if (theme.value === 'custom') {
+    overlay = customThemeIsDark(customTheme.value) ? BG_OVERLAY.dark : BG_OVERLAY.light
+  } else {
+    const real = theme.value === 'system' ? systemTheme() : theme.value
+    overlay = BG_OVERLAY[real] ?? BG_OVERLAY.light
+  }
   return {
     backgroundImage: `linear-gradient(${overlay}, ${overlay}), url("${bgImageUrl.value}")`,
     backgroundSize: 'cover',
     backgroundPosition: 'center',
     backgroundAttachment: 'fixed',
   }
+})
+/** 阅读页根元素样式：背景图样式 + 自定义主题 CSS 变量（theme=custom 时注入三色及派生变量） */
+const pageStyle = computed(() => {
+  if (theme.value !== 'custom') return bgStyle.value
+  return [bgStyle.value, customThemeVars(customTheme.value)] as Array<Record<string, string> | undefined>
 })
 /** 纸纹生效：设置页模式=纸纹，或阅读页开关开启（图片模式优先，不叠加纸纹） */
 const effectiveTexture = computed(() => bgMode.value !== 'image' && (paperTexture.value || bgMode.value === 'texture'))
@@ -946,10 +1171,10 @@ function stopTtsParaTracking() {
 /** 顶栏按钮文案 */
 const ttsTopLabel = computed(() =>
   ttsState.value === 'playing' || ttsState.value === 'loading'
-    ? '停止'
+    ? t('reader.stop')
     : ttsState.value === 'paused'
-      ? '继续'
-      : '听书',
+      ? t('reader.resumeShort')
+      : t('reader.ttsLabel'),
 )
 
 /** 语速 0.5-2.0 → Edge 百分比（+0% / +10% / -50%） */
@@ -1536,11 +1761,30 @@ async function ensureParagraphRendered(idx: number) {
     await settleFrames()
   }
 }
+/* ---------------- 章节字数（目录抽屉：后端 chapterWordCount 优先；书源书从前端已缓存正文估算，未加载章省略） ---------------- */
+
+/** 当前会话已加载正文的字数：chapterUrl → 字符数（与后端 length(content) 口径一致） */
+const chapterWordCounts = ref<Record<string, number>>({})
+/** 章节字数：后端字段（本地书）→ 本会话缓存正文估算 → 未知返回 null（目录省略显示） */
+function chapterWordCountOf(ch: BookChapter): number | null {
+  const wc = typeof ch.chapterWordCount === 'number' ? ch.chapterWordCount : chapterWordCounts.value[ch.url]
+  return typeof wc === 'number' && wc > 0 ? wc : null
+}
+/** 格式化：≥1 万显示「x.x万字」，否则「n字」 */
+function fmtWordCount(n: number): string {
+  return n >= 10000 ? `${(n / 10000).toFixed(1)}万字` : `${n}字`
+}
+/** 目录项字数文案（null = 不显示） */
+function chapterWordCountLabel(ch: BookChapter): string | null {
+  const n = chapterWordCountOf(ch)
+  return n === null ? null : fmtWordCount(n)
+}
+
 const displayBookName = computed(() => hanConvert(bookName.value))
 const displayChapterTitle = computed(() => (currentChapter.value ? hanConvert(currentChapter.value.title) : ''))
-/** 目录项（含卷标题）统一按当前简繁模式转换 */
+/** 目录项（含卷标题）统一按当前简繁模式转换；wcLabel=字数文案（未加载章为 null） */
 const drawerChapters = computed(() =>
-  chapters.value.map((c) => ({ ...c, title: hanConvert(c.title) })),
+  chapters.value.map((c) => ({ ...c, title: hanConvert(c.title), wcLabel: chapterWordCountLabel(c) })),
 )
 
 /* ---------------- 目录卷折叠（点击卷标题折叠/展开；localStorage reader_toc_collapsed {volTitle: bool}） ---------------- */
@@ -1588,6 +1832,12 @@ function progressKey(): string {
   return `reader-progress-${bookUrl.value}`
 }
 
+/** 当前阅读位置（纵向滚动 px；仿真翻页为列轴 px；非文本书为媒体秒数/漫画页索引） */
+function currentPos(): number {
+  if (isNonTextBook.value) return mediaPosition()
+  return isFlipMode() ? flipScrollLeft() : window.scrollY
+}
+
 function saveProgress() {
   if (!currentChapter.value) return
   try {
@@ -1596,7 +1846,7 @@ function saveProgress() {
       JSON.stringify({
         chapterIndex: chapterIndex.value,
         // 非文本书：scrollY 槽位存音频/视频秒数或漫画页索引
-        scrollY: isNonTextBook.value ? mediaPosition() : window.scrollY,
+        scrollY: currentPos(),
         updatedAt: Date.now(),
       } satisfies ReaderProgress),
     )
@@ -1639,7 +1889,7 @@ function syncServerProgress() {
   void post('/saveBookProgress', {
     bookUrl: bookUrl.value,
     durChapterIndex: chapterIndex.value,
-    durChapterPos: Math.round(isNonTextBook.value ? mediaPosition() : window.scrollY),
+    durChapterPos: Math.round(currentPos()),
     durChapterTime: Date.now(),
     durChapterTitle: currentChapter.value.title,
   }).catch(() => {
@@ -1685,6 +1935,28 @@ function imagesReady(): Promise<void> {
 
 async function applyRestoreScroll() {
   if (restoreScrollY == null) return
+  const v = flipViewRef.value
+  if (isFlipMode() && v) {
+    // 仿真翻页：目标为列轴 px；不足时逐块加载直到可分页到目标
+    const target = restoreScrollY
+    while (hasMoreParagraphs.value) {
+      if (v.scrollWidth > target) break
+      renderedCount.value = Math.min(renderedCount.value + SEGMENT_SIZE, paragraphs.value.length)
+      await nextTick()
+      await settleFrames()
+    }
+    await nextTick()
+    await settleFrames()
+    const clamp = () => Math.min(target, Math.max(0, v.scrollWidth - v.clientWidth))
+    v.scrollTo(0, clamp())
+    // 双保险：图片加载（或 3s 超时）后再校正一次
+    await imagesReady()
+    await settleFrames()
+    v.scrollTo(0, clamp())
+    restoreScrollY = null
+    updateScrollFrac()
+    return
+  }
   // GAP 155：恢复目标超出当前已渲染高度时，先逐块加载直到可滚动到目标位置
   while (hasMoreParagraphs.value) {
     const doc = document.documentElement
@@ -1714,6 +1986,12 @@ async function loadContent(chapterUrl: string) {
   try {
     const res = await getBookContent(chapterUrl, shelfBook.value.origin)
     content.value = res.data?.content ?? ''
+    // 章节字数：后端 chapterWordCount（本地书正文接口附带）优先；缺失（书源书）用已缓存正文估算
+    if (typeof res.data?.chapterWordCount === 'number') {
+      chapterWordCounts.value = { ...chapterWordCounts.value, [chapterUrl]: res.data.chapterWordCount }
+    } else {
+      chapterWordCounts.value = { ...chapterWordCounts.value, [chapterUrl]: content.value.length }
+    }
     // 听书：播放中切章 / 本章播完自动连播 → 新章正文就绪后自动续播
     if (ttsState.value !== 'idle' || ttsAutoNext) {
       ttsAutoNext = false
@@ -1728,8 +2006,18 @@ async function loadContent(chapterUrl: string) {
   }
   // 等正文真正渲染（loading 置 false 后）再滚动，避免被加载态高度钳制
   await nextTick()
+  if (isFlipMode()) measureFlipColumns()
   if (restoreParagraphIdx != null) {
     await applyRestoreParagraph()
+  } else if (isFlipMode()) {
+    const v = flipViewRef.value
+    if (v) v.scrollTo(0, restoreScrollY ?? 0)
+    if (restoreScrollY != null) {
+      await applyRestoreScroll()
+    } else {
+      restoreScrollY = null
+      updateScrollFrac()
+    }
   } else {
     window.scrollTo(0, restoreScrollY ?? 0)
     if (restoreScrollY != null) {
@@ -1779,6 +2067,8 @@ function goToChapter(idx: number) {
   if (!ch || ch.isVolume) return
   drawerOpen.value = false
   if (idx === chapterIndex.value) return
+  // 切章方向（hslide 模式正文滑入过渡动画用）
+  chapterDir.value = idx > chapterIndex.value ? 1 : -1
   saveProgress()
   chapterIndex.value = idx
   if (isNonTextBook.value) void loadNonTextChapter(ch.url)
@@ -2280,25 +2570,30 @@ function onKeydown(e: KeyboardEvent) {
       // 目录抽屉打开时 ←/→ 不翻章（避免浏览目录时误翻）
       if (drawerOpen.value) return
       e.preventDefault()
-      prevChapter()
+      if (isFlipMode()) flipPage(-1)
+      else prevChapter()
       break
     case 'ArrowRight':
       if (drawerOpen.value) return
       e.preventDefault()
-      nextChapter()
+      if (isFlipMode()) flipPage(1)
+      else nextChapter()
       break
     case 'PageUp':
       e.preventDefault()
-      window.scrollBy({ top: -window.innerHeight * 0.9, behavior: 'auto' })
+      if (isFlipMode()) flipPage(-1)
+      else window.scrollBy({ top: -window.innerHeight * 0.9, behavior: 'auto' })
       break
     case 'PageDown':
       e.preventDefault()
-      window.scrollBy({ top: window.innerHeight * 0.9, behavior: 'auto' })
+      if (isFlipMode()) flipPage(1)
+      else window.scrollBy({ top: window.innerHeight * 0.9, behavior: 'auto' })
       break
     case 'Space':
-      // 非文本书：空格 = 播放/暂停；文本书：自动阅读暂停/恢复（阻止默认的页面滚动）
+      // 非文本书：空格 = 播放/暂停；文本书：仿真翻页翻页 / 其余模式自动阅读暂停/恢复（阻止默认的页面滚动）
       e.preventDefault()
       if (isNonTextBook.value) toggleMediaPlay()
+      else if (isFlipMode()) flipPage(1)
       else toggleAuto()
       break
     case 'Escape':
@@ -2329,7 +2624,7 @@ onMounted(() => {
   mediaQuery.addEventListener('change', onSystemThemeChange)
   applyTheme(theme.value)
   window.addEventListener('scroll', onScroll, { passive: true })
-  window.addEventListener('resize', updateScrollFrac, { passive: true })
+  window.addEventListener('resize', onResize, { passive: true })
   window.addEventListener('mouseup', onSelectionUp)
   window.addEventListener('touchend', onSelectionUp, { passive: true })
   window.addEventListener('mousedown', onDocMouseDown)
@@ -2337,12 +2632,15 @@ onMounted(() => {
   // GAP 85：左右滑动翻章（passive——不 preventDefault，不干扰纵向滚动/选择）
   window.addEventListener('touchstart', onSwipeTouchStart, { passive: true })
   window.addEventListener('touchend', onSwipeTouchEnd, { passive: true })
-  if (pageMode.value === 'slide') {
+  if (pageMode.value === 'slide' || pageMode.value === 'flip') {
     window.addEventListener('wheel', onWheel, { passive: false })
     window.addEventListener('touchstart', onTouchStart, { passive: true })
     window.addEventListener('touchmove', onTouchMove, { passive: false })
     window.addEventListener('touchend', onTouchEnd, { passive: true })
   }
+  // 屏幕常亮（Wake Lock）：进入阅读页且页面可见时请求；切后台自动释放，回前台自动恢复
+  document.addEventListener('visibilitychange', onWakeVisibilityChange)
+  if (wakeLockEnabled.value && document.visibilityState === 'visible') void requestWakeLock()
   // GAP 110：每日阅读时长累计（本机）
   startDailyTracker()
   void init()
@@ -2351,7 +2649,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   mediaQuery?.removeEventListener('change', onSystemThemeChange)
   window.removeEventListener('scroll', onScroll)
-  window.removeEventListener('resize', updateScrollFrac)
+  window.removeEventListener('resize', onResize)
   window.removeEventListener('wheel', onWheel)
   window.removeEventListener('touchstart', onTouchStart)
   window.removeEventListener('touchmove', onTouchMove)
@@ -2371,6 +2669,9 @@ onBeforeUnmount(() => {
   stopTts()
   stopAuto()
   stopDailyTracker()
+  // 屏幕常亮：离开阅读页释放
+  document.removeEventListener('visibilitychange', onWakeVisibilityChange)
+  void releaseWakeLock()
   // 非文本书：暂停媒体 + 销毁 hls.js 实例
   mediaAudioRef.value?.pause()
   videoElRef.value?.pause()
@@ -2381,13 +2682,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="pageRef" class="reader-page" :class="{ texture: effectiveTexture }" :style="bgStyle">
+  <div ref="pageRef" class="reader-page" :class="{ texture: effectiveTexture, 'flip-layout': pageMode === 'flip' && isTextBook }" :style="pageStyle">
     <!-- GAP 149：顶部细进度条（scroll 比例，1px 强调色；点击可跳章） -->
     <button
       v-if="!loading && !loadError && !notFound && realChapters.length > 0"
       class="reading-progress"
       type="button"
-      title="跳转章节"
+      :title="t('reader.jumpTip')"
       @click="jumpOpen = true"
     >
       <i class="reading-progress-fill" :style="{ width: `${progressPct}%` }"></i>
@@ -2395,14 +2696,14 @@ onBeforeUnmount(() => {
 
     <!-- 顶部极简栏 -->
     <header class="topbar">
-      <button class="icon-btn" type="button" title="返回" @click="goBack">
+      <button class="icon-btn" type="button" :title="t('reader.back')" @click="goBack">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
           <path d="M19 12H5" />
           <path d="M11 18l-6-6 6-6" />
         </svg>
       </button>
 
-      <span class="book-name" :title="displayBookName">{{ displayBookName || '阅读' }}</span>
+      <span class="book-name" :title="displayBookName">{{ displayBookName || t('reader.title') }}</span>
 
       <div class="top-actions">
         <button
@@ -2410,7 +2711,7 @@ onBeforeUnmount(() => {
           class="font-btn"
           type="button"
           :disabled="fontSize <= MIN_FONT"
-          title="减小字号"
+          :title="t('reader.fontDec')"
           @click="fontSize = Math.max(MIN_FONT, fontSize - 1)"
         >
           A-
@@ -2420,7 +2721,7 @@ onBeforeUnmount(() => {
           class="font-btn"
           type="button"
           :disabled="fontSize >= MAX_FONT"
-          title="增大字号"
+          :title="t('reader.fontInc')"
           @click="fontSize = Math.min(MAX_FONT, fontSize + 1)"
         >
           A+
@@ -2434,17 +2735,17 @@ onBeforeUnmount(() => {
         >
           {{ hanTargetLabel }}
         </button>
-        <button class="font-btn" type="button" :title="`主题：${theme}（点击切换）`" @click="cycleTheme">
-          {{ THEME_LABEL[theme] }}
+        <button class="font-btn" type="button" :title="t('reader.themeTip', { t: t('theme.' + theme) })" @click="cycleTheme">
+          {{ t('theme.' + theme) }}
         </button>
         <button
           class="font-btn"
           type="button"
           :class="{ active: brightness !== 1 }"
-          title="亮度（0.6-1.4 倍）"
+          :title="t('reader.brightnessTip')"
           @click="brightnessOpen = true"
         >
-          亮度
+          {{ t('reader.brightness') }}
         </button>
         <button
           v-if="isTextBook"
@@ -2453,49 +2754,49 @@ onBeforeUnmount(() => {
           :class="{ active: ttsPlaying }"
           :title="
             ttsState === 'playing' || ttsState === 'loading'
-              ? '停止朗读'
+              ? t('reader.ttsStop')
               : ttsState === 'paused'
-                ? '继续朗读'
-                : '听书（后端语音合成，本章播完自动下一章）'
+                ? t('reader.ttsResume')
+                : t('reader.tts')
           "
           @click="toggleTts"
         >
           {{ ttsTopLabel }}
         </button>
-        <button v-if="isTextBook" class="font-btn" type="button" title="在当前位置添加书签" @click="addBookmark">
-          ＋书签
+        <button v-if="isTextBook" class="font-btn" type="button" :title="t('reader.addBookmarkTip')" @click="addBookmark">
+          {{ t('reader.addBookmark') }}
         </button>
-        <button v-if="isTextBook" class="font-btn" type="button" title="书签列表" @click="openBookmarks">
-          书签
+        <button v-if="isTextBook" class="font-btn" type="button" :title="t('reader.bookmarksTip')" @click="openBookmarks">
+          {{ t('reader.bookmarks') }}
         </button>
-        <button v-if="isTextBook" class="font-btn" type="button" title="搜索本章内容" @click="openChapterSearch">
-          搜索
+        <button v-if="isTextBook" class="font-btn" type="button" :title="t('reader.searchChapterTip')" @click="openChapterSearch">
+          {{ t('reader.searchChapter') }}
         </button>
         <button
           v-if="isTextBook"
           class="font-btn"
           type="button"
           :disabled="loading || loadError || paragraphs.length === 0"
-          title="复制本章全文"
+          :title="t('reader.copyChapterTip')"
           @click="copyChapter"
         >
-          复制本章
+          {{ t('reader.copyChapter') }}
         </button>
         <button
           v-if="isTextBook"
           class="font-btn auto-btn"
           type="button"
           :class="{ active: autoPlaying }"
-          :title="autoPlaying ? '停止自动阅读' : '自动阅读（定时滚动，到底自动切章）'"
+          :title="autoPlaying ? t('reader.stopAutoTip') : t('reader.autoTip')"
           @click="toggleAuto"
         >
-          {{ autoPlaying ? '停止' : '自动' }}
+          {{ autoPlaying ? t('reader.stop') : t('reader.auto') }}
         </button>
-        <button class="font-btn" type="button" title="排版设置" @click="settingsOpen = true">
-          排版
+        <button class="font-btn" type="button" :title="t('reader.layoutTip')" @click="settingsOpen = true">
+          {{ t('reader.layout') }}
         </button>
-        <button class="toc-btn" type="button" title="目录" @click="drawerOpen = true">
-          目录
+        <button class="toc-btn" type="button" :title="t('reader.tocTip')" @click="drawerOpen = true">
+          {{ t('reader.toc') }}
         </button>
       </div>
     </header>
@@ -2507,14 +2808,14 @@ onBeforeUnmount(() => {
     >
       <!-- 不在书架 -->
       <div v-if="notFound" class="state">
-        <p class="state-text">未找到这本书（可能不在书架中）</p>
-        <button class="retry-btn" type="button" @click="router.replace('/')">返回书架</button>
+        <p class="state-text">{{ t('reader.notFound') }}</p>
+        <button class="retry-btn" type="button" @click="router.replace('/')">{{ t('reader.backShelf') }}</button>
       </div>
 
       <!-- 目录为空 -->
       <div v-else-if="!loading && !loadError && chapters.length === 0" class="state">
-        <p class="state-text">未获取到章节目录</p>
-        <button class="retry-btn" type="button" @click="retry">重试</button>
+        <p class="state-text">{{ t('reader.noToc') }}</p>
+        <button class="retry-btn" type="button" @click="retry">{{ t('common.retry') }}</button>
       </div>
 
       <template v-else>
@@ -2524,33 +2825,29 @@ onBeforeUnmount(() => {
         <template v-if="isTextBook">
           <!-- 加载态：细字 -->
           <div v-if="loading" class="state">
-            <p class="state-text loading-text">加载中…</p>
+            <p class="state-text loading-text">{{ t('reader.loading') }}</p>
           </div>
 
           <!-- 错误态 -->
           <div v-else-if="loadError" class="state">
-            <p class="state-text">正文获取失败，请稍后重试</p>
-            <button class="retry-btn" type="button" @click="retry">重试</button>
+            <p class="state-text">{{ t('reader.loadError') }}</p>
+            <button class="retry-btn" type="button" @click="retry">{{ t('common.retry') }}</button>
           </div>
 
           <!-- 空内容 -->
           <div v-else-if="paragraphs.length === 0" class="state">
-            <p class="state-text">本章暂无内容</p>
+            <p class="state-text">{{ t('reader.emptyChapter') }}</p>
           </div>
 
-          <!-- 正文 -->
-          <article
+          <!-- 正文（flip 模式：横向分页容器；其余模式：普通纵向流） -->
+          <div
             v-else
-            class="reader-content"
-            :style="{
-              fontSize: `${fontSize}px`,
-              lineHeight: `${lineHeight}`,
-              fontWeight: `${fontWeight}`,
-              fontFamily: fontFamilyStyle || undefined,
-              letterSpacing: letterSpacing > 0 ? `${letterSpacing}px` : undefined,
-              textAlign,
-            }"
+            ref="flipViewRef"
+            class="flip-view"
+            :class="{ active: pageMode === 'flip' }"
+            @scroll.passive="onFlipScroll"
           >
+            <article class="reader-content" :class="chapterAnimClass" :style="contentStyle">
             <template v-for="(para, i) in visibleParagraphs" :key="i">
               <!-- 单张图片段落（GAP 102）：渲染图片，点击全屏查看 -->
               <img
@@ -2572,7 +2869,8 @@ onBeforeUnmount(() => {
                 <template v-else>{{ para }}</template>
               </p>
             </template>
-          </article>
+            </article>
+          </div>
 
           <!-- 底部极简导航（长按快进/快退：按住 250ms 后每 300ms 连续翻章） -->
           <nav class="chapter-nav">
@@ -2580,27 +2878,27 @@ onBeforeUnmount(() => {
               class="nav-btn"
               type="button"
               :disabled="!hasPrev"
-              title="上一章（长按连续快退）"
+              :title="t('reader.prevTip')"
               @click="onPrevClick"
               @pointerdown="prevHold.start"
               @pointerup="prevHold.stop"
               @pointerleave="prevHold.stop"
               @pointercancel="prevHold.stop"
             >
-              上一章
+              {{ t('common.prevChapter') }}
             </button>
             <button
               class="nav-btn"
               type="button"
               :disabled="!hasNext"
-              title="下一章（长按连续快进）"
+              :title="t('reader.nextTip')"
               @click="onNextClick"
               @pointerdown="nextHold.start"
               @pointerup="nextHold.stop"
               @pointerleave="nextHold.stop"
               @pointercancel="nextHold.stop"
             >
-              下一章
+              {{ t('common.nextChapter') }}
             </button>
           </nav>
         </template>
@@ -2609,13 +2907,13 @@ onBeforeUnmount(() => {
         <template v-else>
           <!-- 加载态 -->
           <div v-if="loading" class="state">
-            <p class="state-text loading-text">加载中…</p>
+            <p class="state-text loading-text">{{ t('reader.loading') }}</p>
           </div>
 
           <!-- 错误态 -->
           <div v-else-if="loadError" class="state">
             <p class="state-text">内容获取失败，请稍后重试</p>
-            <button class="retry-btn" type="button" @click="retry">重试</button>
+            <button class="retry-btn" type="button" @click="retry">{{ t('common.retry') }}</button>
           </div>
 
           <!-- 音频书：播放器（播放/暂停/进度/上一章下一章；m3u8 走 hls.js） -->
@@ -2625,25 +2923,25 @@ onBeforeUnmount(() => {
                 class="media-art"
                 :style="shelfBook?.coverUrl || shelfBook?.customCoverUrl ? { backgroundImage: `url(${shelfBook?.customCoverUrl || shelfBook?.coverUrl})` } : {}"
               >
-                <span class="media-badge">音频书</span>
-                <span v-if="audioBuffering" class="media-buffering">缓冲中…</span>
+                <span class="media-badge">{{ t('reader.audioBook') }}</span>
+                <span v-if="audioBuffering" class="media-buffering">{{ t('reader.buffering') }}</span>
               </div>
               <p class="media-chapter">{{ displayChapterTitle }}</p>
               <div class="media-controls">
-                <button class="media-nav" type="button" :disabled="!hasPrev" title="上一章" @click="prevChapter">
-                  上一章
+                <button class="media-nav" type="button" :disabled="!hasPrev" :title="t('common.prevChapter')" @click="prevChapter">
+                  {{ t('common.prevChapter') }}
                 </button>
                 <button
                   class="media-play"
                   type="button"
                   :disabled="!audioUrl"
-                  :title="audioPlaying ? '暂停' : '播放'"
+                  :title="audioPlaying ? t('reader.pause') : t('reader.play')"
                   @click="toggleAudioPlay"
                 >
                   {{ audioPlaying ? '❚❚' : '▶' }}
                 </button>
-                <button class="media-nav" type="button" :disabled="!hasNext" title="下一章" @click="nextChapter">
-                  下一章
+                <button class="media-nav" type="button" :disabled="!hasNext" :title="t('common.nextChapter')" @click="nextChapter">
+                  {{ t('common.nextChapter') }}
                 </button>
               </div>
               <div class="media-progress">
@@ -2661,16 +2959,16 @@ onBeforeUnmount(() => {
                 <span class="media-time">{{ fmtTime(audioDuration) }}</span>
               </div>
               <p v-if="hlsFailed" class="media-hint">
-                m3u8 需要 HLS 支持：浏览器不支持且 hls.js 加载失败（请检查网络）
+                {{ t('reader.hlsFailed') }}
               </p>
-              <p class="media-hint">本章播完自动连播下一章 · 空格键播放/暂停</p>
+              <p class="media-hint">{{ t('reader.autoNext') }}</p>
             </div>
           </div>
 
           <!-- 漫画书：横向滑动 + 点击左右边缘翻页 + 懒加载占位 -->
           <div v-else-if="isComicBook" class="media-stage comic-stage">
             <div v-if="comicImages.length === 0" class="state">
-              <p class="state-text">本章暂无图片</p>
+              <p class="state-text">{{ t('reader.noComic') }}</p>
             </div>
             <template v-else>
               <div ref="comicScrollRef" class="comic-scroll" @scroll="onComicScroll">
@@ -2681,7 +2979,7 @@ onBeforeUnmount(() => {
                   :class="{ active: i === comicPage }"
                 >
                   <!-- 加载中占位（懒加载完成前显示） -->
-                  <div class="comic-placeholder">加载中…</div>
+                  <div class="comic-placeholder">{{ t('reader.loading') }}</div>
                   <img
                     v-lazy="img"
                     class="comic-img"
@@ -2692,8 +2990,8 @@ onBeforeUnmount(() => {
                 </div>
               </div>
               <div class="comic-foot">
-                <span class="comic-hint">← 点击左右边缘翻页 / 横向滑动浏览 →</span>
-                <span class="comic-page-indicator">第 {{ comicPage + 1 }} / {{ comicImages.length }} 页</span>
+                <span class="comic-hint">{{ t('reader.comicTip') }}</span>
+                <span class="comic-page-indicator">{{ t('reader.comicPage', { c: comicPage + 1, t: comicImages.length }) }}</span>
               </div>
             </template>
           </div>
@@ -2701,7 +2999,7 @@ onBeforeUnmount(() => {
           <!-- 视频书：原生视频播放器 -->
           <div v-else-if="isVideoBook" class="media-stage video-stage">
             <div v-if="!videoUrl" class="state">
-              <p class="state-text">未获取到视频地址</p>
+              <p class="state-text">{{ t('reader.noVideo') }}</p>
             </div>
             <video
               v-else
@@ -2720,7 +3018,7 @@ onBeforeUnmount(() => {
           <div v-else-if="isFileBook" class="media-stage file-stage">
             <div class="file-card">
               <p class="file-title">{{ displayBookName }}</p>
-              <p class="file-intro">{{ shelfBook?.customIntro || shelfBook?.intro || '文件型书籍：点击下方按钮下载文件阅读。' }}</p>
+              <p class="file-intro">{{ shelfBook?.customIntro || shelfBook?.intro || t('reader.fileIntro') }}</p>
               <a
                 v-if="fileUrl"
                 class="download-btn"
@@ -2729,9 +3027,9 @@ onBeforeUnmount(() => {
                 rel="noopener noreferrer"
                 :download="displayBookName || 'download'"
               >
-                下载文件
+                {{ t('reader.download') }}
               </a>
-              <p v-else class="media-hint">未获取到下载链接</p>
+              <p v-else class="media-hint">{{ t('reader.noDownload') }}</p>
             </div>
           </div>
 
@@ -2741,20 +3039,20 @@ onBeforeUnmount(() => {
               class="nav-btn"
               type="button"
               :disabled="!hasPrev"
-              title="上一章（长按连续快退）"
+              :title="t('reader.prevTip')"
               @click="onPrevClick"
               @pointerdown="prevHold.start"
               @pointerup="prevHold.stop"
               @pointerleave="prevHold.stop"
               @pointercancel="prevHold.stop"
             >
-              上一章
+              {{ t('common.prevChapter') }}
             </button>
             <button
               class="nav-btn"
               type="button"
               :disabled="!hasNext"
-              title="下一章（长按连续快进）"
+              :title="t('reader.nextTip')"
               @click="onNextClick"
               @pointerdown="nextHold.start"
               @pointerup="nextHold.stop"
@@ -2898,14 +3196,14 @@ onBeforeUnmount(() => {
             <span class="set-label">主题</span>
             <div class="seg">
               <button
-                v-for="t in THEME_ORDER"
-                :key="t"
+                v-for="th in THEME_ORDER"
+                :key="th"
                 class="seg-btn"
-                :class="{ active: theme === t }"
+                :class="{ active: theme === th }"
                 type="button"
-                @click="theme = t"
+                @click="selectTheme(th)"
               >
-                {{ THEME_LABEL[t] }}
+                {{ t('theme.' + th) }}
               </button>
             </div>
           </div>
@@ -3139,7 +3437,7 @@ onBeforeUnmount(() => {
                 type="button"
                 role="switch"
                 :aria-checked="effectiveTexture"
-                :title="effectiveTexture ? '关闭纸纹' : '开启纸纹（细噪点微纹理，纸色主题效果最佳）'"
+                :title="effectiveTexture ? '关闭纸纹' : '开启纸纹（细噪点微纹理，暖色主题效果最佳）'"
                 @click="toggleTexture"
               >
                 <span class="switch-knob"></span>
@@ -3149,11 +3447,12 @@ onBeforeUnmount(() => {
 
           <div class="set-row">
             <span class="set-label">翻页</span>
-            <div class="seg">
+            <div class="seg compact">
               <button
                 class="seg-btn"
                 type="button"
                 :class="{ active: pageMode === 'scroll' }"
+                title="连续滚动（默认）"
                 @click="pageMode = 'scroll'"
               >
                 滚动
@@ -3161,10 +3460,46 @@ onBeforeUnmount(() => {
               <button
                 class="seg-btn"
                 type="button"
+                :class="{ active: pageMode === 'hslide' }"
+                title="左右滑动翻章（带切章过渡动画）"
+                @click="pageMode = 'hslide'"
+              >
+                左右
+              </button>
+              <button
+                class="seg-btn"
+                type="button"
                 :class="{ active: pageMode === 'slide' }"
+                title="上下翻页（滚轮/触屏/按钮逐屏滚动）"
                 @click="pageMode = 'slide'"
               >
-                滑动
+                上下
+              </button>
+              <button
+                class="seg-btn"
+                type="button"
+                :class="{ active: pageMode === 'flip' }"
+                title="仿真翻页（横向页过渡）"
+                @click="pageMode = 'flip'"
+              >
+                仿真
+              </button>
+            </div>
+          </div>
+
+          <div v-if="bookCfgTab === 'global'" class="set-row">
+            <span class="set-label">屏幕常亮</span>
+            <div class="set-controls">
+              <button
+                class="switch"
+                :class="{ on: wakeLockEnabled }"
+                type="button"
+                role="switch"
+                :aria-checked="wakeLockEnabled"
+                :title="wakeLockEnabled ? '关闭屏幕常亮（阅读时允许锁屏）' : '开启屏幕常亮（阅读时保持亮屏）'"
+                @click="wakeLockEnabled = !wakeLockEnabled"
+              >
+                <span class="switch-knob"></span>
               </button>
             </div>
           </div>
@@ -3236,6 +3571,39 @@ onBeforeUnmount(() => {
             >
               {{ removing ? '确认移出？' : '移出书架' }}
             </button>
+          </div>
+        </div>
+      </div>
+    </transition>
+
+    <!-- 自定义主题弹层（第 5 档主题：背景色/文字色/强调色 + 恢复默认；localStorage reader_theme_custom） -->
+    <transition name="pop">
+      <div v-if="customOpen" class="pop-mask custom-mask" @click="customOpen = false">
+        <div class="pop-card" @click.stop>
+          <p class="pop-title">自定义主题</p>
+          <p class="pop-hint">背景色 / 文字色 / 强调色 · 仅保存在本机</p>
+          <div class="custom-row">
+            <span class="set-label">背景色</span>
+            <input v-model="customTheme.bg" class="custom-color" type="color" title="背景色" />
+          </div>
+          <div class="custom-row">
+            <span class="set-label">文字色</span>
+            <input v-model="customTheme.text" class="custom-color" type="color" title="文字色" />
+          </div>
+          <div class="custom-row">
+            <span class="set-label">强调色</span>
+            <input v-model="customTheme.accent" class="custom-color" type="color" title="强调色" />
+          </div>
+          <div class="set-foot">
+            <button
+              class="text-btn"
+              type="button"
+              title="恢复默认配色（米白纸色 + 深褐文字 + 棕金强调）"
+              @click="resetCustomTheme"
+            >
+              恢复默认
+            </button>
+            <button class="pop-btn" type="button" @click="customOpen = false">完成</button>
           </div>
         </div>
       </div>
@@ -3459,13 +3827,42 @@ onBeforeUnmount(() => {
                 :class="{ current: i === chapterIndex }"
                 @click="goToChapter(i)"
               >
-                {{ ch.title }}
+                <span class="chapter-item-title">{{ ch.title }}</span>
+                <span v-if="ch.wcLabel" class="chapter-item-wc">{{ ch.wcLabel }}</span>
               </button>
             </template>
           </div>
         </aside>
       </div>
     </transition>
+
+    <!-- 翻页模式浮动按钮：上下翻页 ▲/▼ 逐屏；左右滑动 ‹/› 翻章；仿真翻页 ‹/› 翻页 -->
+    <template v-if="isTextBook && !loading && !loadError && paragraphs.length > 0">
+      <div v-if="pageMode === 'slide'" class="flip-nav-vert">
+        <button class="flip-nav-btn" type="button" title="上一屏" @click="slideFlip(-1)">▲</button>
+        <button class="flip-nav-btn" type="button" title="下一屏" @click="slideFlip(1)">▼</button>
+      </div>
+      <template v-else-if="pageMode === 'hslide' || pageMode === 'flip'">
+        <button
+          class="flip-nav-btn flip-nav-side prev"
+          type="button"
+          :disabled="pageMode === 'hslide' ? !hasPrev : flipPageIdx <= 0"
+          :title="pageMode === 'flip' ? '上一页' : t('common.prevChapter')"
+          @click="pageMode === 'flip' ? flipPage(-1) : prevChapter()"
+        >
+          ‹
+        </button>
+        <button
+          class="flip-nav-btn flip-nav-side next"
+          type="button"
+          :disabled="pageMode === 'hslide' ? !hasNext : false"
+          :title="pageMode === 'flip' ? '下一页' : t('common.nextChapter')"
+          @click="pageMode === 'flip' ? flipPage(1) : nextChapter()"
+        >
+          ›
+        </button>
+      </template>
+    </template>
   </div>
 </template>
 
@@ -4260,6 +4657,30 @@ onBeforeUnmount(() => {
   text-align: center;
 }
 
+/* ================= 自定义主题弹层 ================= */
+.custom-mask {
+  z-index: 45;
+}
+.custom-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 16px;
+}
+.custom-color {
+  width: 46px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+.custom-color:hover {
+  border-color: var(--accent);
+}
+
 /* ================= 亮度弹层 ================= */
 .bright-row {
   display: flex;
@@ -4650,7 +5071,9 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 .chapter-item {
-  display: block;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
   width: 100%;
   padding: 11px 20px;
   border: none;
@@ -4662,13 +5085,26 @@ onBeforeUnmount(() => {
   font-weight: 300;
   text-align: left;
   cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   transition:
     color 0.2s ease,
     background 0.2s ease,
     border-color 0.2s ease;
+}
+.chapter-item-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 章节字数（目录抽屉）：后端返回或本会话已加载章显示，未加载章省略 */
+.chapter-item-wc {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 0.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
 }
 .chapter-item:hover {
   color: var(--text-1);
@@ -4679,6 +5115,9 @@ onBeforeUnmount(() => {
   border-left-color: var(--accent);
   background: var(--accent-soft);
   font-weight: 400;
+}
+.chapter-item.current .chapter-item-wc {
+  color: var(--accent);
 }
 
 /* ================= 听书面板 ================= */
@@ -4847,6 +5286,125 @@ onBeforeUnmount(() => {
 }
 .sel-btn:hover {
   color: var(--accent);
+}
+
+/* ================= 翻页模式：仿真翻页（横向分页）/ 切章过渡 / 浮动按钮 ================= */
+/* 仿真翻页：阅读页锁高，正文区弹性撑满，禁止整页纵向滚动 */
+.reader-page.flip-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+.reader-page.flip-layout .reader-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 32px;
+}
+.reader-page.flip-layout .chapter-title,
+.reader-page.flip-layout .chapter-nav {
+  flex-shrink: 0;
+}
+.flip-view {
+  width: 100%;
+}
+.flip-view.active {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.flip-view.active .reader-content {
+  height: 100%;
+  column-fill: auto;
+}
+.flip-view.active .reader-img {
+  break-inside: avoid;
+}
+/* hslide 切章过渡：正文随方向滑入（翻页动画） */
+.chapter-slide-in-right {
+  animation: chapter-slide-in-right 0.32s ease both;
+}
+.chapter-slide-in-left {
+  animation: chapter-slide-in-left 0.32s ease both;
+}
+@keyframes chapter-slide-in-right {
+  from {
+    opacity: 0.25;
+    transform: translateX(48px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes chapter-slide-in-left {
+  from {
+    opacity: 0.25;
+    transform: translateX(-48px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* 翻页模式浮动按钮 */
+.flip-nav-vert {
+  position: fixed;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.flip-nav-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.14);
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    opacity 0.2s ease;
+}
+.flip-nav-btn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.flip-nav-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.flip-nav-side {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 15;
+}
+.flip-nav-side.prev {
+  left: 8px;
+}
+.flip-nav-side.next {
+  right: 8px;
+}
+/* 翻页模式 4 按钮塞入 320px 弹层：收紧内边距 */
+.seg.compact .seg-btn {
+  padding: 0 9px;
+  font-size: 11.5px;
+  letter-spacing: 0.5px;
 }
 
 /* ================= 响应式 ================= */

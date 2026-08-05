@@ -17,6 +17,15 @@
         <button class="han-btn" type="button" title="内容宽度（与阅读页同一设置）" @click="cycleWidth">
           {{ WIDTH_OPTIONS.find((o) => o.value === contentWidth)?.label ?? '适中' }}
         </button>
+        <button
+          class="han-btn"
+          :class="{ active: favSourcesOnly }"
+          type="button"
+          :title="favSourcesOnly ? '显示全部探索书源' : '只看收藏的书源（我的探索）'"
+          @click="favSourcesOnly = !favSourcesOnly"
+        >
+          {{ favSourcesOnly ? '全部' : '我的探索' }}
+        </button>
       </div>
     </header>
 
@@ -106,13 +115,30 @@
         <p class="state-text">没有支持探索的书源</p>
         <router-link class="link" to="/sources">前往书源管理</router-link>
       </div>
-      <ul v-else class="source-list">
-        <li v-for="s in sources" :key="s.bookSourceUrl" class="source-item" @click="selectSource(s)">
+      <ul v-else-if="shownSources.length > 0" class="source-list">
+        <li
+          v-for="s in shownSources"
+          :key="s.bookSourceUrl"
+          class="source-item"
+          :class="{ fav: isFavSource(s.bookSourceUrl) }"
+          @click="selectSource(s)"
+        >
+          <span
+            class="src-star"
+            :class="{ fav: isFavSource(s.bookSourceUrl) }"
+            :title="isFavSource(s.bookSourceUrl) ? `取消收藏「${s.bookSourceName}」` : `收藏「${s.bookSourceName}」（我的探索）`"
+            @click.stop="toggleFavSource(s)"
+          >{{ isFavSource(s.bookSourceUrl) ? '★' : '☆' }}</span>
           <span class="source-name">{{ applyHan(s.bookSourceName, hanMode) }}</span>
           <span class="source-count">{{ exploreCount(s) }} 个分类</span>
           <span class="chevron">›</span>
         </li>
       </ul>
+      <div v-else class="state">
+        <p class="state-text">「我的探索」暂无收藏的书源</p>
+        <p class="state-hint">在书源行点击 ☆ 即可收藏，收藏后从此处快速进入</p>
+        <button class="retry" type="button" @click="favSourcesOnly = false">查看全部书源</button>
+      </div>
     </main>
 
     <!-- 书源探索页：分类 + 书籍 -->
@@ -120,7 +146,7 @@
       <div v-if="catsLoading" class="state"><p class="state-text">加载分类…</p></div>
       <p v-else-if="catsError" class="state-error">{{ catsError }} <button class="retry" type="button" @click="loadCategories">重试</button></p>
       <template v-else>
-        <!-- 书单页顶部：书单内搜索（GAP 49 补——前端过滤当前列表，不发请求） -->
+        <!-- 书单页顶部：书单内搜索（GAP 49 补——前端过滤当前列表，不发请求）+ 视图切换（GAP 200：列表/墙，localStorage: reader_explore_view） -->
         <div class="list-search">
           <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
             <circle cx="11" cy="11" r="6.5" />
@@ -134,6 +160,22 @@
             spellcheck="false"
           />
           <button v-if="listFilter" class="list-search-clear" type="button" @click="listFilter = ''">清空</button>
+          <div class="explore-view-toggle" role="group" aria-label="视图切换">
+            <button
+              type="button"
+              class="view-btn"
+              :class="{ active: exploreView === 'wall' }"
+              title="墙视图：大封面网格"
+              @click="exploreView = 'wall'"
+            >墙</button>
+            <button
+              type="button"
+              class="view-btn"
+              :class="{ active: exploreView === 'list' }"
+              title="列表视图：小缩略图行"
+              @click="exploreView = 'list'"
+            >列表</button>
+          </div>
         </div>
 
         <div class="cats">
@@ -166,7 +208,7 @@
             <div v-if="filteredBooks.length === 0" class="state">
               <p class="state-text">没有匹配「{{ listFilter.trim() }}」的书籍</p>
             </div>
-            <div v-else class="book-grid">
+            <div v-else class="book-grid" :class="exploreView === 'list' ? 'list' : 'wall'">
               <button v-for="b in filteredBooks" :key="b.bookUrl" type="button" class="book-card" @click="goBook(b)">
                 <span class="book-cover" :style="{ background: coverGradient(b.name) }">
                   <img
@@ -241,6 +283,58 @@ function clearHistory() {
 }
 
 const sources = ref<ExploreSourceInfo[]>([])
+/* ============ 探索源收藏（localStorage: reader_fav_explore_sources {url: name}） ============ */
+const FAV_SRC_KEY = 'reader_fav_explore_sources'
+
+function loadFavSources(): Record<string, string> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FAV_SRC_KEY) ?? '{}') as unknown
+    if (raw && typeof raw === 'object') {
+      const out: Record<string, string> = {}
+      for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+        if (typeof v === 'string') out[k] = v
+      }
+      return out
+    }
+  } catch {
+    /* ignore */
+  }
+  return {}
+}
+
+const favSrcs = ref<Record<string, string>>(loadFavSources())
+
+function persistFavSrcs() {
+  try {
+    localStorage.setItem(FAV_SRC_KEY, JSON.stringify(favSrcs.value))
+  } catch {
+    /* ignore */
+  }
+}
+
+const isFavSource = (url: string) => !!favSrcs.value[url]
+
+/** 星标收藏/取消收藏探索书源 */
+function toggleFavSource(s: ExploreSourceInfo) {
+  if (favSrcs.value[s.bookSourceUrl]) {
+    const next = { ...favSrcs.value }
+    delete next[s.bookSourceUrl]
+    favSrcs.value = next
+    ElMessage.info(`已取消收藏「${s.bookSourceName}」`)
+  } else {
+    favSrcs.value = { ...favSrcs.value, [s.bookSourceUrl]: s.bookSourceName }
+    ElMessage.success(`已收藏「${s.bookSourceName}」`)
+  }
+  persistFavSrcs()
+}
+
+/** 「我的探索」：只看收藏书源（顶栏切换） */
+const favSourcesOnly = ref(false)
+const shownSources = computed(() =>
+  favSourcesOnly.value
+    ? sources.value.filter((s) => isFavSource(s.bookSourceUrl))
+    : sources.value,
+)
 /** 全站共享简繁模式（书海/搜索/目录/书源名统一响应，见 utils/hanMode.ts） */
 const hanMode = useHanMode()
 function toggleHan() {
@@ -282,6 +376,23 @@ const booksError = ref('')
 
 /* ============ 书单内搜索（GAP 49 补：前端过滤当前列表） ============ */
 const listFilter = ref('')
+
+/* ============ GAP 200：书单视图切换（墙=大封面网格 / 列表=小缩略图行；localStorage: reader_explore_view） ============ */
+type ExploreViewMode = 'wall' | 'list'
+const EXPLORE_VIEW_KEY = 'reader_explore_view'
+const exploreView = ref<ExploreViewMode>('wall')
+{
+  const raw = localStorage.getItem(EXPLORE_VIEW_KEY)
+  if (raw === 'wall' || raw === 'list') exploreView.value = raw
+}
+watch(exploreView, (v) => {
+  try {
+    localStorage.setItem(EXPLORE_VIEW_KEY, v)
+  } catch {
+    /* ignore */
+  }
+})
+
 const filteredBooks = computed(() => {
   const kw = listFilter.value.trim().toLowerCase()
   if (!kw) return books.value
@@ -664,6 +775,11 @@ onBeforeUnmount(() => {
   border-color: var(--accent, #4f46e5);
   color: var(--accent, #4f46e5);
 }
+.han-btn.active {
+  border-color: var(--accent, #4f46e5);
+  color: var(--accent, #4f46e5);
+  background: var(--accent-soft, rgba(79, 70, 229, 0.08));
+}
 .main {
   margin: 0 auto;
   padding: 24px 20px 80px;
@@ -871,6 +987,25 @@ onBeforeUnmount(() => {
   border-color: var(--accent, #4f46e5);
   transform: translateY(-1px);
 }
+.src-star {
+  flex-shrink: 0;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-3, #999);
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.2s ease, transform 0.2s ease;
+}
+.src-star:hover {
+  color: var(--accent, #4f46e5);
+  transform: scale(1.15);
+}
+.src-star.fav {
+  color: #f59e0b;
+}
+.source-item.fav {
+  border-color: rgba(245, 158, 11, 0.45);
+}
 .source-name {
   flex: 1;
   font-size: 14px;
@@ -1008,6 +1143,46 @@ onBeforeUnmount(() => {
   grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
   gap: 20px 16px;
 }
+.book-grid.wall {
+  /* GAP 200：墙视图 = 大封面网格（比默认网格更大、间距更宽） */
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 28px 22px;
+}
+.book-grid.list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.book-grid.list .book-card {
+  flex-direction: row;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  transition: background-color 0.2s ease;
+}
+.book-grid.list .book-card:hover {
+  background: var(--bg-soft, #f4f4f5);
+}
+.book-grid.list .book-cover {
+  width: 46px;
+  height: 62px;
+  aspect-ratio: auto;
+  flex-shrink: 0;
+  border-radius: 6px;
+  font-size: 18px;
+}
+.book-grid.list .book-card:hover .book-cover {
+  transform: none;
+}
+.book-grid.list .book-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+}
+.book-grid.list .book-author {
+  flex-shrink: 0;
+}
 .book-card {
   display: flex;
   flex-direction: column;
@@ -1108,6 +1283,34 @@ onBeforeUnmount(() => {
 }
 .list-search-clear:hover {
   color: var(--accent, #4f46e5);
+}
+.explore-view-toggle {
+  flex-shrink: 0;
+  display: flex;
+  gap: 4px;
+  padding: 2px;
+  border: 1px solid var(--border, #ececec);
+  border-radius: 999px;
+}
+.view-btn {
+  padding: 3px 12px;
+  border: none;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-3, #999);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.view-btn:hover {
+  color: var(--accent, #4f46e5);
+}
+.view-btn.active {
+  color: var(--accent, #4f46e5);
+  background: var(--accent-soft, #eef2ff);
 }
 .paging-note {
   margin: 8px 0 0;

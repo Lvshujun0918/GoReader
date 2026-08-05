@@ -1,0 +1,232 @@
+<html>
+<head>
+	<meta charset="UTF-8">
+	<script src="../libs/jquery-3.4.1.min.js"></script>
+	<script src="index.js"></script>
+	<style>
+		html {
+			overflow: hidden;
+
+			/* 
+				the following is a terrible hack, 
+				The only way I have found to get the popup height to be adjusted accorfing to content actual height
+				If it is not set, the popup is taller than the content inside and in addition it is not get shrinked back when resized to the bottom, once content is changed back  :(
+			*/
+			height: 1px;
+		}
+		body {
+			margin: 0;
+			font-family: Helvetica Neue,sans-serif;
+			font-size: 13px;
+			font-weight: 400;
+			color: #454545;
+			overflow: hidden;
+			padding: 0;
+			background: #fafafa 0 0 no-repeat padding-box;
+			min-width: 265px;
+		}
+		.main-div {
+			width: 292px;
+			padding-bottom: 10px;
+			opacity: 1;
+			display: inline-block;
+			width: 100%;
+			/* max-height: 660px; */
+			margin: 0;
+			vertical-align: middle;
+		}
+		.header {
+			background-image: url(../images/ico.app.24.png);
+			background-size: 24px 24px;
+			background-position: 20px 18px;
+			border-radius: 4px 4px 0 0;
+			padding-left: 56px;
+			background-repeat: no-repeat;
+			font-size: 16px;
+			line-height: 20px;
+			letter-spacing: 0;
+			color: #2c2c2c;
+			margin: 0;
+			padding-top: 20px;
+			height: auto;
+			padding-bottom: 16px;
+			background-color: #fff;
+			opacity: 1;
+		}
+		.close-dialog {
+			background-position: 50%;
+			background-repeat: no-repeat;
+			background-size: 14px 14px;
+			background-image: url(../images/close-menu.svg);
+			padding: 0;
+			width: 24px;
+			height: 24px;
+			position: absolute;
+			right: 16px;
+			top: 18px;
+			opacity: 1;
+			cursor: pointer;
+			right: 11px;
+			border: 1px solid transparent !important;
+			background-color: transparent !important;
+		}
+		.close-dialog:hover {
+			background-image: url(../images/close-menu_hover.svg);
+		}
+		.actions input[type=button] {
+			color: #454545;
+			border: 1px solid transparent;
+			border-radius: 2px;
+			background-color: transparent;
+			cursor: pointer;
+			height: 42px;
+			line-height: 30px;
+			width: 270px;
+			text-align: left;
+			margin: 5px 15px 0;
+			padding-left: 38px;
+			font-size: 14px;
+			font-weight: 100;
+			background-repeat: no-repeat;
+			background-position: 5px center
+		}
+		input[type=button]:hover {
+			border: 1px solid #cbcbcb;
+			background-color: #fbfbfb;
+			opacity: 1
+		}
+		input[type=button].do_preferences {	background-image: url(../images/cmd.props.png); }
+		input[type=button].do_openPDF     {	background-image: url(../images/ico.openWith.png); }
+		input[type=button].do_convertHTML {	background-image: url(../images/ico.toPDF.png);	}
+		.hidden { display: none; }
+		.horizontal-rule {
+			height: 1px;
+			width: 100%;
+			background-color: #dfdfdf;
+			margin: 10px auto 0
+		}
+		.api-option-container {	padding: 15px 20px 10px }
+		.api-option-container-inner { user-select: none; }
+		.api-option-container input[type=checkbox] { cursor: pointer; text-align: left;	}
+		.api-option-container input[type=checkbox] ~ label { cursor: pointer }
+
+		/* PROGRESS */
+		#progress-container {
+			clear: both;
+			margin-top: 10px;
+		}
+
+		.progress {
+			display: flex;
+			height: 1rem;
+			overflow: hidden;
+			line-height: 0;
+			font-size: .75rem;
+			background-color: #e9ecef;
+			border-radius: 0.25rem;
+		}
+
+		.progress-bar {
+			display: flex;
+			flex-direction: column;
+			justify-content: center;
+			overflow: hidden;
+			color: #fff;
+			text-align: center;
+			white-space: nowrap;
+			background-color: #007bff;
+			/*background-color: #3e454c;*/
+			transition: width .6s ease;
+		}
+		.progress-box {	padding: 10px 10px 1em 15px; }
+		.progress-action { text-align: center; }
+
+		@keyframes progress-bar-stripes {
+			from { background-position: 0 0; }
+			to { background-position: 10px 10px; }
+		}
+
+		.progress-bar-striped {
+			background-image: linear-gradient(
+				-45deg,
+				rgba(255,255,255,.15) 25%,
+				transparent 25%,
+				transparent 50%,
+				rgba(255,255,255,.15) 50%,
+				rgba(255,255,255,.15) 75%,
+				transparent 75%,
+				transparent
+			);
+			background-size: 20px 20px;
+		}
+
+		.progress-bar-animated {
+			-webkit-animation: 1s linear infinite progress-bar-stripes;
+			animation: 1s linear infinite progress-bar-stripes;
+		}
+
+		#cancel-button-box {
+			display: none;
+			margin-top: 15px;
+		}
+
+		#cancel-button {
+			text-decoration: underline;
+			padding-bottom: 4px;
+		}
+		/* //PROGRESS */
+
+		.error-box {
+			color: red;
+			text-align: center;
+			overflow: auto;
+			padding: 0 20px;
+		}
+	</style>
+</head>
+<body>
+	<div class="main-div">
+		<div style="width: 100%">
+			<div class="header">
+				<div>PDF-XChange Editor</div>
+				<input type="button" class="close-dialog">
+			</div>
+			<div class="loading-box" style="padding: 15px 0px 15px 56px;"><img src="../images/loading.svg" /></div>
+			<div class="progress-box hidden">
+				<div class="progress-action">Progress action</div>
+				<div id="progress-container">
+					<div class="progress" style="height: 10px;">
+						<div class="progress-bar" role="progressbar" 
+							 style="width: 0%;" aria-valuenow="25" aria-valuemin="0" aria-valuemax="100"></div>
+					</div>
+				</div>
+				<div id="cancel-button-box" style="text-align: center">
+					<a href="#" id="cancel-button">CANCEL</a>
+				</div>
+			</div>
+
+			<div class="error-box hidden">
+				<p></p>
+			</div>
+
+			<div class="actions">
+				<!-- For opened PDF documents -->
+				<input type="button" class="do_openPDF hidden" value="Open in PDF-XChange Editor">
+
+				<!-- For opened HTML documents -->
+				<input type="button" class="do_convertHTML hidden" value="Convert to PDF..." />
+				<input type="button" class="do_preferences" value="Preferences.." />
+
+				<!-- Bottom section -->
+				<div class="horizontal-rule hidden"></div>
+				<div class="api-option-container hidden">
+					<div class="api-option-container-inner">
+						<input type="checkbox" class="always-show" id="always-show" checked="checked" />
+						<label class="label" id="show-open-in-editor-lbl" for="always-show">Show "Open in PDF-XChange Editor"</label>
+					</div>
+				</div>
+			</div>
+		</div>
+	</div>
+</body>
+</html>

@@ -64,6 +64,14 @@ pub struct BookSource {
     #[sqlx(rename = "respond_time")]
     pub respond_time: i64,
     pub weight: i64,
+    // ---- 使用统计（权重自动调整数据源；serde skip：不外泄/不参与 raw_json，
+    //      客户端回写 saveBookSource 也不会覆盖——upsert 不写这两列）----
+    #[serde(skip)]
+    #[sqlx(rename = "use_count")]
+    pub use_count: i64,
+    #[serde(skip)]
+    #[sqlx(rename = "use_ts")]
+    pub use_ts: i64,
     #[serde(rename = "exploreUrl")]
     #[sqlx(rename = "explore_url")]
     pub explore_url: Option<String>,

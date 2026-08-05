@@ -49,6 +49,8 @@ impl ReturnData {
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Storage,
+    /// 图片代理磁盘缓存（GAP：storage/cache/images，LRU 容量控制 + 并发去重）
+    pub image_cache: std::sync::Arc<crate::service::image_cache::ImageCache>,
 }
 
 /// F-10：目录缓存 TTL（5 分钟）
@@ -58,7 +60,9 @@ const TOC_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
     // 书源 cookie 存取注册（crawler 抓取/登录按用户命名空间读表）
     crate::service::crawler::register_cookie_storage(storage.clone());
-    let state = AppState { storage };
+    // 图片代理磁盘缓存（GAP：storage/cache/images；容量 env READER_IMAGE_CACHE_MB 默认 512MB）
+    let image_cache = crate::service::image_cache::ImageCache::new(&config);
+    let state = AppState { storage, image_cache };
 
     // /assets 静态资源（封面等：storage/assets/**，legacy 兼容）
     let assets_dir = config.storage_dir().join("assets");
@@ -176,6 +180,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/importDefaultTxtTocRules", post(import_default_txt_toc_rules))
         // 系统信息 + 书源导出
         .route("/reader3/getSystemInfo", get(get_system_info))
+        .route("/reader3/getServerStats", get(get_server_stats))
         .route("/reader3/exportBookSources", get(export_book_sources))
         // SPA fallback：未匹配路由 → webdav 分流 / API 404 / 前端
         .fallback(fallback_handler)
@@ -277,10 +282,14 @@ async fn health() -> &'static str {
 }
 
 /// GAP #88/125：GET /assets/proxy?url=&referer=（封面/正文图片防盗链代理）
+/// GAP #88/125：GET /assets/proxy?url=&referer=（封面/正文图片防盗链代理）
 ///
 /// 服务端拉取图片：自动附加书源 header（书源登录 cookie/UA 按用户命名空间 + Referer）；
 /// 超时 10s；大小上限 5MB（Content-Length 预检 + 流式累计兜底）；Content-Type 透传。
 /// GAP 130：?fmt=webp&q=80 → 转码 webp 输出（image 编解码，失败回退原图透传）。
+/// GAP：磁盘缓存（storage/cache/images，LRU 容量上限 env READER_IMAGE_CACHE_MB 默认 512MB）——
+/// 命中直接读盘（Cache-Control 长缓存 public, max-age=31536000, immutable），未命中回源后写盘；
+/// 同 URL 并发请求共享一次回源（内存 in-flight map）。
 /// secure 模式下按 accessToken 解析用户命名空间（与 /reader3 一致）。
 async fn assets_proxy(
     State(state): State<AppState>,
@@ -310,16 +319,18 @@ async fn assets_proxy(
         .get("q")
         .and_then(|v| v.parse().ok())
         .unwrap_or(80);
-    match crate::service::crawler::fetch_image(
-        &namespace,
-        parsed.as_str(),
-        referer.as_deref(),
-        10,
-        5 * 1024 * 1024,
-    )
-    .await
+    match state
+        .image_cache
+        .get_or_fetch(&namespace, parsed.as_str(), referer.as_deref(), 10, 5 * 1024 * 1024)
+        .await
     {
-        Ok((bytes, content_type, status)) => {
+        Ok((bytes, content_type, status, from_cache)) => {
+            // 磁盘命中 → 长缓存（内容按 URL 定址；上游图片变更依赖 LRU 淘汰换新）
+            let cache_control = if from_cache {
+                "public, max-age=31536000, immutable"
+            } else {
+                "public, max-age=3600"
+            };
             let is_raster = content_type
                 .as_deref()
                 .map(|ct| ct.starts_with("image/"))
@@ -333,7 +344,7 @@ async fn assets_proxy(
                 Some(webp) => Response::builder()
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
                     .header("Content-Type", "image/webp")
-                    .header("Cache-Control", "public, max-age=3600")
+                    .header("Cache-Control", cache_control)
                     .body(Body::from(webp))
                     .unwrap(),
                 None => Response::builder()
@@ -342,7 +353,7 @@ async fn assets_proxy(
                         "Content-Type",
                         content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
                     )
-                    .header("Cache-Control", "public, max-age=3600")
+                    .header("Cache-Control", cache_control)
                     .body(Body::from(bytes))
                     .unwrap(),
             }
@@ -1728,7 +1739,7 @@ async fn search_book(
         return Json(ReturnData::err("书源不存在"));
     };
 
-    match crate::service::search::search_one_source(&namespace, &source, &key, page).await {
+    match crate::service::search::search_one_source(&state.storage, &namespace, &source, &key, page).await {
         Ok(books) => Json(ReturnData::ok(serde_json::to_value(books).unwrap_or(serde_json::Value::Null))),
         Err(e) => {
             tracing::error!("搜索失败 [{}]: {e:?}", source.book_source_name);
@@ -1755,6 +1766,7 @@ async fn search_book_multi(
     let mut key = params.get("key").cloned().unwrap_or_default();
     let mut page = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1i64);
     let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
+    let mut exact = params.get("exact").map(|v| v == "1").unwrap_or(false);
     let mut max_sources = params
         .get("maxSources")
         .and_then(|v| v.parse::<usize>().ok())
@@ -1769,6 +1781,12 @@ async fn search_book_multi(
             }
             if let Some(v) = json.get("bookSourceGroup").and_then(|v| v.as_str()) {
                 group = v.to_string();
+            }
+            if let Some(v) = json.get("exact") {
+                exact = v.as_u64() == Some(1)
+                    || v.as_str()
+                        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
             }
             if let Some(v) = json.get("maxSources").and_then(|v| v.as_u64()) {
                 max_sources = v as usize;
@@ -1805,13 +1823,15 @@ async fn search_book_multi(
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     let mut handles = Vec::with_capacity(sources.len());
     let ns = namespace.clone();
+    let storage = state.storage.clone();
     for source in sources {
         let sem = semaphore.clone();
         let key = key.clone();
         let ns = ns.clone();
+        let storage = storage.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
-            crate::service::search::search_one_source(&ns, &source, &key, page).await.unwrap_or_default()
+            crate::service::search::search_one_source(&storage, &ns, &source, &key, page).await.unwrap_or_default()
         }));
     }
     let mut all: Vec<crate::service::search::SearchBook> = Vec::new();
@@ -1819,6 +1839,10 @@ async fn search_book_multi(
         if let Ok(books) = h.await {
             all.extend(books);
         }
+    }
+    // 精确模式（exact=1）：书源规则解析后按书名/作者等值过滤（大小写/全半角忽略）
+    if exact {
+        all = crate::service::search::filter_exact(all, &key);
     }
     Json(ReturnData::ok(serde_json::to_value(all).unwrap_or(serde_json::Value::Null)))
 }
@@ -1845,6 +1869,18 @@ async fn search_book_source(
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let url = param_of(&params, body_json.as_ref(), "url");
     let book_source_param = param_of(&params, body_json.as_ref(), "bookSource");
+    // 精确模式（exact=1）：书名等值匹配（大小写/全半角忽略）；缺省模糊（双向包含）
+    let exact = params.get("exact").map(|v| v == "1").unwrap_or(false)
+        || body_json
+            .as_ref()
+            .and_then(|j| j.get("exact"))
+            .map(|v| {
+                v.as_u64() == Some(1)
+                    || v.as_str()
+                        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
     if url.is_empty() {
         return Json(ReturnData::err("请输入书籍链接"));
     }
@@ -1907,19 +1943,21 @@ async fn search_book_source(
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     let mut handles = Vec::with_capacity(sources.len());
     let ns = namespace.clone();
+    let storage = state.storage.clone();
     for source in sources {
         let sem = semaphore.clone();
         let key = key.to_string();
         let ns = ns.clone();
+        let storage = storage.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
-            crate::service::search::search_one_source(&ns, &source, &key, 1)
+            crate::service::search::search_one_source(&storage, &ns, &source, &key, 1)
                 .await
                 .unwrap_or_default()
         }));
     }
 
-    // ④ 汇总：书名匹配过滤（忽略大小写，双向包含）+ 按书源去重（保留首条）
+    // ④ 汇总：书名匹配过滤（忽略大小写，双向包含；精确模式=书名/作者等值）+ 按书源去重（保留首条）
     let mut all: Vec<crate::service::search::SearchBook> = Vec::new();
     for h in handles {
         if let Ok(books) = h.await {
@@ -1931,8 +1969,12 @@ async fn search_book_source(
     let matched: Vec<_> = all
         .into_iter()
         .filter(|b| {
-            let bl = b.name.to_lowercase();
-            bl.contains(&ql) || ql.contains(&bl)
+            if exact {
+                crate::service::search::exact_match(b, key)
+            } else {
+                let bl = b.name.to_lowercase();
+                bl.contains(&ql) || ql.contains(&bl)
+            }
         })
         .filter(|b| seen.insert(b.origin.clone()))
         .collect();
@@ -2123,6 +2165,13 @@ async fn get_book_toc(
     }
 }
 
+/// 书源使用统计：正文抓取成功 → use_count+1 / use_ts 刷新（计数失败仅记 debug，不影响响应）
+async fn bump_source_use(state: &AppState, ns: &str, source: &crate::model::BookSource) {
+    if let Err(e) = state.storage.bump_book_source_use(ns, &source.book_source_url).await {
+        tracing::debug!("书源使用计数失败 [{}]: {e}", source.book_source_name);
+    }
+}
+
 /// POST/GET /reader3/getBookContent：章节正文（ruleContent）
 async fn get_book_content(
     State(state): State<AppState>,
@@ -2186,10 +2235,13 @@ async fn get_book_content(
             return match crate::service::book::analyze_media_url(&namespace, &chapter_url, &source)
                 .await
             {
-                Ok(url) => Json(ReturnData::ok(serde_json::json!({
-                    "audioUrl": url,
-                    "contentType": crate::service::book::audio_content_type(&url),
-                }))),
+                Ok(url) => {
+                    bump_source_use(&state, &namespace, &source).await;
+                    Json(ReturnData::ok(serde_json::json!({
+                        "audioUrl": url,
+                        "contentType": crate::service::book::audio_content_type(&url),
+                    })))
+                }
                 Err(e) => {
                     tracing::error!("getBookContent(音频) 失败 [{chapter_url}]: {e}");
                     Json(ReturnData::err("获取音频失败"))
@@ -2201,9 +2253,12 @@ async fn get_book_content(
             return match crate::service::book::analyze_comic_images(&namespace, &chapter_url, &source)
                 .await
             {
-                Ok(images) if !images.is_empty() => Json(ReturnData::ok(serde_json::json!({
-                    "images": images,
-                }))),
+                Ok(images) if !images.is_empty() => {
+                    bump_source_use(&state, &namespace, &source).await;
+                    Json(ReturnData::ok(serde_json::json!({
+                        "images": images,
+                    })))
+                }
                 Ok(_) => Json(ReturnData::err("未提取到图片，请检查书源规则")),
                 Err(e) => {
                     tracing::error!("getBookContent(漫画) 失败 [{chapter_url}]: {e}");
@@ -2216,9 +2271,12 @@ async fn get_book_content(
             return match crate::service::book::analyze_media_url(&namespace, &chapter_url, &source)
                 .await
             {
-                Ok(url) => Json(ReturnData::ok(serde_json::json!({
-                    "downloadUrl": url,
-                }))),
+                Ok(url) => {
+                    bump_source_use(&state, &namespace, &source).await;
+                    Json(ReturnData::ok(serde_json::json!({
+                        "downloadUrl": url,
+                    })))
+                }
                 Err(e) => {
                     tracing::error!("getBookContent(文件) 失败 [{chapter_url}]: {e}");
                     Json(ReturnData::err("获取下载链接失败"))
@@ -2230,9 +2288,12 @@ async fn get_book_content(
             return match crate::service::book::analyze_media_url(&namespace, &chapter_url, &source)
                 .await
             {
-                Ok(url) => Json(ReturnData::ok(serde_json::json!({
-                    "videoUrl": url,
-                }))),
+                Ok(url) => {
+                    bump_source_use(&state, &namespace, &source).await;
+                    Json(ReturnData::ok(serde_json::json!({
+                        "videoUrl": url,
+                    })))
+                }
                 Err(e) => {
                     tracing::error!("getBookContent(视频) 失败 [{chapter_url}]: {e}");
                     Json(ReturnData::err("获取视频失败"))
@@ -2264,6 +2325,8 @@ async fn get_book_content(
                     .cache_chapter_content(&book_url, idx, &title, &content)
                     .await;
             }
+            // 书源使用统计：正文抓取成功
+            bump_source_use(&state, &namespace, &source).await;
             Json(ReturnData::ok(serde_json::json!({ "content": content })))
         }
         Err(e) => {
@@ -2276,7 +2339,8 @@ async fn get_book_content(
 // ==================== 差距补全批：导出 / 调试 / 缓存 / 配置 / 刷新 / 批量 / 健康 / 统计 ====================
 
 /// GET /reader3/exportBook：多格式导出（url 单本 + format=txt|epub|html）
-/// txt=章节拼接（GAP 104：encoding=utf-8|gbk|gb2312|gb18030 转码）、epub=zip 构造、html=单页
+/// txt=章节拼接（GAP 104：encoding=utf-8|gbk|gb2312|gb18030 转码）、epub=zip 构造
+/// （GAP 176：font=none|lxk-wenkai|source-han-serif 内嵌中文字体）、html=单页
 async fn export_book(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -2299,6 +2363,15 @@ async fn export_book(
     }
     // GAP 104：TXT 导出编码（utf-8 默认；gbk/gb2312/gb18030；其他格式固定 UTF-8）
     let encoding = param_of(&params, body_json.as_ref(), "encoding");
+    // GAP 176：epub 内嵌中文字体（none|lxk-wenkai|source-han-serif；缺省 none；仅 epub 生效）
+    let font = match crate::service::export_book::EmbedFont::parse_param(&param_of(
+        &params,
+        body_json.as_ref(),
+        "font",
+    )) {
+        Ok(f) => f,
+        Err(msg) => return Json(ReturnData::err(msg)).into_response(),
+    };
     let (title, author, chapters) =
         match collect_export_chapters(&state, &namespace, &url, &params, body_json.as_ref()).await
         {
@@ -2319,21 +2392,20 @@ async fn export_book(
         // GAP 111：epub 导出携带封面（OPF manifest properties="cover-image" +
         // <meta name="cover"> + OEBPS/cover.{jpg,png} 图片条目）；本地封面直读，
         // 远程封面短超时抓取，失败静默降级为无封面
+        // GAP 176：font 参数指定时内嵌中文字体（OPF manifest 字体条目 + style.css
+        // @font-face + OEBPS/fonts/*.woff2 + 章节链接样式表）
         "epub" => {
             let cover = book_cover_bytes(&state, &namespace, &url).await;
-            let epub = if let Some(cover) = cover {
-                crate::service::export_book::build_epub_full(
-                    &title,
-                    &author,
-                    &crate::service::export_book::EpubMeta {
-                        cover: Some(cover),
-                        ..Default::default()
-                    },
-                    &export_chapters,
-                )
-            } else {
-                crate::service::export_book::build_epub(&title, &author, &export_chapters)
-            };
+            let epub = crate::service::export_book::build_epub_full(
+                &title,
+                &author,
+                &crate::service::export_book::EpubMeta {
+                    cover,
+                    font,
+                    ..Default::default()
+                },
+                &export_chapters,
+            );
             (epub, "application/epub+zip".to_string(), "epub")
         }
         "html" => (
@@ -3288,6 +3360,8 @@ async fn get_invalid_book_sources(
         }
     };
     let invalid = crate::service::health::find_invalid(&namespace, &sources).await;
+    // 服务监控：记录最近一次书源检测结果（总数/失败数 → 成功率）
+    crate::service::monitor::record_book_source_check(&namespace, sources.len() as u64, invalid.len() as u64);
     let arr: Vec<serde_json::Value> = invalid
         .into_iter()
         .map(|(s, reason)| {
@@ -3326,6 +3400,8 @@ async fn disable_invalid_book_sources(
         return Json(ReturnData::ok(json!({ "count": 0, "disabled": [] })));
     }
     let invalid = crate::service::health::find_invalid(&namespace, &sources).await;
+    // 服务监控：记录最近一次书源检测结果
+    crate::service::monitor::record_book_source_check(&namespace, sources.len() as u64, invalid.len() as u64);
     let mut disabled: Vec<String> = Vec::new();
     for (s, reason) in &invalid {
         match state
@@ -3585,6 +3661,7 @@ async fn search_book_source_sse(
     let (tx, rx) =
         tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::convert::Infallible>>();
     let ns = namespace.clone();
+    let storage = state.storage.clone();
     tokio::spawn(async move {
         if sources.is_empty() {
             let payload = json!({ "lastIndex": -1, "isEnd": true });
@@ -3597,9 +3674,10 @@ async fn search_book_source_sse(
             let sem = semaphore.clone();
             let key = key.clone();
             let ns = ns.clone();
+            let storage = storage.clone();
             tasks.push(Box::pin(async move {
                 let _permit = sem.acquire().await;
-                let books = crate::service::search::search_one_source(&ns, &source, &key, 1)
+                let books = crate::service::search::search_one_source(&storage, &ns, &source, &key, 1)
                     .await
                     .unwrap_or_default();
                 (i as i64, books)
@@ -5120,6 +5198,7 @@ async fn search_book_multi_sse(
     // 参数解析（POST body JSON 优先，GET query 兜底）
     let mut key = params.get("key").cloned().unwrap_or_default();
     let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
+    let mut exact = params.get("exact").map(|v| v == "1").unwrap_or(false);
     let mut last_index = params
         .get("lastIndex")
         .and_then(|v| v.parse::<i64>().ok())
@@ -5139,6 +5218,12 @@ async fn search_book_multi_sse(
             }
             if let Some(v) = json.get("bookSourceGroup").and_then(|v| v.as_str()) {
                 group = v.to_string();
+            }
+            if let Some(v) = json.get("exact") {
+                exact = v.as_u64() == Some(1)
+                    || v.as_str()
+                        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
             }
             if let Some(v) = json.get("lastIndex").and_then(|v| v.as_i64()) {
                 last_index = v;
@@ -5194,6 +5279,7 @@ async fn search_book_multi_sse(
     let start = (last_index + 1).max(0) as usize;
     let end = (start + search_size).min(sources.len());
     let ns = namespace.clone();
+    let storage = state.storage.clone();
     tokio::spawn(async move {
         // 并发受控（semaphore），结果到达即推送（FuturesUnordered 完成顺序）
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrent_count));
@@ -5202,11 +5288,18 @@ async fn search_book_multi_sse(
             let sem = sem.clone();
             let key = key.clone();
             let ns = ns.clone();
+            let storage = storage.clone();
             let source = sources[i].clone();
             tasks.push(Box::pin(async move {
                 let _permit = sem.acquire().await;
                 let books =
-                    crate::service::search::search_one_source(&ns, &source, &key, 1).await.unwrap_or_default();
+                    crate::service::search::search_one_source(&storage, &ns, &source, &key, 1).await.unwrap_or_default();
+                // 精确模式（exact=1）：书源规则解析后按书名/作者等值过滤（大小写/全半角忽略）
+                let books = if exact {
+                    crate::service::search::filter_exact(books, &key)
+                } else {
+                    books
+                };
                 let payload = serde_json::json!({ "lastIndex": i as i64, "data": books });
                 (i as i64, format!("event: book\ndata: {payload}\n\n"))
             }));
@@ -6383,9 +6476,13 @@ async fn import_default_txt_toc_rules(
     }
 }
 
-// ---------------- 系统信息 + 书源导出 ----------------
+// ---------------- 系统信息 + 服务监控 + 书源导出 ----------------
 
-/// GET /reader3/getSystemInfo：系统信息（版本/端口/用户数/书数/书源数 + legacy 兼容内存字段）
+/// GET /reader3/getSystemInfo：系统信息（版本/端口/用户数/书数/书源数 + 真实监控聚合）
+///
+/// legacy 兼容内存字段（freeMemory/totalMemory/maxMemory，"NNN M" 字符串）为真实值——
+/// Windows 上经 sysinfo 读取物理内存，不再全 0M；另附结构化 memory/cpu/requests/
+/// online/bookSource（与 getServerStats 相同聚合）。
 async fn get_system_info(
     State(state): State<AppState>,
     Query(_params): Query<HashMap<String, String>>,
@@ -6396,17 +6493,31 @@ async fn get_system_info(
     let book_count = state.storage.count_books().await.unwrap_or(0);
     let source_count = state.storage.count_all_book_sources().await.unwrap_or(0);
     let version = env!("CARGO_PKG_VERSION");
-    Json(ReturnData::ok(serde_json::json!({
-        "version": version,
-        "port": state.storage.config.port,
-        "userCount": user_count,
-        "bookCount": book_count,
-        "bookSourceCount": source_count,
-        // legacy 兼容字段（内存统计：暂不引入系统探针依赖，置 0）
-        "freeMemory": "0M",
-        "totalMemory": "0M",
-        "maxMemory": "0M",
-    })))
+    let agg = crate::service::monitor::collect(&state.storage).await;
+    let mut data = agg.to_json();
+    data["version"] = json!(version);
+    data["port"] = json!(state.storage.config.port);
+    data["userCount"] = json!(user_count);
+    data["bookCount"] = json!(book_count);
+    data["bookSourceCount"] = json!(source_count);
+    // legacy 兼容字段（真实值，单位 MB 字符串）
+    data["freeMemory"] = json!(format!("{}M", agg.memory.available_mb));
+    data["totalMemory"] = json!(format!("{}M", agg.memory.total_mb));
+    data["maxMemory"] = json!(format!("{}M", agg.memory.total_mb));
+    Json(ReturnData::ok(data))
+}
+
+/// GET /reader3/getServerStats：服务监控聚合
+///
+/// 内存（总量/可用/已用/进程，MB + 百分比）、CPU（短采样 ~200ms）、请求计数
+/// （总数/今日/按接口 Top10）、在线会话（有效 token 数）、书源成功率（最近一次检测
+/// 结果，未检测则 successRate=null + 说明）、uptime。
+async fn get_server_stats(State(state): State<AppState>) -> Json<ReturnData> {
+    let agg = crate::service::monitor::collect(&state.storage).await;
+    let mut data = agg.to_json();
+    data["version"] = json!(env!("CARGO_PKG_VERSION"));
+    data["port"] = json!(state.storage.config.port);
+    Json(ReturnData::ok(data))
 }
 
 /// GET /reader3/exportBookSources：当前命名空间书源 JSON 下载（attachment）
@@ -6666,8 +6777,8 @@ async fn get_book_toc_loc_book(
         .or_else(|| books.iter().find(|b| b.origin == "loc_book"))?;
     let book_url = &book.book_url;
     tracing::debug!("loc_book toc: req={req_url} matched={book_url}");
-    // GAP 171：已迁移（migrateLocBook）的书——章节表命中即 DB 直读
-    if let Ok(chapters) = state.storage.list_chapters(book_url).await {
+    // GAP 171：已迁移（migrateLocBook）的书——章节表命中即 DB 直读（含字数）
+    if let Ok(chapters) = state.storage.list_chapters_with_word_count(book_url).await {
         if !chapters.is_empty() {
             return toc_json_from_chapters(book_url, &chapters);
         }
@@ -6699,6 +6810,7 @@ async fn get_book_toc_loc_book(
                 "url": format!("{book_url}#{i}"),
                 "isVolume": false,
                 "index": i,
+                "chapterWordCount": c.content.chars().count(),
             })
         })
         .collect();
@@ -6707,8 +6819,8 @@ async fn get_book_toc_loc_book(
 
 /// 文件型本地书目录：按扩展名解析（TXT 用用户规则）→ 章节列表（chapterUrl = bookUrl#index）
 async fn get_book_toc_file(state: &AppState, ns: &str, book_url: &str) -> Option<Json<ReturnData>> {
-    // GAP 171：已迁移（migrateLocBook）的书——章节表命中即 DB 直读（不再解析文件）
-    if let Ok(chapters) = state.storage.list_chapters(book_url).await {
+    // GAP 171：已迁移（migrateLocBook）的书——章节表命中即 DB 直读（含字数）
+    if let Ok(chapters) = state.storage.list_chapters_with_word_count(book_url).await {
         if !chapters.is_empty() {
             return toc_json_from_chapters(book_url, &chapters);
         }
@@ -6728,25 +6840,27 @@ async fn get_book_toc_file(state: &AppState, ns: &str, book_url: &str) -> Option
                 "url": format!("{book_url}#{i}"),
                 "isVolume": false,
                 "index": i,
+                "chapterWordCount": c.content.chars().count(),
             })
         })
         .collect();
     Some(Json(ReturnData::ok(serde_json::Value::Array(list))))
 }
 
-/// 章节表 → 目录 JSON（文件书 url 格式 {book_url}#{index}）
+/// 章节表 → 目录 JSON（文件书 url 格式 {book_url}#{index}；含字数 chapterWordCount）
 fn toc_json_from_chapters(
     book_url: &str,
-    chapters: &[(i64, String)],
+    chapters: &[(i64, String, i64)],
 ) -> Option<Json<ReturnData>> {
     let list: Vec<serde_json::Value> = chapters
         .iter()
-        .map(|(idx, title)| {
+        .map(|(idx, title, wc)| {
             serde_json::json!({
                 "title": title,
                 "url": format!("{book_url}#{idx}"),
                 "isVolume": false,
                 "index": idx,
+                "chapterWordCount": wc,
             })
         })
         .collect();
@@ -6777,15 +6891,16 @@ async fn get_book_toc_local(
     _namespace: &str,
     book_url: &str,
 ) -> Option<Json<ReturnData>> {
-    let chapters = state.storage.list_chapters(book_url).await.ok()?;
+    let chapters = state.storage.list_chapters_with_word_count(book_url).await.ok()?;
     let list: Vec<serde_json::Value> = chapters
         .iter()
-        .map(|(idx, title)| {
+        .map(|(idx, title, wc)| {
             serde_json::json!({
                 "title": title,
                 "url": format!("{book_url}/{idx}"),
                 "isVolume": false,
                 "index": idx,
+                "chapterWordCount": wc,
             })
         })
         .collect();
@@ -6904,7 +7019,12 @@ mod tests {
         // 既有认证测试不关心过期——默认禁用（GAP 118 过期由专用测试单独覆盖）
         config.token_ttl_days = 0;
         let storage = crate::storage::init(&config).await.unwrap();
-        (AppState { storage }, dir)
+        // 图片代理磁盘缓存：独立临时目录 + 固定 1MB 容量（不受宿主 env READER_IMAGE_CACHE_MB 影响）
+        let image_cache = crate::service::image_cache::ImageCache::with_capacity(
+            dir.join("storage").join("cache").join("images"),
+            1024 * 1024,
+        );
+        (AppState { storage, image_cache }, dir)
     }
 
     async fn cleanup(state: AppState, dir: std::path::PathBuf) {
@@ -8024,7 +8144,70 @@ mod tests {
         assert_eq!(ret.0.data["userCount"], 0);
         assert_eq!(ret.0.data["bookCount"], 1);
         assert_eq!(ret.0.data["bookSourceCount"], 1);
+        // 真实内存（修复 Windows 全 0M bug）：legacy 字符串字段 + 结构化字段
         assert!(ret.0.data["freeMemory"].is_string());
+        assert!(ret.0.data["totalMemory"].is_string());
+        assert_ne!(ret.0.data["totalMemory"], "0M", "物理内存应真实读取（非 0M）");
+        assert_ne!(ret.0.data["freeMemory"], "0M", "可用内存应真实读取（非 0M）");
+        assert!(ret.0.data["memory"]["totalMb"].as_u64().unwrap() > 0, "memory.totalMb > 0");
+        assert!(ret.0.data["memory"]["availableMb"].as_u64().unwrap() > 0, "memory.availableMb > 0");
+        assert!(ret.0.data["memory"]["percent"].as_f64().unwrap() > 0.0, "memory.percent > 0");
+        assert!(ret.0.data["cpu"]["cores"].as_u64().unwrap() >= 1, "cpu.cores >= 1");
+        assert!(ret.0.data["requests"]["total"].is_number());
+        assert!(ret.0.data["online"]["sessions"].is_number());
+        assert!(ret.0.data["bookSource"]["successRate"].is_null() || ret.0.data["bookSource"]["successRate"].is_number());
+
+        cleanup(state, dir).await;
+    }
+
+    /// getServerStats：监控聚合结构断言（内存/CPU/请求/在线/书源/uptime）
+    #[tokio::test]
+    async fn test_get_server_stats_structure() {
+        let (state, dir) = test_state("statsapi").await;
+        // 模拟中间件已计入的请求（getServerStats 自身不依赖中间件计数）
+        crate::service::monitor::record_request("/reader3/getBookshelf");
+        crate::service::monitor::record_request("/reader3/getBookshelf");
+        crate::service::monitor::record_request("/reader3/getBookSources");
+        // 模拟最近一次书源检测
+        crate::service::monitor::record_book_source_check("default", 10, 3);
+
+        let ret = get_server_stats(AxumState(state.clone())).await;
+        assert!(ret.0.is_success, "{} {}", ret.0.error_msg, ret.0.data);
+        let d = &ret.0.data;
+        // 版本/端口
+        assert_eq!(d["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(d["port"], 8080);
+        assert!(d["timestamp"].as_i64().unwrap() > 0);
+        assert!(d["uptimeSeconds"].as_i64().unwrap() >= 0);
+        // 内存：真实值（总量/可用/已用/进程 + 百分比）
+        assert!(d["memory"]["totalMb"].as_u64().unwrap() > 0, "内存真实读取");
+        assert!(d["memory"]["usedMb"].as_u64().unwrap() > 0);
+        assert!(d["memory"]["processMb"].as_u64().unwrap() > 0, "进程内存真实读取");
+        let pct = d["memory"]["percent"].as_f64().unwrap();
+        assert!((0.0..=100.0).contains(&pct), "内存百分比 0..=100: {pct}");
+        // CPU：短采样 + 核心数
+        let cpu = d["cpu"]["percent"].as_f64().unwrap();
+        assert!((0.0..=100.0).contains(&cpu), "CPU 使用率 0..=100: {cpu}");
+        assert!(d["cpu"]["cores"].as_u64().unwrap() >= 1);
+        // 请求计数：总数/今日/按接口 Top（排序断言）
+        assert!(d["requests"]["total"].as_u64().unwrap() >= 3);
+        assert!(d["requests"]["today"].as_u64().unwrap() >= 3);
+        let top = d["requests"]["topEndpoints"].as_array().unwrap();
+        assert!(!top.is_empty());
+        assert_eq!(top[0]["path"], "/reader3/getBookshelf");
+        assert_eq!(top[0]["count"], 2, "同路径应聚合计数");
+        // 在线会话：数字
+        assert!(d["online"]["sessions"].as_i64().unwrap() >= 0);
+        // 书源成功率：全局最近检测结果（其他检测测试可能并发写入）——只断言结构
+        assert!(d["bookSource"]["total"].as_u64().is_some());
+        assert!(d["bookSource"]["ok"].as_u64().is_some());
+        assert!(d["bookSource"]["failed"].as_u64().is_some());
+        match d["bookSource"]["successRate"].as_f64() {
+            Some(rate) => assert!((0.0..=1.0).contains(&rate), "成功率 0..=1: {rate}"),
+            None => assert!(d["bookSource"]["successRate"].is_null(), "未检测 → null"),
+        }
+        assert!(d["bookSource"]["note"].is_string());
+        assert!(d["bookSource"]["checkedAt"].is_null() || d["bookSource"]["checkedAt"].is_number());
 
         cleanup(state, dir).await;
     }
@@ -9720,6 +9903,129 @@ mod tests {
         let resp = export_book(AxumState(state.clone()), Query(HashMap::new()), HeaderMap::new(), None).await;
         let json: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap();
         assert!(!json["isSuccess"].as_bool().unwrap());
+
+        cleanup(state, dir).await;
+    }
+
+    /// GAP 176：exportBook font 参数——epub 内嵌中文字体（zip 含字体文件 + OPF manifest
+    /// 字体条目 + style.css @font-face）；非法 font 参数明确报错；txt 格式忽略 font
+    #[tokio::test]
+    async fn test_export_book_epub_font_api() {
+        use std::io::Read as _;
+        let (state, dir) = test_state("exportfont").await;
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "local://expfont".into(),
+                    name: "字体书".into(),
+                    author: "作者甲".into(),
+                    origin: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_chapters(
+                "local://expfont",
+                &[("第一章".to_string(), "正文一。".to_string())],
+            )
+            .await
+            .unwrap();
+        let url = "local://expfont".to_string();
+
+        // font=lxk-wenkai → epub 内嵌霞鹜文楷
+        let params: HashMap<String, String> = [
+            ("url".into(), url.clone()),
+            ("format".into(), "epub".into()),
+            ("font".into(), "lxk-wenkai".into()),
+        ]
+        .into_iter()
+        .collect();
+        let resp = export_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap().to_vec();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("epub 应合法");
+        // zip 含字体文件（字节非空且为 woff2 魔数 wOF2）
+        let mut font_file = zip
+            .by_name("OEBPS/fonts/lxgw-wenkai-regular.woff2")
+            .expect("zip 应含字体文件");
+        let mut font_bytes = Vec::new();
+        font_file.read_to_end(&mut font_bytes).unwrap();
+        drop(font_file); // 释放 zip 可变借用（ZipFile 带 Drop——借用延续到作用域尾）
+        assert!(font_bytes.starts_with(b"wOF2"), "woff2 魔数");
+        assert!(font_bytes.len() > 100_000, "完整字体子集: {}B", font_bytes.len());
+        // OPF manifest 字体条目 + style 条目
+        let mut opf = String::new();
+        zip.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(opf.contains("font-embedded"), "OPF 字体条目: {opf}");
+        assert!(opf.contains("fonts/lxgw-wenkai-regular.woff2"));
+        assert!(opf.contains("<item id=\"style\" href=\"style.css\" media-type=\"text/css\"/>"));
+        // CSS @font-face
+        let mut css = String::new();
+        zip.by_name("OEBPS/style.css").unwrap().read_to_string(&mut css).unwrap();
+        assert!(css.contains("@font-face"), "CSS: {css}");
+        assert!(css.contains("font-family: 'LXGW WenKai';"));
+        assert!(css.contains("url('fonts/lxgw-wenkai-regular.woff2') format('woff2')"));
+        assert!(css.contains("font-family: 'LXGW WenKai', 'Kaiti SC', '楷体', serif;"), "正文应用: {css}");
+        // 章节链接样式表
+        let mut ch0 = String::new();
+        zip.by_name("OEBPS/chap_0000.xhtml").unwrap().read_to_string(&mut ch0).unwrap();
+        assert!(ch0.contains("href=\"style.css\""));
+
+        // font=source-han-serif → 思源宋体
+        let params: HashMap<String, String> = [
+            ("url".into(), url.clone()),
+            ("format".into(), "epub".into()),
+            ("font".into(), "source-han-serif".into()),
+        ]
+        .into_iter()
+        .collect();
+        let resp = export_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap().to_vec();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("epub 应合法");
+        assert!(zip.by_name("OEBPS/fonts/source-han-serif-cn-regular.woff2").is_ok());
+
+        // 缺省 font → 无字体条目（既有行为）
+        let params: HashMap<String, String> = [
+            ("url".into(), url.clone()),
+            ("format".into(), "epub".into()),
+        ]
+        .into_iter()
+        .collect();
+        let resp = export_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap().to_vec();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("epub 应合法");
+        assert!(zip.by_name("OEBPS/style.css").is_err(), "无 font 不应有 style.css");
+
+        // 非法 font 参数 → 明确错误
+        let params: HashMap<String, String> = [
+            ("url".into(), url.clone()),
+            ("format".into(), "epub".into()),
+            ("font".into(), "comic-sans".into()),
+        ]
+        .into_iter()
+        .collect();
+        let resp = export_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        let json: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap());
+        assert!(json["errorMsg"].as_str().unwrap().contains("不支持的字体"), "{json}");
+
+        // txt 格式忽略 font（不报错）
+        let params: HashMap<String, String> = [
+            ("url".into(), url.clone()),
+            ("format".into(), "txt".into()),
+            ("font".into(), "lxk-wenkai".into()),
+        ]
+        .into_iter()
+        .collect();
+        let resp = export_book(AxumState(state.clone()), Query(params), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
 
         cleanup(state, dir).await;
     }
@@ -11480,6 +11786,80 @@ mod tests {
         let resp = assets_proxy(AxumState(state.clone()), Query(params), HeaderMap::new()).await;
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("参数错误"));
+        cleanup(state, dir).await;
+    }
+
+    /// GAP：/assets/proxy 磁盘缓存——首次回源写盘（短缓存），二次磁盘命中
+    /// （长 Cache-Control，不再回源）；缓存文件落在 storage/cache/images/{md5前16}.png
+    #[tokio::test]
+    async fn test_assets_proxy_disk_cache() {
+        let (state, dir) = test_state("proxy-cache").await;
+        // mock 图片服务器（每请求计数）
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = count.clone();
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 9, 9, 9];
+        let body = png.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let body = body.clone();
+                let cnt = cnt.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let mut resp = head.into_bytes();
+                    resp.extend_from_slice(&body);
+                    let _ = sock.write_all(&resp).await;
+                });
+            }
+        });
+        let img_url = format!("http://{addr}/c.png");
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), img_url.clone());
+
+        // 首次：回源 + 短缓存
+        let resp = assets_proxy(AxumState(state.clone()), Query(params.clone()), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Cache-Control").and_then(|v| v.to_str().ok()),
+            Some("public, max-age=3600"),
+            "首次回源应为短缓存"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        assert_eq!(bytes.to_vec(), png, "图片字节透传");
+
+        // 缓存文件落盘：storage/cache/images/{md5前16}.png
+        let key = crate::util::md5::md5_encode(&img_url);
+        let cache_file = dir
+            .join("storage")
+            .join("cache")
+            .join("images")
+            .join(format!("{}.png", &key[..16]));
+        assert!(cache_file.exists(), "首次拉取应写缓存文件: {cache_file:?}");
+
+        // 二次：磁盘命中 + 长缓存 + 不再回源
+        let resp = assets_proxy(AxumState(state.clone()), Query(params), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Cache-Control").and_then(|v| v.to_str().ok()),
+            Some("public, max-age=31536000, immutable"),
+            "磁盘命中应下发长 Cache-Control"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        assert_eq!(bytes.to_vec(), png);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "二次请求不应回源"
+        );
         cleanup(state, dir).await;
     }
 

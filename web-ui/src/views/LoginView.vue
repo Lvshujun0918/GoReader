@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { login as loginApi } from '@/api/auth'
 import { useUserStore } from '@/stores/user'
+import { t } from '@/utils/i18n'
 
 const router = useRouter()
 const route = useRoute()
@@ -22,15 +23,15 @@ function switchMode(m: 'login' | 'register') {
 async function submit() {
   const { username, password } = form
   if (!username.trim() || !password) {
-    ElMessage.warning('请输入用户名和密码')
+    ElMessage.warning(t('login.needBoth'))
     return
   }
   if (mode.value === 'register' && username.trim().length < 5) {
-    ElMessage.warning('用户名不能低于 5 位（字母/数字）')
+    ElMessage.warning(t('login.usernameTooShort'))
     return
   }
   if (mode.value === 'register' && password.length < 8) {
-    ElMessage.warning('密码不能低于 8 位')
+    ElMessage.warning(t('login.passwordTooShort'))
     return
   }
 
@@ -44,7 +45,7 @@ async function submit() {
       code: mode.value === 'register' && form.code.trim() ? form.code.trim() : undefined,
     })
     store.setSession(res.data.accessToken, res.data.username, remember.value)
-    ElMessage.success(mode.value === 'login' ? '欢迎回来' : '注册成功，已自动登录')
+    ElMessage.success(mode.value === 'login' ? t('login.welcomeBack') : t('login.registered'))
     // GAP 127：登录成功回跳 redirect query（仅限站内路径，防开放重定向）
     const q = route.query.redirect
     const redirect =
@@ -63,8 +64,8 @@ async function submit() {
     <main class="login-panel">
       <!-- 徽标 + 字标 -->
       <div class="wordmark">
-        <img class="login-logo" src="/logo.svg" alt="夜读" />
-        <h1 class="wordmark-text">夜读<span class="wordmark-dot">.</span></h1>
+        <img class="login-logo" src="/logo.svg" :alt="t('brand.name')" />
+        <h1 class="wordmark-text">{{ t('brand.name') }}<span class="wordmark-dot">.</span></h1>
         <p class="wordmark-sub">READER</p>
       </div>
 
@@ -75,26 +76,26 @@ async function submit() {
           :class="{ active: mode === 'login' }"
           @click="switchMode('login')"
         >
-          登录
+          {{ t('login.title') }}
         </button>
         <button
           type="button"
           :class="{ active: mode === 'register' }"
           @click="switchMode('register')"
         >
-          注册
+          {{ t('login.register') }}
         </button>
       </div>
 
       <!-- 下划线风格表单 -->
       <form class="login-form" @submit.prevent="submit">
         <label class="field">
-          <span class="field-label">用户名</span>
+          <span class="field-label">{{ t('login.username') }}</span>
           <input
             v-model="form.username"
             class="field-input"
             type="text"
-            placeholder="请输入用户名"
+            :placeholder="t('login.placeholder.username')"
             maxlength="32"
             autocomplete="username"
             spellcheck="false"
@@ -102,12 +103,12 @@ async function submit() {
         </label>
 
         <label class="field">
-          <span class="field-label">密码</span>
+          <span class="field-label">{{ t('login.password') }}</span>
           <input
             v-model="form.password"
             class="field-input"
             type="password"
-            placeholder="至少 8 位"
+            :placeholder="t('login.placeholder.password')"
             maxlength="64"
             autocomplete="current-password"
           />
@@ -115,12 +116,12 @@ async function submit() {
 
         <!-- GAP 90：注册模式邀请码（后端开启邀请注册时必填；未开启可留空） -->
         <label v-if="mode === 'register'" class="field">
-          <span class="field-label">邀请码</span>
+          <span class="field-label">{{ t('login.inviteCode') }}</span>
           <input
             v-model="form.code"
             class="field-input"
             type="text"
-            placeholder="邀请码（如后端未开启邀请注册可留空）"
+            :placeholder="t('login.placeholder.code')"
             maxlength="64"
             autocomplete="off"
             spellcheck="false"
@@ -130,25 +131,25 @@ async function submit() {
         <!-- GAP 150：记住我（不勾选 → sessionStorage 存 token，关闭标签页即登出） -->
         <label class="remember-row">
           <input v-model="remember" class="remember-box" type="checkbox" />
-          <span class="remember-label">记住我（30 天免登录；不勾选则关闭标签页后需重新登录）</span>
+          <span class="remember-label">{{ t('login.remember') }}</span>
         </label>
 
         <button class="submit-btn" type="submit" :disabled="loading">
           <span v-if="loading" class="btn-spinner" aria-hidden="true"></span>
-          <span v-else>{{ mode === 'login' ? '登 录' : '注 册' }}</span>
+          <span v-else>{{ mode === 'login' ? t('login.submit') : t('login.registerSubmit') }}</span>
         </button>
       </form>
 
       <p class="login-foot">
-        {{ mode === 'login' ? '还没有账号？' : '已有账号？' }}
+        {{ mode === 'login' ? t('login.noAccount') : t('login.hasAccount') }}
         <button
           type="button"
           class="link-btn"
           @click="switchMode(mode === 'login' ? 'register' : 'login')"
         >
-          {{ mode === 'login' ? '立即注册' : '去登录' }}
+          {{ mode === 'login' ? t('login.goRegister') : t('login.goLogin') }}
         </button>
-        <a class="tg-foot" href="https://t.me/readerdev" target="_blank" rel="noopener">Telegram 交流群</a>
+        <a class="tg-foot" href="https://t.me/readerdev" target="_blank" rel="noopener">{{ t('login.tgGroup') }}</a>
       </p>
     </main>
 

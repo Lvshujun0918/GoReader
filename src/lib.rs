@@ -114,6 +114,8 @@ impl AppConfig {
         let app = app.layer(tower_http::compression::CompressionLayer::new());
         // GAP 62：multipart 超限（DefaultBodyLimit 413）→ 替换为明确的 JSON 错误（最外层兜底）
         let app = app.layer(crate::middleware::upload_limit::UploadLimitLayer { max_mb: self.upload_max_mb });
+        // 服务监控：请求计数（最外层——413/404/静态资源同样计入）
+        let app = app.layer(crate::middleware::stats::StatsLayer);
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         tracing::info!("reader-dev (Rust) listening on {addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;

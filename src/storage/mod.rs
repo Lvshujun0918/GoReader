@@ -293,6 +293,8 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             last_update_time INTEGER DEFAULT 0,
             respond_time INTEGER DEFAULT 0,
             weight INTEGER DEFAULT 0,
+            use_count INTEGER DEFAULT 0,
+            use_ts INTEGER DEFAULT 0,
             explore_url TEXT,
             search_url TEXT,
             rule_explore TEXT,
@@ -546,6 +548,10 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     ensure_column_typed(&pool, "books", "local_file_size", "INTEGER DEFAULT 0").await?;
     ensure_column_typed(&pool, "books", "local_file_deleted", "INTEGER DEFAULT 0").await?;
 
+    // 书源使用统计列（幂等补列：旧库缺 use_count/use_ts 时 ALTER TABLE 补上）
+    ensure_column_typed(&pool, "book_sources", "use_count", "INTEGER DEFAULT 0").await?;
+    ensure_column_typed(&pool, "book_sources", "use_ts", "INTEGER DEFAULT 0").await?;
+
     tracing::info!("storage initialized at {}", db_path.display());
 
     // JSON → SQLite 迁移（幂等：users 表非空跳过）
@@ -637,9 +643,11 @@ impl Storage {
     }
 
     /// 书源列表（按命名空间；无则回退 default）
+    /// 默认排序：weight DESC 优先（权重自动调整后高权重书源靠前），
+    /// 权重相同回落 custom_order（legacy 手动排序），再按名称稳定排序。
     pub async fn get_book_sources(&self, ns: &str) -> Result<Vec<crate::model::BookSource>> {
         let rows = sqlx::query_as::<_, crate::model::BookSource>(
-            "SELECT * FROM book_sources WHERE user_namespace = ?1 ORDER BY custom_order, book_source_name",
+            "SELECT * FROM book_sources WHERE user_namespace = ?1 ORDER BY weight DESC, custom_order, book_source_name",
         )
         .bind(ns)
         .fetch_all(&self.pool)
@@ -649,11 +657,26 @@ impl Storage {
         }
         // 回退 default 命名空间（legacy 语义：用户无书源时用系统书源）
         sqlx::query_as::<_, crate::model::BookSource>(
-            "SELECT * FROM book_sources WHERE user_namespace = 'default' ORDER BY custom_order, book_source_name",
+            "SELECT * FROM book_sources WHERE user_namespace = 'default' ORDER BY weight DESC, custom_order, book_source_name",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// 书源使用统计自增（搜索/换源/正文抓取成功时调用）：
+    /// use_count+1 并刷新 use_ts（原子 UPDATE；未命中行静默忽略，不影响业务）
+    pub async fn bump_book_source_use(&self, ns: &str, url: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE book_sources SET use_count = use_count + 1, use_ts = ?1 \
+             WHERE user_namespace = ?2 AND book_source_url = ?3",
+        )
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(ns)
+        .bind(url)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// 按 URL 查书源（精确或前缀匹配，兼容 ##@ 后缀；用户命名空间 + fallback default）
@@ -1226,6 +1249,17 @@ impl Storage {
     pub async fn list_chapters(&self, book_url: &str) -> Result<Vec<(i64, String)>> {
         let rows = sqlx::query_as::<_, (i64, String)>(
             "SELECT chapter_index, title FROM book_chapters WHERE book_url = ?1 ORDER BY chapter_index",
+        )
+        .bind(book_url)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 本地书章节列表（含字数：SQLite length() 对 TEXT 按字符数统计正文，避免整章内容回传）
+    pub async fn list_chapters_with_word_count(&self, book_url: &str) -> Result<Vec<(i64, String, i64)>> {
+        let rows = sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT chapter_index, title, length(content) FROM book_chapters WHERE book_url = ?1 ORDER BY chapter_index",
         )
         .bind(book_url)
         .fetch_all(&self.pool)
@@ -2462,6 +2496,27 @@ impl Storage {
         Ok(count)
     }
 
+    /// 在线会话数（活跃 token 总数，服务监控用）
+    ///
+    /// 每用户：token_map 非空 → 其条目数（多设备会话，含主 token）；
+    /// 否则主 token 非空 → 1。
+    pub async fn count_active_tokens(&self) -> Result<i64> {
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT token, token_map FROM users")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut n: i64 = 0;
+        for (token, token_map) in rows {
+            if let Some(map) = token_map {
+                let v: Option<serde_json::Value> = serde_json::from_str(&map).ok();
+                n += crate::model::user::token_map_list(&v).len() as i64;
+            } else if !token.is_empty() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// 新建用户
     pub async fn insert_user(&self, user: &User) -> Result<()> {
         sqlx::query(
@@ -3561,8 +3616,12 @@ async fn rebuild_books_bool_columns(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// INSERT OR REPLACE 单条书源（save_book_source / save_book_sources 共用；
+/// 单条书源 upsert（save_book_source / save_book_sources 共用；
 /// raw_json 由 serde 按 camelCase 重新序列化，序列化时跳过 user_namespace / raw_json 内部字段）
+///
+/// 用 INSERT ... ON CONFLICT DO UPDATE 而非 INSERT OR REPLACE：
+/// REPLACE 会先删后插，未列出的列（use_count/use_ts 使用统计）会被重置为默认值；
+/// DO UPDATE 只覆盖客户端字段，统计列保持不变（客户端保存/导入不会清零计数）。
 async fn upsert_book_source<'e, E>(executor: E, ns: &str, source: &crate::model::BookSource) -> Result<()>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
@@ -3570,7 +3629,7 @@ where
     let raw_json = serde_json::to_string(source)?;
     sqlx::query(
         r#"
-        INSERT OR REPLACE INTO book_sources
+        INSERT INTO book_sources
             (book_source_url, book_source_name, book_source_group, book_source_type,
              book_url_pattern, custom_order, enabled, enabled_explore, enabled_cookie_jar,
              concurrent_rate, header, login_url, login_ui, login_check_js, login_js,
@@ -3581,6 +3640,45 @@ where
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
                 ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)
+        ON CONFLICT(book_source_url) DO UPDATE SET
+            book_source_name = excluded.book_source_name,
+            book_source_group = excluded.book_source_group,
+            book_source_type = excluded.book_source_type,
+            book_url_pattern = excluded.book_url_pattern,
+            custom_order = excluded.custom_order,
+            enabled = excluded.enabled,
+            enabled_explore = excluded.enabled_explore,
+            enabled_cookie_jar = excluded.enabled_cookie_jar,
+            concurrent_rate = excluded.concurrent_rate,
+            header = excluded.header,
+            login_url = excluded.login_url,
+            login_ui = excluded.login_ui,
+            login_check_js = excluded.login_check_js,
+            login_js = excluded.login_js,
+            book_source_comment = excluded.book_source_comment,
+            variable_comment = excluded.variable_comment,
+            last_update_time = excluded.last_update_time,
+            respond_time = excluded.respond_time,
+            weight = excluded.weight,
+            explore_url = excluded.explore_url,
+            search_url = excluded.search_url,
+            rule_explore = excluded.rule_explore,
+            rule_search = excluded.rule_search,
+            rule_book_info = excluded.rule_book_info,
+            rule_toc = excluded.rule_toc,
+            rule_content = excluded.rule_content,
+            rule_related = excluded.rule_related,
+            search_rule = excluded.search_rule,
+            explore_rule = excluded.explore_rule,
+            book_info_rule = excluded.book_info_rule,
+            toc_rule = excluded.toc_rule,
+            content_rule = excluded.content_rule,
+            key = excluded.key,
+            tag = excluded.tag,
+            logger = excluded.logger,
+            variable = excluded.variable,
+            user_namespace = excluded.user_namespace,
+            raw_json = excluded.raw_json
         "#,
     )
     .bind(&source.book_source_url)
@@ -3854,6 +3952,107 @@ mod tests {
         assert_eq!(groups_fb, vec!["小说", "玄幻"]);
 
         cleanup(storage, "batch").await;
+    }
+
+    /// 书源使用统计：bump 原子自增 use_count/use_ts；命名空间/URL 隔离；
+    /// 客户端重新保存（全字段 upsert）不清零统计；serde 输出不携带统计字段
+    #[tokio::test]
+    async fn test_book_source_use_stats() {
+        let storage = test_storage("usestats").await;
+        let s = source("https://stats.com", "统计源", None);
+        storage.save_book_source("default", &s).await.unwrap();
+
+        let got = storage
+            .get_book_source("default", "https://stats.com")
+            .await
+            .unwrap()
+            .expect("保存后应能查到");
+        assert_eq!(got.use_count, 0, "初始计数为 0");
+        assert_eq!(got.use_ts, 0, "初始时间戳为 0");
+
+        // 两次自增：use_count=2 且 use_ts 刷新为当前毫秒时间戳
+        storage
+            .bump_book_source_use("default", "https://stats.com")
+            .await
+            .unwrap();
+        storage
+            .bump_book_source_use("default", "https://stats.com")
+            .await
+            .unwrap();
+        let got = storage
+            .get_book_source("default", "https://stats.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.use_count, 2);
+        assert!(got.use_ts > 0);
+
+        // 不存在的源 / 其他命名空间：静默忽略不报错
+        storage
+            .bump_book_source_use("default", "https://nope.com")
+            .await
+            .unwrap();
+        storage
+            .bump_book_source_use("ghost", "https://stats.com")
+            .await
+            .unwrap();
+        let got = storage
+            .get_book_source("default", "https://stats.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.use_count, 2, "无关 bump 不应影响计数");
+
+        // 客户端重新保存（save_book_source 全字段覆盖）不清零统计
+        let mut s2 = source("https://stats.com", "统计源改名", None);
+        s2.custom_order = 5;
+        storage.save_book_source("default", &s2).await.unwrap();
+        let got = storage
+            .get_book_source("default", "https://stats.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.use_count, 2, "客户端保存不应重置使用统计");
+        assert_eq!(got.book_source_name, "统计源改名", "覆盖保存仍应生效");
+
+        // 统计字段不外泄：serde 输出与 raw_json 均不含 useCount/useTs
+        let json = serde_json::to_value(&got).unwrap();
+        assert!(json.get("useCount").is_none(), "序列化不应含 useCount");
+        assert!(json.get("useTs").is_none(), "序列化不应含 useTs");
+        assert!(
+            !got.raw_json.as_deref().unwrap_or("").contains("useCount"),
+            "raw_json 不应含统计字段"
+        );
+
+        cleanup(storage, "usestats").await;
+    }
+
+    /// getBookSources 默认排序：weight DESC 优先，同权重回落 custom_order
+    #[tokio::test]
+    async fn test_book_sources_weight_order() {
+        let storage = test_storage("weightorder").await;
+        let mut a = source("https://w1.com", "A", None);
+        a.weight = 10;
+        a.custom_order = 0;
+        let mut b = source("https://w2.com", "B", None);
+        b.weight = 100;
+        b.custom_order = 3;
+        let mut c = source("https://w3.com", "C", None);
+        c.weight = 10;
+        c.custom_order = 1;
+        storage
+            .save_book_sources("default", &[a, b, c])
+            .await
+            .unwrap();
+
+        let all = storage.get_book_sources("default").await.unwrap();
+        let urls: Vec<&str> = all.iter().map(|s| s.book_source_url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://w2.com", "https://w1.com", "https://w3.com"],
+            "weight DESC 优先，同权重回落 custom_order"
+        );
+        cleanup(storage, "weightorder").await;
     }
 
     /// 旧库兼容：books.local_epub/local_pdf 为 TEXT 类型时，init 应重建为 INTEGER 且数据无损读回
@@ -5337,6 +5536,45 @@ mod tests {
         assert_eq!(storage.count_books().await.unwrap(), 2);
         assert_eq!(storage.count_all_book_sources().await.unwrap(), 2);
         cleanup(storage, "sysinfo").await;
+    }
+
+    /// 在线会话计数：主 token + token_map 多设备（服务监控）
+    #[tokio::test]
+    async fn test_count_active_tokens() {
+        let storage = test_storage("activetok").await;
+        assert_eq!(storage.count_active_tokens().await.unwrap(), 0, "无用户 → 0");
+
+        // 无 token 用户
+        storage
+            .insert_user(&User {
+                username: "guest".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 单设备：仅主 token
+        storage
+            .insert_user(&User {
+                username: "single".into(),
+                token: "t-main".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 多设备：add_user_token 推入 token_map（主 token = 最近一个）
+        storage.insert_user(&User {
+            username: "multi".into(),
+            ..Default::default()
+        }).await.unwrap();
+        storage.add_user_token("multi", "t-dev1", 1000).await.unwrap();
+        storage.add_user_token("multi", "t-dev2", 2000).await.unwrap();
+
+        assert_eq!(storage.count_active_tokens().await.unwrap(), 3, "单设备 1 + 多设备 2");
+
+        // 登出（清主 token）后多设备仍在线
+        storage.logout_user("single").await.unwrap();
+        assert_eq!(storage.count_active_tokens().await.unwrap(), 2);
+        cleanup(storage, "activetok").await;
     }
 
     /// 缓存管理：getCacheInfo 统计（toc_cache 行数 / book_chapters 行数 / sum length 大小）+

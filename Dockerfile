@@ -12,6 +12,8 @@ FROM rust:1.85-slim AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# GAP 176：epub 导出内嵌中文字体（include_bytes 编译期内嵌 web-ui/public/fonts/）
+COPY web-ui/public/fonts ./web-ui/public/fonts
 RUN cargo build --release
 
 # ---------- 阶段 2：前端构建 ----------

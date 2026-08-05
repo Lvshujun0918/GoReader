@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<link href="css/frame.css" type="text/css" rel="stylesheet" />
+	<script src="libs/jquery-3.4.1.min.js"></script>
+	<script src="frame.js"></script>
+</head>
+<body>
+	<div class="MainDiv">
+		<div class="actions">
+			<div style="display: flex; align-items: center;">
+				<div class="click-area">
+					<div class="do-editor-icon"></div>
+					<div class="label"></div>
+				</div>
+				<div style="flex: 1">
+					<input type="button" class="close-dialog" />
+				</div>
+			</div>
+			<!--
+	<input type="button" class="do_openPDF" id="openButton" />
+	<input type="button" class="close-dialog" />
+	-->
+			<div id="progress-container" style="clear: both; padding: 5px; margin-top: 4px; width: 95%;">
+				<div class="progress" style="height: 3px;">
+					<div class="progress-bar" role="progressbar" style="width: 0%;" aria-valuenow="25" aria-valuemin="0" aria-valuemax="100"></div>
+				</div>
+			</div>
+			<div id="indeterminated-progress-container">
+				<progress style="width: 90%"></progress>
+			</div>
+		</div>
+	</div>
+</body>
+</html>

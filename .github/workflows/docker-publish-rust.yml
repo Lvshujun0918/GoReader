@@ -1,0 +1,78 @@
+name: Publish Rust Release
+
+on:
+  push:
+    tags:
+      - 'v1.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: docker-publish-rust
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    runs-on: DE
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Rust 发版保护
+        shell: bash
+        run: |
+          # 仅 master 分支的 v1.* tag 允许发版（legacy 的 v4.* 走旧 workflow）
+          if git merge-base --is-ancestor $GITHUB_SHA origin/master; then
+            echo 'OK 允许发版'
+          else
+            echo '非 master 祖先——拒绝发版'
+            exit 1
+          fi
+
+      - name: 构建前端
+        working-directory: web-ui
+        run: |
+          npm install
+          npm run build
+
+      - name: 构建 Rust release
+        run: cargo build --release
+
+      - name: 打包 Linux 二进制
+        run: |
+          mkdir -p dist
+          cp target/release/reader-dev dist/reader-dev-linux-x64
+          chmod +x dist/reader-dev-linux-x64
+
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/reader-dev-linux-x64
+          generate_release_notes: true
+
+  docker:
+    runs-on: DE
+    needs: build-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: 登录 GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: 登录 Docker Hub
+        run: |
+          echo "${{ secrets.DOCKERHUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
+      - name: 构建并推送多架构镜像
+        run: |
+          docker buildx create --use --name reader-builder || docker buildx use reader-builder
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            -t ghcr.io/${{ github.repository }}:latest \
+            -t ghcr.io/${{ github.repository }}:${{ github.ref_name }} \
+            -t ${{ secrets.DOCKERHUB_USERNAME }}/reader-dev:latest \
+            -t ${{ secrets.DOCKERHUB_USERNAME }}/reader-dev:${{ github.ref_name }} \
+            .

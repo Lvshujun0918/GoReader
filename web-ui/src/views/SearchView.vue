@@ -7,6 +7,7 @@ import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { useUserStore } from '@/stores/user'
 import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
 import { hanText, syncHanMode } from '@/utils/hanMode'
+import { t } from '@/utils/i18n'
 import type { Book, ReturnData, SearchBook } from '@/types'
 
 const router = useRouter()
@@ -14,6 +15,24 @@ const route = useRoute()
 
 /* ================= 搜索 ================= */
 const key = ref('')
+/** 精确匹配开关（默认关=模糊 contains；开启后请求带 exact=1，后端按书名/作者等值过滤） */
+const EXACT_KEY = 'reader_search_exact'
+function loadExact(): boolean {
+  try {
+    return localStorage.getItem(EXACT_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+const exact = ref(loadExact())
+function toggleExact() {
+  exact.value = !exact.value
+  try {
+    localStorage.setItem(EXACT_KEY, exact.value ? '1' : '0')
+  } catch {
+    /* localStorage 不可用时静默（仅本次会话生效） */
+  }
+}
 const searching = ref(false)
 const searched = ref(false)
 const errorMsg = ref('')
@@ -119,6 +138,7 @@ async function doSearch(kw?: string) {
         lastIndex: -1,
         searchSize: 50,
         concurrentCount: 12,
+        exact: exact.value,
       },
       {
         onBooks: (lastIndex, books) => {
@@ -163,7 +183,7 @@ async function doSearch(kw?: string) {
 async function runBatch(word: string, seq: number, page = 1) {
   batchAbort = new AbortController()
   try {
-    const res = await searchBookMulti(word, 50, batchAbort.signal, page)
+    const res = await searchBookMulti(word, 50, batchAbort.signal, page, exact.value)
     if (seq !== searchSeq) return
     if (!res.isSuccess) {
       if ((res.data as unknown) === 'NEED_LOGIN' || (res.errorMsg || '').includes('请登录')) {
@@ -200,7 +220,7 @@ async function loadMore() {
   batchLoadingMore.value = true
   batchAbort = new AbortController()
   try {
-    const res = await searchBookMulti(word, 50, batchAbort.signal, nextPage)
+    const res = await searchBookMulti(word, 50, batchAbort.signal, nextPage, exact.value)
     if (seq !== searchSeq) return
     if (!res.isSuccess) throw new Error(res.errorMsg || '加载失败，请稍后重试')
     const before = bookMap.size
@@ -341,7 +361,9 @@ const hotSearches = computed(() =>
 )
 /** 占位符：显示当前最热词 */
 const hotPlaceholder = computed(() =>
-  hotSearches.value[0] ? `热门：${hotSearches.value[0]}（书名 / 作者）` : '书名 / 作者',
+  hotSearches.value[0]
+    ? t('search.hotPlaceholder', { h: hotSearches.value[0] })
+    : t('search.placeholder'),
 )
 function recordHotClick(word: string) {
   hotClicks.value = { ...hotClicks.value, [word]: (hotClicks.value[word] ?? 0) + 1 }
@@ -504,14 +526,14 @@ onBeforeUnmount(() => {
           <path d="M19 12H5" />
           <path d="M11 18l-6-6 6-6" />
         </svg>
-        <span>书架</span>
+        <span>{{ t('nav.backShelf') }}</span>
       </button>
       <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand">夜读<span class="brand-dot">.</span></span>
+        <span class="brand">{{ t('brand.name') }}<span class="brand-dot">.</span></span>
     </header>
 
     <main class="content">
-      <h1 class="page-title">搜索</h1>
+      <h1 class="page-title">{{ t('search.title') }}</h1>
 
       <!-- 极简搜索框：细字 + 下划线 focus 强调色 + 搜索按钮 -->
       <div class="search-bar">
@@ -536,8 +558,19 @@ onBeforeUnmount(() => {
           @focus="onSearchFocus"
           @blur="closeSuggest"
         />
+        <!-- 精确匹配开关：默认关（模糊）；开启后请求 exact=1，后端按书名/作者等值过滤 -->
+        <button
+          class="exact-toggle"
+          type="button"
+          :class="{ on: exact }"
+          :title="t('search.exactTip')"
+          :aria-pressed="exact"
+          @click="toggleExact"
+        >
+          {{ t('search.exact') }}
+        </button>
         <button class="search-btn" type="button" :disabled="searching || !key.trim()" @click="onEnter">
-          {{ searching ? '搜索中…' : '搜索' }}
+          {{ searching ? t('common.searching') : t('common.search') }}
         </button>
       </div>
 
@@ -553,14 +586,14 @@ onBeforeUnmount(() => {
         >
           <span class="suggest-text">{{ s.text }}</span>
           <span v-if="s.sub" class="suggest-sub">{{ s.sub }}</span>
-          <span class="suggest-tag" :class="s.kind">{{ s.kind === 'history' ? '历史' : '书架' }}</span>
+          <span class="suggest-tag" :class="s.kind">{{ s.kind === 'history' ? t('search.tag.history') : t('search.tag.shelf') }}</span>
         </button>
       </div>
 
       <!-- GAP 121：热门搜索（静态列表 + 本地点击计数排序） -->
       <div v-if="!searching && !searched && !errorMsg" class="history hot">
         <div class="history-head">
-          <span class="history-label">热门搜索</span>
+          <span class="history-label">{{ t('search.hot') }}</span>
         </div>
         <div class="history-chips">
           <button
@@ -579,8 +612,8 @@ onBeforeUnmount(() => {
       <!-- 搜索历史 -->
       <div v-if="history.length && !searching && !searched && !errorMsg" class="history">
         <div class="history-head">
-          <span class="history-label">搜索历史</span>
-          <button class="history-clear" type="button" @click="clearHistory">清空</button>
+          <span class="history-label">{{ t('search.history') }}</span>
+          <button class="history-clear" type="button" @click="clearHistory">{{ t('common.clear') }}</button>
         </div>
         <div class="history-chips">
           <button
@@ -601,13 +634,13 @@ onBeforeUnmount(() => {
           <path d="M21 12a9 9 0 1 1-6.2-8.56" />
         </svg>
         <span class="state-text">
-          {{ usingSSE ? `正在搜索 · 已搜索 ${searchedSources} 个书源` : '正在搜索多个书源…' }}
+          {{ usingSSE ? t('search.progress', { n: searchedSources }) : t('search.multi') }}
         </span>
-        <button class="stop-btn" type="button" @click="stopSearch">停止</button>
+        <button class="stop-btn" type="button" @click="stopSearch">{{ t('search.stop') }}</button>
       </div>
 
       <!-- GAP 72：搜索首载骨架（shimmer 行；首屏无结果时展示） -->
-      <div v-if="searching && results.length === 0" class="skeleton-list" aria-label="搜索中">
+      <div v-if="searching && results.length === 0" class="skeleton-list" :aria-label="t('common.searching')">
         <div v-for="i in 6" :key="i" class="skeleton-row">
           <div class="skeleton-cover"></div>
           <div class="skeleton-body">
@@ -621,20 +654,20 @@ onBeforeUnmount(() => {
       <!-- 错误态（无结果时整行展示） -->
       <div v-else-if="errorMsg && !results.length" class="state-row">
         <span class="state-text error">{{ errorMsg }}</span>
-        <button class="retry-btn" type="button" @click="doSearch()">重试</button>
+        <button class="retry-btn" type="button" @click="doSearch()">{{ t('common.retry') }}</button>
       </div>
 
       <!-- 空结果 / 已停止 -->
       <div v-else-if="searched && !results.length" class="state-row">
-        <span class="state-text">{{ stopped ? '已停止搜索' : `没有找到与「${key.trim()}」相关的书籍` }}</span>
+        <span class="state-text">{{ stopped ? t('search.stopped') : t('search.noResults', { k: key.trim() }) }}</span>
       </div>
 
       <!-- 结果列表（SSE 增量累积；按书源分组折叠，GAP 23） -->
       <div v-if="results.length" class="results-wrap">
         <p v-if="errorMsg" class="result-note error">{{ errorMsg }}</p>
-        <p v-else-if="stopped" class="result-note">已停止 · 以下为部分结果</p>
+        <p v-else-if="stopped" class="result-note">{{ t('search.stoppedPartial') }}</p>
         <p class="result-meta">
-          共 {{ results.length }} 本书<span v-if="searchedSources"> · 来自 {{ searchedSources }} 个书源</span>
+          {{ t('search.resultsMeta', { n: results.length }) }}<span v-if="searchedSources">{{ t('search.resultsFrom', { n: searchedSources }) }}</span>
         </p>
         <ul class="result-list">
           <li v-for="g in sourceGroups" :key="g.key" class="source-group">
@@ -652,7 +685,7 @@ onBeforeUnmount(() => {
                 <path d="M9 6l6 6-6 6" />
               </svg>
               <span class="group-name" :title="hanText(g.label)">{{ hanText(g.label) }}</span>
-              <span class="group-count">{{ g.count }} 本</span>
+              <span class="group-count">{{ g.count }} {{ t('common.unit.book') }}</span>
             </button>
             <div v-if="!collapsedSources.has(g.key)" class="group-body">
               <div
@@ -668,7 +701,7 @@ onBeforeUnmount(() => {
                 <div class="result-main">
                   <p class="result-name" :title="hanText(entry.book.name)">{{ hanText(entry.book.name) }}</p>
                   <p class="result-sub">
-                    <span class="result-author">{{ hanText(entry.book.author || '佚名') }}</span>
+                    <span class="result-author">{{ hanText(entry.book.author || t('search.unknownAuthor')) }}</span>
                     <span
                       v-for="o in entry.origins"
                       :key="o.key"
@@ -687,7 +720,7 @@ onBeforeUnmount(() => {
                   type="button"
                   :class="{ done: shelfUrlSet.has(entry.book.bookUrl), busy: addingUrls.has(entry.book.bookUrl) }"
                   :disabled="shelfUrlSet.has(entry.book.bookUrl) || addingUrls.has(entry.book.bookUrl)"
-                  :title="shelfUrlSet.has(entry.book.bookUrl) ? '已在书架' : '加入书架'"
+                  :title="shelfUrlSet.has(entry.book.bookUrl) ? t('search.onShelf') : t('search.addShelf')"
                   @click.stop="quickAdd(entry.book)"
                 >
                   <svg v-if="shelfUrlSet.has(entry.book.bookUrl)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
@@ -706,7 +739,7 @@ onBeforeUnmount(() => {
         <!-- GAP 100：底部加载更多（批量模式逐页；SSE 已全量则提示已全部） -->
         <div v-if="searched && results.length" class="load-more">
           <template v-if="usingSSE">
-            <span class="load-all">已全部加载（流式搜索全量返回）</span>
+            <span class="load-all">{{ t('search.loadAll') }}</span>
           </template>
           <template v-else>
             <button
@@ -716,9 +749,9 @@ onBeforeUnmount(() => {
               :disabled="batchLoadingMore"
               @click="loadMore"
             >
-              {{ batchLoadingMore ? '加载中…' : '加载更多' }}
+              {{ batchLoadingMore ? t('common.loading') : t('common.loadMore') }}
             </button>
-            <span v-else class="load-all">已全部加载</span>
+            <span v-else class="load-all">{{ t('search.loadAllShort') }}</span>
           </template>
         </div>
       </div>
@@ -861,6 +894,34 @@ onBeforeUnmount(() => {
 .search-btn:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+/* 精确匹配开关：细字胶囊；开启后 accent 高亮 */
+.exact-toggle {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: none;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+.exact-toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.exact-toggle.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 
 /* ================= 搜索联想（GAP 22） ================= */

@@ -38,3 +38,13 @@ app.use(router)
 app.use(ElementPlus)
 app.directive('lazy', lazy)
 app.mount('#app')
+
+// PWA：Service Worker 注册——仅生产模式（开发期热更新会与 SW 缓存互相干扰）
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch((err) => {
+      // 注册失败不阻断应用（如非 https/localhost 环境）
+      console.warn('[sw] register failed:', err)
+    })
+  })
+}

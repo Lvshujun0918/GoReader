@@ -256,6 +256,20 @@ const resumeLabel = computed(() => {
   return '开始阅读'
 })
 
+/** 阅读进度环（书架数据 durChapterIndex / totalChapterNum；未入架或缺数据（0）时隐藏） */
+const readProgress = computed<{ percent: number; cur: number; total: number } | null>(() => {
+  const b = shelfBook.value
+  const total = b?.totalChapterNum
+  const cur = b?.durChapterIndex
+  if (typeof total !== 'number' || total <= 0) return null
+  if (typeof cur !== 'number' || cur <= 0) return null
+  return {
+    percent: Math.min(100, Math.round((cur / total) * 100)),
+    cur,
+    total,
+  }
+})
+
 /** 非书架书直接阅读（不加入书架——退出时阅读器提醒入架） */
 function startReadingTemp() {
   const b = shelfBook.value ?? info.value
@@ -1150,17 +1164,39 @@ onMounted(() => {
       <div v-else class="detail-layout">
         <!-- 封面 -->
         <div class="cover-wrap">
-          <!-- GAP 19：换封面（右上角；仅书架书可保存） -->
-          <button
-            v-if="shelfBook"
-            class="cover-change"
-            type="button"
-            :disabled="coverBusy"
-            :title="coverBusy ? '上传中…' : '更换封面（上传图片到服务器）'"
-            @click="openCoverPicker"
-          >
-            {{ coverBusy ? '上传中…' : '换封面' }}
-          </button>
+          <!-- 右上角控件组：阅读进度环（常显）+ 换封面（hover 显现，位于环下方不重叠） -->
+          <div class="cover-corner">
+            <div
+              v-if="readProgress"
+              class="read-ring"
+              :class="{ done: readProgress.percent >= 100 }"
+              :title="`读到第 ${readProgress.cur + 1} 章/共 ${readProgress.total} 章`"
+            >
+              <svg class="read-ring-svg" viewBox="0 0 36 36" aria-hidden="true">
+                <circle class="ring-track" cx="18" cy="18" r="15.5" />
+                <circle
+                  class="ring-bar"
+                  cx="18"
+                  cy="18"
+                  r="15.5"
+                  pathLength="100"
+                  :stroke-dasharray="`${readProgress.percent} 100`"
+                />
+              </svg>
+              <span class="read-ring-text">{{ readProgress.percent }}%</span>
+            </div>
+            <!-- GAP 19：换封面（右上角；仅书架书可保存） -->
+            <button
+              v-if="shelfBook"
+              class="cover-change"
+              type="button"
+              :disabled="coverBusy"
+              :title="coverBusy ? '上传中…' : '更换封面（上传图片到服务器）'"
+              @click="openCoverPicker"
+            >
+              {{ coverBusy ? '上传中…' : '换封面' }}
+            </button>
+          </div>
           <img
             v-if="display.cover && !coverFailed"
             :src="resolveCoverUrl(display.cover)"
@@ -1710,12 +1746,70 @@ onMounted(() => {
   transition: color 0.15s ease;
 }
 
-/* ================= 自定义封面（GAP 19） ================= */
-.cover-change {
+/* ================= 自定义封面（GAP 19）+ 阅读进度环（右上角） ================= */
+/* 右上角控件组：进度环常显，换封面 hover 显现（位于环下方，不重叠） */
+.cover-corner {
   position: absolute;
   top: 8px;
   right: 8px;
   z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+/* 阅读进度环：SVG circle + stroke-dasharray 百分比（pathLength=100 归一）；读完变绿 */
+.read-ring {
+  position: relative;
+  width: 44px;
+  height: 44px;
+}
+.read-ring::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: rgba(20, 20, 24, 0.55);
+  backdrop-filter: blur(1px);
+}
+.read-ring-svg {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: block;
+  transform: rotate(-90deg);
+}
+.ring-track {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.3);
+  stroke-width: 3;
+}
+.ring-bar {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  transition: stroke 0.3s ease;
+}
+/* 读完（100%）变绿 */
+.read-ring.done .ring-bar {
+  stroke: #2f9e44;
+}
+.read-ring-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 500;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+}
+.read-ring.done .read-ring-text {
+  color: #7ee2a8;
+}
+.cover-change {
   padding: 4px 10px;
   border: none;
   border-radius: 999px;

@@ -3,6 +3,11 @@
 //! - txt：书名 + 逐章拼接（标题 + 正文）
 //! - epub：zip 构造（mimetype 存根 / META-INF/container.xml / OEBPS/content.opf / spine 章节 XHTML）
 //! - html：单页（标题 + 章节标题/正文段落）
+//!
+//! 内嵌中文字体（GAP 176）：`EpubMeta.font` 指定后，epub 内嵌 web-ui/public/fonts/ 的
+//! woff2 子集（编译期 include_bytes——单源无拷贝，路径相对本文件：src/service → 仓库根），
+//! OPF manifest 声明字体条目 + style.css
+//! @font-face 引用 + 字体文件写入 OEBPS/fonts/，章节 XHTML 链接 style.css。
 
 use std::io::Write;
 
@@ -12,6 +17,77 @@ use futures::StreamExt as _; // buffer_unordered（GAP 104b 并发抓章）
 pub struct ExportChapter {
     pub title: String,
     pub content: String,
+}
+
+/// EPUB 内嵌中文字体（GAP 176）：web-ui/public/fonts/ 现有 woff2 子集（编译期内嵌，单源无拷贝）
+///
+/// 格式结论：项目仅有 woff2（无 ttf/otf 来源）。woff2 需 EPUB3 时代阅读器
+/// （Apple Books / Google Play Books / Kobo / ADE 4.5+ / 新版 Kindle 均支持）；
+/// Kindle 老设备（MOBI/早期 KF8）与不支持字体内嵌的阅读器会忽略 @font-face，
+/// 自动回退 font-family 栈里的系统字体（不影响可读性）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmbedFont {
+    /// 不内嵌字体（默认）
+    #[default]
+    None,
+    /// 霞鹜文楷（LXGW WenKai Regular，楷体风格）
+    LxgwWenKai,
+    /// 思源宋体（Source Han Serif CN Regular，宋体风格）
+    SourceHanSerif,
+}
+
+impl EmbedFont {
+    /// 解析 exportBook 的 font 参数（none|lxk-wenkai|source-han-serif；空串/缺省 = none；大小写不敏感）
+    pub fn parse_param(s: &str) -> Result<EmbedFont, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "none" => Ok(EmbedFont::None),
+            "lxk-wenkai" => Ok(EmbedFont::LxgwWenKai),
+            "source-han-serif" => Ok(EmbedFont::SourceHanSerif),
+            other => Err(format!("不支持的字体（none|lxk-wenkai|source-han-serif）：{other}")),
+        }
+    }
+
+    /// @font-face 的 font-family 名（与 web-ui 阅读器一致）
+    pub fn family(self) -> Option<&'static str> {
+        match self {
+            EmbedFont::None => None,
+            EmbedFont::LxgwWenKai => Some("LXGW WenKai"),
+            EmbedFont::SourceHanSerif => Some("Source Han Serif CN"),
+        }
+    }
+
+    /// zip 内相对路径（OEBPS/ 下；CSS url() 与 OPF href 共用）
+    pub fn href(self) -> Option<&'static str> {
+        match self {
+            EmbedFont::None => None,
+            EmbedFont::LxgwWenKai => Some("fonts/lxgw-wenkai-regular.woff2"),
+            EmbedFont::SourceHanSerif => Some("fonts/source-han-serif-cn-regular.woff2"),
+        }
+    }
+
+    /// 正文 font-family 栈（内嵌字体优先，兜底系统字体）
+    pub fn css_family_stack(self) -> Option<&'static str> {
+        match self {
+            EmbedFont::None => None,
+            EmbedFont::LxgwWenKai => Some("'LXGW WenKai', 'Kaiti SC', '楷体', serif"),
+            EmbedFont::SourceHanSerif => {
+                Some("'Source Han Serif CN', 'Songti SC', 'SimSun', '宋体', serif")
+            }
+        }
+    }
+
+    /// 字体字节（编译期内嵌 web-ui/public/fonts/——构建时 web-ui 必须在仓库内，Dockerfile 已同步拷贝）
+    pub fn bytes(self) -> Option<&'static [u8]> {
+        match self {
+            EmbedFont::None => None,
+            EmbedFont::LxgwWenKai => Some(include_bytes!(
+                "../../web-ui/public/fonts/lxgw-wenkai-regular.woff2"
+            )),
+            EmbedFont::SourceHanSerif => Some(include_bytes!(
+                "../../web-ui/public/fonts/source-han-serif-cn-regular.woff2"
+            )),
+        }
+    }
 }
 
 /// TXT 导出：书名 + 章节（标题行 + 正文）
@@ -78,6 +154,9 @@ pub struct EpubMeta {
     pub subject: Option<String>,
     /// 封面字节（嵌入 OEBPS/cover.{jpg,png} + manifest properties="cover-image" + meta cover）
     pub cover: Option<Vec<u8>>,
+    /// 内嵌中文字体（GAP 176：默认 None 不内嵌；指定后 OPF manifest 字体条目 + style.css
+    /// @font-face + OEBPS/fonts/*.woff2 文件 + 章节 XHTML 链接样式表）
+    pub font: EmbedFont,
 }
 
 /// EPUB 导出（全量元数据版本）：zip（mimetype Stored 且为首个条目）
@@ -119,14 +198,28 @@ pub fn build_epub_full(
         .expect("write container");
 
         // 3. content.opf（manifest + spine + GAP 173 全量元数据）
+        // uuid 全局唯一：OPF dc:identifier 与 NCX dtb:uid 共用同一值（EPUB 规范要求一致）
+        let uuid = uuid::Uuid::new_v4();
+        // 章节 href 表（spine 顺序）——manifest / nav.xhtml / toc.ncx 共用，保证目录跳转与 spine 一一对应
+        let chapter_hrefs: Vec<String> = (0..chapters.len())
+            .map(|i| format!("chap_{i:04}.xhtml"))
+            .collect();
         let mut manifest = String::new();
         let mut spine = String::new();
-        for (i, _ch) in chapters.iter().enumerate() {
+        for (i, href) in chapter_hrefs.iter().enumerate() {
             manifest.push_str(&format!(
-                "    <item id=\"chap{i}\" href=\"chap_{i:04}.xhtml\" media-type=\"application/xhtml+xml\"/>\n"
+                "    <item id=\"chap{i}\" href=\"{href}\" media-type=\"application/xhtml+xml\"/>\n"
             ));
             spine.push_str(&format!("    <itemref idref=\"chap{i}\"/>\n"));
         }
+        // 目录导航双格式：nav.xhtml（EPUB3 导航文档，manifest properties="nav"）+
+        // toc.ncx（EPUB2 NCX——Kindle 等老阅读器靠它出目录；spine toc="ncx" 指向其 id）
+        manifest.push_str(
+            "    <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n",
+        );
+        manifest.push_str(
+            "    <item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\n",
+        );
         // 封面条目（manifest properties="cover-image"——parse_opf 可识别）
         let (cover_ext, cover_mediatype) = match &meta.cover {
             Some(c) if c.starts_with(&[0x89, b'P', b'N', b'G']) => ("png", "image/png"),
@@ -140,8 +233,28 @@ pub fn build_epub_full(
         } else {
             String::new()
         };
+        // GAP 176 内嵌字体：OPF manifest 字体条目（properties="font-face"——EPUB3 阅读器
+        // 识别；EPUB2 阅读器忽略该属性但 CSS @font-face 仍生效）+ style.css 条目
+        let (font_manifest, style_manifest, font_css) = if meta.font != EmbedFont::None {
+            let font_href = meta.font.href().expect("非 None 字体必有 href");
+            let style = "    <item id=\"style\" href=\"style.css\" media-type=\"text/css\"/>\n";
+            let css = format!(
+                "/* GAP 176 内嵌字体（woff2 子集——EPUB3 阅读器支持；老设备忽略 @font-face 自动回退系统字体） */\n@font-face {{\n  font-family: '{}';\n  src: url('{font_href}') format('woff2');\n  font-weight: 400;\n  font-display: swap;\n}}\nbody {{\n  font-family: {};\n}}\n",
+                meta.font.family().expect("非 None 字体必有 family"),
+                meta.font.css_family_stack().expect("非 None 字体必有栈")
+            );
+            (
+                format!(
+                    "    <item id=\"font-embedded\" href=\"{font_href}\" media-type=\"font/woff2\" properties=\"font-face\"/>\n"
+                ),
+                style.to_string(),
+                css,
+            )
+        } else {
+            (String::new(), String::new(), String::new())
+        };
         let mut metadata = String::new();
-        metadata.push_str(&format!("    <dc:identifier id=\"BookId\">uuid:{uuid}</dc:identifier>\n", uuid = uuid::Uuid::new_v4()));
+        metadata.push_str(&format!("    <dc:identifier id=\"BookId\">uuid:{uuid}</dc:identifier>\n"));
         metadata.push_str(&format!("    <dc:title>{title}</dc:title>\n", title = escape_xml(title)));
         metadata.push_str(&format!("    <dc:creator>{author}</dc:creator>\n", author = escape_xml(author)));
         metadata.push_str(&format!(
@@ -177,7 +290,7 @@ pub fn build_epub_full(
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
 {metadata}  </metadata>
   <manifest>
-{manifest}{cover_manifest}  </manifest>
+{manifest}{cover_manifest}{font_manifest}{style_manifest}  </manifest>
   <spine toc="ncx">
 {spine}  </spine>
 </package>
@@ -185,10 +298,69 @@ pub fn build_epub_full(
             metadata = metadata,
             manifest = manifest,
             cover_manifest = cover_manifest,
+            font_manifest = font_manifest,
+            style_manifest = style_manifest,
             spine = spine,
         );
         zip.start_file("OEBPS/content.opf", deflated).expect("start opf");
         zip.write_all(opf.as_bytes()).expect("write opf");
+
+        // 3.25 nav.xhtml（EPUB3 导航文档：toc 列表，href 与 spine 章节一致）
+        let lang = meta.language.as_deref().unwrap_or("zh-CN");
+        let mut nav = String::new();
+        nav.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+        nav.push_str("<!DOCTYPE html>\n");
+        nav.push_str(&format!(
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\" lang=\"{}\" xml:lang=\"{}\">\n",
+            escape_xml(lang),
+            escape_xml(lang)
+        ));
+        nav.push_str("<head>\n<title>目录</title>\n</head>\n<body>\n");
+        nav.push_str("<nav epub:type=\"toc\" id=\"toc\">\n<h1>目录</h1>\n<ol>\n");
+        for (href, ch) in chapter_hrefs.iter().zip(chapters.iter()) {
+            nav.push_str(&format!(
+                "<li><a href=\"{href}\">{}</a></li>\n",
+                escape_xml(ch.title.trim())
+            ));
+        }
+        nav.push_str("</ol>\n</nav>\n</body>\n</html>\n");
+        zip.start_file("OEBPS/nav.xhtml", deflated).expect("start nav");
+        zip.write_all(nav.as_bytes()).expect("write nav");
+
+        // 3.5 toc.ncx（EPUB2 NCX：navMap/navPoint，Kindle 等老阅读器目录来源）
+        let mut ncx = String::new();
+        ncx.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        ncx.push_str(&format!(
+            "<ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\" xml:lang=\"{}\">\n",
+            escape_xml(lang)
+        ));
+        ncx.push_str("<head>\n");
+        ncx.push_str(&format!("<meta name=\"dtb:uid\" content=\"uuid:{uuid}\"/>\n"));
+        ncx.push_str("<meta name=\"dtb:depth\" content=\"1\"/>\n");
+        ncx.push_str("<meta name=\"dtb:totalPageCount\" content=\"0\"/>\n");
+        ncx.push_str("<meta name=\"dtb:maxPageNumber\" content=\"0\"/>\n");
+        ncx.push_str("</head>\n");
+        ncx.push_str(&format!(
+            "<docTitle><text>{}</text></docTitle>\n",
+            escape_xml(title.trim())
+        ));
+        ncx.push_str("<navMap>\n");
+        for (i, (href, ch)) in chapter_hrefs.iter().zip(chapters.iter()).enumerate() {
+            ncx.push_str(&format!(
+                "  <navPoint id=\"navPoint-{}\" playOrder=\"{}\">\n",
+                i + 1,
+                i + 1
+            ));
+            ncx.push_str(&format!(
+                "    <navLabel><text>{}</text></navLabel>\n",
+                escape_xml(ch.title.trim())
+            ));
+            ncx.push_str(&format!("    <content src=\"{href}\"/>\n"));
+            ncx.push_str("  </navPoint>\n");
+        }
+        ncx.push_str("</navMap>\n</ncx>\n");
+        zip.start_file("OEBPS/toc.ncx", deflated).expect("start ncx");
+        zip.write_all(ncx.as_bytes()).expect("write ncx");
 
         // 3.5 封面文件
         if let Some(cover) = &meta.cover {
@@ -197,12 +369,26 @@ pub fn build_epub_full(
             zip.write_all(cover).expect("write cover");
         }
 
+        // 3.6 GAP 176 内嵌字体：style.css（@font-face + 正文应用）+ OEBPS/fonts/*.woff2
+        if meta.font != EmbedFont::None {
+            zip.start_file("OEBPS/style.css", deflated).expect("start style");
+            zip.write_all(font_css.as_bytes()).expect("write style");
+            if let (Some(href), Some(bytes)) = (meta.font.href(), meta.font.bytes()) {
+                zip.start_file(format!("OEBPS/{href}"), deflated)
+                    .expect("start font");
+                zip.write_all(bytes).expect("write font");
+            }
+        }
+
         // 4. 章节 XHTML（spine 顺序）
         for (i, ch) in chapters.iter().enumerate() {
             let mut xhtml = String::new();
             xhtml.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
             xhtml.push_str("<html xmlns=\"http://www.w3.org/1999/xhtml\">\n<head>\n");
             xhtml.push_str(&format!("<title>{}</title>\n", escape_xml(&ch.title)));
+            if meta.font != EmbedFont::None {
+                xhtml.push_str("<link rel=\"stylesheet\" type=\"text/css\" href=\"style.css\"/>\n");
+            }
             xhtml.push_str("</head>\n<body>\n");
             if !ch.title.trim().is_empty() {
                 xhtml.push_str(&format!("<h1>{}</h1>\n", escape_xml(ch.title.trim())));
@@ -369,6 +555,7 @@ mod tests {
             publisher: Some("出版社".into()),
             subject: Some("标签".into()),
             cover: Some(vec![0xFF, 0xD8, 0xFF, 0xE0]),
+            ..Default::default()
         };
         let bytes = build_epub_full(&title, "作者甲", &meta, &chs);
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("合法 zip");
@@ -397,6 +584,158 @@ mod tests {
     #[test]
     fn test_escape_xml() {
         assert_eq!(escape_xml("<a & b>"), "&lt;a &amp; b&gt;");
+    }
+
+    // ---------- GAP 176 内嵌中文字体 ----------
+
+    #[test]
+    fn test_embed_font_parse_param() {
+        // 缺省/空串/none → 不内嵌
+        assert_eq!(EmbedFont::parse_param(""), Ok(EmbedFont::None));
+        assert_eq!(EmbedFont::parse_param("none"), Ok(EmbedFont::None));
+        assert_eq!(EmbedFont::parse_param("  none  "), Ok(EmbedFont::None));
+        // 两种字体（大小写不敏感）
+        assert_eq!(EmbedFont::parse_param("lxk-wenkai"), Ok(EmbedFont::LxgwWenKai));
+        assert_eq!(EmbedFont::parse_param("LXK-WENKAI"), Ok(EmbedFont::LxgwWenKai));
+        assert_eq!(EmbedFont::parse_param("source-han-serif"), Ok(EmbedFont::SourceHanSerif));
+        // 未知 → 明确错误
+        let err = EmbedFont::parse_param("comic-sans").unwrap_err();
+        assert!(err.contains("不支持的字体"), "{err}");
+    }
+
+    /// GAP 176：构造 epub 断言——zip 含字体文件（字节与源一致）+ OPF manifest 字体条目
+    /// + style.css @font-face 及正文应用 + 章节链接样式表；无字体对照无条目
+    #[test]
+    fn test_build_epub_embedded_font() {
+        let (title, chs) = sample();
+        for font in [EmbedFont::LxgwWenKai, EmbedFont::SourceHanSerif] {
+            let href = font.href().unwrap();
+            let meta = EpubMeta { font, ..Default::default() };
+            let bytes = build_epub_full(&title, "作者甲", &meta, &chs);
+            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("合法 zip");
+            // 1) zip 含字体文件且字节与 web-ui/public/fonts 源完全一致
+            let mut font_bytes = Vec::new();
+            zip.by_name(&format!("OEBPS/{href}"))
+                .expect("zip 应含字体文件")
+                .read_to_end(&mut font_bytes)
+                .unwrap();
+            assert_eq!(font_bytes, font.bytes().unwrap(), "字体字节应完整内嵌（{href}）");
+            // 2) OPF manifest 字体条目 + style.css 条目
+            let mut opf = String::new();
+            zip.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+            assert!(
+                opf.contains(&format!(
+                    "<item id=\"font-embedded\" href=\"{href}\" media-type=\"font/woff2\" properties=\"font-face\"/>"
+                )),
+                "OPF 应含字体条目: {opf}"
+            );
+            assert!(opf.contains("<item id=\"style\" href=\"style.css\" media-type=\"text/css\"/>"));
+            // 3) CSS @font-face 引用 + 正文应用
+            let mut css = String::new();
+            zip.by_name("OEBPS/style.css").unwrap().read_to_string(&mut css).unwrap();
+            assert!(css.contains(&format!("font-family: '{}';", font.family().unwrap())), "CSS: {css}");
+            assert!(css.contains(&format!("url('{href}') format('woff2')")), "CSS: {css}");
+            assert!(css.contains(&format!("font-family: {};", font.css_family_stack().unwrap())), "CSS 正文应应用: {css}");
+            // 4) 章节 XHTML 链接样式表
+            let mut ch0 = String::new();
+            zip.by_name("OEBPS/chap_0000.xhtml").unwrap().read_to_string(&mut ch0).unwrap();
+            assert!(ch0.contains("<link rel=\"stylesheet\" type=\"text/css\" href=\"style.css\"/>"));
+        }
+        // 5) 对照：未指定字体 → 无字体文件/无 style.css/无字体条目（既有导出不变）
+        let plain = build_epub(&title, "作者甲", &chs);
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(plain)).expect("合法 zip");
+        assert!(zip.by_name("OEBPS/style.css").is_err(), "无字体不应有 style.css");
+        assert!(zip.by_name("OEBPS/fonts/lxgw-wenkai-regular.woff2").is_err());
+        assert!(zip.by_name("OEBPS/fonts/source-han-serif-cn-regular.woff2").is_err());
+        let mut opf = String::new();
+        zip.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(!opf.contains("font-embedded"), "无字体不应有字体条目");
+        let mut ch0 = String::new();
+        zip.by_name("OEBPS/chap_0000.xhtml").unwrap().read_to_string(&mut ch0).unwrap();
+        assert!(!ch0.contains("style.css"), "无字体章节不应链接样式表");
+    }
+
+    // ---------- 目录导航完整性（nav.xhtml EPUB3 + toc.ncx EPUB2） ----------
+
+    #[test]
+    fn test_build_epub_navigation_nav_ncx() {
+        let (title, chs) = sample();
+        let bytes = build_epub(&title, "作者甲", &chs);
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("合法 zip");
+
+        // OPF：manifest 声明 nav.xhtml（EPUB3 properties=nav）+ toc.ncx（EPUB2 x-dtbncx）
+        let mut opf = String::new();
+        zip.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(
+            opf.contains("<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>")
+                || opf.contains("<item id=\"nav\" href=\"nav.xhtml\""),
+            "OPF manifest 声明 nav.xhtml: {opf}"
+        );
+        assert!(
+            opf.contains("<item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>"),
+            "OPF manifest 声明 toc.ncx: {opf}"
+        );
+        // spine toc="ncx" 有对应 manifest id（老阅读器经 NCX 出目录）
+        assert!(opf.contains("<spine toc=\"ncx\">"), "spine 指向 ncx: {opf}");
+        // spine itemref ↔ manifest 章节 id 对应
+        assert!(opf.contains("<item id=\"chap0\" href=\"chap_0000.xhtml\" media-type=\"application/xhtml+xml\"/>"));
+        assert!(opf.contains("<itemref idref=\"chap0\"/>"));
+        assert!(opf.contains("<itemref idref=\"chap1\"/>"));
+
+        // nav.xhtml：EPUB3 toc 列表，href 与章节一一对应（顺序一致）
+        let mut nav = String::new();
+        zip.by_name("OEBPS/nav.xhtml").unwrap().read_to_string(&mut nav).unwrap();
+        assert!(nav.contains("<nav epub:type=\"toc\""), "EPUB3 toc nav: {nav}");
+        assert!(nav.contains("<ol>"));
+        for (i, ch) in chs.iter().enumerate() {
+            assert!(
+                nav.contains(&format!("<a href=\"chap_{i:04}.xhtml\">{}</a>", ch.title)),
+                "nav 第 {i} 项 href/标题匹配"
+            );
+        }
+
+        // toc.ncx：navMap/navPoint + playOrder + content src 与章节 href 匹配
+        let mut ncx = String::new();
+        zip.by_name("OEBPS/toc.ncx").unwrap().read_to_string(&mut ncx).unwrap();
+        assert!(ncx.contains("<navMap>"), "NCX navMap: {ncx}");
+        assert!(ncx.contains("<navPoint id=\"navPoint-1\" playOrder=\"1\">"));
+        assert!(ncx.contains("<navLabel><text>第一章</text></navLabel>"));
+        assert!(ncx.contains("<navLabel><text>第二章</text></navLabel>"));
+        assert!(ncx.contains("<content src=\"chap_0000.xhtml\"/>"));
+        assert!(ncx.contains("<content src=\"chap_0001.xhtml\"/>"));
+        assert!(ncx.contains("<docTitle><text>测试书</text></docTitle>"));
+        // dtb:uid 与 OPF dc:identifier 的 uuid 一致（EPUB 规范：NCX uid 必须与包标识一致）
+        let opf_uuid = opf.split("uuid:").nth(1).unwrap().split('<').next().unwrap().to_string();
+        assert!(
+            ncx.contains(&format!("<meta name=\"dtb:uid\" content=\"uuid:{opf_uuid}\"/>"))
+                || ncx.contains(&format!("dtb:uid\" content=\"uuid:{opf_uuid}\"")),
+            "NCX dtb:uid 与 OPF 标识一致（{opf_uuid}）"
+        );
+    }
+
+    #[test]
+    fn test_build_epub_navigation_cover_and_full_meta() {
+        // 封面 + 全量元数据路径下目录导航同样完整（nav/ncx/封面 href 引用正确）
+        let (title, chs) = sample();
+        let meta = EpubMeta {
+            language: Some("en".into()),
+            cover: Some(vec![0xFF, 0xD8, 0xFF, 0xE0]),
+            ..Default::default()
+        };
+        let bytes = build_epub_full(&title, "作者甲", &meta, &chs);
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("合法 zip");
+        assert!(zip.by_name("OEBPS/nav.xhtml").is_ok());
+        assert!(zip.by_name("OEBPS/toc.ncx").is_ok());
+        let mut opf = String::new();
+        zip.by_name("OEBPS/content.opf").unwrap().read_to_string(&mut opf).unwrap();
+        assert!(opf.contains("properties=\"cover-image\""), "封面 manifest 声明");
+        assert!(opf.contains("<meta name=\"cover\" content=\"cover-image\"/>"));
+        assert!(opf.contains("<item id=\"cover-image\" href=\"cover.jpg\" media-type=\"image/jpeg\" properties=\"cover-image\"/>"));
+        assert!(zip.by_name("OEBPS/cover.jpg").is_ok(), "封面文件存在");
+        let mut ncx = String::new();
+        zip.by_name("OEBPS/toc.ncx").unwrap().read_to_string(&mut ncx).unwrap();
+        // language 透传到 nav/ncx 的 xml:lang
+        assert!(ncx.contains("xml:lang=\"en\""));
     }
 
     // ---------- GAP 104 编码 ----------

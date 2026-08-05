@@ -517,6 +517,8 @@ async fn generate_epub_for_book(
         publisher: book.publisher.clone(),
         subject: book.custom_tag.clone().or_else(|| book.kind.clone()),
         cover: read_local_cover(storage, ns, book.cover_url.as_deref()),
+        // GAP 176：双轨同步自动生成的 epub 不内嵌字体（保持体积最小；导出 API 可指定）
+        font: crate::service::export_book::EmbedFont::None,
     };
     let bytes = build_epub_full(&book.name, &book.author, &meta, &chapters);
     // 文件名：{书名}.epub（冲突加后缀）

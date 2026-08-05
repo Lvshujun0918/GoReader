@@ -444,7 +444,9 @@ const ALIGN_OPTIONS: { value: TextAlign; label: string }[] = [
 ]
 const PAGE_MODE_OPTIONS: { value: PageMode; label: string }[] = [
   { value: 'scroll', label: '滚动' },
-  { value: 'slide', label: '滑动翻页' },
+  { value: 'slide', label: '上下翻页' },
+  { value: 'hslide', label: '左右翻章' },
+  { value: 'flip', label: '仿真翻页' },
 ]
 
 /** 界面主题（外观卡片）：浅色 / 深色 / 跟随系统——与阅读内容主题分离，切换即时生效并落 localStorage */
@@ -1625,6 +1627,64 @@ async function runExportData() {
         <p v-else class="tts-empty">暂无自定义规则。可「导入默认规则」或新增正则（匹配行作为章节标题）。</p>
       </section>
 
+      <!-- 快捷键（GAP 198：全局 + 阅读器速查表，简单表格排版） -->
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">快捷键</h2>
+          <span class="card-sub">全局与阅读器按键速查</span>
+        </div>
+        <table class="keys-table">
+          <thead>
+            <tr>
+              <th class="keys-scope">范围</th>
+              <th class="keys-key">按键</th>
+              <th>功能</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td rowspan="4">全局</td>
+              <td><kbd class="kbd">G</kbd></td>
+              <td>书架页：聚焦搜索框</td>
+            </tr>
+            <tr>
+              <td><kbd class="kbd">S</kbd></td>
+              <td>书架页：跳转设置</td>
+            </tr>
+            <tr>
+              <td><kbd class="kbd">R</kbd></td>
+              <td>书架页：刷新书架</td>
+            </tr>
+            <tr>
+              <td><kbd class="kbd">Ctrl + K</kbd></td>
+              <td>命令面板（全站可用）</td>
+            </tr>
+            <tr>
+              <td rowspan="5">阅读器</td>
+              <td><kbd class="kbd">←</kbd> / <kbd class="kbd">→</kbd></td>
+              <td>上一章 / 下一章（目录抽屉打开时不触发）</td>
+            </tr>
+            <tr>
+              <td><kbd class="kbd">PageUp</kbd> / <kbd class="kbd">PageDown</kbd></td>
+              <td>向上 / 向下翻页（约 90% 视口高度）</td>
+            </tr>
+            <tr>
+              <td><kbd class="kbd">Space</kbd></td>
+              <td>音频/视频书：播放 / 暂停；文本书：自动阅读暂停 / 恢复</td>
+            </tr>
+            <tr>
+              <td><kbd class="kbd">Esc</kbd></td>
+              <td>关闭图片全屏查看</td>
+            </tr>
+            <tr>
+              <td class="keys-none">—</td>
+              <td>亮度 / 字号调节：阅读页顶栏按钮（无默认按键）</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="card-note">输入框 / 文本域聚焦时快捷键不触发；g / s / r 仅在书架页生效，Ctrl+K 命令面板全站可用（macOS 为 Cmd+K）。</p>
+      </section>
+
       <!-- 关于 -->
       <section class="card">
         <h2 class="card-title">关于</h2>
@@ -2570,6 +2630,55 @@ async function runExportData() {
   justify-content: flex-end;
   padding-top: 16px;
 }
+/* GAP 198：快捷键速查表（简单表格排版） */
+.keys-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.keys-table th {
+  padding: 6px 10px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--border);
+}
+.keys-table td {
+  padding: 8px 10px;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.keys-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.keys-table .keys-scope {
+  width: 64px;
+  white-space: nowrap;
+  font-weight: 400;
+  color: var(--text-1);
+}
+.keys-table .keys-key {
+  width: 190px;
+  white-space: nowrap;
+}
+.keys-table .keys-none {
+  color: var(--text-3);
+}
+.kbd {
+  display: inline-block;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--bg);
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
 .card-note {
   margin: 10px 0 0;
   font-size: 11.5px;
@@ -2934,6 +3043,11 @@ async function runExportData() {
   }
   .card {
     padding: 18px 16px;
+  }
+  .keys-table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
   }
   .row-hint {
     display: none;
