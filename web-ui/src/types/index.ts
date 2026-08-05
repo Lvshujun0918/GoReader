@@ -66,6 +66,8 @@ export interface BookInfo {
   bookUrl: string
   origin: string
   originName: string
+  /** 书籍类型（legacy BookType：0 文本/1 音频/2 漫画/3 文件/4 视频——书源 bookSourceType 透传） */
+  type?: number
   [key: string]: unknown
 }
 
@@ -78,9 +80,22 @@ export interface BookChapter {
   [key: string]: unknown
 }
 
-/** 章节正文（/reader3/getBookContent → data.content 纯文本） */
+/** 章节正文（/reader3/getBookContent → data；文本书 data.content 纯文本；
+ *  非文本书按 book_type 返回：音频 {audioUrl, contentType} / 漫画 {images} /
+ *  视频 {videoUrl} / 文件 {downloadUrl}） */
 export interface BookContent {
-  content: string
+  content?: string
+  /** 音频书：音频流 URL（m3u8 → contentType=application/vnd.apple.mpegurl） */
+  audioUrl?: string
+  /** 音频书：媒体类型（按扩展名映射） */
+  contentType?: string
+  /** 漫画书：章节图片 URL 列表 */
+  images?: string[]
+  /** 视频书：视频流 URL */
+  videoUrl?: string
+  /** 文件书：下载链接 */
+  downloadUrl?: string
+  [key: string]: unknown
 }
 
 /** 搜索结果（/reader3/searchBookMulti → SearchBook，全字段 camelCase） */

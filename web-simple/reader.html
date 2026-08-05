@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>阅读 - Reader</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-size:20px; line-height:1.8; color:#222; background:#f7f5f0;
+         font-family:"STSong","SimSun","Noto Serif CJK SC",serif; }
+  #wrap { max-width:640px; margin:0 auto; padding:10px; }
+  #topbar { margin-bottom:8px; }
+  #topbar a { display:inline-block; font-size:18px; padding:8px 12px; margin-right:6px;
+              background:#333; color:#fff; text-decoration:none; border-radius:6px; }
+  .ctrl { margin:6px 0; }
+  .ctrl button { font-size:19px; padding:10px 12px; margin:2px 3px 2px 0; background:#356;
+                 color:#fff; border:none; border-radius:6px; min-width:64px; }
+  .ctrl button.small { font-size:17px; padding:8px 10px; min-width:52px; }
+  #bookTitle { font-size:22px; font-weight:bold; padding:8px 2px; }
+  #chapterTitle { font-size:21px; font-weight:bold; padding:10px 2px 6px; }
+  #content { font-size:20px; white-space:pre-wrap; word-break:break-word; padding:4px 2px 20px; }
+  #status { color:#888; font-size:16px; min-height:22px; padding:2px; }
+  .navbtn { display:block; width:100%; font-size:24px; padding:14px; margin:8px 0;
+            background:#356; color:#fff; border:none; border-radius:8px; }
+  /* 目录面板 */
+  #tocPanel { display:none; background:#fff; border:1px solid #ccc; border-radius:8px;
+              padding:8px; margin:8px 0; }
+  #tocPanel h2 { font-size:20px; padding:4px; }
+  #tocPanel ul { list-style:none; }
+  #tocPanel li a { display:block; font-size:19px; padding:10px 6px; border-bottom:1px solid #eee;
+                   text-decoration:none; color:#222; }
+  #tocPanel .vol { font-size:17px; font-weight:bold; color:#666; padding:10px 6px 2px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="topbar">
+    <a id="backLink" href="index.html">返回书架</a>
+  </div>
+  <div class="ctrl">
+    <button id="prevBtn">上一章</button>
+    <button id="nextBtn">下一章</button>
+    <button id="tocBtn">目录</button>
+    <button class="small" id="smallBtn">A-</button>
+    <button class="small" id="bigBtn">A+</button>
+    <button class="small" id="zhBtn">繁</button>
+  </div>
+  <div id="status">加载中…</div>
+  <div id="bookTitle"></div>
+  <div id="tocPanel"><h2>目录</h2><ul id="tocList"></ul></div>
+  <div id="chapterTitle"></div>
+  <div id="content"></div>
+  <button class="navbtn" id="prevBtn2">上一章</button>
+  <button class="navbtn" id="nextBtn2">下一章</button>
+</div>
+<script src="zh.js"></script>
+<script>
+(function () {
+  // —— URL 参数 ——
+  var QS = {};
+  location.search.replace(/^\?/, "").split("&").forEach(function (p) {
+    var kv = p.split("=");
+    if (kv[0]) QS[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || "");
+  });
+  var TOKEN = QS.accessToken || "";
+  var BOOK_URL = QS.bookUrl || "";
+  var TOC_URL = QS.tocUrl || BOOK_URL;
+  var BOOK_SOURCE = QS.bookSource || "";
+
+  var chapters = [];        // [{title,url,isVolume,index}]
+  var cur = -1;             // 当前章节在 chapters 中的下标
+  var loading = false;
+
+  // —— 设置存取（Kindle 旧 WebKit localStorage 可能不可用，安全降级）——
+  var mem = {};
+  function storeGet(k) { try { return localStorage.getItem(k); } catch (e) { return mem[k] || null; } }
+  function storeSet(k, v) { mem[k] = v; try { localStorage.setItem(k, v); } catch (e) {} }
+
+  var FONT = parseInt(storeGet("rd_font"), 10) || 20;
+  var TRAD = storeGet("rd_trad") === "1";
+
+  var statusEl = document.getElementById("status");
+  var bookTitleEl = document.getElementById("bookTitle");
+  var chapterTitleEl = document.getElementById("chapterTitle");
+  var contentEl = document.getElementById("content");
+  var tocPanel = document.getElementById("tocPanel");
+  var tocList = document.getElementById("tocList");
+  var backLink = document.getElementById("backLink");
+
+  backLink.href = "index.html?accessToken=" + encodeURIComponent(TOKEN);
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+  function apiUrl(path, extra) {
+    var parts = [];
+    if (TOKEN) parts.push("accessToken=" + encodeURIComponent(TOKEN));
+    for (var k in extra) parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(extra[k]));
+    return path + "?" + parts.join("&");
+  }
+  function getJSON(url, ok, err) {
+    fetch(url).then(function (r) { return r.json(); })
+      .then(function (j) { if (j && j.isSuccess === false) err(j.errorMsg || "请求失败"); else ok(j); })
+      .catch(function (e) { err(e.message || e); });
+  }
+  function convert(text) { return window.zhConvert ? window.zhConvert(text, TRAD) : text; }
+
+  // —— 目录加载 ——
+  getJSON(apiUrl("/reader3/getBookToc", { url: TOC_URL, tocUrl: TOC_URL }),
+    function (j) {
+      chapters = (j.data || []).filter(function (c) { return c && c.url; });
+      if (!chapters.length) { statusEl.innerHTML = "目录为空或解析失败"; return; }
+      var start = -1;
+      if (QS.chapterUrl) {
+        for (var i = 0; i < chapters.length; i++)
+          if (chapters[i].url === QS.chapterUrl) { start = i; break; }
+      }
+      if (start < 0 && QS.index != null) {
+        var idx = parseInt(QS.index, 10);
+        for (var i = 0; i < chapters.length; i++)
+          if (chapters[i].index === idx) { start = i; break; }
+        if (start < 0 && idx < chapters.length) start = idx;
+      }
+      if (start < 0) {
+        var saved = storeGet("rd_idx_" + BOOK_URL);
+        if (saved != null) {
+          var s = parseInt(saved, 10);
+          for (var i = 0; i < chapters.length; i++)
+            if (chapters[i].index === s) { start = i; break; }
+        }
+      }
+      if (start < 0) start = 0;
+      // 跳到首个非卷章节
+      while (start < chapters.length && chapters[start].isVolume) start++;
+      if (start >= chapters.length) start = 0;
+      buildToc();
+      showChapter(start);
+    },
+    function (msg) { statusEl.innerHTML = "目录加载失败：" + esc(msg); });
+
+  // —— 章节渲染 ——
+  function showChapter(i) {
+    if (loading) return;
+    if (i < 0 || i >= chapters.length) { statusEl.innerHTML = "没有更多章节了"; return; }
+    if (chapters[i].isVolume) { showChapter(i + (i < cur ? -1 : 1)); return; }
+    loading = true;
+    cur = i;
+    var ch = chapters[i];
+    statusEl.innerHTML = "加载中…";
+    window.scrollTo ? window.scrollTo(0, 0) : null;
+    // 先渲染标题，正文异步
+    chapterTitleEl.innerHTML = esc(convert(ch.title));
+    var extra = { url: ch.url };
+    if (BOOK_URL) extra.bookUrl = BOOK_URL;
+    if (BOOK_SOURCE) extra.bookSource = BOOK_SOURCE;
+    getJSON(apiUrl("/reader3/getBookContent", extra),
+      function (j) {
+        loading = false;
+        var text = (j.data && j.data.content) || "";
+        contentEl.textContent = convert(text);   // 纯文本渲染，天然防注入
+        statusEl.innerHTML = "第 " + (cur + 1) + " / " + chapters.length + " 章";
+        storeSet("rd_idx_" + BOOK_URL, String(ch.index));
+        saveProgress();
+        restoreScroll();
+      },
+      function (msg) {
+        loading = false;
+        statusEl.innerHTML = "正文加载失败：" + esc(msg);
+      });
+  }
+
+  function prev() { saveScroll(); showChapter(cur - 1); }
+  function next() { saveScroll(); showChapter(cur + 1); }
+
+  // —— 阅读进度（本地 + 服务端）——
+  function saveScroll() { storeSet("rd_pos_" + BOOK_URL, String(document.body.scrollTop || document.documentElement.scrollTop || 0)); }
+  function restoreScroll() {
+    var p = parseInt(storeGet("rd_pos_" + BOOK_URL), 10) || 0;
+    if (p > 0) setTimeout(function () {
+      document.body.scrollTop = p; document.documentElement.scrollTop = p;
+    }, 60);
+  }
+  function saveProgress() {
+    if (!BOOK_URL || cur < 0) return;
+    var ch = chapters[cur];
+    var body = { bookUrl: BOOK_URL, durChapterIndex: ch.index,
+                 durChapterPos: 0, durChapterTitle: ch.title };
+    try {
+      fetch(apiUrl("/reader3/saveBookProgress", {}), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }).catch(function () {});
+    } catch (e) {}
+  }
+  window.addEventListener("pagehide", function () { saveScroll(); saveProgress(); });
+
+  // —— 目录面板 ——
+  function buildToc() {
+    var html = "";
+    for (var i = 0; i < chapters.length; i++) {
+      var c = chapters[i];
+      if (c.isVolume) { html += "<div class='vol'>" + esc(convert(c.title)) + "</div>"; continue; }
+      html += "<li><a href='javascript:void(0)' data-i='" + i + "'>" + esc(convert(c.title)) + "</a></li>";
+    }
+    tocList.innerHTML = html;
+    var as = tocList.getElementsByTagName("a");
+    for (var i = 0; i < as.length; i++) {
+      (function (a) {
+        a.addEventListener("click", function () {
+          tocPanel.style.display = "none";
+          showChapter(parseInt(a.getAttribute("data-i"), 10));
+        });
+      })(as[i]);
+    }
+  }
+  document.getElementById("tocBtn").addEventListener("click", function () {
+    tocPanel.style.display = tocPanel.style.display === "none" ? "block" : "none";
+  });
+
+  // —— 字号 ——
+  function applyFont() {
+    contentEl.style.fontSize = FONT + "px";
+    document.getElementById("chapterTitle").style.fontSize = Math.min(FONT + 2, 30) + "px";
+  }
+  document.getElementById("bigBtn").addEventListener("click", function () {
+    if (FONT < 36) { FONT += 2; storeSet("rd_font", String(FONT)); applyFont(); }
+  });
+  document.getElementById("smallBtn").addEventListener("click", function () {
+    if (FONT > 14) { FONT -= 2; storeSet("rd_font", String(FONT)); applyFont(); }
+  });
+
+  // —— 简繁 ——
+  function applyZh() {
+    document.getElementById("zhBtn").innerHTML = TRAD ? "简" : "繁";
+    if (cur >= 0) {
+      chapterTitleEl.innerHTML = esc(convert(chapters[cur].title));
+      contentEl.textContent = convert(contentEl.textContent, TRAD);
+      buildToc();
+    }
+  }
+  document.getElementById("zhBtn").addEventListener("click", function () {
+    TRAD = !TRAD;
+    storeSet("rd_trad", TRAD ? "1" : "0");
+    applyZh();
+  });
+
+  // —— 事件绑定 ——
+  document.getElementById("prevBtn").addEventListener("click", prev);
+  document.getElementById("nextBtn").addEventListener("click", next);
+  document.getElementById("prevBtn2").addEventListener("click", prev);
+  document.getElementById("nextBtn2").addEventListener("click", next);
+
+  applyFont();
+  applyZh();
+})();
+</script>
+</body>
+</html>

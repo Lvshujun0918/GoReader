@@ -153,8 +153,14 @@ pub async fn health() -> Result<bool> {
 mod tests {
     use super::*;
 
+    /// 环境变量测试串行锁（READER_CAMOUFOX_* 全局共享——并行跑会互相踩踏：
+    /// test_fallback_combines_errors_when_disabled 设置 DISABLE=1 时
+    /// test_enabled_flags 的 remove_var 断言会间歇性失败）
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_server_url_default_and_env() {
+        let _g = ENV_LOCK.lock().unwrap();
         // 默认地址
         std::env::remove_var("READER_CAMOUFOX_URL");
         assert_eq!(server_url(), "http://127.0.0.1:8196");
@@ -166,6 +172,7 @@ mod tests {
 
     #[test]
     fn test_enabled_flags() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("READER_CAMOUFOX_DISABLE");
         std::env::remove_var("READER_CAMOUFOX_FIRST");
         assert!(enabled());
@@ -181,6 +188,7 @@ mod tests {
 
     #[test]
     fn test_fallback_combines_errors_when_disabled() {
+        let _g = ENV_LOCK.lock().unwrap();
         // camoufox 禁用时 fallback 直接透传 CDP 错误（合并语义）
         std::env::set_var("READER_CAMOUFOX_DISABLE", "1");
         let cdp = anyhow!("内置浏览器超时");

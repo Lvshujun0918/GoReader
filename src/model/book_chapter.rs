@@ -27,6 +27,10 @@ pub struct BookInfo {
     /// 相关推荐（GAP 17b：书源 ruleRelated 解析，[{name, author, bookUrl, coverUrl}]）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_books: Vec<RelatedBook>,
+    /// 书籍类型（legacy BookType：0 文本/1 音频/2 漫画/3 文件/4 视频——来自书源
+    /// bookSourceType；阅读器按此分派非文本渲染）
+    #[serde(rename = "type")]
+    pub book_type: i64,
 }
 
 /// 相关推荐书（GAP 17b：legacy RelatedBook 字段）

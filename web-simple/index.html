@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>书架 - Reader</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-size:20px; line-height:1.5; color:#222; background:#f7f5f0;
+         font-family:"STSong","SimSun","Noto Serif CJK SC",serif; }
+  #wrap { max-width:640px; margin:0 auto; padding:10px; }
+  h1 { font-size:26px; padding:8px 2px; }
+  nav a { display:inline-block; font-size:20px; padding:10px 16px; margin:4px 6px 4px 0;
+          background:#333; color:#fff; text-decoration:none; border-radius:6px; }
+  #searchbox { width:100%; font-size:22px; padding:12px; margin:10px 0; border:2px solid #999;
+               border-radius:6px; }
+  .btn { display:inline-block; font-size:20px; padding:10px 16px; margin:4px 6px 4px 0;
+         background:#356; color:#fff; text-decoration:none; border:none; border-radius:6px; }
+  #status { margin:8px 2px; color:#666; font-size:18px; min-height:26px; }
+  ul#list { list-style:none; }
+  ul#list li { margin:8px 0; }
+  ul#list a { display:block; background:#fff; border:1px solid #ccc; border-radius:8px;
+              padding:14px 12px; text-decoration:none; color:#222; }
+  ul#list .name { font-size:22px; font-weight:bold; }
+  ul#list .meta { font-size:16px; color:#777; margin-top:4px; }
+  ul#list .latest { font-size:17px; color:#356; margin-top:4px; }
+  .empty { color:#888; padding:20px 4px; text-align:center; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>书架</h1>
+  <nav>
+    <a href="index.html?accessToken=__TOKEN__">书架</a>
+    <a href="search.html?accessToken=__TOKEN__">搜索</a>
+    <a href="rss.html?accessToken=__TOKEN__">RSS</a>
+  </nav>
+  <input id="searchbox" type="search" placeholder="过滤书架…" value="">
+  <a class="btn" id="goSearch" href="search.html?accessToken=__TOKEN__">全网搜索</a>
+  <div id="status">加载中…</div>
+  <ul id="list"></ul>
+</div>
+<script>
+(function () {
+  // —— URL 参数（accessToken 透传）——
+  var QS = {};
+  location.search.replace(/^\?/, "").split("&").forEach(function (p) {
+    var kv = p.split("=");
+    if (kv[0]) QS[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || "");
+  });
+  var TOKEN = QS.accessToken || "";
+  // 导航链接补 token
+  var links = document.getElementsByTagName("a");
+  for (var i = 0; i < links.length; i++) {
+    var h = links[i].getAttribute("href") || "";
+    if (h.indexOf("__TOKEN__") >= 0) {
+      links[i].setAttribute("href", h.split("__TOKEN__").join(encodeURIComponent(TOKEN)));
+    }
+  }
+  var list = document.getElementById("list");
+  var status = document.getElementById("status");
+  var searchbox = document.getElementById("searchbox");
+  var books = [];
+
+  function apiUrl(path, extra) {
+    var parts = [];
+    if (TOKEN) parts.push("accessToken=" + encodeURIComponent(TOKEN));
+    for (var k in extra) parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(extra[k]));
+    return path + "?" + parts.join("&");
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function render(filter) {
+    var html = "";
+    var shown = 0;
+    filter = (filter || "").trim().toLowerCase();
+    for (var i = 0; i < books.length; i++) {
+      var b = books[i];
+      if (filter && (b.name || "").toLowerCase().indexOf(filter) < 0 &&
+          (b.author || "").toLowerCase().indexOf(filter) < 0) continue;
+      shown++;
+      var q = "reader.html?bookUrl=" + encodeURIComponent(b.bookUrl) +
+              "&tocUrl=" + encodeURIComponent(b.tocUrl || b.bookUrl) +
+              (b.origin ? "&bookSource=" + encodeURIComponent(b.origin) : "") +
+              "&accessToken=" + encodeURIComponent(TOKEN);
+      html += "<li><a href=\"" + q + "\">" +
+              "<div class=\"name\">" + esc(b.name) + "</div>" +
+              "<div class=\"meta\">" + esc(b.author || "佚名") + " · " + esc(b.originName || "") + "</div>" +
+              (b.latestChapterTitle ? "<div class=\"latest\">" + esc(b.latestChapterTitle) + "</div>" : "") +
+              "</a></li>";
+    }
+    if (!books.length) {
+      status.innerHTML = "书架为空，去 <a href='search.html?accessToken=" + encodeURIComponent(TOKEN) + "'>搜索</a> 添加书籍";
+      list.innerHTML = "";
+    } else if (!shown) {
+      list.innerHTML = "<li class='empty'>无匹配书籍</li>";
+    } else {
+      status.innerHTML = "共 " + books.length + " 本";
+      list.innerHTML = html;
+    }
+  }
+
+  fetch(apiUrl("/reader3/getBookshelf", {}))
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (!j || j.isSuccess === false) {
+        status.innerHTML = "加载失败：" + esc(j && j.errorMsg || "未知错误");
+        return;
+      }
+      books = j.data || [];
+      render(searchbox.value);
+    })
+    .catch(function (e) {
+      status.innerHTML = "网络错误：" + esc(e.message || e);
+    });
+
+  searchbox.addEventListener("input", function () { render(searchbox.value); });
+  document.getElementById("goSearch").addEventListener("click", function (ev) {
+    var key = searchbox.value.trim();
+    if (key) {
+      ev.preventDefault();
+      location.href = "search.html?key=" + encodeURIComponent(key) +
+                      "&accessToken=" + encodeURIComponent(TOKEN);
+    }
+  });
+})();
+</script>
+</body>
+</html>

@@ -311,6 +311,7 @@ fn content_type_for_ext(ext: &str) -> &'static str {
         "epub" => "application/epub+zip",
         "zip" | "cbz" => "application/zip",
         "pdf" => "application/pdf",
+        "umd" => "application/octet-stream",
         _ => "text/plain; charset=utf-8",
     }
 }

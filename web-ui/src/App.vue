@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { getCurrentInstance, onMounted } from 'vue'
 import { applyUiTheme, loadUiTheme } from '@/utils/uiTheme'
+import { applyCustomCss } from '@/utils/customCss'
 import ErrorBoundary from '@/components/ErrorBoundary.vue'
 
 // GAP 69 全局错误处理：未被子组件捕获的渲染/生命周期/异步错误统一记录
@@ -18,6 +19,8 @@ if (app) {
 onMounted(() => {
   // 界面主题（浅色/深色/跟随系统）：进入即恢复，并监听系统深色偏好（system 时自动切换）
   applyUiTheme(loadUiTheme())
+  // GAP 5：自定义样式注入（reader_custom_css → 全局 <style>，阅读器/界面均可覆盖）
+  applyCustomCss()
   const mq = window.matchMedia('(prefers-color-scheme: dark)')
   const onSystemChange = () => {
     if (loadUiTheme() === 'system') applyUiTheme('system')

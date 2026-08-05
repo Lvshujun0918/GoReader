@@ -401,6 +401,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             chapter_index INTEGER DEFAULT 0,
             created_at INTEGER DEFAULT 0,
             user_namespace TEXT DEFAULT '',
+            raw_json TEXT,
             PRIMARY KEY (book_url, title)
         );
         "#,
@@ -518,6 +519,8 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     // 幂等补列（兼容旧库：缺列则 ALTER TABLE 补上）
     let columns = [
         ("users", &["token_map", "raw_json"][..]),
+        // legacy bookmark.json 的 content 字段无对应列 → raw_json 原文保底
+        ("bookmarks", &["raw_json"][..]),
         ("book_sources", &["rule_related"][..]),
         // GAP 44：旧库缺 rss_source_group 列时补上（新库 CREATE TABLE 已含）
         ("rss_sources", &["rss_source_group"][..]),
@@ -2054,6 +2057,34 @@ impl Storage {
         Ok(r.rows_affected())
     }
 
+    /// 批量删除替换规则（单事务：全部成功或全部回滚）；返回受影响行数。
+    /// 每个 id 同时按 id 或 name 匹配（legacy 数组以 name 匹配规则）
+    pub async fn delete_replace_rules(&self, ns: &str, ids: &[String]) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let mut total = 0u64;
+        for id in ids {
+            let r = sqlx::query(
+                "DELETE FROM replace_rules WHERE user_namespace = ?1 AND (id = ?2 OR name = ?2)",
+            )
+            .bind(ns)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            total += r.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(total)
+    }
+
+    /// 清空命名空间全部替换规则；返回受影响行数
+    pub async fn delete_all_replace_rules(&self, ns: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM replace_rules WHERE user_namespace = ?1")
+            .bind(ns)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     // ---------------- F-26 HttpTTS ----------------
 
     /// HttpTTS 听书源列表（按名称排序；无用户数据回退 default，同书源语义）
@@ -2086,6 +2117,24 @@ impl Storage {
         .bind(ns)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// 批量保存 HttpTTS（单事务：全部成功或全部回滚）
+    pub async fn save_http_tts_multi(&self, ns: &str, items: &[crate::model::HttpTts]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for tts in items {
+            sqlx::query(
+                "INSERT OR REPLACE INTO http_tts_list (url, name, type, user_namespace)              VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(&tts.url)
+            .bind(&tts.name)
+            .bind(tts.tts_type)
+            .bind(ns)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2636,6 +2685,30 @@ impl Storage {
         tx.commit().await?;
         self.remove_user_data_dir(username);
         Ok(1)
+    }
+
+    /// 批量删除用户（单事务：全部用户删除 + 数据清理原子提交，任一失败整体回滚；
+    /// 成功后事务外逐个删除用户数据目录）。已存在用户才计入返回数。
+    pub async fn delete_users(&self, usernames: &[String]) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let mut deleted = 0u64;
+        let mut removed: Vec<String> = Vec::new();
+        for username in usernames {
+            let r = sqlx::query("DELETE FROM users WHERE username = ?1")
+                .bind(username)
+                .execute(&mut *tx)
+                .await?;
+            if r.rows_affected() > 0 {
+                delete_user_rows(&mut tx, username).await?;
+                deleted += 1;
+                removed.push(username.clone());
+            }
+        }
+        tx.commit().await?;
+        for username in removed {
+            self.remove_user_data_dir(&username);
+        }
+        Ok(deleted)
     }
 
     /// 删除 storage/data/{username} 目录（递归——含 webdav/opds_files 等）；失败仅告警

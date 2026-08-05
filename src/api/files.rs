@@ -526,6 +526,70 @@ pub async fn delete(
     }
 }
 
+/// POST /reader3/file/deleteMulti：批量删除文件/目录（legacy 对齐）。
+/// body：`{"paths":["/a","/b"], "home": "..."}`（兼容 legacy `path` 数组键）；
+/// 逐路径静默跳过不存在/非法（防穿越拒绝）路径；目录递归删除。
+pub async fn delete_multi(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Json<ReturnData> {
+    let ns = match resolve_namespace(&state, &params, &headers).await {
+        Ok(ns) => ns,
+        Err(ret) => return Json(ret),
+    };
+    let body_json = body.and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let home = str_param(&params, body_json.as_ref(), "home");
+    let user = state.storage.find_user(&ns).await.ok().flatten();
+    let manager = manager_ok(&state.storage.config, &params, body_json.as_ref());
+    let base = match file_home(&state.storage.config, &ns, &home, false, true, manager, user.as_ref()) {
+        Ok(b) => b,
+        Err(ret) => return Json(ret),
+    };
+    let paths: Vec<String> = match &body_json {
+        Some(Value::Object(obj)) => {
+            let arr = obj.get("paths").or_else(|| obj.get("path")).and_then(|v| v.as_array());
+            match arr {
+                Some(arr) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
+                None => return Json(ReturnData::err("参数错误")),
+            }
+        }
+        _ => return Json(ReturnData::err("参数错误")),
+    };
+    if paths.is_empty() {
+        return Json(ReturnData::err("参数错误"));
+    }
+    let mut deleted = 0u64;
+    let mut failed = 0u64;
+    for path in paths {
+        if path.is_empty() {
+            continue;
+        }
+        // 非法（防穿越）路径静默跳过（legacy：resolveSecurePath 失败即跳过）
+        let Some(file) = resolve_secure_path(&base, &path) else { continue };
+        if !file.exists() {
+            continue;
+        }
+        let result = if file.is_dir() {
+            std::fs::remove_dir_all(&file)
+        } else {
+            std::fs::remove_file(&file)
+        };
+        match result {
+            Ok(_) => deleted += 1,
+            Err(e) => {
+                tracing::error!("file/deleteMulti 失败 [{}]: {e}", file.display());
+                failed += 1;
+            }
+        }
+    }
+    Json(ReturnData::ok(json!({ "deleted": deleted, "failed": failed })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,6 +750,53 @@ mod tests {
         let ret = get(State(state.clone()), Query(params), headers, None).await;
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "路径不存在");
+
+        cleanup(state, dir).await;
+    }
+
+    /// file/deleteMulti：批量删文件+目录；legacy `path` 键兼容；防穿越跳过；缺 paths 报参数错误
+    #[tokio::test]
+    async fn test_file_delete_multi() {
+        let (state, dir) = test_state("delmulti").await;
+        let headers = HeaderMap::new();
+
+        // 准备：a.txt / b.txt / docs/c.txt / 外部 escape.txt
+        let base = state.storage.config.storage_dir().join("data").join("default");
+        std::fs::create_dir_all(base.join("docs")).unwrap();
+        std::fs::write(base.join("a.txt"), "a").unwrap();
+        std::fs::write(base.join("b.txt"), "b").unwrap();
+        std::fs::write(base.join("docs/c.txt"), "c").unwrap();
+        let outside = dir.join("escape.txt");
+        std::fs::write(&outside, "x").unwrap();
+
+        // {paths} 批量删除：文件 + 目录 + 不存在的路径（跳过）+ 防穿越路径（跳过）
+        let body = Bytes::from(
+            r#"{"paths":["/a.txt","/docs","/missing.txt","/../escape.txt"],"home":""}"#,
+        );
+        let ret = delete_multi(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        assert!(ret.0.is_success, "deleteMulti 应成功: {}", ret.0.error_msg);
+        assert_eq!(ret.0.data["deleted"], 2, "应删除 a.txt + docs 目录: {:?}", ret.0.data);
+        assert!(!base.join("a.txt").exists());
+        assert!(!base.join("docs").exists());
+        assert!(outside.exists(), "外部文件不应被删");
+        assert!(base.join("b.txt").exists());
+
+        // legacy `path` 键（数组）兼容
+        let body = Bytes::from(r#"{"path":["/b.txt"],"home":""}"#);
+        let ret = delete_multi(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        assert!(ret.0.is_success);
+        assert_eq!(ret.0.data["deleted"], 1);
+        assert!(!base.join("b.txt").exists());
+
+        // 缺 paths/path 键 → 参数错误；空数组 → 参数错误
+        let body = Bytes::from(r#"{"home":""}"#);
+        let ret = delete_multi(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "参数错误");
+        let body = Bytes::from(r#"{"paths":[],"home":""}"#);
+        let ret = delete_multi(State(state.clone()), Query(HashMap::new()), headers, Some(body)).await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "参数错误");
 
         cleanup(state, dir).await;
     }

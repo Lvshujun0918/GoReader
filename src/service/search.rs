@@ -374,6 +374,9 @@ fn analyze_book_list_impl(
                 origin: source.book_source_url.clone(),
                 origin_name: source.book_source_name.clone(),
                 origin_order: source.custom_order,
+                // 非文本书源（音频/漫画等）：bookSourceType 透传到搜索结果的 type——
+                // 入架后 books.book_type 即带类型，阅读器按此分派渲染
+                book_type: source.book_source_type.clamp(0, 4),
                 time: chrono::Utc::now().timestamp_millis(),
                 ..Default::default()
             };

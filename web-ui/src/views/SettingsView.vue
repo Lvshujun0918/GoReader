@@ -1,9 +1,19 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import LogoMark from '@/components/LogoMark.vue'
 import { deleteHttpTts, getHttpTtsList, saveHttpTts } from '@/api/httpTts'
+import { uploadFile, mkdir } from '@/api/file'
+import { loadCustomCss, saveCustomCss, applyCustomCss } from '@/utils/customCss'
+import {
+  loadBgMode,
+  loadBgImagePath,
+  saveBgMode,
+  saveBgImagePath,
+  bgImageUrl as bgImageUrlOf,
+  type BgMode,
+} from '@/utils/readerBg'
 import { clearCache, getCacheInfo } from '@/api/cache'
 import { backupToWebdav, downloadBackupZip } from '@/api/backup'
 import { getSystemInfo } from '@/api/system'
@@ -538,6 +548,107 @@ async function resetPref() {
     resetPrefBusy.value = false
   }
 }
+
+/* ================= GAP 4：阅读背景（纯色/纸纹/图片——图片上传到服务器 assets/background/，本地只记路径） ================= */
+
+const BG_OPTIONS: { value: BgMode; label: string }[] = [
+  { value: 'color', label: '纯色' },
+  { value: 'texture', label: '纸纹' },
+  { value: 'image', label: '图片' },
+]
+
+const bgMode = ref<BgMode>(loadBgMode())
+const bgImagePath = ref(loadBgImagePath())
+/** 预览/阅读展示 URL（file/download + accessToken） */
+const bgImageUrl = computed(() => bgImageUrlOf(bgImagePath.value, store.accessToken))
+const bgImageName = computed(() => {
+  const p = bgImagePath.value
+  return p ? p.split('/').pop() || p : ''
+})
+const bgUploadBusy = ref(false)
+const bgPick = ref<HTMLInputElement | null>(null)
+
+/** 背景模式切换：纸纹同步 reader_texture（阅读页纸纹开关同源），纯色清除 */
+function setBgMode(m: BgMode) {
+  bgMode.value = m
+  saveBgMode(m)
+  try {
+    if (m === 'texture') localStorage.setItem('reader_texture', '1')
+    else if (m === 'color') localStorage.removeItem('reader_texture')
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 上传背景图：file/upload 到 assets/background/（用户根，后端 file API）；目标目录不存在时先 mkdir */
+function ensureBgDir(): Promise<void> {
+  // mkdir 幂等失败静默（目录已存在时后端可能报错，不影响上传）
+  return mkdir('', 'assets', '', { silent: true })
+    .catch(() => undefined)
+    .then(() => mkdir('assets', 'background', '', { silent: true }).catch(() => undefined))
+    .then(() => undefined)
+}
+
+async function onBgPick(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = '' // 允许重复选择同一文件
+  if (!file) return
+  if (!file.type.startsWith('image/')) {
+    ElMessage.warning('请选择图片文件（png/jpg/webp 等）')
+    return
+  }
+  bgUploadBusy.value = true
+  try {
+    await ensureBgDir()
+    // 上传返回 FileItem[]（path 相对用户根，形如 /assets/background/x.jpg）
+    const res = await uploadFile(file, 'assets/background', '')
+    const items = (res.data ?? []) as { path?: string }[]
+    const path = items[0]?.path ? items[0].path.replace(/^\/+/, '') : `assets/background/${file.name}`
+    bgImagePath.value = path
+    saveBgImagePath(path)
+    bgMode.value = 'image'
+    saveBgMode('image')
+    ElMessage.success('背景图已上传（阅读页图片背景生效）')
+  } catch {
+    // 请求层已提示
+  } finally {
+    bgUploadBusy.value = false
+  }
+}
+
+function removeBgImage() {
+  bgImagePath.value = ''
+  saveBgImagePath('')
+  if (bgMode.value === 'image') {
+    bgMode.value = 'color'
+    saveBgMode('color')
+  }
+  ElMessage.success('已移除背景图')
+}
+
+/* ================= GAP 5：自定义样式（reader_custom_css → 注入全局 <style>；输入停顿自动保存并生效） ================= */
+
+const customCss = ref(loadCustomCss())
+let cssTimer: number | undefined
+watch(customCss, (v) => {
+  if (cssTimer !== undefined) window.clearTimeout(cssTimer)
+  cssTimer = window.setTimeout(() => {
+    saveCustomCss(v)
+    applyCustomCss(v)
+  }, 400)
+})
+
+function restoreCustomCss() {
+  customCss.value = ''
+  saveCustomCss('')
+  applyCustomCss('')
+  ElMessage.success('已恢复默认（自定义样式已清空）')
+}
+
+onBeforeUnmount(() => {
+  if (cssTimer !== undefined) window.clearTimeout(cssTimer)
+})
 
 /* ================= 阅读统计（GET /reader3/getReadingStats；后端未就绪时本地进度降级） ================= */
 
@@ -1238,6 +1349,62 @@ async function runExportData() {
         </div>
         <p v-if="prefMsg" class="card-note" :class="{ error: prefMsgError }">{{ prefMsg }}</p>
         <p class="card-note">阅读页内的调整同样写入本机；「保存到云端」后多端一致（服务器优先）。</p>
+      </section>
+
+      <!-- 阅读背景（GAP 4：纯色 / 纸纹 / 自定义图片——图片上传到服务器 assets/background/） -->
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">阅读背景</h2>
+          <span class="card-sub">阅读页背景 · 纯色 / 纸纹 / 自定义图片</span>
+        </div>
+        <div class="row">
+          <span class="row-label">背景</span>
+          <div class="pref-pills">
+            <button
+              v-for="o in BG_OPTIONS"
+              :key="o.value"
+              class="capsule"
+              :class="{ active: bgMode === o.value }"
+              type="button"
+              @click="setBgMode(o.value)"
+            >
+              {{ o.label }}
+            </button>
+          </div>
+        </div>
+        <div v-if="bgMode === 'image'" class="row">
+          <span class="row-label">背景图</span>
+          <span class="row-value mono" :title="bgImagePath">{{ bgImageName || '未上传' }}</span>
+          <button class="row-action" type="button" :disabled="bgUploadBusy" @click="bgPick?.click()">
+            {{ bgUploadBusy ? '上传中…' : '上传背景图' }}
+          </button>
+          <input ref="bgPick" class="hidden-file" type="file" accept="image/*" @change="onBgPick" />
+          <button v-if="bgImageName" class="row-action" type="button" :disabled="bgUploadBusy" @click="removeBgImage">
+            移除
+          </button>
+        </div>
+        <div v-if="bgMode === 'image' && bgImageUrl" class="bg-preview-wrap">
+          <div class="bg-preview" :style="{ backgroundImage: `url('${bgImageUrl}')` }"></div>
+          <span class="bg-preview-tip">预览（阅读页为固定铺满 + 遮罩）</span>
+        </div>
+        <p class="card-note">背景图经 file/upload 保存到服务器 assets/background/（用户目录），本机仅记路径；图片背景在阅读页叠加半透明遮罩保证文字可读。secure 模式写文件需管理密码，上传失败时以页面提示为准。</p>
+      </section>
+
+      <!-- 自定义样式（GAP 5：reader_custom_css → 注入全局 <style>，阅读器/界面均可覆盖） -->
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">自定义样式</h2>
+          <span class="card-sub">自定义 CSS · 注入阅读器与全局界面（本机）</span>
+          <button class="row-action" type="button" @click="restoreCustomCss">恢复默认</button>
+        </div>
+        <textarea
+          v-model="customCss"
+          class="css-editor"
+          rows="8"
+          spellcheck="false"
+          placeholder=".reader-content { letter-spacing: 0.5px; }&#10;.reader-page { padding-top: 8px; }"
+        ></textarea>
+        <p class="card-note">输入停顿约 0.4s 后自动保存并注入（localStorage: reader_custom_css）；可覆盖阅读页 .reader-page/.reader-content 及全局样式。「恢复默认」清空。</p>
       </section>
 
       <!-- 阅读统计（GET /reader3/getReadingStats；后端未就绪时本地降级） -->
@@ -2530,6 +2697,55 @@ async function runExportData() {
 }
 .card-note.error {
   color: #cf4444;
+}
+
+/* ================= 阅读背景（GAP 4） ================= */
+.hidden-file {
+  display: none;
+}
+.bg-preview-wrap {
+  margin-top: 14px;
+}
+.bg-preview {
+  height: 120px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background-color: var(--bg);
+  background-size: cover;
+  background-position: center;
+}
+.bg-preview-tip {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+
+/* ================= 自定义样式（GAP 5） ================= */
+.css-editor {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 140px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  font-weight: 300;
+  line-height: 1.7;
+  outline: none;
+  resize: vertical;
+  transition: border-color 0.2s ease;
+}
+.css-editor::placeholder {
+  color: var(--text-3);
+}
+.css-editor:focus {
+  border-color: var(--accent);
 }
 
 /* ================= 阅读统计弹窗 ================= */

@@ -4,7 +4,7 @@
 //! v1：CSS/JSONPath/JS（简单）规则；多页目录/正文（nextTocUrl/nextContentUrl）循环支持
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::book_chapter::{BookChapter, BookInfo};
 use crate::model::BookSource;
@@ -133,6 +133,7 @@ pub fn analyze_book_info(html: &str, base_url: &str, source: &BookSource, book_u
         publisher: None,
         published_at: None,
         related_books: analyze_related_books(html, base_url, source),
+        book_type: source.book_source_type,
     }
 }
 
@@ -279,6 +280,187 @@ fn chapters_from_items(
             })
         })
         .collect()
+}
+
+/// 非文本正文返回结构（legacy getBookContent 对音频/漫画/视频/文件书的返回契约）
+///
+/// - 音频书（book_type=1）：`{audioUrl, contentType}`（contentType：m3u8 →
+///   `application/vnd.apple.mpegurl`，其余按扩展名 audio/*）
+/// - 漫画书（book_type=2）：`{images: [url, ...]}`（章节 = 图片列表）
+/// - 文件书（book_type=3）：`{downloadUrl}`
+/// - 视频书（book_type=4）：`{videoUrl}`
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum MediaContent {
+    Audio {
+        audio_url: String,
+        content_type: String,
+    },
+    Comic {
+        images: Vec<String>,
+    },
+    Video {
+        video_url: String,
+    },
+    File {
+        download_url: String,
+    },
+}
+
+/// 音频 URL → contentType（m3u8 走 HLS，其余按扩展名映射；未知默认 audio/mpeg）
+pub fn audio_content_type(url: &str) -> &'static str {
+    let path = url.split('?').next().unwrap_or(url).to_lowercase();
+    if path.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if path.ends_with(".mp3") {
+        "audio/mpeg"
+    } else if path.ends_with(".m4a") || path.ends_with(".aac") {
+        "audio/mp4"
+    } else if path.ends_with(".ogg") || path.ends_with(".oga") {
+        "audio/ogg"
+    } else if path.ends_with(".wav") {
+        "audio/wav"
+    } else if path.ends_with(".flac") {
+        "audio/flac"
+    } else if path.ends_with(".opus") {
+        "audio/opus"
+    } else if path.ends_with(".mp4") || path.ends_with(".m4v") {
+        "audio/mp4"
+    } else {
+        "audio/mpeg"
+    }
+}
+
+/// 规则结果 → URL 列表（兼容三种形态：普通 URL 文本 / JSON 字符串数组
+/// （@js: 返回数组经 js_result_to_string 序列化）/ JSON 对象数组）
+fn collect_urls(value: &str, out: &mut Vec<String>) {
+    let t = value.trim();
+    if t.is_empty() {
+        return;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        match v {
+            serde_json::Value::String(s) => {
+                let s = s.trim().to_string();
+                if !s.is_empty() {
+                    out.push(s);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    match item {
+                        serde_json::Value::String(s) => {
+                            let s = s.trim().to_string();
+                            if !s.is_empty() {
+                                out.push(s);
+                            }
+                        }
+                        // 对象数组（如 [{url: "..."}]）：取 url/src/href 字段
+                        serde_json::Value::Object(map) => {
+                            for k in ["url", "src", "href"] {
+                                if let Some(serde_json::Value::String(s)) = map.get(k) {
+                                    let s = s.trim().to_string();
+                                    if !s.is_empty() {
+                                        out.push(s);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => out.push(t.to_string()),
+        }
+    } else {
+        out.push(t.to_string());
+    }
+}
+
+/// 媒体 URL 提取（音频/视频/文件书共用）：ruleContent.content 规则应用到章节页 → URL；
+/// 规则缺失或提取为空 → 章节 URL 本身（音频书章节 URL 常即音频流 URL 直链）。
+pub async fn analyze_media_url(
+    ns: &str,
+    chapter_url: &str,
+    source: &BookSource,
+) -> Result<String> {
+    let rule: ContentRule = source
+        .rule_content
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let Some(content_rule) = rule.content.clone() else {
+        return Ok(chapter_url.to_string());
+    };
+    if content_rule.trim().is_empty() {
+        return Ok(chapter_url.to_string());
+    }
+    let resp = fetch_url(ns, chapter_url, source).await?;
+    let base = resp.url.clone();
+    // 规则结果可能含多值（CSS 命中多个/JSON 数组）——取首个 URL
+    let mut urls: Vec<String> = Vec::new();
+    for v in apply(&content_rule, &resp.body) {
+        collect_urls(&v, &mut urls);
+        if !urls.is_empty() {
+            break;
+        }
+    }
+    let Some(mut url) = urls.into_iter().next() else {
+        return Ok(chapter_url.to_string());
+    };
+    url = to_abs(&url, &base);
+    Ok(url)
+}
+
+/// 漫画书图片列表提取（ruleContent.content 规则 → 图片 URL 列表）：
+/// - CSS/JSONPath/Regex 规则：全部命中值均为图片 URL
+/// - @js:/<js> 规则：结果可为 URL 字符串或字符串数组（JSON 序列化形态）
+/// - 规则缺失：章节 URL 本身为图片直链时直接返回
+pub async fn analyze_comic_images(
+    ns: &str,
+    chapter_url: &str,
+    source: &BookSource,
+) -> Result<Vec<String>> {
+    let rule: ContentRule = source
+        .rule_content
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let Some(content_rule) = rule.content.clone() else {
+        // 无规则：章节 URL 即图片直链（部分图源章节 URL 直接指向图片）
+        if looks_like_image_url(chapter_url) {
+            return Ok(vec![chapter_url.to_string()]);
+        }
+        return Ok(vec![]);
+    };
+    if content_rule.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    let resp = fetch_url(ns, chapter_url, source).await?;
+    let base = resp.url.clone();
+    let mut urls: Vec<String> = Vec::new();
+    for v in apply(&content_rule, &resp.body) {
+        collect_urls(&v, &mut urls);
+    }
+    // 绝对化 + 去重保序
+    let mut seen = std::collections::HashSet::new();
+    let mut images: Vec<String> = Vec::new();
+    for u in urls {
+        let abs = to_abs(&u, &base);
+        if seen.insert(abs.clone()) {
+            images.push(abs);
+        }
+    }
+    Ok(images)
+}
+
+/// 是否为图片直链（按扩展名判断，忽略查询串）
+fn looks_like_image_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
+    [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".svg"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
 }
 
 /// 正文解析（ruleContent：content 字段 + sourceRegex 清洗 + 多页）
@@ -581,4 +763,140 @@ mod tests {
         assert!(!content.contains("广告"), "sourceRegex 应删除广告片段: {content}");
         assert!(content.contains("正文甲。") && content.contains("正文乙。"));
     }
+
+    // ---------------- 非文本内容分派（音频/漫画/视频/文件） ----------------
+
+    /// 微型 HTTP 服务器：固定响应体（同 crawler 测试模式）
+    async fn serve(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..10 {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let mut resp = head.into_bytes();
+                resp.extend_from_slice(body.as_bytes());
+                let _ = sock.write_all(&mut resp).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 音频书：ruleContent.content 提取音频 URL → analyze_media_url 返回音频流直链
+    #[tokio::test]
+    async fn test_analyze_media_url_audio() {
+        let base = serve(r#"<html><div class="player"><audio src="/stream/1.mp3"></audio></div></html>"#).await;
+        let mut src = test_source();
+        src.rule_content = Some(serde_json::json!({
+            "content": "div.player audio@src"
+        }));
+        let url = analyze_media_url("default", &format!("{base}/chapter/1"), &src)
+            .await
+            .unwrap();
+        assert_eq!(url, format!("{base}/stream/1.mp3"), "音频 URL 应提取并绝对化");
+        // contentType 映射
+        assert_eq!(audio_content_type(&url), "audio/mpeg");
+        assert_eq!(audio_content_type("https://x/a.m3u8?t=1"), "application/vnd.apple.mpegurl");
+        assert_eq!(audio_content_type("https://x/a.m4a"), "audio/mp4");
+    }
+
+    /// 音频书：无 ruleContent（章节 URL 即音频流直链）→ 原样返回章节 URL
+    #[tokio::test]
+    async fn test_analyze_media_url_direct_chapter() {
+        let mut src = test_source();
+        src.rule_content = None;
+        let url = analyze_media_url("default", "https://cdn.example.com/audio/42.m4a", &src)
+            .await
+            .unwrap();
+        assert_eq!(url, "https://cdn.example.com/audio/42.m4a");
+    }
+
+    /// 漫画书：CSS 规则命中多个图片节点 → images 列表（绝对化 + 去重）
+    #[tokio::test]
+    async fn test_analyze_comic_images_css() {
+        let base = serve(
+            r#"<html><div class="imgs"><img src="/p/1.jpg"><img src="/p/2.jpg"><img src="/p/1.jpg"></div></html>"#,
+        )
+        .await;
+        let mut src = test_source();
+        src.rule_content = Some(serde_json::json!({ "content": "div.imgs img@src" }));
+        let images = analyze_comic_images("default", &format!("{base}/comic/1"), &src)
+            .await
+            .unwrap();
+        assert_eq!(
+            images,
+            vec![format!("{base}/p/1.jpg"), format!("{base}/p/2.jpg")],
+            "应提取全部图片且去重保序、相对转绝对"
+        );
+    }
+
+    /// 漫画书：@js: 规则返回 JSON 字符串数组 → images 列表
+    #[tokio::test]
+    async fn test_analyze_comic_images_js_array() {
+        let base = serve(r#"{"data":["/a/1.webp","/a/2.webp"]}"#).await;
+        let mut src = test_source();
+        src.rule_content = Some(serde_json::json!({
+            "content": "@js:JSON.parse(result).data"
+        }));
+        let images = analyze_comic_images("default", &format!("{base}/comic/2"), &src)
+            .await
+            .unwrap();
+        assert_eq!(
+            images,
+            vec![format!("{base}/a/1.webp"), format!("{base}/a/2.webp")],
+            "JS 数组应逐个提取并绝对化"
+        );
+    }
+
+    /// 漫画书：无规则且章节 URL 即图片直链 → 单图列表；有规则但提取不到 → 空列表
+    #[tokio::test]
+    async fn test_analyze_comic_images_direct() {
+        // 有规则但页面无匹配 → 空列表
+        let base = serve(r#"<html><div class="imgs"></div></html>"#).await;
+        let mut src = test_source();
+        src.rule_content = Some(serde_json::json!({ "content": "div.imgs img@src" }));
+        let images = analyze_comic_images("default", &format!("{base}/comic/3"), &src)
+            .await
+            .unwrap();
+        assert!(images.is_empty(), "有规则但提取不到 → 空列表");
+
+        // 无规则且章节 URL 即图片直链 → 单图列表（不抓取）
+        let mut src2 = test_source();
+        src2.rule_content = None;
+        let images2 = analyze_comic_images("default", "https://img.example.com/comic/5.jpg", &src2)
+            .await
+            .unwrap();
+        assert_eq!(images2, vec!["https://img.example.com/comic/5.jpg".to_string()]);
+    }
+
+    /// collect_urls 纯函数：URL 文本 / JSON 字符串数组 / 对象数组 / 空
+    #[test]
+    fn test_collect_urls() {
+        let mut out = Vec::new();
+        collect_urls("https://a.mp3", &mut out);
+        collect_urls(r#"["https://b.jpg","/c.png"]"#, &mut out);
+        collect_urls(r#"[{"url":"https://d.webp"},{"src":"https://e.avif"}]"#, &mut out);
+        collect_urls("  ", &mut out);
+        assert_eq!(
+            out,
+            vec![
+                "https://a.mp3",
+                "https://b.jpg",
+                "/c.png",
+                "https://d.webp",
+                "https://e.avif"
+            ]
+        );
+        // 对象数组取 url/src/href 首命中
+        let mut out2 = Vec::new();
+        collect_urls(r#"[{"name":"x","href":"/h/1"}]"#, &mut out2);
+        assert_eq!(out2, vec!["/h/1"]);
+    }
 }
+

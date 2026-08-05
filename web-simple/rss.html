@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RSS - Reader</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-size:20px; line-height:1.6; color:#222; background:#f7f5f0;
+         font-family:"STSong","SimSun","Noto Serif CJK SC",serif; }
+  #wrap { max-width:640px; margin:0 auto; padding:10px; }
+  h1 { font-size:26px; padding:8px 2px; }
+  nav a { display:inline-block; font-size:20px; padding:10px 16px; margin:4px 6px 4px 0;
+          background:#333; color:#fff; text-decoration:none; border-radius:6px; }
+  #status { margin:8px 2px; color:#666; font-size:18px; min-height:26px; }
+  ul { list-style:none; }
+  ul li { margin:8px 0; }
+  ul li a { display:block; background:#fff; border:1px solid #ccc; border-radius:8px;
+            padding:14px 12px; text-decoration:none; color:#222; }
+  .t { font-size:21px; font-weight:bold; }
+  .m { font-size:15px; color:#777; margin-top:4px; }
+  .unread { color:#a33; font-size:15px; margin-top:4px; }
+  button { font-size:20px; padding:10px 16px; margin:6px 6px 6px 0; background:#356;
+           color:#fff; border:none; border-radius:6px; }
+  #articleTitle { font-size:23px; font-weight:bold; padding:10px 2px; }
+  #articleBody { font-size:20px; white-space:pre-wrap; word-break:break-word; padding:4px 2px 20px; }
+  .back { display:inline-block; font-size:18px; padding:8px 12px; margin:4px 6px 4px 0;
+          background:#333; color:#fff; text-decoration:none; border-radius:6px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>RSS</h1>
+  <nav>
+    <a href="index.html?accessToken=__TOKEN__">书架</a>
+    <a href="search.html?accessToken=__TOKEN__">搜索</a>
+    <a href="rss.html?accessToken=__TOKEN__">RSS</a>
+  </nav>
+  <div id="status">加载中…</div>
+  <div id="view">
+    <ul id="list"></ul>
+  </div>
+</div>
+<script>
+(function () {
+  var QS = {};
+  location.search.replace(/^\?/, "").split("&").forEach(function (p) {
+    var kv = p.split("=");
+    if (kv[0]) QS[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || "");
+  });
+  var TOKEN = QS.accessToken || "";
+  var links = document.getElementsByTagName("a");
+  for (var i = 0; i < links.length; i++) {
+    var h = links[i].getAttribute("href") || "";
+    if (h.indexOf("__TOKEN__") >= 0) {
+      links[i].setAttribute("href", h.split("__TOKEN__").join(encodeURIComponent(TOKEN)));
+    }
+  }
+  var status = document.getElementById("status");
+  var list = document.getElementById("list");
+  var view = document.getElementById("view");
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+  function apiUrl(path, extra) {
+    var parts = [];
+    if (TOKEN) parts.push("accessToken=" + encodeURIComponent(TOKEN));
+    for (var k in extra) parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(extra[k]));
+    return path + "?" + parts.join("&");
+  }
+  function getJSON(url, ok, err) {
+    fetch(url).then(function (r) { return r.json(); })
+      .then(function (j) { if (j && j.isSuccess === false) err(j.errorMsg || "请求失败"); else ok(j); })
+      .catch(function (e) { err(e.message || e); });
+  }
+  function fmtTime(ms) {
+    if (!ms) return "";
+    var d = new Date(ms);
+    function p(n) { return n < 10 ? "0" + n : "" + n; }
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+           " " + p(d.getHours()) + ":" + p(d.getMinutes());
+  }
+  // feed 正文是 HTML——转纯文本展示（textContent 剥离标签，安全）
+  function toText(html) {
+    if (!html) return "";
+    var d = document.createElement("div");
+    d.innerHTML = html;
+    return (d.textContent || d.innerText || "").replace(/\s+/g, " ").trim();
+  }
+
+  // —— 视图 1：RSS 源列表 ——
+  function showSources() {
+    status.innerHTML = "加载中…";
+    getJSON(apiUrl("/reader3/getRssSources", {}),
+      function (j) {
+        var arr = j.data || [];
+        if (!arr.length) { status.innerHTML = "暂无 RSS 源"; list.innerHTML = ""; return; }
+        status.innerHTML = "共 " + arr.length + " 个源";
+        var html = "";
+        for (var i = 0; i < arr.length; i++) {
+          var s = arr[i];
+          html += "<li><a href='javascript:void(0)' data-url='" +
+                  encodeURIComponent(s.sourceUrl) + "'>" +
+                  "<div class='t'>" + esc(s.sourceName || s.sourceUrl) + "</div>" +
+                  "<div class='m'>" + (s.enabled ? "启用" : "停用") + "</div></a></li>";
+        }
+        list.innerHTML = html;
+        var as = list.getElementsByTagName("a");
+        for (var i = 0; i < as.length; i++) {
+          (function (a) {
+            a.addEventListener("click", function () {
+              showArticles(decodeURIComponent(a.getAttribute("data-url")));
+            });
+          })(as[i]);
+        }
+      },
+      function (msg) { status.innerHTML = "加载失败：" + esc(msg); });
+  }
+
+  // —— 视图 2：文章列表 ——
+  function showArticles(sourceUrl) {
+    status.innerHTML = "加载文章…";
+    getJSON(apiUrl("/reader3/getRssArticles", { rssSourceUrl: sourceUrl, page: 1 }),
+      function (j) {
+        var arr = j.data || [];
+        if (!arr.length) { status.innerHTML = "暂无文章"; list.innerHTML = ""; return; }
+        status.innerHTML = "共 " + arr.length + " 篇";
+        var html = "";
+        for (var i = 0; i < arr.length; i++) {
+          var a = arr[i];
+          html += "<li><a href='javascript:void(0)' data-url='" +
+                  encodeURIComponent(a.url) + "'>" +
+                  "<div class='t'>" + esc(a.title || "(无标题)") + "</div>" +
+                  "<div class='m'>" + fmtTime(a.time) + (a.author ? " · " + esc(a.author) : "") + "</div>" +
+                  (a.hasRead ? "" : "<div class='unread'>未读</div>") +
+                  "</a></li>";
+        }
+        list.innerHTML = html;
+        var as = list.getElementsByTagName("a");
+        for (var i = 0; i < as.length; i++) {
+          (function (a) {
+            a.addEventListener("click", function () {
+              showArticle(decodeURIComponent(a.getAttribute("data-url")));
+            });
+          })(as[i]);
+        }
+      },
+      function (msg) { status.innerHTML = "加载失败：" + esc(msg); });
+  }
+
+  // —— 视图 3：文章正文 ——
+  function showArticle(url) {
+    status.innerHTML = "加载正文…";
+    getJSON(apiUrl("/reader3/getRssArticle", { url: url }),
+      function (j) {
+        var a = j.data || {};
+        view.innerHTML = "<a class='back' href='javascript:void(0)' id='backBtn'>← 返回列表</a>" +
+          "<div id='articleTitle'>" + esc(a.title || "") + "</div>" +
+          "<div id='articleBody'></div>";
+        document.getElementById("articleBody").textContent = toText(a.content || "(无正文)");
+        document.getElementById("backBtn").addEventListener("click", showSources);
+        status.innerHTML = "";
+        // 标记已读（尽力而为）
+        try {
+          fetch(apiUrl("/reader3/markRssArticleRead", {}), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ articleUrl: url })
+          }).catch(function () {});
+        } catch (e) {}
+      },
+      function (msg) { status.innerHTML = "加载失败：" + esc(msg); });
+  }
+
+  showSources();
+})();
+</script>
+</body>
+</html>

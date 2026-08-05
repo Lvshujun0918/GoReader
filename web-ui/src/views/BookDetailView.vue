@@ -175,7 +175,8 @@ function buildShelfBook(): Book {
     coverUrl: i?.coverUrl ?? null,
     intro: i?.intro ?? null,
     charset: null,
-    type: 0,
+    // 非文本书（音频/漫画等）：getBookInfo 返回的 type 透传入架——阅读器按此分派
+    type: typeof i?.type === 'number' && i.type >= 0 && i.type <= 4 ? i.type : 0,
     group: 0,
     latestChapterTitle: i?.latestChapterTitle ?? null,
     latestChapterTime: 0,
@@ -263,6 +264,8 @@ function startReadingTemp() {
     sourceName: b.originName || '',
     toc: b.tocUrl || b.bookUrl || '',
     name: b.name || '',
+    // 非文本书临时直读：阅读器按 type 分派渲染（0 文本/1 音频/2 漫画/3 文件/4 视频）
+    type: String(typeof b.type === 'number' && b.type >= 0 && b.type <= 4 ? b.type : 0),
   })
   void router.push(`/reader/${encodeURIComponent(b.bookUrl)}?${q.toString()}`)
 }

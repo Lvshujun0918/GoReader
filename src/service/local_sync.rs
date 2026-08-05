@@ -35,7 +35,7 @@ const DEBOUNCE_MS: Duration = Duration::from_millis(300);
 const BOOKS_DIR: &str = "books";
 /// 书仓支持的文件格式（与 SUPPORTED_EXTENSIONS 一致但排除 zip——zip 语义歧义
 /// （EPUB 容器 / 裸 OPF 结构），书仓对账只认确定格式）
-const SYNC_EXTENSIONS: &[&str] = &["epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx"];
+const SYNC_EXTENSIONS: &[&str] = &["epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx", "cbz", "umd"];
 
 // ---------------------------------------------------------------------------
 // 启动入口

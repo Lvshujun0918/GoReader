@@ -1,4 +1,4 @@
-//! 本地书籍导入（EPUB / TXT / MOBI / AZW3 / PDF / FB2 / DOCX）
+//! 本地书籍导入（EPUB / TXT / MOBI / AZW3 / PDF / FB2 / DOCX / CBZ / UMD）
 //!
 //! - EPUB：zip 解包 → container.xml → OPF 元数据 → spine 章节（XHTML → 纯文本）→ 封面
 //! - TXT：编码检测（UTF-8/GBK）→ 分章（章节标题正则）
@@ -7,9 +7,13 @@
 //! - PDF：lopdf 按页提取文本（每页解压上限防炸弹；大 PDF 限 300 页）→ 标题分章或页分章
 //! - FB2：quick-xml 解析 body/section/title/p → 分章（每 section 一章）
 //! - DOCX：zip + word/document.xml → 段落提取（标题样式分章或按规则/字数回退）
+//! - CBZ：zip 内图片列表 → 章节 = 按文件名自然序的图片页（正文为 base64 data URI 图片标记）
+//! - UMD：手写解析（对齐 me.ag2s.umdlib 语义）——魔数 + section/附加块状态机 →
+//!   属性（标题/作者/年月日/题材/出版商）→ 0x83 章节偏移 + 0x84 标题 + zlib 正文块（UTF-16LE）
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::io::Read;
 
 use crate::service::epub::{parse_opf, OpfMeta};
 
@@ -868,6 +872,442 @@ fn docx_core_meta(xml: &str) -> (String, String) {
     (title.trim().to_string(), author.trim().to_string())
 }
 
+// ---------- CBZ（漫画压缩包） ----------
+
+/// 图片扩展名 → MIME（无扩展名/非图片返回 None）
+fn image_mime(name: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// 文件名自然排序（数字段按数值比较：page2 < page10；其余按不区分大小写字符序）。
+/// 用于漫画页排序——纯字典序会把 10.jpg 排在 2.jpg 前面。
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        let (da, db) = (a[i].is_ascii_digit(), b[j].is_ascii_digit());
+        if da && db {
+            // 跳过前导零后比较数值（先比有效位数，再逐位）
+            let (mut x, mut y) = (i, j);
+            while x < a.len() && a[x] == b'0' {
+                x += 1;
+            }
+            while y < b.len() && b[y] == b'0' {
+                y += 1;
+            }
+            let (mut xe, mut ye) = (x, y);
+            while xe < a.len() && a[xe].is_ascii_digit() {
+                xe += 1;
+            }
+            while ye < b.len() && b[ye].is_ascii_digit() {
+                ye += 1;
+            }
+            let ord = (xe - x).cmp(&(ye - y));
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            for k in 0..(xe - x) {
+                let o = a[x + k].cmp(&b[y + k]);
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            i = xe;
+            j = ye;
+        } else {
+            let o = a[i].to_ascii_lowercase().cmp(&b[j].to_ascii_lowercase());
+            if o != std::cmp::Ordering::Equal {
+                return o;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// CBZ 解析（漫画压缩包）：zip 内图片列表 → 章节 = 按文件名自然序的图片页。
+///
+/// 每页一章：title = 页文件名，content = markdown 图片语法 + base64 data URI
+/// （`![页名](data:image/jpeg;base64,...)`）。前端 ReaderView 的 singleImageUrl
+/// 识别该形式并直接渲染 <img>，data URI 无需额外图片服务路由，导入/导出/重扫自包含。
+pub fn parse_cbz(bytes: &[u8]) -> Result<ImportedBook> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("CBZ 不是有效的 zip")?;
+    let mut pages: Vec<(String, usize)> = Vec::new();
+    for i in 0..zip.len() {
+        let Ok(f) = zip.by_index(i) else { continue };
+        if f.is_dir() {
+            continue;
+        }
+        let name = f.name().to_string();
+        let base = std::path::Path::new(&name)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.clone());
+        // 跳过隐藏文件（.DS_Store 等）；非图片扩展名不参与分页
+        if base.starts_with('.') {
+            continue;
+        }
+        if image_mime(&name).is_some() {
+            pages.push((name, i));
+        }
+    }
+    if pages.is_empty() {
+        anyhow::bail!("CBZ 内未找到图片（支持 jpg/jpeg/png/gif/webp/bmp/svg）");
+    }
+    // 按文件名自然序（数字感知）：page2.jpg < page10.jpg
+    pages.sort_by(|x, y| natural_cmp(&x.0, &y.0));
+    use base64::Engine;
+    let mut chapters = Vec::with_capacity(pages.len());
+    for (name, _idx) in pages {
+        let bytes = read_zip(&mut zip, &name).context("读取 CBZ 图片失败")?;
+        let file_name = std::path::Path::new(&name)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.clone());
+        let mime = image_mime(&name).unwrap_or("image/jpeg");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        // alt 文本避免前端 singleImageUrl 正则的 `]` 边界字符
+        let alt = file_name.replace(']', "-").replace(')', "-");
+        chapters.push(Chapter {
+            title: file_name.clone(),
+            content: format!("![{alt}](data:{mime};base64,{b64})"),
+        });
+    }
+    Ok(ImportedBook {
+        meta: OpfMeta::default(),
+        chapters,
+        cover: None,
+        format: "cbz".into(),
+    })
+}
+
+// ---------- UMD ----------
+
+/// UMD（掌上书院）解析——语义对齐 me.ag2s.umdlib（legacy 阅读器 UmdFile 所用解析库）。
+///
+/// 文件结构（umdlib UmdReader 状态机）：
+/// - 魔数：4 字节 LE int 0xDE9A9B89（文件字节 89 9B 9A DE）
+/// - section：`#`(0x23) + 类型(2B LE) + 标志(1B) + 长度字节(1B，数据长 = 值 - 5) + 数据
+/// - section 后可跟 0..n 个附加块：`$`(0x24) + 校验号(4B LE) + 长度(4B LE，数据长 = 值 - 9) + 数据
+/// - 属性 section：0x01 文件类型（1=文本 0x02=漫画）、0x02 标题、0x03 作者、0x04-0x06 年月日、
+///   0x07 题材、0x08 出版商、0x09 零售商、0x0B 未压缩正文总字节数、0x0C 结束（文件总长）、
+///   0x0A/0xF1 内容 ID/许可证（跳过）
+/// - 章节偏移 section 0x83：附加块 = n × 4B LE 章节偏移（字节偏移，指向拼接后的未压缩正文）
+/// - 章节 section 0x84：附加块校验号 == section 头校验号 → n 个标题（1B 长度 + UTF-16LE 字节）；
+///   校验号不同 → zlib 压缩正文块（按序拼接）
+/// - 封面 section 0x82：附加块 = 封面图片字节
+///
+/// 正文为 UTF-16LE；按章节偏移切片后解码，U+2029 段落分隔符替换为 \n（umdlib getContentString）。
+pub fn parse_umd(bytes: &[u8]) -> Result<ImportedBook> {
+    let mut cur = UmdCursor::new(bytes);
+    let magic = cur.read_u32le().context("UMD 文件过短")?;
+    if magic != 0xDE9A9B89 {
+        anyhow::bail!("不是有效的 UMD 文件（魔数不符）");
+    }
+    let mut meta = OpfMeta::default();
+    let mut umd_year = String::new();
+    let mut umd_month = String::new();
+    let mut umd_day = String::new();
+    let mut umd_type: u8 = 1;
+    let mut content_lengths: Vec<usize> = Vec::new();
+    let mut titles: Vec<String> = Vec::new();
+    let mut contents: Vec<u8> = Vec::new();
+    let mut total_content_len: Option<usize> = None;
+    let mut num_chapters: usize = 0;
+    let mut additional_check: u32 = 0;
+    let mut cover: Option<Vec<u8>> = None;
+    let mut prev_section: u16 = 0;
+    let mut end = false;
+    let mut next: Option<u8> = None;
+
+    loop {
+        if end {
+            break;
+        }
+        let b = match next.take() {
+            Some(b) => b,
+            None => match cur.read_u8() {
+                Ok(b) => b,
+                Err(_) => break, // EOF：正常结束（文件可无 0x0C 结束标记）
+            },
+        };
+        if b != 0x23 {
+            break;
+        }
+        let seg_type = cur.read_u16le().context("UMD section 头损坏")?;
+        let _seg_flag = cur.read_u8().context("UMD section 头损坏")?;
+        let len_byte = cur.read_u8().context("UMD section 头损坏")?;
+        let length = len_byte as i32 - 5;
+        if length < 0 {
+            anyhow::bail!("UMD section 长度非法（{len_byte}）");
+        }
+        match seg_type {
+            1 => {
+                umd_type = cur.read_u8().context("UMD 文件类型缺失")?;
+                let _ = cur.bytes(2).context("UMD 文件类型段损坏")?;
+            }
+            2..=9 => {
+                let raw = cur.bytes(length as usize).context("UMD 属性段损坏")?;
+                let s = umd_utf16_string(&raw);
+                match seg_type {
+                    2 => meta.title = s,
+                    3 => meta.author = s,
+                    4 => umd_year = s,
+                    5 => umd_month = s,
+                    6 => umd_day = s,
+                    7 => {
+                        if !s.is_empty() {
+                            meta.subjects.push(s);
+                        }
+                    }
+                    8 => meta.publisher = Some(s),
+                    _ => { /* 0x09 零售商：忽略 */ }
+                }
+            }
+            10 => {
+                let _ = cur.bytes(length as usize).context("UMD 内容 ID 段损坏")?;
+            }
+            11 => {
+                total_content_len = Some(cur.read_u32le().context("UMD 正文长度段损坏")? as usize);
+            }
+            12 => {
+                end = true;
+                let _ = cur.read_u32le().context("UMD 结束段损坏")?;
+            }
+            13 => {}
+            14 => {
+                let _ = cur.read_u8().context("UMD 段损坏")?;
+            }
+            15 => {
+                let _ = cur.bytes(length as usize).context("UMD 段损坏")?;
+            }
+            129 | 131 | 132 => {
+                additional_check = cur.read_u32le().context("UMD 章节段损坏")?;
+            }
+            130 => {
+                let _ = cur.read_u8().context("UMD 封面段损坏")?;
+                additional_check = cur.read_u32le().context("UMD 封面段损坏")?;
+            }
+            135 => {
+                let _ = cur.read_u8().context("UMD 段损坏")?;
+                let _ = cur.read_u8().context("UMD 段损坏")?;
+                let _ = cur.bytes(4).context("UMD 段损坏")?;
+            }
+            240 => {}
+            241 => {
+                let _ = cur.bytes(16).context("UMD 许可证段损坏")?;
+            }
+            _ => {
+                if length > 0 {
+                    let _ = cur.bytes(length as usize).context("UMD 未知段损坏")?;
+                }
+            }
+        }
+        // 0x0A/0xF1 的附加块归属前一 section（umdlib 语义）
+        let effective = if seg_type == 241 || seg_type == 10 {
+            prev_section
+        } else {
+            seg_type
+        };
+        // 附加块（`$` 开头）
+        loop {
+            let b2 = match cur.read_u8() {
+                Ok(b2) => b2,
+                Err(_) => break, // EOF
+            };
+            if b2 != 0x24 {
+                next = Some(b2);
+                break;
+            }
+            let check = cur.read_u32le().context("UMD 附加块损坏")?;
+            let len32 = cur.read_u32le().context("UMD 附加块损坏")?;
+            let block_len = len32 as i64 - 9;
+            if block_len < 0 {
+                anyhow::bail!("UMD 附加块长度非法（{len32}）");
+            }
+            match effective {
+                129 => {
+                    let _ = cur.bytes(block_len as usize).context("UMD 附加块损坏")?;
+                }
+                130 => {
+                    cover = Some(cur.bytes(block_len as usize).context("UMD 封面损坏")?);
+                }
+                131 => {
+                    num_chapters = (block_len / 4) as usize;
+                    content_lengths.clear();
+                    for _ in 0..num_chapters {
+                        content_lengths
+                            .push(cur.read_u32le().context("UMD 章节偏移损坏")? as usize);
+                    }
+                }
+                132 => {
+                    if additional_check != check {
+                        // 正文块：zlib 解压后按序拼接
+                        let compressed =
+                            cur.bytes(block_len as usize).context("UMD 正文块损坏")?;
+                        let mut out = Vec::new();
+                        flate2::read::ZlibDecoder::new(&compressed[..])
+                            .read_to_end(&mut out)
+                            .context("UMD 正文解压失败")?;
+                        contents.extend_from_slice(&out);
+                    } else {
+                        // 标题块
+                        for _ in 0..num_chapters {
+                            let tlen = cur.read_u8().context("UMD 标题损坏")? as usize;
+                            let raw = cur.bytes(tlen).context("UMD 标题损坏")?;
+                            titles.push(umd_utf16_string(&raw));
+                        }
+                    }
+                }
+                _ => {
+                    let _ = cur.bytes(block_len as usize).context("UMD 附加块损坏")?;
+                }
+            }
+        }
+        prev_section = seg_type;
+    }
+
+    if umd_type == 2 {
+        anyhow::bail!("暂不支持 UMD 漫画（图片型）文件");
+    }
+    if titles.is_empty() && contents.is_empty() {
+        anyhow::bail!("UMD 未解析到章节内容");
+    }
+    // 出版时间：年[-月[-日]]（legacy UmdHeader year/month/day）
+    if !umd_year.is_empty() {
+        let mut published = umd_year;
+        if !umd_month.is_empty() {
+            published.push('-');
+            published.push_str(&umd_month);
+            if !umd_day.is_empty() {
+                published.push('-');
+                published.push_str(&umd_day);
+            }
+        }
+        meta.published_at = Some(published);
+    }
+
+    // 章节切片：偏移指向拼接后未压缩正文（UTF-16LE 字节）；最后一章到 total_content_len
+    //（缺失/越界时回退到实际拼接长度）
+    let total = total_content_len.unwrap_or(contents.len());
+    let mut chapters = Vec::with_capacity(titles.len());
+    for (idx, title) in titles.iter().enumerate() {
+        let start = content_lengths.get(idx).copied().unwrap_or(0).min(contents.len());
+        let end = if idx + 1 < content_lengths.len() {
+            content_lengths[idx + 1]
+        } else {
+            total
+        };
+        let end = if end <= start || end > contents.len() {
+            contents.len()
+        } else {
+            end
+        };
+        let text = umd_utf16_string(&contents[start..end]);
+        if text.trim().is_empty() && title.trim().is_empty() {
+            continue;
+        }
+        chapters.push(Chapter {
+            title: title.clone(),
+            content: text,
+        });
+    }
+    // 无标题但有正文（缺 0x84 的变体文件）：整书单章兜底
+    if chapters.is_empty() && !contents.is_empty() {
+        let text = umd_utf16_string(&contents);
+        if !text.trim().is_empty() {
+            let title = if meta.title.is_empty() {
+                "正文".to_string()
+            } else {
+                meta.title.clone()
+            };
+            chapters.push(Chapter { title, content: text });
+        }
+    }
+    if chapters.is_empty() {
+        anyhow::bail!("UMD 未解析到章节内容");
+    }
+    Ok(ImportedBook {
+        meta,
+        chapters,
+        cover,
+        format: "umd".into(),
+    })
+}
+
+/// UMD 顺序读取游标
+struct UmdCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> UmdCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn read_u8(&mut self) -> std::io::Result<u8> {
+        let b = *self
+            .data
+            .get(self.pos)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn read_u16le(&mut self) -> std::io::Result<u16> {
+        let mut buf = [0u8; 2];
+        self.read_exact(&mut buf)?;
+        Ok(u16::from_le_bytes(buf))
+    }
+
+    fn read_u32le(&mut self) -> std::io::Result<u32> {
+        let mut buf = [0u8; 4];
+        self.read_exact(&mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn bytes(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        self.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        if self.pos + buf.len() > self.data.len() {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        buf.copy_from_slice(&self.data[self.pos..self.pos + buf.len()]);
+        self.pos += buf.len();
+        Ok(())
+    }
+}
+
+/// UTF-16LE 解码（encoding_rs；容忍奇数尾字节；剥离 BOM）
+fn umd_utf16_string(bytes: &[u8]) -> String {
+    let (s, _) = encoding_rs::UTF_16LE.decode_without_bom_handling(bytes);
+    let s = s.into_owned();
+    // BOM（FF FE）被无 BOM 处理保留为 U+FEFF → 剥离
+    let s = s.strip_prefix('\u{feff}').unwrap_or(&s).to_string();
+    // U+2029 段落分隔符 → 换行（umdlib getContentString 语义）
+    s.replace('\u{2029}', "\n")
+}
+
 /// 判断是否本地书（local:// 或文件路径型 legacy 本地书）
 pub fn is_local_book(book_url: &str, origin: &str) -> bool {
     book_url.starts_with("local://")
@@ -877,7 +1317,7 @@ pub fn is_local_book(book_url: &str, origin: &str) -> bool {
 }
 
 /// 支持的本地书扩展名白名单（上传 / getBookToc / getBookContent 分派共用）
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx", "zip"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx", "zip", "cbz", "umd"];
 
 /// 取文件名/路径的小写扩展名（不含点；无扩展名返回空串）
 pub fn file_ext(name: &str) -> String {
@@ -906,6 +1346,8 @@ pub fn parse_file_bytes(bytes: &[u8], ext: &str, user_rules: &[String]) -> Resul
         "pdf" => parse_pdf(bytes),
         "fb2" => parse_fb2(bytes),
         "docx" => parse_docx(bytes),
+        "cbz" => parse_cbz(bytes),
+        "umd" => parse_umd(bytes),
         other => anyhow::bail!("不支持的格式：{other}"),
     }
 }
@@ -1461,8 +1903,12 @@ mod tests {
         assert!(SUPPORTED_EXTENSIONS.contains(&"mobi"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"fb2"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"docx"));
+        assert!(SUPPORTED_EXTENSIONS.contains(&"cbz"));
+        assert!(SUPPORTED_EXTENSIONS.contains(&"umd"));
         assert!(is_local_book("storage/data/x/book.mobi", ""));
         assert!(is_local_book("C:/tmp/book.fb2", ""));
+        assert!(is_local_book("C:/tmp/book.cbz", ""));
+        assert!(is_local_book("C:/tmp/book.umd", ""));
         assert!(!is_local_book("https://a.com/book", ""));
     }
 
@@ -1624,6 +2070,337 @@ mod tests {
         let err = parse_mobi(b"not a mobi file at all").unwrap_err();
         assert!(format!("{err:#}").contains("MOBI"), "应提示 MOBI 相关错误: {err:#}");
         assert!(parse_azw3(b"").is_err());
+    }
+
+    // ---------- CBZ（漫画压缩包） ----------
+
+    /// 1x1 透明 PNG（最小合法 PNG 头）
+    const PNG_1PX: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// 构造内存 CBZ：entries = (zip 内路径, 字节)
+    fn build_cbz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::FileOptions::default();
+            for (name, data) in entries {
+                zip.start_file(*name, opts).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// CBZ：图片页按文件名自然序成章；正文为 base64 data URI 图片标记；非图片/隐藏文件跳过
+    #[test]
+    fn parse_cbz_pages_and_natural_order() {
+        let bytes = build_cbz(&[
+            ("notes.txt", b"not an image"),
+            (".DS_Store", b"hidden"),
+            ("page/10.png", PNG_1PX),
+            ("page/2.jpg", b"jpeg-bytes"),
+            ("page/1.png", PNG_1PX),
+            ("cover.jpg", b"cover-bytes"),
+        ]);
+        let book = parse_cbz(&bytes).expect("CBZ 解析成功");
+        assert_eq!(book.format, "cbz");
+        assert_eq!(book.meta.title, "", "CBZ 无内嵌元数据（书名由文件名兜底）");
+        // 4 个图片页（notes/.DS_Store 跳过）；自然序：cover.jpg < 1.png < 2.jpg < 10.png
+        // （'c' < 'p' 且数字段按数值：2 < 10）
+        let titles: Vec<&str> = book.chapters.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, vec!["cover.jpg", "1.png", "2.jpg", "10.png"]);
+        // 正文 = markdown 图片 + base64 data URI，可还原原始字节
+        let first = book.chapters.iter().find(|c| c.title == "1.png").expect("含 1.png 页");
+        assert!(first.content.starts_with("![1.png](data:image/png;base64,"));
+        use base64::Engine;
+        let b64 = first.content.trim_start_matches("![1.png](data:image/png;base64,").trim_end_matches(')');
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(b64).unwrap(),
+            PNG_1PX,
+            "base64 应还原原始图片字节"
+        );
+        let jpeg = book.chapters.iter().find(|c| c.title == "2.jpg").expect("含 2.jpg 页");
+        assert!(jpeg.content.contains("data:image/jpeg;base64,"));
+    }
+
+    /// CBZ 错误路径：非 zip / zip 内无图片
+    #[test]
+    fn parse_cbz_errors() {
+        let err = parse_cbz(b"not a zip").unwrap_err();
+        assert!(format!("{err:#}").contains("zip"), "应提示 zip 错误: {err:#}");
+        let bytes = build_cbz(&[("readme.txt", b"hi")]);
+        let err = parse_cbz(&bytes).unwrap_err();
+        assert!(format!("{err:#}").contains("未找到图片"), "应提示无图片: {err:#}");
+    }
+
+    /// 自然排序：数字段按数值；数字 < 字母（p2 < pa）；大小写不敏感
+    #[test]
+    fn natural_sort_order() {
+        let mut v = vec!["page10.png", "page2.jpg", "page1.png", "Page2.png", "p2a.png", "p2b.png"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            v,
+            vec!["p2a.png", "p2b.png", "page1.png", "page2.jpg", "Page2.png", "page10.png"],
+            "数字段按数值且数字先于字母"
+        );
+        let mut v2 = vec!["01.png", "1.png", "2.png"];
+        v2.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v2, vec!["1.png", "01.png", "2.png"], "前导零等值时按完整串长稳定排序");
+    }
+
+    // ---------- UMD ----------
+
+    /// 构造 UMD（镜像 me.ag2s.umdlib UmdBook.buildUmd 布局）：魔数 + 头部 + 属性 +
+    /// 0x0B 正文总长 + 0x83 偏移 + 0x84 标题 + zlib 正文块 + 0xF1 + 0x81 + 封面 + 0x0C
+    fn build_umd(
+        title: &str,
+        author: &str,
+        chapters: &[(&str, &str)],
+        with_cover: bool,
+    ) -> Vec<u8> {
+        use std::io::Write;
+        let utf16 = |s: &str| -> Vec<u8> {
+            s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x89, 0x9B, 0x9A, 0xDE]);
+        // 头部 section：'#' + 0x01 00 00 08 + 类型(1=文本) + 2 随机
+        out.extend_from_slice(&[0x23, 0x01, 0x00, 0x00, 0x08, 0x01, 0x12, 0x34]);
+        // 属性：'#' + 类型 + 00 00 + (长度+5) + UTF-16LE
+        let mut prop = |t: u8, s: &str| {
+            let b = utf16(s);
+            out.extend_from_slice(&[0x23, t, 0x00, 0x00, (b.len() + 5) as u8]);
+            out.extend_from_slice(&b);
+        };
+        prop(0x02, title);
+        prop(0x03, author);
+        prop(0x04, "2013");
+        prop(0x05, "8");
+        prop(0x06, "8");
+        prop(0x07, "都市");
+        prop(0x08, "某出版社");
+        // 正文（UTF-16LE 拼接）+ 章节偏移
+        let mut contents = Vec::new();
+        let mut offsets = Vec::new();
+        for (_, c) in chapters {
+            offsets.push(contents.len());
+            let b = utf16(c);
+            contents.extend_from_slice(&b);
+        }
+        out.extend_from_slice(&[0x23, 0x0B, 0x00, 0x00, 0x09]);
+        out.extend_from_slice(&(contents.len() as u32).to_le_bytes());
+        // 0x83 章节偏移：'#' 83 00 00 09 + 随机 + '$' + 同随机 + (4n+9) + n×偏移
+        out.extend_from_slice(&[0x23, 0x83, 0x00, 0x00, 0x09]);
+        out.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        out.push(0x24);
+        out.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        out.extend_from_slice(&((offsets.len() * 4 + 9) as u32).to_le_bytes());
+        for o in &offsets {
+            out.extend_from_slice(&(*o as u32).to_le_bytes());
+        }
+        // 0x84 标题：'#' 84 00 01 09 + 随机 + '$' + 同随机 + (总长+9) + 每章(1B 长 + UTF-16LE)
+        out.extend_from_slice(&[0x23, 0x84, 0x00, 0x01, 0x09]);
+        out.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        out.push(0x24);
+        out.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let mut title_bytes = Vec::new();
+        for (t, _) in chapters {
+            let b = utf16(t);
+            title_bytes.push(b.len() as u8);
+            title_bytes.extend_from_slice(&b);
+        }
+        out.extend_from_slice(&((title_bytes.len() + 9) as u32).to_le_bytes());
+        out.extend_from_slice(&title_bytes);
+        // 正文块：'$' + 随机 + (压缩长+9) + zlib 压缩数据
+        let chunk_rb = [0x55u8, 0x66, 0x77, 0x88];
+        out.push(0x24);
+        out.extend_from_slice(&chunk_rb);
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&contents).unwrap();
+        let compressed = enc.finish().unwrap();
+        out.extend_from_slice(&((compressed.len() + 9) as u32).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        // '# F1 00 00 15' + 16 字节许可证
+        out.extend_from_slice(&[0x23, 0xF1, 0x00, 0x00, 0x15]);
+        out.extend_from_slice(&[0u8; 16]);
+        // '# 81 00 01 09' + 0 + '$' + 0 + (4+9) + 块随机字节
+        out.extend_from_slice(&[0x23, 0x81, 0x00, 0x01, 0x09]);
+        out.extend_from_slice(&[0u8; 4]);
+        out.push(0x24);
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&(4u32 + 9).to_le_bytes());
+        out.extend_from_slice(&chunk_rb);
+        // 封面：'#' 82 00 01 0A 01 + 随机 + '$' + 同随机 + (长+9) + 图片字节
+        if with_cover {
+            out.extend_from_slice(&[0x23, 0x82, 0x00, 0x01, 0x0A, 0x01]);
+            out.extend_from_slice(&[0x21, 0x43, 0x65, 0x87]);
+            out.push(0x24);
+            out.extend_from_slice(&[0x21, 0x43, 0x65, 0x87]);
+            out.extend_from_slice(&((PNG_1PX.len() + 9) as u32).to_le_bytes());
+            out.extend_from_slice(PNG_1PX);
+        }
+        // 结束：'#' 0C 00 01 09 + 文件总长
+        out.extend_from_slice(&[0x23, 0x0C, 0x00, 0x01, 0x09]);
+        out.extend_from_slice(&((out.len() + 4) as u32).to_le_bytes());
+        out
+    }
+
+    /// UMD：属性（标题/作者/题材/出版时间/出版商）+ 多章标题与正文（含 U+2029 换行）+ 封面
+    #[test]
+    fn parse_umd_roundtrip() {
+        let chapters = [
+            ("第一章", "第一段正文。\u{2029}第二段正文。"),
+            ("第二章", "第二章正文内容。"),
+        ];
+        let bytes = build_umd("测试书", "测试作者", &chapters, true);
+        let book = parse_umd(&bytes).expect("UMD 解析成功");
+        assert_eq!(book.format, "umd");
+        assert_eq!(book.meta.title, "测试书");
+        assert_eq!(book.meta.author, "测试作者");
+        assert_eq!(book.meta.published_at.as_deref(), Some("2013-8-8"));
+        assert_eq!(book.meta.publisher.as_deref(), Some("某出版社"));
+        assert!(book.meta.subjects.iter().any(|s| s == "都市"));
+        assert_eq!(book.chapters.len(), 2);
+        assert_eq!(book.chapters[0].title, "第一章");
+        assert_eq!(book.chapters[0].content, "第一段正文。\n第二段正文。", "U+2029 应替换为换行");
+        assert_eq!(book.chapters[1].title, "第二章");
+        assert_eq!(book.chapters[1].content, "第二章正文内容。");
+        assert_eq!(book.cover.as_deref(), Some(PNG_1PX), "封面应提取");
+    }
+
+    /// 构造无 0x84 标题的 UMD 变体（有 0x83 偏移 + 正文块）：验证单章兜底
+    fn build_umd_no_titles(title: &str, content: &str) -> Vec<u8> {
+        use std::io::Write;
+        let utf16 = |s: &str| -> Vec<u8> {
+            s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x89, 0x9B, 0x9A, 0xDE]);
+        out.extend_from_slice(&[0x23, 0x01, 0x00, 0x00, 0x08, 0x01, 0x12, 0x34]);
+        let tb = utf16(title);
+        out.extend_from_slice(&[0x23, 0x02, 0x00, 0x00, (tb.len() + 5) as u8]);
+        out.extend_from_slice(&tb);
+        let cb = utf16(content);
+        out.extend_from_slice(&[0x23, 0x0B, 0x00, 0x00, 0x09]);
+        out.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+        // 0x83：1 个偏移（0）
+        out.extend_from_slice(&[0x23, 0x83, 0x00, 0x00, 0x09]);
+        out.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        out.push(0x24);
+        out.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        out.extend_from_slice(&(4u32 + 9).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        // 0x84：仅段头（无标题附加块）——正文块直接挂其后
+        out.extend_from_slice(&[0x23, 0x84, 0x00, 0x01, 0x09]);
+        out.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        // 正文块
+        let chunk_rb = [0x55u8, 0x66, 0x77, 0x88];
+        out.push(0x24);
+        out.extend_from_slice(&chunk_rb);
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&cb).unwrap();
+        let compressed = enc.finish().unwrap();
+        out.extend_from_slice(&((compressed.len() + 9) as u32).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        out.extend_from_slice(&[0x23, 0xF1, 0x00, 0x00, 0x15]);
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&[0x23, 0x81, 0x00, 0x01, 0x09]);
+        out.extend_from_slice(&[0u8; 4]);
+        out.push(0x24);
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&(4u32 + 9).to_le_bytes());
+        out.extend_from_slice(&chunk_rb);
+        out.extend_from_slice(&[0x23, 0x0C, 0x00, 0x01, 0x09]);
+        out.extend_from_slice(&((out.len() + 4) as u32).to_le_bytes());
+        out
+    }
+
+    /// UMD：无 0x84 标题但有正文 → 单章兜底；坏魔数/截断/漫画型 → 明确报错
+    #[test]
+    fn parse_umd_variants_and_errors() {
+        // 单章兜底：无 0x84 标题、有正文块
+        let bytes = build_umd_no_titles("兜底书", "正文内容");
+        let book = parse_umd(&bytes).expect("变体应可解析");
+        assert_eq!(book.chapters.len(), 1);
+        assert_eq!(book.chapters[0].title, "兜底书", "无标题时用书名兜底");
+        assert!(book.chapters[0].content.contains("正文内容"));
+
+        // 坏魔数
+        let err = parse_umd(b"").unwrap_err();
+        assert!(format!("{err:#}").contains("UMD") || format!("{err:#}").contains("过短"));
+        let mut bad = build_umd("t", "a", &[], false);
+        bad[0] = 0x00;
+        let err = parse_umd(&bad).unwrap_err();
+        assert!(format!("{err:#}").contains("魔数"), "应提示魔数错误: {err:#}");
+
+        // 截断（正文块中间切断）→ 报错
+        let full = build_umd("t", "a", &[("c", "内容")], false);
+        let cut = &full[..full.len() - 10];
+        assert!(parse_umd(cut).is_err(), "截断文件应报错");
+
+        // 漫画型（umdType=2）→ 明确拒绝
+        let mut comic = build_umd("t", "a", &[], false);
+        comic[9] = 0x02;
+        let err = parse_umd(&comic).unwrap_err();
+        assert!(format!("{err:#}").contains("漫画"), "应提示漫画不支持: {err:#}");
+    }
+
+    /// 真实 UMD 样本回归（样本在 target/search-test/samples/——缺失时跳过）：
+    /// 明朝那些事儿（7 章）/ 天涯-青春疼痛小说（单章 + 封面）
+    #[test]
+    fn parse_real_umd_samples() {
+        let samples = [
+            (
+                "C:/Users/chong/pr-review/reader-dev/target/search-test/samples/明朝那些事儿.umd",
+                "明朝那些事儿（1-7全套）终极版",
+                7usize,
+            ),
+            (
+                "C:/Users/chong/pr-review/reader-dev/target/search-test/samples/用左手爱你.umd",
+                "青春疼痛小说：用左手爱你",
+                1usize,
+            ),
+        ];
+        for (path, title, n) in samples {
+            let Ok(bytes) = std::fs::read(path) else {
+                eprintln!("跳过（样本缺失）: {path}");
+                continue;
+            };
+            let book = parse_umd(&bytes).expect("真实 UMD 样本解析成功");
+            assert_eq!(book.meta.title, title);
+            assert_eq!(book.chapters.len(), n, "{title} 章节数");
+            assert!(
+                book.chapters.iter().all(|c| !c.content.is_empty()),
+                "章节正文不应为空"
+            );
+            assert!(
+                book.cover.is_some() && !book.cover.as_ref().unwrap().is_empty(),
+                "样本应带封面"
+            );
+        }
+    }
+
+    /// 分派：cbz/umd 走对应解析器；白名单生效
+    #[test]
+    fn test_parse_file_bytes_cbz_umd_dispatch() {
+        // cbz：合法 zip 无图片 → CBZ 解析器错误（而非“不支持的格式”）
+        let zip_bytes = build_cbz(&[("a.txt", b"x")]);
+        let err = parse_file_bytes(&zip_bytes, "cbz", &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("未找到图片"), "cbz 应走 parse_cbz: {err:#}");
+        // umd：坏文件 → UMD 解析器错误（魔数/长度）
+        let err = parse_file_bytes(b"garbage", "umd", &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("UMD") || format!("{err:#}").contains("过短"));
+        // 未知扩展名仍拒绝
+        let err = parse_file_bytes(b"x", "rar", &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("不支持的格式"));
     }
 }
 

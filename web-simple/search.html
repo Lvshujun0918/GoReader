@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>搜索 - Reader</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-size:20px; line-height:1.5; color:#222; background:#f7f5f0;
+         font-family:"STSong","SimSun","Noto Serif CJK SC",serif; }
+  #wrap { max-width:640px; margin:0 auto; padding:10px; }
+  h1 { font-size:26px; padding:8px 2px; }
+  nav a { display:inline-block; font-size:20px; padding:10px 16px; margin:4px 6px 4px 0;
+          background:#333; color:#fff; text-decoration:none; border-radius:6px; }
+  .row { margin:12px 0; }
+  #key { width:100%; font-size:22px; padding:12px; border:2px solid #999; border-radius:6px; }
+  button { font-size:22px; padding:12px 20px; margin-top:8px; background:#356; color:#fff;
+           border:none; border-radius:6px; }
+  #status { margin:10px 2px; color:#666; font-size:18px; min-height:26px; }
+  ul#list { list-style:none; }
+  ul#list li { margin:8px 0; }
+  ul#list a { display:block; background:#fff; border:1px solid #ccc; border-radius:8px;
+              padding:14px 12px; text-decoration:none; color:#222; }
+  ul#list .name { font-size:22px; font-weight:bold; }
+  ul#list .meta { font-size:16px; color:#777; margin-top:4px; }
+  ul#list .latest { font-size:17px; color:#356; margin-top:4px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>搜索</h1>
+  <nav>
+    <a href="index.html?accessToken=__TOKEN__">书架</a>
+    <a href="search.html?accessToken=__TOKEN__">搜索</a>
+    <a href="rss.html?accessToken=__TOKEN__">RSS</a>
+  </nav>
+  <div class="row"><input id="key" type="search" placeholder="书名 / 作者"></div>
+  <button id="go">搜索</button>
+  <div id="status"></div>
+  <ul id="list"></ul>
+</div>
+<script>
+(function () {
+  var QS = {};
+  location.search.replace(/^\?/, "").split("&").forEach(function (p) {
+    var kv = p.split("=");
+    if (kv[0]) QS[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || "");
+  });
+  var TOKEN = QS.accessToken || "";
+  var links = document.getElementsByTagName("a");
+  for (var i = 0; i < links.length; i++) {
+    var h = links[i].getAttribute("href") || "";
+    if (h.indexOf("__TOKEN__") >= 0) {
+      links[i].setAttribute("href", h.split("__TOKEN__").join(encodeURIComponent(TOKEN)));
+    }
+  }
+  var keyEl = document.getElementById("key");
+  var status = document.getElementById("status");
+  var list = document.getElementById("list");
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+  function apiUrl(path, extra) {
+    var parts = [];
+    if (TOKEN) parts.push("accessToken=" + encodeURIComponent(TOKEN));
+    for (var k in extra) parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(extra[k]));
+    return path + "?" + parts.join("&");
+  }
+
+  function doSearch() {
+    var key = keyEl.value.trim();
+    if (!key) { status.innerHTML = "请输入关键字"; return; }
+    list.innerHTML = "";
+    status.innerHTML = "搜索中（多书源并发，请稍候）…";
+    // maxSources=5 控制并发源数量，Kindle 上不至于等太久
+    fetch(apiUrl("/reader3/searchBookMulti", { key: key, page: 1, maxSources: 5 }))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j || j.isSuccess === false) {
+          status.innerHTML = "搜索失败：" + esc(j && j.errorMsg || "未知错误");
+          return;
+        }
+        var arr = j.data || [];
+        if (!arr.length) { status.innerHTML = "无结果"; return; }
+        status.innerHTML = "找到 " + arr.length + " 条结果";
+        var html = "";
+        for (var i = 0; i < arr.length; i++) {
+          var b = arr[i];
+          var q = "reader.html?bookUrl=" + encodeURIComponent(b.bookUrl) +
+                  "&tocUrl=" + encodeURIComponent(b.tocUrl || b.bookUrl) +
+                  "&bookSource=" + encodeURIComponent(b.origin || "") +
+                  "&accessToken=" + encodeURIComponent(TOKEN);
+          html += "<li><a href=\"" + q + "\">" +
+                  "<div class=\"name\">" + esc(b.name) + "</div>" +
+                  "<div class=\"meta\">" + esc(b.author || "佚名") + " · " + esc(b.originName || "") + "</div>" +
+                  (b.latestChapterTitle ? "<div class=\"latest\">" + esc(b.latestChapterTitle) + "</div>" : "") +
+                  "</a></li>";
+        }
+        list.innerHTML = html;
+      })
+      .catch(function (e) {
+        status.innerHTML = "网络错误：" + esc(e.message || e);
+      });
+  }
+
+  document.getElementById("go").addEventListener("click", doSearch);
+  keyEl.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter" || ev.keyCode === 13) doSearch();
+  });
+  if (QS.key) { keyEl.value = QS.key; doSearch(); }
+})();
+</script>
+</body>
+</html>

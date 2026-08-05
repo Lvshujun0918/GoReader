@@ -1655,6 +1655,7 @@ onMounted(() => {
         <button class="nav-link" type="button" @click="router.push('/rules')">替换规则</button>
         <button class="nav-link" type="button" @click="router.push('/rss')">RSS</button>
         <button class="nav-link" type="button" @click="router.push('/files')">文件</button>
+        <button class="nav-link" type="button" title="共享书仓（storage/localStore，浏览并批量导入书架）" @click="router.push('/store')">书仓</button>
         <button class="nav-link" type="button" title="OPDS 服务器（外部阅读器连接）" @click="openOpds">OPDS</button>
         <button v-if="secureMode" class="nav-link" type="button" @click="router.push('/users')">用户</button>
         <span class="user-chip">{{ store.username || '未登录' }}</span>
