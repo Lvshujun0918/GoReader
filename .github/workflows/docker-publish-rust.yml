@@ -22,22 +22,30 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-      - name: Rust 发版保护
+      - name: 发版保护（v1.* 仅 master 祖先）
         shell: bash
         run: |
-          # 仅 master 分支的 v1.* tag 允许发版（legacy 的 v4.* 走旧 workflow）
+          git fetch origin master --quiet || true
           if git merge-base --is-ancestor $GITHUB_SHA origin/master; then
             echo 'OK 允许发版'
           else
-            echo '非 master 祖先——拒绝发版'
+            echo "SHA $GITHUB_SHA 非 master 祖先——拒绝发版"
             exit 1
           fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: 构建前端
         working-directory: web-ui
         run: |
           npm install
           npm run build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: 构建 Rust release
         run: cargo build --release
