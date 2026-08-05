@@ -8,7 +8,7 @@
 # ============================================================
 
 # ---------- 阶段 1：后端编译 ----------
-FROM rust:1.88-slim AS builder
+FROM rust:1.97-slim AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
