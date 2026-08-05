@@ -1013,7 +1013,9 @@ function updateViewport() {
   }
   r1 = Math.min(total, r1 + 3)
   startRow.value = r0
-  endRow.value = Math.max(r0 + 1, r1)
+  // endRow 为「结束索引（不含）」：slice(start, end) 要包含最后满足的行 r1——必须 r1+1，
+  // 否则滚动到底部时最后一行（r1 = total-1）被 slice 切掉不渲染（bug：最下行整排不显示）
+  endRow.value = Math.max(r0 + 1, Math.min(total, r1 + 1))
 }
 
 /** 计算列数并测量行高（卡片宽高比固定，任取一张测量） */

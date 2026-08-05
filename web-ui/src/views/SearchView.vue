@@ -6,6 +6,7 @@ import { searchBookMulti, searchBookMultiSSE } from '@/api/search'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { useUserStore } from '@/stores/user'
 import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
+import { hanText, syncHanMode } from '@/utils/hanMode'
 import type { Book, ReturnData, SearchBook } from '@/types'
 
 const router = useRouter()
@@ -401,6 +402,8 @@ async function quickAdd(book: SearchBook) {
 onMounted(() => {
   loadHistory()
   loadShelfOnceForAdd()
+  // 简繁模式可能在其他页面改动（同标签页直写 localStorage 场景）→ 挂载时同步全站状态
+  syncHanMode()
   // 支持 /search?key=xxx 预填并自动搜索（阅读页划词「搜索」跳转）
   const kw = typeof route.query.key === 'string' ? route.query.key.trim() : ''
   if (kw) void doSearch(kw)
@@ -648,7 +651,7 @@ onBeforeUnmount(() => {
               >
                 <path d="M9 6l6 6-6 6" />
               </svg>
-              <span class="group-name" :title="g.label">{{ g.label }}</span>
+              <span class="group-name" :title="hanText(g.label)">{{ hanText(g.label) }}</span>
               <span class="group-count">{{ g.count }} 本</span>
             </button>
             <div v-if="!collapsedSources.has(g.key)" class="group-body">
@@ -659,24 +662,24 @@ onBeforeUnmount(() => {
                 @click="openBook(entry.book)"
               >
                 <span v-if="entry.book.coverUrl && !failedCovers.has(entry.book.bookUrl)" class="result-cover">
-                  <img :src="entry.book.coverUrl" :alt="entry.book.name" loading="lazy" @error="failedCovers.add(entry.book.bookUrl)" />
+                  <img :src="entry.book.coverUrl" :alt="hanText(entry.book.name)" loading="lazy" @error="failedCovers.add(entry.book.bookUrl)" />
                 </span>
-                <span v-else class="result-cover placeholder">{{ entry.book.name.charAt(0) }}</span>
+                <span v-else class="result-cover placeholder">{{ hanText(entry.book.name).charAt(0) }}</span>
                 <div class="result-main">
-                  <p class="result-name" :title="entry.book.name">{{ entry.book.name }}</p>
+                  <p class="result-name" :title="hanText(entry.book.name)">{{ hanText(entry.book.name) }}</p>
                   <p class="result-sub">
-                    <span class="result-author">{{ entry.book.author || '佚名' }}</span>
+                    <span class="result-author">{{ hanText(entry.book.author || '佚名') }}</span>
                     <span
                       v-for="o in entry.origins"
                       :key="o.key"
                       class="source-badge"
-                      :title="o.label"
-                    >{{ o.label }}</span>
-                    <span v-if="entry.book.latestChapterTitle" class="result-chapter" :title="entry.book.latestChapterTitle">
-                      {{ entry.book.latestChapterTitle }}
+                      :title="hanText(o.label)"
+                    >{{ hanText(o.label) }}</span>
+                    <span v-if="entry.book.latestChapterTitle" class="result-chapter" :title="hanText(entry.book.latestChapterTitle)">
+                      {{ hanText(entry.book.latestChapterTitle) }}
                     </span>
                   </p>
-                  <p v-if="entry.book.intro" class="result-intro">{{ entry.book.intro }}</p>
+                  <p v-if="entry.book.intro" class="result-intro">{{ hanText(entry.book.intro) }}</p>
                 </div>
                 <!-- GAP 158：快捷加入书架（hover 显示「+」；已在书架显示 ✓；失败静默） -->
                 <button

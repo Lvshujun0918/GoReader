@@ -11,7 +11,7 @@
         <span class="brand">夜读<em>.</em></span>
       <span class="title">{{ source ? applyHan(source.bookSourceName, hanMode) : '探索' }}</span>
       <div class="top-actions">
-        <button class="han-btn" type="button" :title="'简繁转换（当前：' + hanLabel + '）'" @click="toggleHan(); updateHanLabel()">
+        <button class="han-btn" type="button" :title="'简繁转换（当前：' + hanLabel + '）'" @click="toggleHan()">
           {{ hanLabel }}
         </button>
         <button class="han-btn" type="button" title="内容宽度（与阅读页同一设置）" @click="cycleWidth">
@@ -206,7 +206,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { applyHan, getHanMode, type HanMode } from '@/utils/chinese'
+import { applyHan } from '@/utils/chinese'
+import { useHanMode, setGlobalHanMode, syncHanMode } from '@/utils/hanMode'
 import { useRouter } from 'vue-router'
 import { getExploreSources, getExploreUrls, exploreBook } from '@/api/explore'
 import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
@@ -240,19 +241,14 @@ function clearHistory() {
 }
 
 const sources = ref<ExploreSourceInfo[]>([])
-const hanMode = ref<HanMode>(getHanMode())
+/** 全站共享简繁模式（书海/搜索/目录/书源名统一响应，见 utils/hanMode.ts） */
+const hanMode = useHanMode()
 function toggleHan() {
-  hanMode.value = hanMode.value === 'auto' ? 'simp' : hanMode.value === 'simp' ? 'trad' : 'auto'
-  setHanModeLocal(hanMode.value)
+  setGlobalHanMode(hanMode.value === 'auto' ? 'simp' : hanMode.value === 'simp' ? 'trad' : 'auto')
 }
-function setHanModeLocal(m: HanMode) {
-  try { localStorage.setItem('reader_han_mode', m) } catch { /* ignore */ }
-}
-const hanLabel = ref('自动')
-function updateHanLabel() {
-  hanLabel.value = hanMode.value === 'auto' ? '自动' : hanMode.value === 'trad' ? '繁' : '简'
-}
-updateHanLabel()
+const hanLabel = computed(() =>
+  hanMode.value === 'auto' ? '自动' : hanMode.value === 'trad' ? '繁' : '简',
+)
 const contentWidth = ref('900px')
 {
   const raw = localStorage.getItem('reader_content_width')
@@ -584,6 +580,8 @@ function onCatsWheel(e: WheelEvent) {
 onMounted(() => {
   loadSources()
   searchHistory.value = loadSearchHistory()
+  // 简繁模式可能在其他页面改动 → 挂载时同步全站状态
+  syncHanMode()
   const catsEl = document.querySelector('.cats')
   catsEl?.addEventListener('wheel', onCatsWheel as EventListener, { passive: false })
 })

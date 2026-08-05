@@ -7,6 +7,7 @@ import { getBookInfo, getBookToc, searchBookSource, searchBookSourceSSE } from '
 import { getInvalidBookSources } from '@/api/sources'
 import { deleteBookCache, getShelfBookWithCacheInfo, searchBookContent } from '@/api/cache'
 import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export'
+import { hanText, syncHanMode } from '@/utils/hanMode'
 import { cacheBookOnServer, cacheBookSSE, cancelCacheBook } from '@/api/cacheBook'
 import { uploadFile, mkdir } from '@/api/file'
 import { post } from '@/api/request'
@@ -377,18 +378,18 @@ const tocPreview = computed(() => {
   return out
 })
 
-/** 目录预览渲染条目（GAP 91：卷标题行 isVolume 渲染分隔行；GAP 147：当前章高亮 durChapterIndex） */
+/** 目录预览渲染条目（GAP 91：卷标题行 isVolume 渲染分隔行；GAP 147：当前章高亮 durChapterIndex；简繁按全站模式转换） */
 const tocEntries = computed<{ kind: 'volume' | 'chapter'; index: number; title: string }[]>(() => {
   const out: { kind: 'volume' | 'chapter'; index: number; title: string }[] = []
   let count = 0
   tocChapters.value.forEach((c, i) => {
     if (c.isVolume) {
-      out.push({ kind: 'volume', index: i, title: c.title })
+      out.push({ kind: 'volume', index: i, title: hanText(c.title) })
       return
     }
     if (count >= TOC_PREVIEW_MAX) return
     count++
-    out.push({ kind: 'chapter', index: i, title: c.title })
+    out.push({ kind: 'chapter', index: i, title: hanText(c.title) })
   })
   return out
 })
@@ -1051,7 +1052,11 @@ async function addRelated(r: RelatedBook) {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  // 简繁模式可能在其他页面改动 → 挂载时同步全站状态（目录 tab 展示随其响应）
+  syncHanMode()
+  load()
+})
 </script>
 
 <template>

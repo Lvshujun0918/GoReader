@@ -5,7 +5,7 @@
  */
 
 export type HanMode = 'auto' | 'simp' | 'trad'
-export type Theme = 'light' | 'dark' | 'paper' | 'system'
+export type Theme = 'light' | 'dark' | 'warm' | 'system'
 export type TextAlign = 'left' | 'justify'
 export type PageMode = 'scroll' | 'slide'
 export type FontKind =
@@ -26,7 +26,7 @@ export type FontKind =
 export interface ReaderConfig {
   /** 简繁模式：auto=自动 / simp=简体 / trad=繁体（reader_han_mode） */
   hanMode: HanMode
-  /** 主题：light/dark/paper/system（reader_theme） */
+  /** 主题：light/dark/warm/system（reader_theme；旧值 paper 已迁移为 warm） */
   theme: Theme
   /** 正文字号（reader_font_size，14-22） */
   fontSize: number
@@ -102,7 +102,13 @@ export function loadReaderConfig(): ReaderConfig {
   const fontRaw = ls(KEY_MAP.fontFamily)
   return {
     hanMode: raw === 'simp' || raw === 'trad' ? raw : 'auto',
-    theme: themeRaw === 'dark' || themeRaw === 'paper' || themeRaw === 'system' ? themeRaw : 'light',
+    // 旧值 paper（纸色）→ 迁移为 warm（暖色）
+    theme:
+      themeRaw === 'dark' || themeRaw === 'warm' || themeRaw === 'system'
+        ? themeRaw
+        : themeRaw === 'paper'
+          ? 'warm'
+          : 'light',
     fontSize: num(ls(KEY_MAP.fontSize), 14, 22, 18),
     lineHeight: num(ls(KEY_MAP.lineHeight), 1.5, 2.5, 1.9, 0.1),
     paraSpacing: num(ls(KEY_MAP.paraSpacing), 0.5, 2, 1, 0.1),
@@ -180,8 +186,15 @@ export function fromServerConfig(raw: unknown): Partial<ReaderConfig> {
   const out: Partial<ReaderConfig> = {}
   if (o.reader_han_mode === 'simp' || o.reader_han_mode === 'trad' || o.reader_han_mode === 'auto')
     out.hanMode = o.reader_han_mode
-  if (o.reader_theme === 'light' || o.reader_theme === 'dark' || o.reader_theme === 'paper' || o.reader_theme === 'system')
-    out.theme = o.reader_theme
+  if (
+    o.reader_theme === 'light' ||
+    o.reader_theme === 'dark' ||
+    o.reader_theme === 'warm' ||
+    o.reader_theme === 'system' ||
+    // 旧值 paper → 迁移为 warm
+    o.reader_theme === 'paper'
+  )
+    out.theme = o.reader_theme === 'paper' ? 'warm' : o.reader_theme
   const fs = num(o.reader_font_size, 14, 22, NaN)
   if (!Number.isNaN(fs)) out.fontSize = fs
   const lh = num(o.reader_line_height, 1.5, 2.5, NaN, 0.1)

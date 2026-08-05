@@ -122,15 +122,15 @@ html[data-theme='dark'] {
   --on-accent: #16161c;
 }
 
-.reader-page[data-reader-theme='paper'] {
+.reader-page[data-reader-theme='warm'] {
   color-scheme: light;
-  --bg: #f6f1e6;
-  --bg-float: rgba(246, 241, 230, 0.88);
-  --hover: #eee7d6;
-  --surface: #fbf7ed;
-  --card: #fbf7ed;
-  --border: #e3dac4;
-  --border-strong: #d2c6a8;
+  --bg: #f7f0e6;
+  --bg-float: rgba(247, 240, 230, 0.88);
+  --hover: #efe7d6;
+  --surface: #fbf6ec;
+  --card: #fbf6ec;
+  --border: #e7dcc6;
+  --border-strong: #d6c8a9;
   --text-1: #3d382c;
   --text-2: #6d6450;
   --text-3: #a99f84;

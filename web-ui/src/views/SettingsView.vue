@@ -24,6 +24,7 @@ import { resetUserPassword } from '@/api/users'
 import { getUserConfig, saveUserConfig } from '@/api/userConfig'
 import { getReadingStats } from '@/api/stats'
 import { getOpdsSettings, saveOpdsSettings } from '@/api/opds'
+import { setGlobalHanMode, syncHanMode } from '@/utils/hanMode'
 import {
   loadReaderConfig,
   applyReaderConfig,
@@ -401,6 +402,12 @@ const prefSaving = ref(false)
 const prefMsg = ref('')
 const prefMsgError = ref(false)
 
+/** 简繁模式改动 → 全站响应（搜索/目录/书源/书海等共用 hanMode 共享状态，见 utils/hanMode.ts） */
+watch(
+  () => pref.value.hanMode,
+  (m) => setGlobalHanMode(m),
+)
+
 const HAN_OPTIONS: { value: HanMode; label: string }[] = [
   { value: 'auto', label: '自动' },
   { value: 'simp', label: '简体' },
@@ -409,7 +416,7 @@ const HAN_OPTIONS: { value: HanMode; label: string }[] = [
 const THEME_OPTIONS: { value: Theme; label: string }[] = [
   { value: 'light', label: '浅色' },
   { value: 'dark', label: '深色' },
-  { value: 'paper', label: '纸色' },
+  { value: 'warm', label: '暖色' },
   { value: 'system', label: '跟随系统' },
 ]
 const WIDTH_OPTIONS: { value: string; label: string }[] = [
@@ -465,6 +472,8 @@ async function loadServerPref() {
     const merged = { ...loadReaderConfig(), ...server }
     applyReaderConfig(merged)
     pref.value = merged
+    // 服务器下发的简繁模式同步到全站共享状态
+    syncHanMode()
     // 界面主题（ui_theme 键）同样服务器优先
     const ui = uiThemeFromServer(cfg ? (cfg as Record<string, unknown>).ui_theme : undefined)
     if (ui) {
@@ -1202,7 +1211,7 @@ async function runExportData() {
         </div>
         <div class="row">
           <span class="row-label">阅读内容主题</span>
-          <span class="row-value hint">阅读页内独立设置（浅色/深色/纸色），与界面主题互不影响</span>
+          <span class="row-value hint">阅读页内独立设置（浅色/深色/暖色/跟随系统），与界面主题互不影响</span>
         </div>
       </section>
 

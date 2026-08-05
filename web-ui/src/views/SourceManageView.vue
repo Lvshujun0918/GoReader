@@ -15,6 +15,7 @@ import {
   type CaptchaProbe,
 } from '@/api/sourceLogin'
 import { downloadBlob } from '@/utils/download'
+import { hanText, syncHanMode } from '@/utils/hanMode'
 import type { BookSource, SourceSub } from '@/types'
 
 const router = useRouter()
@@ -1435,6 +1436,8 @@ onMounted(() => {
   syncLoggedUrls()
   load()
   void loadSubs()
+  // 简繁模式可能在其他页面改动 → 挂载时同步全站状态（书源名展示随其响应）
+  syncHanMode()
 })
 
 onBeforeUnmount(() => {
@@ -1590,7 +1593,7 @@ onBeforeUnmount(() => {
             </svg>
           </button>
           <div class="source-main">
-            <p class="source-name" :title="s.bookSourceName">{{ s.bookSourceName }}</p>
+            <p class="source-name" :title="hanText(s.bookSourceName)">{{ hanText(s.bookSourceName) }}</p>
             <p class="source-url" :title="s.bookSourceUrl">{{ s.bookSourceUrl }}</p>
           </div>
           <span v-if="s.bookSourceGroup" class="source-group" :title="s.bookSourceGroup">
@@ -1690,7 +1693,7 @@ onBeforeUnmount(() => {
         <ul v-else class="subs-list">
           <li v-for="sub in subs" :key="sub.url" class="subs-row">
             <div class="subs-main">
-              <p class="subs-name" :title="sub.name">{{ sub.name }}</p>
+              <p class="subs-name" :title="hanText(sub.name)">{{ hanText(sub.name) }}</p>
               <p class="subs-url" :title="sub.url">{{ sub.url }}</p>
             </div>
             <span class="source-state" :class="{ on: sub.enabled }">{{ sub.enabled ? '启用' : '停用' }}</span>

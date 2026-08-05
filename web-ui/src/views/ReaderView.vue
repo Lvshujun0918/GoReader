@@ -9,7 +9,8 @@ import { getHttpTtsList } from '@/api/httpTts'
 import { get, post } from '@/api/request'
 import { loadReplaceRules } from '@/api/replaceRules'
 import { getTtsVoices, synthesizeTts, type TtsVoice } from '@/api/tts'
-import { applyHan, getHanMode, setHanMode, type HanMode } from '@/utils/chinese'
+import { applyHan, getHanMode, type HanMode } from '@/utils/chinese'
+import { setGlobalHanMode } from '@/utils/hanMode'
 import { DAILY_STATS_KEY, accumulateDaily, parseDailyStats } from '@/utils/dailyStats'
 import { useUserStore } from '@/stores/user'
 import { loadBookConfig, saveBookConfig, clearBookConfig } from '@/utils/bookConfig'
@@ -82,12 +83,12 @@ const isFileBook = computed(() => bookType.value === 3)
 const isVideoBook = computed(() => bookType.value === 4)
 const isNonTextBook = computed(() => bookType.value !== 0)
 
-/* ---------------- 1. 主题（浅色/深色/纸色/跟随系统） ---------------- */
+/* ---------------- 1. 主题（亮/暗/暖/跟随系统） ---------------- */
 
-type Theme = 'light' | 'dark' | 'paper' | 'system'
+type Theme = 'light' | 'dark' | 'warm' | 'system'
 const THEME_KEY = 'reader_theme'
-const THEME_ORDER: Theme[] = ['light', 'dark', 'paper', 'system']
-const THEME_LABEL: Record<Theme, string> = { light: '浅', dark: '深', paper: '纸', system: '系统' }
+const THEME_ORDER: Theme[] = ['light', 'dark', 'warm', 'system']
+const THEME_LABEL: Record<Theme, string> = { light: '亮', dark: '暗', warm: '暖', system: '系统' }
 const theme = ref<Theme>('light')
 /** 阅读页根元素（主题只作用于阅读页内，与界面主题 html[data-theme] 分离） */
 const pageRef = ref<HTMLElement | null>(null)
@@ -486,25 +487,42 @@ function scrollToParagraph(idx: number) {
   window.scrollTo(0, top)
 }
 
-/* ---------------- 4.2 章节内搜索（前端本地：当前章段落包含匹配 + 高亮 + 点击跳段） ---------------- */
+/* ---------------- 4.2 页内搜索（前端本地：当前章正文关键词 <mark> 高亮 + 上一个/下一个跳转 + 计数） ---------------- */
 
 const searchOpen = ref(false)
 const searchKeyword = ref('')
 const searchSearched = ref(false)
-/** 搜索结果：段落序号 + 高亮 HTML 片段 */
-const searchResults = ref<{ idx: number; html: string }[]>([])
+/** 每段命中数（与 paragraphs 对齐；未参与搜索时为全 0） */
+const paraMatchCounts = ref<number[]>([])
+/** 当前命中序号（全局 0 基；-1 = 无命中/未定位） */
+const curMatch = ref(-1)
+/** 命中总数 */
+const matchTotal = computed(() => paraMatchCounts.value.reduce((a, b) => a + b, 0))
+/** 搜索是否生效（已搜索且有非空关键词 → 正文渲染 <mark> 高亮） */
+const searchActive = computed(() => searchSearched.value && searchKeyword.value.trim().length > 0)
 /** 跳转后短暂高亮的目标段落 */
 const flashParaIdx = ref(-1)
 const searchInputRef = ref<HTMLInputElement | null>(null)
 let flashTimer: number | undefined
-const SEARCH_MAX_HITS = 100
+/** 单段命中上限（防超长段死循环） */
+const SEARCH_MAX_PER_PARA = 500
 
 function openChapterSearch() {
   searchKeyword.value = ''
   searchSearched.value = false
-  searchResults.value = []
+  paraMatchCounts.value = []
+  curMatch.value = -1
   searchOpen.value = true
   void nextTick(() => searchInputRef.value?.focus())
+}
+
+/** 关闭页内搜索并清除全部高亮状态 */
+function closeChapterSearch() {
+  searchOpen.value = false
+  searchKeyword.value = ''
+  searchSearched.value = false
+  paraMatchCounts.value = []
+  curMatch.value = -1
 }
 
 function escapeHtml(s: string): string {
@@ -515,8 +533,8 @@ function escapeHtml(s: string): string {
     .replace(/"/g, '&quot;')
 }
 
-/** 生成高亮 HTML：对转义后的段落按关键词（大小写不敏感）包 <mark> */
-function highlightSnippet(text: string, kw: string): string {
+/** 全文高亮 HTML：对转义后的段落按关键词（大小写不敏感）把所有命中包 <mark> */
+function highlightAll(text: string, kw: string): string {
   const esc = escapeHtml(text)
   const escKw = escapeHtml(kw)
   if (!escKw) return esc
@@ -526,7 +544,7 @@ function highlightSnippet(text: string, kw: string): string {
   let from = 0
   let found = 0
   let i = lower.indexOf(kwLower, from)
-  while (i !== -1 && found < 60) {
+  while (i !== -1 && found < SEARCH_MAX_PER_PARA) {
     parts.push(esc.slice(from, i), `<mark>${esc.slice(i, i + escKw.length)}</mark>`)
     from = i + escKw.length
     i = lower.indexOf(kwLower, from)
@@ -536,35 +554,86 @@ function highlightSnippet(text: string, kw: string): string {
   return parts.join('')
 }
 
-/** 在当前章段落中查找包含关键词的段落（大小写不敏感） */
+/** 正文段落渲染：搜索生效且有命中 → 返回带 <mark> 的高亮 HTML；否则 null（走纯文本插值） */
+function paraDisplayHtml(i: number): string | null {
+  if (!searchActive.value || !paraMatchCounts.value[i]) return null
+  return highlightAll(paragraphs.value[i], searchKeyword.value.trim())
+}
+
+/** 在当前章段落中统计每个关键词命中数（大小写不敏感；正文按简繁/替换规则转换后的可见文本匹配） */
 function runChapterSearch() {
   const kw = searchKeyword.value.trim()
   searchSearched.value = true
-  searchResults.value = []
+  paraMatchCounts.value = []
+  curMatch.value = -1
   if (!kw) return
   const lower = kw.toLowerCase()
-  const hits: { idx: number; html: string }[] = []
+  const counts: number[] = new Array(paragraphs.value.length).fill(0)
   paragraphs.value.forEach((p, i) => {
-    if (hits.length >= SEARCH_MAX_HITS) return
-    if (p.toLowerCase().includes(lower)) hits.push({ idx: i, html: highlightSnippet(p, kw) })
+    if (!p.toLowerCase().includes(lower)) return
+    let n = 0
+    let from = 0
+    while (n < SEARCH_MAX_PER_PARA) {
+      const j = p.toLowerCase().indexOf(lower, from)
+      if (j === -1) break
+      n++
+      from = j + kw.length
+    }
+    counts[i] = n
   })
-  searchResults.value = hits
+  paraMatchCounts.value = counts
+  const total = counts.reduce((a, b) => a + b, 0)
+  if (total > 0) void scrollToMatch(0)
 }
 
-/** 点击结果：跳转该段并短暂高亮（GAP 155：目标段未渲染时先加载对应块） */
-function jumpToSearchResult(idx: number) {
-  searchOpen.value = false
-  searchKeyword.value = ''
-  searchSearched.value = false
-  searchResults.value = []
-  void ensureParagraphRendered(idx).then(() => {
-    scrollToParagraph(idx)
-    flashParaIdx.value = idx
-    window.clearTimeout(flashTimer)
-    flashTimer = window.setTimeout(() => {
-      flashParaIdx.value = -1
-    }, 1600)
-  })
+/** 全局命中序号 → 所在段下标 + 段内第几个 mark */
+function locateMatch(globalIdx: number): { para: number; mark: number } {
+  let acc = 0
+  for (let i = 0; i < paraMatchCounts.value.length; i++) {
+    const c = paraMatchCounts.value[i]
+    if (globalIdx < acc + c) return { para: i, mark: globalIdx - acc }
+    acc += c
+  }
+  return { para: -1, mark: -1 }
+}
+
+/** 跳转到第 globalIdx 个命中：滚动到对应段内的 <mark>（GAP 155：目标段未渲染时先加载对应块） */
+async function scrollToMatch(globalIdx: number) {
+  if (globalIdx < 0 || globalIdx >= matchTotal.value) return
+  const { para, mark } = locateMatch(globalIdx)
+  if (para < 0) return
+  curMatch.value = globalIdx
+  await ensureParagraphRendered(para)
+  scrollToParagraph(para)
+  await nextTick()
+  const paraEl = document.querySelector(`.reader-content [data-para="${para}"]`)
+  const markEl = paraEl?.querySelectorAll('mark')[mark]
+  if (markEl instanceof HTMLElement) {
+    // 当前命中 mark 加粗描边（其他命中淡黄底）
+    paraEl?.querySelectorAll('mark').forEach((m) => m.classList.remove('mark-current'))
+    markEl.classList.add('mark-current')
+    const top = markEl.getBoundingClientRect().top + window.scrollY - window.innerHeight / 2
+    window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+  }
+  flashParaIdx.value = para
+  window.clearTimeout(flashTimer)
+  flashTimer = window.setTimeout(() => {
+    flashParaIdx.value = -1
+  }, 1600)
+}
+
+/** 下一个命中（到尾回绕） */
+function nextMatch() {
+  if (matchTotal.value === 0) return
+  const next = curMatch.value + 1 >= matchTotal.value ? 0 : curMatch.value + 1
+  void scrollToMatch(next)
+}
+
+/** 上一个命中（到头回绕） */
+function prevMatch() {
+  if (matchTotal.value === 0) return
+  const prev = curMatch.value - 1 < 0 ? matchTotal.value - 1 : curMatch.value - 1
+  void scrollToMatch(prev)
 }
 
 /* ---------------- 5. 简繁转换（legacy chinese.js 移植） ---------------- */
@@ -581,6 +650,8 @@ const detectTraditional = (text: string): boolean => detectTraditionalFn(text)
 import { detectTraditional as detectTraditionalFn } from '@/utils/chinese'
 watch(content, (c) => {
   if (hanMode.value === 'auto') hanTrad.value = detectTraditional(c)
+  // 换章/正文变化：页内搜索命中失效 → 清除高亮与计数
+  closeChapterSearch()
   // GAP 155：正文变化 → 分段渲染重置为首块
   resetSegments()
 })
@@ -629,14 +700,20 @@ function saveSetting(key: string, value: unknown) {
     bookOverrides.value = o
     persistBookOverrides()
   }
-  if (key === 'reader_han_mode') setHanMode(value as HanMode)
+  if (key === 'reader_han_mode') setGlobalHanMode(value as HanMode)
   else persist(key, value)
 }
 
 /** 从全局 localStorage 重新装载 12 项设置 ref（初始化 / 恢复全局默认时调用） */
 function loadGlobalIntoRefs() {
   const rawTheme = localStorage.getItem(THEME_KEY)
-  theme.value = rawTheme === 'dark' || rawTheme === 'paper' || rawTheme === 'system' ? rawTheme : 'light'
+  // 旧值 paper（纸色）→ 迁移为 warm（暖色）
+  theme.value =
+    rawTheme === 'dark' || rawTheme === 'warm' || rawTheme === 'system'
+      ? rawTheme
+      : rawTheme === 'paper'
+        ? 'warm'
+        : 'light'
   fontSize.value = loadSetting(FONT_KEY, MIN_FONT, MAX_FONT, 18)
   lineHeight.value = loadSetting('reader_line_height', MIN_LINE, MAX_LINE, 1.9, 0.1)
   paraSpacing.value = loadSetting('reader_para_spacing', MIN_PARA, MAX_PARA, 1, 0.1)
@@ -658,7 +735,9 @@ function applyBookOverridesToRefs() {
   const o = bookOverrides.value
   const get = (k: string) => o[k]
   const t = get(THEME_KEY)
-  if (t === 'light' || t === 'dark' || t === 'paper' || t === 'system') theme.value = t
+  // 旧值 paper → 迁移为 warm
+  if (t === 'light' || t === 'dark' || t === 'warm' || t === 'system') theme.value = t
+  else if (t === 'paper') theme.value = 'warm'
   const fs = Number(get(FONT_KEY))
   if (fs >= MIN_FONT && fs <= MAX_FONT) fontSize.value = fs
   const lh = Number(get('reader_line_height'))
@@ -717,7 +796,7 @@ const bgImageUrl = computed(() => bgImageUrlOf(bgImagePath.value, store.accessTo
 const BG_OVERLAY: Record<Theme, string> = {
   light: 'rgba(250, 250, 250, 0.86)',
   dark: 'rgba(17, 17, 20, 0.88)',
-  paper: 'rgba(246, 241, 230, 0.88)',
+  warm: 'rgba(247, 240, 230, 0.88)',
   system: 'rgba(250, 250, 250, 0.86)',
 }
 /** 图片背景样式：遮罩渐变叠在图上（cover 铺满 + 固定），失败时回退 var(--bg) */
@@ -1463,6 +1542,41 @@ const displayChapterTitle = computed(() => (currentChapter.value ? hanConvert(cu
 const drawerChapters = computed(() =>
   chapters.value.map((c) => ({ ...c, title: hanConvert(c.title) })),
 )
+
+/* ---------------- 目录卷折叠（点击卷标题折叠/展开；localStorage reader_toc_collapsed {volTitle: bool}） ---------------- */
+
+const TOC_COLLAPSED_KEY = 'reader_toc_collapsed'
+/** 折叠状态：卷标题（简繁转换后展示名）→ 是否折叠 */
+const tocCollapsed = ref<Record<string, boolean>>({})
+{
+  try {
+    const raw = JSON.parse(localStorage.getItem(TOC_COLLAPSED_KEY) ?? '{}')
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) tocCollapsed.value = raw
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 点击卷标题行：折叠/展开 + 持久化 */
+function toggleVolume(title: string) {
+  tocCollapsed.value = { ...tocCollapsed.value, [title]: !tocCollapsed.value[title] }
+  try {
+    localStorage.setItem(TOC_COLLAPSED_KEY, JSON.stringify(tocCollapsed.value))
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 与 drawerChapters 对齐：非卷条目是否被所在卷折叠隐藏（卷标题行本身始终显示） */
+const chapterHidden = computed(() => {
+  const out: boolean[] = []
+  let currentCollapsed = false
+  for (const c of drawerChapters.value) {
+    if (c.isVolume) currentCollapsed = !!tocCollapsed.value[c.title]
+    out.push(currentCollapsed)
+  }
+  return out
+})
 
 /** 首次进入需要恢复的滚动位置（正文渲染完成后应用一次） */
 let restoreScrollY: number | null = null
@@ -2450,10 +2564,12 @@ onBeforeUnmount(() => {
               <p
                 v-else
                 class="reader-para"
+                :data-para="i"
                 :class="{ flash: flashParaIdx === i, 'tts-reading': ttsReadingPara === i }"
                 :style="{ marginBottom: `${paraSpacing}em`, textIndent: textIndent ? '2em' : '0' }"
               >
-                {{ para }}
+                <span v-if="paraDisplayHtml(i) !== null" v-html="paraDisplayHtml(i)"></span>
+                <template v-else>{{ para }}</template>
               </p>
             </template>
           </article>
@@ -2686,9 +2802,9 @@ onBeforeUnmount(() => {
       </div>
     </transition>
 
-    <!-- 章节内搜索弹层（本地搜索当前章，段落高亮 + 点击跳段） -->
+    <!-- 页内搜索弹层（本地搜索当前章：正文 <mark> 高亮 + 上一个/下一个跳转 + 计数） -->
     <transition name="pop">
-      <div v-if="searchOpen" class="pop-mask" @click="searchOpen = false">
+      <div v-if="searchOpen" class="pop-mask" @click="closeChapterSearch">
         <div class="pop-card search-card" @click.stop>
           <p class="pop-title">搜索本章</p>
           <div class="pop-row">
@@ -2700,22 +2816,25 @@ onBeforeUnmount(() => {
               placeholder="输入关键词，搜索当前章正文"
               spellcheck="false"
               @keyup.enter="runChapterSearch"
+              @keyup.esc="closeChapterSearch"
             />
             <button class="pop-btn" type="button" @click="runChapterSearch">搜索</button>
           </div>
           <p v-if="searchSearched && !searchKeyword.trim()" class="pop-hint">请输入关键词</p>
-          <p v-else-if="searchSearched && searchResults.length === 0" class="pop-hint">
+          <p v-else-if="searchSearched && matchTotal === 0" class="pop-hint">
             本章未找到「{{ searchKeyword.trim() }}」
           </p>
-          <ul v-else-if="searchResults.length" class="search-list">
-            <li v-for="r in searchResults" :key="r.idx" class="search-item">
-              <button type="button" class="search-jump" :title="`跳转到第 ${r.idx + 1} 段`" @click="jumpToSearchResult(r.idx)">
-                <span class="search-idx">{{ r.idx + 1 }}</span>
-                <span class="search-text" v-html="r.html"></span>
-              </button>
-            </li>
-          </ul>
-          <p v-else class="pop-hint">搜索范围：当前章（前端本地匹配，高亮显示，点击跳转）</p>
+          <template v-else-if="searchSearched && matchTotal > 0">
+            <p class="pop-hint">
+              共 {{ matchTotal }} 处命中 · 当前第 {{ curMatch + 1 }} 处（正文已高亮，上一个/下一个跳转）
+            </p>
+            <div class="search-nav">
+              <button class="pop-btn" type="button" @click="prevMatch">上一个</button>
+              <button class="pop-btn" type="button" @click="nextMatch">下一个</button>
+              <button class="text-btn" type="button" @click="closeChapterSearch">完成</button>
+            </div>
+          </template>
+          <p v-else class="pop-hint">搜索范围：当前章（前端本地匹配，正文高亮，上一个/下一个跳转）</p>
         </div>
       </div>
     </transition>
@@ -3321,9 +3440,20 @@ onBeforeUnmount(() => {
           </header>
           <div ref="drawerListRef" class="drawer-list">
             <template v-for="(ch, i) in drawerChapters" :key="`${ch.url}-${i}`">
-              <div v-if="ch.isVolume" class="chapter-volume">{{ ch.title }}</div>
+              <button
+                v-if="ch.isVolume"
+                type="button"
+                class="chapter-volume"
+                :class="{ collapsed: tocCollapsed[ch.title] }"
+                :title="tocCollapsed[ch.title] ? '展开本卷' : '折叠本卷'"
+                @click="toggleVolume(ch.title)"
+              >
+                <span class="vol-arrow">{{ tocCollapsed[ch.title] ? '▸' : '▾' }}</span>
+                <span class="vol-title">{{ ch.title }}</span>
+              </button>
               <button
                 v-else
+                v-show="!chapterHidden[i]"
                 type="button"
                 class="chapter-item"
                 :class="{ current: i === chapterIndex }"
@@ -3524,6 +3654,19 @@ onBeforeUnmount(() => {
   100% {
     background: transparent;
   }
+}
+
+/* 页内搜索：正文 <mark> 高亮（v-html 注入 → :deep）——普通命中淡黄底，当前命中描边突出 */
+.reader-para :deep(mark) {
+  background: rgba(255, 193, 7, 0.45);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.reader-para :deep(mark.mark-current) {
+  background: rgba(255, 170, 0, 0.75);
+  box-shadow: 0 0 0 2px rgba(255, 170, 0, 0.5);
+  color: #000;
 }
 
 /* GAP 7：TTS 朗读中当前段落浅背景高亮 */
@@ -4188,76 +4331,18 @@ onBeforeUnmount(() => {
   background: var(--accent-deep);
 }
 
-/* ================= 章节内搜索弹层 ================= */
+/* ================= 页内搜索弹层 ================= */
 .search-card {
   width: min(460px, 92vw);
 }
-.search-list {
-  list-style: none;
-  margin: 14px 0 0;
-  padding: 0;
-  max-height: 46vh;
-  overflow-y: auto;
+.search-nav {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.search-item {
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  overflow: hidden;
-}
-.search-jump {
-  width: 100%;
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 9px 12px;
-  border: none;
-  background: none;
-  font-family: inherit;
-  text-align: left;
-  cursor: pointer;
-  transition: background 0.15s ease;
-}
-.search-jump:hover {
-  background: var(--accent-soft);
-}
-.search-idx {
-  flex-shrink: 0;
-  margin-top: 2px;
-  min-width: 20px;
-  height: 18px;
-  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  border-radius: 4px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 400;
-  font-variant-numeric: tabular-nums;
+  gap: 8px;
+  margin-top: 12px;
 }
-.search-text {
+.search-nav .pop-btn {
   flex: 1;
-  min-width: 0;
-  font-size: 12.5px;
-  font-weight: 300;
-  line-height: 1.7;
-  color: var(--text-1);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  word-break: break-word;
-}
-/* v-html 注入的 <mark> 需要 :deep 才能命中 scoped 样式 */
-.search-text :deep(mark) {
-  background: rgba(255, 193, 7, 0.4);
-  color: inherit;
-  border-radius: 2px;
-  padding: 0 1px;
 }
 
 /* ================= 排版设置 ================= */
@@ -4532,11 +4617,37 @@ onBeforeUnmount(() => {
   padding: 10px 0 24px;
 }
 .chapter-volume {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
   padding: 20px 20px 8px;
+  border: none;
+  background: none;
+  font-family: inherit;
   font-size: 12px;
   font-weight: 300;
   letter-spacing: 2px;
   color: var(--text-3);
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+.chapter-volume:hover {
+  color: var(--accent);
+}
+.vol-arrow {
+  flex-shrink: 0;
+  font-size: 10px;
+  letter-spacing: 0;
+  transition: transform 0.15s ease;
+}
+.vol-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .chapter-item {
   display: block;
