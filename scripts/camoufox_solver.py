@@ -286,13 +286,18 @@ async def post_navigate(page, post, max_wait_ms, diag):
         await page.evaluate(POST_NAVIGATE_JS % (json.dumps(fields, ensure_ascii=True), json.dumps(action)))
     except Exception as e:
         return {"error": f"表单提交失败: {e}"[:300]}, str(e)[:200]
-    # 等导航离开起始页（表单提交后页面开始跳转）
+    # 等导航离开起始页且文档加载完成（避免在加载中的文档上误判"无质询"）
     start_url = page.url
-    dl = time.monotonic() + 15
+    dl = time.monotonic() + 20
     while time.monotonic() < dl:
         try:
             if page.url != start_url:
-                break
+                try:
+                    rs = await page.evaluate("document.readyState")
+                    if rs == "complete":
+                        break
+                except Exception:
+                    break
         except Exception:
             break
         await asyncio.sleep(0.4)
