@@ -271,11 +271,19 @@ fn eval_js_with_bridge_limited(
     bridge: &JsBridge,
     loop_limit: u64,
 ) -> Result<String> {
+    // legacy 常见变量默认兜底（调用方未注入时避免 ReferenceError）
+    let vars = {
+        let mut v = vars.clone();
+        for k in ["urlSearchSeries", "urlSearch", "url", "baseUrl", "headerMap", "result", "key", "page"] {
+            v.entry(k.to_string()).or_insert_with(String::new);
+        }
+        v
+    };
     let mut context = context_with_limit(loop_limit);
     install_globals(&mut context, bridge)?;
-    inject_vars(&mut context, vars)?;
+    inject_vars(&mut context, &vars)?;
     install_bridge(&mut context, bridge)?;
-    auto_set_content(vars, bridge);
+    auto_set_content(&vars, bridge);
     let result = context
         .eval(Source::from_bytes(code.as_bytes()))
         .map_err(map_js_error)?;
@@ -298,7 +306,7 @@ pub fn eval_js_json_with_bridge(
     bridge: &JsBridge,
 ) -> Result<JsonValue> {
     let mut context = context_with_limit(JS_LOOP_ITERATION_LIMIT);
-    inject_vars(&mut context, vars)?;
+    inject_vars(&mut context, &vars)?;
     install_bridge(&mut context, bridge)?;
     let result = context
         .eval(Source::from_bytes(code.as_bytes()))
@@ -323,9 +331,9 @@ fn eval_js_json_with_bridge_limited(
 ) -> Result<JsonValue> {
     let mut context = context_with_limit(loop_limit);
     install_globals(&mut context, bridge)?;
-    inject_vars(&mut context, vars)?;
+    inject_vars(&mut context, &vars)?;
     install_bridge(&mut context, bridge)?;
-    auto_set_content(vars, bridge);
+    auto_set_content(&vars, bridge);
     let result = context
         .eval(Source::from_bytes(code.as_bytes()))
         .map_err(map_js_error)?;
@@ -336,7 +344,7 @@ fn eval_js_json_with_bridge_limited(
 pub fn eval_js_value(code: &str, vars: &HashMap<String, String>) -> Result<JsValue> {
     let mut context = context_with_limit(JS_LOOP_ITERATION_LIMIT);
     install_globals(&mut context, &JsBridge::default())?;
-    inject_vars(&mut context, vars)?;
+    inject_vars(&mut context, &vars)?;
     context
         .eval(Source::from_bytes(code.as_bytes()))
         .map_err(map_js_error)

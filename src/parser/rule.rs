@@ -192,6 +192,9 @@ fn apply_depth(rule: &str, html: &str, depth: usize) -> Vec<String> {
             vars.insert("key".to_string(), String::new());
             vars.insert("page".to_string(), "1".to_string());
             vars.insert("baseUrl".to_string(), String::new());
+            vars.insert("urlSearchSeries".to_string(), String::new());
+            vars.insert("urlSearch".to_string(), String::new());
+            vars.insert("url".to_string(), String::new());
             match crate::parser::js::eval_js(&code, &vars) {
                 Ok(s) => {
                     // 空串结果 → 空列表（repo 语义）；后续段输入为空串（legado result="" 非 null）
@@ -264,6 +267,9 @@ fn apply_rule_inner(rule: &Rule, html: &str, depth: usize) -> Vec<String> {
             vars.insert("key".to_string(), String::new());
             vars.insert("page".to_string(), "1".to_string());
             vars.insert("baseUrl".to_string(), String::new());
+            vars.insert("urlSearchSeries".to_string(), String::new());
+            vars.insert("urlSearch".to_string(), String::new());
+            vars.insert("url".to_string(), String::new());
             match crate::parser::js::eval_js(&rule.body, &vars) {
                 Ok(s) if !s.is_empty() => vec![s],
                 _ => vec![],

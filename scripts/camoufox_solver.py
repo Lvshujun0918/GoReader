@@ -31,7 +31,8 @@ cf-turnstile-response input 值非空 / challenge 特征消失 / 标题离开 Ju
 依赖：pip install camoufox && camoufox fetch（浏览器二进制）
 用法：python scripts/camoufox_solver.py [--port 8196] [--host 127.0.0.1]
 测试：python -m py_compile scripts/camoufox_solver.py
-      GET /health；POST /solve 指向 scripts/mock-cf-site.py（8193）验证质询自动过
+      GET /health；POST /solve 指向 scripts/mock-cf-site.py（8193）验证质询自动过；
+      指向 scripts/mock-turnstile-site.py（8194）验证 Turnstile 点击→token 链路
 
 69shuba 实测（2026-08-05 续）：UA 覆盖已跑通——Playwright user_agent 选项只改线上
 （wire）UA，camoufox 指纹注入脚本会另把 navigator.userAgent 改回 Firefox；必须用
@@ -257,21 +258,30 @@ async def wait_challenge_clear(page, deadline, diag, max_wait_ms, prefix=""):
                 f"质询求解超时（{max_wait_ms / 1000:.0f}s）——页面仍停留在质询页"
                 f"（title={diag['title']!r} hasInput={diag['hasInput']} clicks={diag['clicks']}）"
             )
-        # Turnstile widget iframe → 坐标点击勾选（比 CDP 坐标数学更稳）
+        # Turnstile widget iframe → 坐标点击勾选；无 iframe 时（mock/直接渲染场景）
+        # 点击 .cf-turnstile 容器
         if not state.get("inputValue"):
             try:
                 frame = next(
                     (f for f in page.frames if "challenges.cloudflare.com" in (f.url or "")),
                     None,
                 )
+                clicked = False
                 if frame is not None:
                     await frame.click("body", timeout=3000)
-                    diag["clicks"] += 1
+                    clicked = True
                 else:
                     loc = page.locator('iframe[src*="challenges.cloudflare.com"]')
                     if await loc.count() > 0:
                         await loc.first.click(timeout=3000)
-                        diag["clicks"] += 1
+                        clicked = True
+                if not clicked:
+                    cont = page.locator(".cf-turnstile")
+                    if await cont.count() > 0:
+                        await cont.first.click(timeout=3000)
+                        clicked = True
+                if clicked:
+                    diag["clicks"] += 1
             except Exception:
                 pass
         await asyncio.sleep(0.5)

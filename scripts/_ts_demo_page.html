@@ -1,8 +1,0 @@
-<!DOCTYPE html><html><head><meta charset="utf-8"><title>ts-demo</title>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head>
-<body><div id="w"></div><script>
-window.onloadTurnstileCallback = function () {
-  turnstile.render("#w", {sitekey: "0x4AAAAAAABGpllqO9XmdphoA",
-    callback: function (t) { document.title = "TOKEN:" + t.slice(0, 20); }});
-};
-</script></body></html>
