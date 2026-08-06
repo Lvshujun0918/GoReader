@@ -2797,6 +2797,7 @@ mod tests {
         assert_eq!(json.as_array().unwrap()[0]["n"], 1);
         // 标量
         assert_eq!(eval_js_json("42", &v).unwrap(), serde_json::json!(42));
+        #[allow(clippy::approx_constant)]
         assert_eq!(eval_js_json("3.14", &v).unwrap(), serde_json::json!(3.14));
         assert_eq!(eval_js_json("true", &v).unwrap(), serde_json::json!(true));
         assert_eq!(eval_js_json("'str'", &v).unwrap(), serde_json::json!("str"));
