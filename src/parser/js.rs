@@ -908,7 +908,8 @@ fn java_toast(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let msg = args.first()
+    let msg = args
+        .first()
         .map(|v| js_value_to_string(v, context))
         .unwrap_or_default();
     tracing::debug!("java.toast: {}", msg);
@@ -2357,7 +2358,8 @@ pub fn js_value_to_json(v: &JsValue, context: &mut Context) -> JsResult<JsonValu
 
 /// java.aesBase64DecodeToString(data, key, mode, iv)：AES/CBC/PKCS5 解密（书源加密 URL 常见）
 fn java_aes_decrypt(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let data = args.first()
+    let data = args
+        .first()
         .map(|v| js_value_to_string(v, context))
         .unwrap_or_default();
     let key = args

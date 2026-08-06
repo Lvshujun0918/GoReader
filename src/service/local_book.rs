@@ -777,10 +777,9 @@ pub fn parse_docx(bytes: &[u8]) -> Result<ImportedBook> {
                             p_buf.push('\t');
                         }
                     }
-                    "br" | "cr"
-                        if in_p => {
-                            p_buf.push('\n');
-                        }
+                    "br" | "cr" if in_p => {
+                        p_buf.push('\n');
+                    }
                     _ => {}
                 }
             }

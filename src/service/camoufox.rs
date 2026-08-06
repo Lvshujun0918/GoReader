@@ -29,7 +29,8 @@ const DEFAULT_SOLVE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleW
 pub fn solve_ua() -> String {
     std::env::var("READER_CAMOUFOX_UA")
         .map(|v| v.trim().to_string())
-        .into_iter().find(|v| !v.is_empty())
+        .into_iter()
+        .find(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_SOLVE_UA.to_string())
 }
 
@@ -37,7 +38,8 @@ pub fn solve_ua() -> String {
 pub fn server_url() -> String {
     std::env::var("READER_CAMOUFOX_URL")
         .map(|v| v.trim().trim_end_matches('/').to_string())
-        .into_iter().find(|v| !v.is_empty())
+        .into_iter()
+        .find(|v| !v.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:8196".to_string())
 }
 

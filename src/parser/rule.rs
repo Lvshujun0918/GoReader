@@ -713,28 +713,32 @@ fn eval_segments<'v>(
             }
             _ => {}
         },
-        JSeg::Slice(s, e, st) => if let serde_json::Value::Array(arr) = value {
-            for v in slice_items(arr, *s, *e, *st) {
-                eval_segments(v, &segs[1..], out);
+        JSeg::Slice(s, e, st) => {
+            if let serde_json::Value::Array(arr) = value {
+                for v in slice_items(arr, *s, *e, *st) {
+                    eval_segments(v, &segs[1..], out);
+                }
             }
-        },
-        JSeg::Multi(items) => if let serde_json::Value::Array(arr) = value {
-            for it in items {
-                match it {
-                    JItem::I(n) => {
-                        if let Some(v) = norm_index(*n, arr.len()).and_then(|idx| arr.get(idx))
-                        {
-                            eval_segments(v, &segs[1..], out);
+        }
+        JSeg::Multi(items) => {
+            if let serde_json::Value::Array(arr) = value {
+                for it in items {
+                    match it {
+                        JItem::I(n) => {
+                            if let Some(v) = norm_index(*n, arr.len()).and_then(|idx| arr.get(idx))
+                            {
+                                eval_segments(v, &segs[1..], out);
+                            }
                         }
-                    }
-                    JItem::S(s, e, st) => {
-                        for v in slice_items(arr, *s, *e, *st) {
-                            eval_segments(v, &segs[1..], out);
+                        JItem::S(s, e, st) => {
+                            for v in slice_items(arr, *s, *e, *st) {
+                                eval_segments(v, &segs[1..], out);
+                            }
                         }
                     }
                 }
             }
-        },
+        }
         JSeg::Filter(expr) => match value {
             serde_json::Value::Array(arr) => {
                 for item in arr {

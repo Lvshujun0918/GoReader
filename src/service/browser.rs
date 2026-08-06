@@ -100,7 +100,9 @@ pub struct Browser {
     child: Option<Child>,
     sink: futures::stream::SplitSink<WsStream, Message>,
     /// 待响应命令表（reader 任务按 id 路由回 oneshot）——Arc 共享，避免跨 await 持有非 Sync 的 Receiver
-    pending: std::sync::Arc<std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>>,
+    pending: std::sync::Arc<
+        std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
+    >,
     next_id: u64,
     session_id: Option<String>,
 }
@@ -185,7 +187,9 @@ async fn spawn_serve_and_connect(exe: &std::path::Path, port: u16) -> Result<Bro
             // 提前退出（端口占用/动态库缺失等）→ 非零退出码即失败
             if let Ok(Some(status)) = child.try_wait() {
                 if !status.success() {
-                    return Err(anyhow!("obscura 进程启动失败（{status}）——端口 {port} 可能被占用"));
+                    return Err(anyhow!(
+                        "obscura 进程启动失败（{status}）——端口 {port} 可能被占用"
+                    ));
                 }
             }
         }
@@ -232,8 +236,9 @@ async fn spawn_serve_and_connect(exe: &std::path::Path, port: u16) -> Result<Bro
 async fn init_session(ws: WsStream) -> Result<Browser> {
     let (sink, stream) = ws.split();
     // reader 任务：按 id 路由响应到对应 oneshot（events 忽略）
-    let pending: std::sync::Arc<std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let pending: std::sync::Arc<
+        std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_task = std::sync::Arc::clone(&pending);
     tokio::spawn(async move {
         let mut stream = stream;
@@ -244,8 +249,12 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
                 Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
                 _ => continue,
             };
-            let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-            let Some(id) = v.get("id").and_then(|i| i.as_u64()) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
+                continue;
+            };
             if let Some(tx) = pending_task
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -277,7 +286,10 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
         .ok_or_else(|| anyhow!("CDP 创建页面失败"))?
         .to_string();
     let session_id = browser
-        .command("Target.attachToTarget", json!({ "targetId": target_id, "flatten": true }))
+        .command(
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        )
         .await?
         .get("sessionId")
         .and_then(|v| v.as_str())
@@ -344,7 +356,10 @@ impl Browser {
     /// 端口冲突等启动失败自动换随机端口重试，最多 3 次）
     pub async fn launch_with(exe: PathBuf) -> Result<Browser> {
         if !exe.exists() {
-            return Err(anyhow!("obscura 可执行文件不存在（{}）——无法使用浏览器自动登录", exe.display()));
+            return Err(anyhow!(
+                "obscura 可执行文件不存在（{}）——无法使用浏览器自动登录",
+                exe.display()
+            ));
         }
         let mut last_err: Option<anyhow::Error> = None;
         for _ in 0..3 {
@@ -390,7 +405,10 @@ impl Browser {
         }
     }
 
-    /// Runtime.evaluate（returnByValue，awaitPromise）→ 返回值
+    /// Runtime.evaluate（returnByValue，awaitPromise）→ 返回值。
+    /// 兼容两种返回形状：Chrome/Edge = `{result: RemoteObject, exceptionDetails}`；
+    /// obscura = RemoteObject **直接**作为命令 result（无内层包装——obscura
+    /// runtime.rs evaluate 返回 `{"result": remote_object_from_info(&info)}`）
     pub async fn evaluate(&mut self, expression: &str) -> Result<Value> {
         let r = self
             .command(
@@ -398,17 +416,22 @@ impl Browser {
                 json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
             )
             .await?;
-        // 异常时 result 里带 exceptionDetails，value 缺失
+        // 异常时 result 里带 exceptionDetails，value 缺失（Chrome 形状；obscura
+        // 的 JS 异常返回 type=undefined 的 RemoteObject——value 为 Null）
         if r.get("exceptionDetails").is_some() {
             return Err(anyhow!(
                 "页面 JS 异常: {}",
                 r.get("exceptionDetails").unwrap_or(&Value::Null)
             ));
         }
-        Ok(r.get("result")
-            .and_then(|v| v.get("value"))
-            .cloned()
-            .unwrap_or(Value::Null))
+        // 形状判别：命令 result 含 "type" 键 → 本身即 RemoteObject（obscura）；
+        // 否则取内层 result（Chrome）
+        let remote = if r.get("type").is_some() {
+            &r
+        } else {
+            r.get("result").unwrap_or(&Value::Null)
+        };
+        Ok(remote.get("value").cloned().unwrap_or(Value::Null))
     }
 
     /// 等待 document.readyState == complete（超时 20s）
@@ -1387,14 +1410,32 @@ mod tests {
     #[test]
     fn test_normalize_cdp_url() {
         // http(s):// 端点（Playwright connectOverCDP 风格）→ ws(s):// + /devtools/browser
-        assert_eq!(normalize_cdp_url("http://127.0.0.1:9222"), "ws://127.0.0.1:9222/devtools/browser");
-        assert_eq!(normalize_cdp_url("http://127.0.0.1:9222/"), "ws://127.0.0.1:9222/devtools/browser");
-        assert_eq!(normalize_cdp_url("https://obscura.example:9443"), "wss://obscura.example:9443/devtools/browser");
+        assert_eq!(
+            normalize_cdp_url("http://127.0.0.1:9222"),
+            "ws://127.0.0.1:9222/devtools/browser"
+        );
+        assert_eq!(
+            normalize_cdp_url("http://127.0.0.1:9222/"),
+            "ws://127.0.0.1:9222/devtools/browser"
+        );
+        assert_eq!(
+            normalize_cdp_url("https://obscura.example:9443"),
+            "wss://obscura.example:9443/devtools/browser"
+        );
         // 已带路径 → 仅换 scheme
-        assert_eq!(normalize_cdp_url("http://127.0.0.1:9222/devtools/browser"), "ws://127.0.0.1:9222/devtools/browser");
+        assert_eq!(
+            normalize_cdp_url("http://127.0.0.1:9222/devtools/browser"),
+            "ws://127.0.0.1:9222/devtools/browser"
+        );
         // ws(s):// 直连 → 原样返回（含首尾空白清理）
-        assert_eq!(normalize_cdp_url("ws://127.0.0.1:9222/devtools/browser"), "ws://127.0.0.1:9222/devtools/browser");
-        assert_eq!(normalize_cdp_url("  wss://h:1/devtools/browser  "), "wss://h:1/devtools/browser");
+        assert_eq!(
+            normalize_cdp_url("ws://127.0.0.1:9222/devtools/browser"),
+            "ws://127.0.0.1:9222/devtools/browser"
+        );
+        assert_eq!(
+            normalize_cdp_url("  wss://h:1/devtools/browser  "),
+            "wss://h:1/devtools/browser"
+        );
     }
 
     #[test]

@@ -67,8 +67,16 @@ impl AppConfig {
                 .unwrap_or_else(|_| "web-ui/dist".to_string()),
             default_user_enable_webdav: env_flag("READER_APP_DEFAULTUSERENABLEWEBDAV"),
             default_user_enable_local_store: env_flag("READER_APP_DEFAULTUSERENABLELOCALSTORE"),
-            default_user_enable_book_source: if env_flag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE") { true } else { true },
-            default_user_enable_rss_source: if env_flag("READER_APP_DEFAULTUSERENABLERSSSOURCE") { true } else { true },
+            default_user_enable_book_source: if env_flag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE") {
+                true
+            } else {
+                true
+            },
+            default_user_enable_rss_source: if env_flag("READER_APP_DEFAULTUSERENABLERSSSOURCE") {
+                true
+            } else {
+                true
+            },
             default_user_book_source_limit: env_i64("READER_APP_DEFAULTUSERBOOKSOURCELIMIT", 100),
             default_user_book_limit: env_i64("READER_APP_DEFAULTUSERBOOKLIMIT", 200),
             upload_max_mb: env_i64("READER_UPLOAD_MAX_MB", 100),

@@ -466,9 +466,9 @@ async fn edge_synthesize_chunk(
     .map_err(|e| anyhow!("发送 speech.config 失败: {e}"))?;
 
     // 2. SSML 合成请求
-    sink.send(tokio_tungstenite::tungstenite::Message::Text(
-        build_ssml(text, voice, rate, pitch),
-    ))
+    sink.send(tokio_tungstenite::tungstenite::Message::Text(build_ssml(
+        text, voice, rate, pitch,
+    )))
     .await
     .map_err(|e| anyhow!("发送合成请求失败: {e}"))?;
 
