@@ -391,7 +391,8 @@ fn is_rule_control_value(v: &str) -> bool {
         || v.starts_with("//")
 }
 
-/// 展开 `{{...}}`（测试/外部便捷入口，无递归深度）
+/// 展开 `{{...}}`（测试便捷入口，无递归深度）
+#[cfg(test)]
 fn expand_inline(body: &str, text: &str) -> String {
     expand_inline_depth(body, text, 0)
 }

@@ -377,6 +377,7 @@ pub fn eval_js_json_with_bridge(
 }
 
 /// 指定循环迭代上限的 JSON 桥接执行（测试用小上限验证超限路径）
+#[cfg(test)]
 fn eval_js_json_with_bridge_limited(
     code: &str,
     vars: &HashMap<String, String>,

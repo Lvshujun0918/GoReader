@@ -267,6 +267,61 @@ fn resolve_local_file(storage: &Storage, ns: &str, book: &Book) -> Option<PathBu
     None
 }
 
+/// 按目标格式过滤的本地原文件定位（format 为空时不过滤）：
+/// `local://cccc` 同 stem 的 cccc.txt 与 cccc.epub 并存时，read_dir 顺序不定——
+/// 必须按 format 精确匹配扩展名（否则 EPUB 下载可能拿到 TXT 文件，CI/本机 flaky）。
+fn resolve_local_file_by_format(
+    storage: &Storage,
+    ns: &str,
+    book: &Book,
+    format: &str,
+) -> Option<PathBuf> {
+    if let Some(p) = &book.local_file {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            let ext = pb.extension().map(|e| e.to_string_lossy().to_lowercase());
+            if format.is_empty() || ext.as_deref() == Some(format) || ext.as_deref().is_none() {
+                return Some(pb);
+            }
+        }
+    }
+    if book.book_url.starts_with("local://") {
+        let id = book.book_url.trim_start_matches("local://");
+        let dir = storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join(ns)
+            .join("opds_files");
+        let rd = std::fs::read_dir(&dir).ok()?;
+        let mut best: Option<PathBuf> = None;
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_file()
+                || p.file_stem()
+                    .map(|s| s.to_string_lossy() != id)
+                    .unwrap_or(true)
+            {
+                continue;
+            }
+            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase());
+            if format.is_empty() {
+                // 无格式要求：任意扩展名（优先 txt——与旧行为一致）
+                if best.is_none() || ext.as_deref() == Some("txt") {
+                    best = Some(p);
+                }
+            } else if ext.as_deref() == Some(format) {
+                return Some(p);
+            }
+        }
+        return best;
+    }
+    if book.book_url.starts_with("storage/") || book.origin == "loc_book" {
+        return resolve_storage_file(&storage.config.storage_dir(), &book.book_url);
+    }
+    None
+}
+
 /// storage/ 文件书定位（兼容 legacy：{name}.epub/ 目录内含 index.epub 等形态）
 fn resolve_storage_file(storage_dir: &Path, book_url: &str) -> Option<PathBuf> {
     let path = storage_dir.join(book_url.trim_start_matches("storage/"));
@@ -1436,8 +1491,8 @@ pub async fn download(
     let book = find_book(storage, ns, book_id).await?;
 
     if is_local_book(&book.book_url, &book.origin) {
-        // 原文件优先（local:// 上传落盘 / storage/ legacy 文件书）
-        if let Some(path) = resolve_local_file(storage, ns, &book) {
+        // 原文件优先（local:// 上传落盘 / storage/ legacy 文件书）——按 format 精确匹配扩展名
+        if let Some(path) = resolve_local_file_by_format(storage, ns, &book, format) {
             let ext = path
                 .extension()
                 .map(|e| e.to_string_lossy().to_lowercase())
