@@ -2786,6 +2786,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn eval_js_json_object_and_scalars() {
         let v = vars(&[]);
         // 对象
