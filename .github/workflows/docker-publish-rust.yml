@@ -3,7 +3,7 @@ name: Publish Rust Release
 on:
   push:
     tags:
-      - 'v1.*'
+      - 'v5.*'
   workflow_dispatch:
 
 permissions:
