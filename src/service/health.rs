@@ -46,7 +46,9 @@ pub async fn check_source(_ns: &str, source: &BookSource) -> (bool, String) {
             // 4xx/5xx：不视为“网络失效”，但按不可用处理（GET 兜底验证首页）
             let get = client.get(base).headers(req_headers.clone()).send().await;
             return match get {
-                Ok(r) if r.status().as_u16() < 400 => (true, format!("GET {}", r.status().as_u16())),
+                Ok(r) if r.status().as_u16() < 400 => {
+                    (true, format!("GET {}", r.status().as_u16()))
+                }
                 Ok(r) => (false, format!("HTTP {}", r.status().as_u16())),
                 Err(e) => (false, format!("连接失败: {e}")),
             };
@@ -67,10 +69,7 @@ pub async fn check_source(_ns: &str, source: &BookSource) -> (bool, String) {
 }
 
 /// 并发检测全部书源（并发上限 8）；返回不可用列表 [(书源, 原因)]
-pub async fn find_invalid(
-    ns: &str,
-    sources: &[BookSource],
-) -> Vec<(BookSource, String)> {
+pub async fn find_invalid(ns: &str, sources: &[BookSource]) -> Vec<(BookSource, String)> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
     let mut handles = Vec::with_capacity(sources.len());
     for source in sources {

@@ -35,7 +35,9 @@ const DEBOUNCE_MS: Duration = Duration::from_millis(300);
 const BOOKS_DIR: &str = "books";
 /// 书仓支持的文件格式（与 SUPPORTED_EXTENSIONS 一致但排除 zip——zip 语义歧义
 /// （EPUB 容器 / 裸 OPF 结构），书仓对账只认确定格式）
-const SYNC_EXTENSIONS: &[&str] = &["epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx", "cbz", "umd"];
+const SYNC_EXTENSIONS: &[&str] = &[
+    "epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx", "cbz", "umd",
+];
 
 // ---------------------------------------------------------------------------
 // 启动入口
@@ -116,17 +118,16 @@ fn spawn_watcher(storage: &Storage, event_tx: tokio::sync::mpsc::UnboundedSender
     for root in roots {
         let tx = event_tx.clone();
         let (std_tx, std_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
-        let mut watcher = match notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| {
+        let mut watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let _ = std_tx.send(res);
-            },
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!("本地书监听创建失败（{}）: {e}", root.display());
-                continue;
-            }
-        };
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("本地书监听创建失败（{}）: {e}", root.display());
+                    continue;
+                }
+            };
         if let Err(e) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
             tracing::warn!("本地书监听目录失败（{}）: {e}", root.display());
             continue;
@@ -227,8 +228,17 @@ pub async fn reconcile_namespace(storage: &Storage, ns: &str) -> Result<bool> {
 }
 
 /// 对账核心（env_dirs 为额外书仓目录；测试直接传入临时目录，避免进程级 env 竞态）
-async fn reconcile_namespace_dirs(storage: &Storage, ns: &str, env_dirs: &[PathBuf]) -> Result<bool> {
-    let books_dir = storage.config.storage_dir().join("data").join(ns).join(BOOKS_DIR);
+async fn reconcile_namespace_dirs(
+    storage: &Storage,
+    ns: &str,
+    env_dirs: &[PathBuf],
+) -> Result<bool> {
+    let books_dir = storage
+        .config
+        .storage_dir()
+        .join("data")
+        .join(ns)
+        .join(BOOKS_DIR);
     std::fs::create_dir_all(&books_dir)?;
     // 环境变量书仓目录（可选；仅 default 命名空间对账——secure 多用户下 env 目录归属 default）
     let env_books: Vec<PathBuf> = if ns == "default" {
@@ -261,7 +271,13 @@ async fn reconcile_namespace_dirs(storage: &Storage, ns: &str, env_dirs: &[PathB
         .get_txt_toc_rules(ns)
         .await
         .ok()
-        .map(|rules| rules.into_iter().filter(|r| r.enable).map(|r| r.rule).collect())
+        .map(|rules| {
+            rules
+                .into_iter()
+                .filter(|r| r.enable)
+                .map(|r| r.rule)
+                .collect()
+        })
         .unwrap_or_default();
     for path in &files {
         let key = normalize_path(&path.to_string_lossy());
@@ -280,11 +296,9 @@ async fn reconcile_namespace_dirs(storage: &Storage, ns: &str, env_dirs: &[PathB
                 {
                     match reparse_and_update(storage, ns, &book, path, mtime, size).await {
                         Ok(()) => changed = true,
-                        Err(e) => tracing::warn!(
-                            "本地书重扫失败 [{}] {}: {e:#}",
-                            ns,
-                            path.display()
-                        ),
+                        Err(e) => {
+                            tracing::warn!("本地书重扫失败 [{}] {}: {e:#}", ns, path.display())
+                        }
                     }
                 }
             }
@@ -313,7 +327,14 @@ async fn reconcile_namespace_dirs(storage: &Storage, ns: &str, env_dirs: &[PathB
             // 书签/章节全部保留（DB 仍可读）；置 local_file_deleted=1 后文件重现
             // 时自动重链重扫（③），不会把重现文件当新书重复导入。
             storage
-                .link_local_file(ns, &book.book_url, Some(p), book.local_file_mtime, book.local_file_size, true)
+                .link_local_file(
+                    ns,
+                    &book.book_url,
+                    Some(p),
+                    book.local_file_mtime,
+                    book.local_file_size,
+                    true,
+                )
                 .await?;
             tracing::info!(
                 "本地书文件已删除，书籍保留 [{}] {}（local_file_deleted=1）",
@@ -385,7 +406,12 @@ async fn import_file(
     storage.save_local_book(ns, &info, &imported).await?;
     // 封面落盘（与上传导入一致）
     if let Some(cover) = &imported.cover {
-        let cover_dir = storage.config.storage_dir().join("assets").join(ns).join("covers");
+        let cover_dir = storage
+            .config
+            .storage_dir()
+            .join("assets")
+            .join(ns)
+            .join("covers");
         let _ = std::fs::create_dir_all(&cover_dir);
         let file_id = format!("{}.jpg", uuid::Uuid::new_v4());
         if std::fs::write(cover_dir.join(&file_id), cover).is_ok() {
@@ -396,7 +422,14 @@ async fn import_file(
     }
     // 文件关联（双轨）
     storage
-        .link_local_file(ns, &book_url, Some(&normalize_path(&path.to_string_lossy())), mtime, size, false)
+        .link_local_file(
+            ns,
+            &book_url,
+            Some(&normalize_path(&path.to_string_lossy())),
+            mtime,
+            size,
+            false,
+        )
         .await?;
     tracing::info!(
         "本地书自动导入 [{}] {}（{} 章）← {}",
@@ -434,12 +467,18 @@ async fn reparse_and_update(
     storage.replace_chapters(&book.book_url, &pairs).await?;
     // 元数据 patch（仅文件可表达的字段；用户编辑字段 custom_intro/custom_tag 不动）
     let mut patch = serde_json::Map::new();
-    patch.insert("totalChapterNum".to_string(), serde_json::json!(pairs.len() as i64));
+    patch.insert(
+        "totalChapterNum".to_string(),
+        serde_json::json!(pairs.len() as i64),
+    );
     if book.name.is_empty() && !imported.meta.title.is_empty() {
         patch.insert("name".to_string(), serde_json::json!(imported.meta.title));
     }
     if !imported.meta.author.is_empty() {
-        patch.insert("author".to_string(), serde_json::json!(imported.meta.author));
+        patch.insert(
+            "author".to_string(),
+            serde_json::json!(imported.meta.author),
+        );
     }
     if let Some(d) = &imported.meta.description {
         if !d.is_empty() {
@@ -461,18 +500,34 @@ async fn reparse_and_update(
     let _ = storage.patch_book(ns, &book.book_url, &patch).await;
     // 封面更新（新封面存在时替换）
     if let Some(cover) = &imported.cover {
-        let cover_dir = storage.config.storage_dir().join("assets").join(ns).join("covers");
+        let cover_dir = storage
+            .config
+            .storage_dir()
+            .join("assets")
+            .join(ns)
+            .join("covers");
         let _ = std::fs::create_dir_all(&cover_dir);
         let file_id = format!("{}.jpg", uuid::Uuid::new_v4());
         if std::fs::write(cover_dir.join(&file_id), cover).is_ok() {
             let _ = storage
-                .update_book_cover(ns, &book.book_url, &format!("/assets/{ns}/covers/{file_id}"))
+                .update_book_cover(
+                    ns,
+                    &book.book_url,
+                    &format!("/assets/{ns}/covers/{file_id}"),
+                )
                 .await;
         }
     }
     // 更新关联（mtime/大小 + 清除删除标记）
     storage
-        .link_local_file(ns, &book.book_url, Some(&normalize_path(&path.to_string_lossy())), mtime, size, false)
+        .link_local_file(
+            ns,
+            &book.book_url,
+            Some(&normalize_path(&path.to_string_lossy())),
+            mtime,
+            size,
+            false,
+        )
         .await?;
     tracing::info!(
         "本地书重扫 [{}] {}（{} 章）← {}",
@@ -544,7 +599,12 @@ async fn generate_epub_for_book(
             false,
         )
         .await?;
-    tracing::info!("本地书 epub 已生成 [{}] {} → {}", ns, book.name, target.display());
+    tracing::info!(
+        "本地书 epub 已生成 [{}] {} → {}",
+        ns,
+        book.name,
+        target.display()
+    );
     Ok(())
 }
 
@@ -564,7 +624,10 @@ fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| {
-            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t') {
+            if matches!(
+                c,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t'
+            ) {
                 ' '
             } else {
                 c
@@ -580,7 +643,9 @@ fn sanitize_filename(name: &str) -> String {
 
 /// 递归收集书仓格式文件（epub/txt/mobi/azw3/pdf/fb2/docx；zip 不入仓）
 fn collect_book_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -641,7 +706,12 @@ mod tests {
     }
 
     fn books_dir(storage: &Storage, ns: &str) -> PathBuf {
-        storage.config.storage_dir().join("data").join(ns).join(BOOKS_DIR)
+        storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join(ns)
+            .join(BOOKS_DIR)
     }
 
     fn write_txt(path: &Path, content: &str) {
@@ -650,14 +720,17 @@ mod tests {
     }
 
     const SAMPLE1: &str = "第一章 起点\n内容一。\n第二章 成长\n内容二。";
-    const SAMPLE2: &str = "第一章 起点\n内容一（修订）。\n第二章 成长\n内容二（修订）。\n第三章 终章\n内容三。";
+    const SAMPLE2: &str =
+        "第一章 起点\n内容一（修订）。\n第二章 成长\n内容二（修订）。\n第三章 终章\n内容三。";
 
     /// ① 新文件 → 自动导入 DB（local:// + local_file 关联 + 章节/元数据）
     #[tokio::test]
     async fn reconcile_imports_new_file() {
         let storage = test_storage("import").await;
         write_txt(&books_dir(&storage, "default").join("测试书.txt"), SAMPLE1);
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
         assert!(changed);
         // 书架新增 1 本 local:// 书
         let books = storage.list_books("default").await.unwrap();
@@ -667,7 +740,11 @@ mod tests {
         assert_eq!(b.name, "第一章 起点", "TXT 首行应为书名");
         assert_eq!(b.origin, "local");
         // 文件关联
-        assert!(b.local_file.as_deref().unwrap().ends_with("books/测试书.txt"));
+        assert!(b
+            .local_file
+            .as_deref()
+            .unwrap()
+            .ends_with("books/测试书.txt"));
         assert!(!b.local_file_deleted);
         assert!(b.local_file_mtime > 0);
         // 章节入库
@@ -676,7 +753,9 @@ mod tests {
         assert_eq!(toc[0].1, "第一章 起点");
         assert_eq!(toc[1].1, "第二章 成长");
         // 幂等：再次对账无变更
-        let changed2 = reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
+        let changed2 = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
         assert!(!changed2);
         assert_eq!(storage.list_books("default").await.unwrap().len(), 1);
         cleanup(storage, "import").await;
@@ -689,13 +768,19 @@ mod tests {
         let storage = test_storage("rescan").await;
         let path = books_dir(&storage, "default").join("测试书.txt");
         write_txt(&path, SAMPLE1);
-        reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
-        let book_url = storage.list_books("default").await.unwrap()[0].book_url.clone();
+        reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
+        let book_url = storage.list_books("default").await.unwrap()[0]
+            .book_url
+            .clone();
         // 修改文件（内容 + 大小变化；sleep 保证 mtime 推进——Windows NTFS 高精度，
         // 但跨平台稳妥起见内容长度也变化，mtime/大小任一不同即触发）
         std::thread::sleep(Duration::from_millis(20));
         write_txt(&path, SAMPLE2);
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
         assert!(changed);
         let books = storage.list_books("default").await.unwrap();
         assert_eq!(books.len(), 1, "重扫不应重复导入");
@@ -720,20 +805,36 @@ mod tests {
         let storage = test_storage("delete").await;
         let path = books_dir(&storage, "default").join("测试书.txt");
         write_txt(&path, SAMPLE1);
-        reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
-        let book_url = storage.list_books("default").await.unwrap()[0].book_url.clone();
+        reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
+        let book_url = storage.list_books("default").await.unwrap()[0]
+            .book_url
+            .clone();
         // 删除文件
         std::fs::remove_file(&path).unwrap();
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
         assert!(changed);
-        let b = storage.find_book("default", &book_url).await.unwrap().unwrap();
+        let b = storage
+            .find_book("default", &book_url)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(b.local_file_deleted, "应标记删除");
         assert!(b.is_in_shelf, "书籍保留在书架");
-        assert_eq!(storage.count_chapters(&book_url).await.unwrap(), 2, "章节保留可读");
+        assert_eq!(
+            storage.count_chapters(&book_url).await.unwrap(),
+            2,
+            "章节保留可读"
+        );
         // 文件重现（内容变化）→ 重链 + 重扫
         std::thread::sleep(Duration::from_millis(20));
         write_txt(&path, SAMPLE2);
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
         assert!(changed);
         let books = storage.list_books("default").await.unwrap();
         assert_eq!(books.len(), 1, "重现不重复导入");
@@ -780,33 +881,52 @@ mod tests {
         storage
             .save_chapters(
                 &book_url,
-                &[("第一章".to_string(), "正文一。".to_string()), ("第二章".to_string(), "正文二。".to_string())],
+                &[
+                    ("第一章".to_string(), "正文一。".to_string()),
+                    ("第二章".to_string(), "正文二。".to_string()),
+                ],
             )
             .await
             .unwrap();
 
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
         assert!(changed);
         // epub 落书仓 + 关联
-        let b = storage.find_book("default", &book_url).await.unwrap().unwrap();
+        let b = storage
+            .find_book("default", &book_url)
+            .await
+            .unwrap()
+            .unwrap();
         let epub_path = b.local_file.as_deref().expect("应生成 epub 关联");
         assert!(epub_path.ends_with("元数据完整书.epub"));
-        let bytes = std::fs::read(&epub_path).unwrap();
+        let bytes = std::fs::read(epub_path).unwrap();
         // 重新解析：零丢失断言
         let imported = local_book::parse_epub(&bytes).expect("生成的 epub 可重新解析");
         assert_eq!(imported.meta.title, "元数据完整书");
         assert_eq!(imported.meta.author, "作者甲");
-        assert_eq!(imported.meta.description.as_deref(), Some("自定义简介（优先）"), "description 应取 custom_intro");
+        assert_eq!(
+            imported.meta.description.as_deref(),
+            Some("自定义简介（优先）"),
+            "description 应取 custom_intro"
+        );
         assert_eq!(imported.meta.language.as_deref(), Some("zh-CN"));
         assert_eq!(imported.meta.published_at.as_deref(), Some("2024-05-06"));
         assert_eq!(imported.meta.publisher.as_deref(), Some("出版社乙"));
-        assert_eq!(imported.meta.subjects, vec!["自定义标签".to_string()], "subject 应取 custom_tag");
+        assert_eq!(
+            imported.meta.subjects,
+            vec!["自定义标签".to_string()],
+            "subject 应取 custom_tag"
+        );
         assert_eq!(imported.chapters.len(), 2);
         // 封面零丢失（字节一致）
         assert!(imported.cover.is_some());
         assert_eq!(imported.cover.unwrap(), cover_bytes);
         // 幂等：不再重复生成
-        let changed2 = reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
+        let changed2 = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
         assert!(!changed2);
         cleanup(storage, "gen").await;
     }
@@ -834,12 +954,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        reconcile_namespace_dirs(&storage, "default", &no_env_dirs()).await.unwrap();
+        reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+            .await
+            .unwrap();
         let books = storage.list_books("default").await.unwrap();
-        let mut files: Vec<String> = books
-            .iter()
-            .filter_map(|b| b.local_file.clone())
-            .collect();
+        let files: Vec<String> = books.iter().filter_map(|b| b.local_file.clone()).collect();
         assert_eq!(files.len(), 2);
         // 两份同名书：首本 {书名}.epub，冲突本 {书名} (1).epub（集合断言——生成顺序与
         // list_books 排序无关，词序上 " (1)" 在 "." 之前）
@@ -847,8 +966,14 @@ mod tests {
             .iter()
             .map(|f| f.rsplit('/').next().unwrap_or(f).to_string())
             .collect();
-        assert!(names.contains(&"同名书.epub".to_string()), "应存在无后缀文件: {names:?}");
-        assert!(names.contains(&"同名书 (1).epub".to_string()), "冲突应加后缀: {names:?}");
+        assert!(
+            names.contains(&"同名书.epub".to_string()),
+            "应存在无后缀文件: {names:?}"
+        );
+        assert!(
+            names.contains(&"同名书 (1).epub".to_string()),
+            "冲突应加后缀: {names:?}"
+        );
         cleanup(storage, "conflict").await;
     }
 
@@ -868,7 +993,11 @@ mod tests {
         assert!(changed);
         let books = storage.list_books("default").await.unwrap();
         assert_eq!(books.len(), 1);
-        assert!(books[0].local_file.as_deref().unwrap().contains("环境书.txt"));
+        assert!(books[0]
+            .local_file
+            .as_deref()
+            .unwrap()
+            .contains("环境书.txt"));
         // 非 default 命名空间不扫 env 目录
         let changed2 = reconcile_namespace(&storage, "other").await.unwrap();
         assert!(!changed2);
@@ -881,28 +1010,51 @@ mod tests {
         let data = PathBuf::from("/srv/storage/data");
         let env = PathBuf::from("/srv/books");
         assert_eq!(
-            namespace_of_path(&Path::new("/srv/storage/data/alice/books/a.txt"), &data, &data).as_deref(),
+            namespace_of_path(
+                Path::new("/srv/storage/data/alice/books/a.txt"),
+                &data,
+                &data
+            )
+            .as_deref(),
             Some("alice")
         );
         assert_eq!(
-            namespace_of_path(&Path::new("/srv/storage/data/alice/books/sub/b.epub"), &data, &data).as_deref(),
+            namespace_of_path(
+                Path::new("/srv/storage/data/alice/books/sub/b.epub"),
+                &data,
+                &data
+            )
+            .as_deref(),
             Some("alice")
         );
         // 非 books 目录（opds_files/assets）不触发
-        assert_eq!(namespace_of_path(&Path::new("/srv/storage/data/alice/opds_files/x.txt"), &data, &data), None);
+        assert_eq!(
+            namespace_of_path(
+                Path::new("/srv/storage/data/alice/opds_files/x.txt"),
+                &data,
+                &data
+            ),
+            None
+        );
         // env 根 → default
         assert_eq!(
-            namespace_of_path(&Path::new("/srv/books/a.txt"), &data, &env).as_deref(),
+            namespace_of_path(Path::new("/srv/books/a.txt"), &data, &env).as_deref(),
             Some("default")
         );
         // 无关路径 → None
-        assert_eq!(namespace_of_path(&Path::new("/tmp/x.txt"), &data, &data), None);
+        assert_eq!(
+            namespace_of_path(Path::new("/tmp/x.txt"), &data, &data),
+            None
+        );
     }
 
     /// 文件名净化
     #[test]
     fn test_sanitize_filename() {
-        assert_eq!(sanitize_filename("a/b\\c:d*e?f\"g<h>i|j"), "a b c d e f g h i j");
+        assert_eq!(
+            sanitize_filename("a/b\\c:d*e?f\"g<h>i|j"),
+            "a b c d e f g h i j"
+        );
         assert_eq!(sanitize_filename("  书  "), "书");
         assert_eq!(sanitize_filename(".."), "");
     }

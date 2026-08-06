@@ -251,7 +251,11 @@ fn resolve_local_file(storage: &Storage, ns: &str, book: &Book) -> Option<PathBu
         let rd = std::fs::read_dir(&dir).ok()?;
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_file() && p.file_stem().map(|s| s.to_string_lossy() == id).unwrap_or(false) {
+            if p.is_file()
+                && p.file_stem()
+                    .map(|s| s.to_string_lossy() == id)
+                    .unwrap_or(false)
+            {
                 return Some(p);
             }
         }
@@ -373,7 +377,10 @@ fn nav_entry_xml(id_suffix: &str, title: &str, content: &str, href: &str, base: 
         now_rfc3339()
     ));
     if !content.is_empty() {
-        s.push_str(&format!("    <content type=\"text\">{}</content>\n", xml_escape(content)));
+        s.push_str(&format!(
+            "    <content type=\"text\">{}</content>\n",
+            xml_escape(content)
+        ));
     }
     s.push_str(&format!(
         "    <link rel=\"subsection\" href=\"{}\" type=\"{}\"/>\n",
@@ -389,7 +396,10 @@ pub async fn root(storage: &Storage, ns: &str, base: &str) -> Result<String> {
     let books = storage.list_books(ns).await?;
     let total = books.len();
     let recent = books.iter().filter(|b| b.dur_chapter_time > 0).count();
-    let local = books.iter().filter(|b| is_local_book(&b.book_url, &b.origin)).count();
+    let local = books
+        .iter()
+        .filter(|b| is_local_book(&b.book_url, &b.origin))
+        .count();
     let groups = storage.list_book_groups_with_count(ns).await?;
     let sources = source_counts(&books);
 
@@ -472,22 +482,37 @@ fn book_entry_xml(storage: &Storage, ns: &str, book: &Book, base: &str) -> Strin
         xml_escape(&book.name)
     ));
     if !book.author.is_empty() {
-        e.push_str(&format!("    <author><name>{}</name></author>\n", xml_escape(&book.author)));
+        e.push_str(&format!(
+            "    <author><name>{}</name></author>\n",
+            xml_escape(&book.author)
+        ));
     }
     e.push_str(&format!("    <updated>{}</updated>\n", entry_updated(book)));
     let intro = display_intro(book);
     if !intro.is_empty() {
-        e.push_str(&format!("    <content type=\"text\">{}</content>\n", xml_escape(&intro)));
+        e.push_str(&format!(
+            "    <content type=\"text\">{}</content>\n",
+            xml_escape(&intro)
+        ));
     }
     // OPDS 1.2 元数据：语言/出版时间/出版社/分类
     if let Some(lang) = book.language.as_deref().filter(|s| !s.is_empty()) {
-        e.push_str(&format!("    <dc:language>{}</dc:language>\n", xml_escape(lang)));
+        e.push_str(&format!(
+            "    <dc:language>{}</dc:language>\n",
+            xml_escape(lang)
+        ));
     }
     if let Some(pub_at) = book.published_at.as_deref().filter(|s| !s.is_empty()) {
-        e.push_str(&format!("    <dcterms:published>{}</dcterms:published>\n", xml_escape(pub_at)));
+        e.push_str(&format!(
+            "    <dcterms:published>{}</dcterms:published>\n",
+            xml_escape(pub_at)
+        ));
     }
     if let Some(publisher) = book.publisher.as_deref().filter(|s| !s.is_empty()) {
-        e.push_str(&format!("    <dcterms:publisher>{}</dcterms:publisher>\n", xml_escape(publisher)));
+        e.push_str(&format!(
+            "    <dcterms:publisher>{}</dcterms:publisher>\n",
+            xml_escape(publisher)
+        ));
     }
     if let Some(kind) = book.kind.as_deref().filter(|s| !s.is_empty()) {
         e.push_str(&format!(
@@ -556,7 +581,9 @@ async fn books_feed_xml(
         ATOM_CT,
         base,
     );
-    xml.push_str(&format!("  <opds:totalResults>{total}</opds:totalResults>\n"));
+    xml.push_str(&format!(
+        "  <opds:totalResults>{total}</opds:totalResults>\n"
+    ));
     xml.push_str(&format!("  <opds:startIndex>{start}</opds:startIndex>\n"));
     xml.push_str(&format!("  <opds:itemsPerPage>{max}</opds:itemsPerPage>\n"));
     xml.push_str(&pager_links_xml(&self_abs, extra_query, start, max, total));
@@ -591,31 +618,85 @@ fn nav_feed_xml(
 }
 
 /// 书架 feed（全部书籍）
-pub async fn shelf(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
+pub async fn shelf(
+    storage: &Storage,
+    ns: &str,
+    start: usize,
+    max: usize,
+    base: &str,
+) -> Result<String> {
     let books = storage.list_books(ns).await?;
-    books_feed_xml(storage, ns, "书架", "shelf", "/opds/shelf", "", &books, start, max, base).await
+    books_feed_xml(
+        storage,
+        ns,
+        "书架",
+        "shelf",
+        "/opds/shelf",
+        "",
+        &books,
+        start,
+        max,
+        base,
+    )
+    .await
 }
 
 /// 最近阅读 feed（dur_chapter_time > 0，按最近阅读时间倒序——list_books 默认序）
-pub async fn recent(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
+pub async fn recent(
+    storage: &Storage,
+    ns: &str,
+    start: usize,
+    max: usize,
+    base: &str,
+) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
         .await?
         .into_iter()
         .filter(|b| b.dur_chapter_time > 0)
         .collect();
-    books_feed_xml(storage, ns, "最近阅读", "recent", "/opds/recent", "", &books, start, max, base).await
+    books_feed_xml(
+        storage,
+        ns,
+        "最近阅读",
+        "recent",
+        "/opds/recent",
+        "",
+        &books,
+        start,
+        max,
+        base,
+    )
+    .await
 }
 
 /// 本地书 feed
-pub async fn local(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
+pub async fn local(
+    storage: &Storage,
+    ns: &str,
+    start: usize,
+    max: usize,
+    base: &str,
+) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
         .await?
         .into_iter()
         .filter(|b| is_local_book(&b.book_url, &b.origin))
         .collect();
-    books_feed_xml(storage, ns, "本地书", "local", "/opds/local", "", &books, start, max, base).await
+    books_feed_xml(
+        storage,
+        ns,
+        "本地书",
+        "local",
+        "/opds/local",
+        "",
+        &books,
+        start,
+        max,
+        base,
+    )
+    .await
 }
 
 /// 分组导航 feed
@@ -632,11 +713,25 @@ pub async fn groups(storage: &Storage, ns: &str, base: &str) -> Result<String> {
             )
         })
         .collect();
-    Ok(nav_feed_xml(ns, "全部分组", "groups", "/opds/groups", entries, base))
+    Ok(nav_feed_xml(
+        ns,
+        "全部分组",
+        "groups",
+        "/opds/groups",
+        entries,
+        base,
+    ))
 }
 
 /// 分组内书籍 feed
-pub async fn group(storage: &Storage, ns: &str, id: i64, start: usize, max: usize, base: &str) -> Result<String> {
+pub async fn group(
+    storage: &Storage,
+    ns: &str,
+    id: i64,
+    start: usize,
+    max: usize,
+    base: &str,
+) -> Result<String> {
     let groups = storage.list_book_groups(ns).await?;
     let name = groups
         .iter()
@@ -678,7 +773,14 @@ pub async fn sources(storage: &Storage, ns: &str, base: &str) -> Result<String> 
             )
         })
         .collect();
-    Ok(nav_feed_xml(ns, "按来源", "source", "/opds/source", entries, base))
+    Ok(nav_feed_xml(
+        ns,
+        "按来源",
+        "source",
+        "/opds/source",
+        entries,
+        base,
+    ))
 }
 
 /// 某来源书籍 feed（name 为 base64url）
@@ -697,7 +799,11 @@ pub async fn source(
         .into_iter()
         .filter(|b| source_key(b) == name)
         .collect();
-    let title = if name.is_empty() { "来源".to_string() } else { name.clone() };
+    let title = if name.is_empty() {
+        "来源".to_string()
+    } else {
+        name.clone()
+    };
     books_feed_xml(
         storage,
         ns,
@@ -801,11 +907,25 @@ pub async fn catalog_json(storage: &Storage, ns: &str, base: &str) -> Result<Str
 
     let group_links: Vec<serde_json::Value> = groups
         .iter()
-        .map(|g| link_obj(&abs_href(base, &format!("/opds/catalog/group/{}", g.id)), "application/opds+json", Some(&g.name), Some("subsection")))
+        .map(|g| {
+            link_obj(
+                &abs_href(base, &format!("/opds/catalog/group/{}", g.id)),
+                "application/opds+json",
+                Some(&g.name),
+                Some("subsection"),
+            )
+        })
         .collect();
     let source_links: Vec<serde_json::Value> = sources
         .iter()
-        .map(|(name, _)| link_obj(&abs_href(base, &format!("/opds/catalog/source/{}", encode_id(name))), "application/opds+json", Some(name), Some("subsection")))
+        .map(|(name, _)| {
+            link_obj(
+                &abs_href(base, &format!("/opds/catalog/source/{}", encode_id(name))),
+                "application/opds+json",
+                Some(name),
+                Some("subsection"),
+            )
+        })
         .collect();
     let facets = vec![
         json!({ "metadata": { "title": "分组" }, "links": group_links }),
@@ -861,7 +981,10 @@ fn publication_json(storage: &Storage, ns: &str, book: &Book, base: &str) -> ser
         metadata.insert("publisher".into(), json!(publisher));
     }
     if let Some(kind) = book.kind.as_deref().filter(|s| !s.is_empty()) {
-        metadata.insert("categories".into(), json!([{ "term": kind, "label": kind }]));
+        metadata.insert(
+            "categories".into(),
+            json!([{ "term": kind, "label": kind }]),
+        );
     }
     let intro = display_intro(book);
     if !intro.is_empty() {
@@ -870,18 +993,43 @@ fn publication_json(storage: &Storage, ns: &str, book: &Book, base: &str) -> ser
     metadata.insert("updated".into(), json!(entry_updated(book)));
 
     let mut links = vec![
-        link_obj(&abs_href(base, &format!("/opds/acquire/{id}")), "text/plain", Some("获取正文"), Some("http://opds-spec.org/acquisition")),
-        link_obj(&abs_href(base, &format!("/opds/download/{id}?format=txt")), "text/plain", Some("下载 TXT"), Some("http://opds-spec.org/acquisition")),
-        link_obj(&abs_href(base, &format!("/opds-save?bookId={id}")), "application/atom+xml;type=entry;profile=opds-save", Some("保存进度"), Some("partial-save")),
+        link_obj(
+            &abs_href(base, &format!("/opds/acquire/{id}")),
+            "text/plain",
+            Some("获取正文"),
+            Some("http://opds-spec.org/acquisition"),
+        ),
+        link_obj(
+            &abs_href(base, &format!("/opds/download/{id}?format=txt")),
+            "text/plain",
+            Some("下载 TXT"),
+            Some("http://opds-spec.org/acquisition"),
+        ),
+        link_obj(
+            &abs_href(base, &format!("/opds-save?bookId={id}")),
+            "application/atom+xml;type=entry;profile=opds-save",
+            Some("保存进度"),
+            Some("partial-save"),
+        ),
     ];
     let mut images: Vec<serde_json::Value> = Vec::new();
     if let Some(cover) = display_cover(book) {
         let cover_abs = abs_href(base, &cover);
-        links.push(link_obj(&cover_abs, "image/jpeg", None, Some("http://opds-spec.org/cover")));
+        links.push(link_obj(
+            &cover_abs,
+            "image/jpeg",
+            None,
+            Some("http://opds-spec.org/cover"),
+        ));
         images.push(json!({ "href": cover_abs, "type": "image/jpeg" }));
     }
     if let Some((ct, href)) = local_original_link(storage, ns, book) {
-        links.push(link_obj(&abs_href(base, &href), &ct, Some("下载原文件"), Some("http://opds-spec.org/acquisition")));
+        links.push(link_obj(
+            &abs_href(base, &href),
+            &ct,
+            Some("下载原文件"),
+            Some("http://opds-spec.org/acquisition"),
+        ));
     }
 
     json!({
@@ -908,17 +1056,52 @@ async fn feed_json(
     let self_abs = abs_href(base, self_href);
     let mut links = vec![
         link_obj(&self_abs, "application/opds+json", None, Some("self")),
-        link_obj(&abs_href(base, "/opds/catalog"), "application/opds+json", None, Some("start")),
-        link_obj(&abs_href(base, "/opds/opensearch.xml"), "application/opensearchdescription+xml", None, Some("search")),
-        link_obj(&abs_href(base, "/opds/catalog/search?q={searchTerms}"), "application/opds+json", None, Some("search")),
+        link_obj(
+            &abs_href(base, "/opds/catalog"),
+            "application/opds+json",
+            None,
+            Some("start"),
+        ),
+        link_obj(
+            &abs_href(base, "/opds/opensearch.xml"),
+            "application/opensearchdescription+xml",
+            None,
+            Some("search"),
+        ),
+        link_obj(
+            &abs_href(base, "/opds/catalog/search?q={searchTerms}"),
+            "application/opds+json",
+            None,
+            Some("search"),
+        ),
     ];
-    let page_href = |s: usize| abs_href(&self_abs, &format!("?startIndex={s}&maxItems={max}{extra_query}"));
-    links.push(link_obj(&page_href(0), "application/opds+json", None, Some("first")));
+    let page_href = |s: usize| {
+        abs_href(
+            &self_abs,
+            &format!("?startIndex={s}&maxItems={max}{extra_query}"),
+        )
+    };
+    links.push(link_obj(
+        &page_href(0),
+        "application/opds+json",
+        None,
+        Some("first"),
+    ));
     if start > 0 {
-        links.push(link_obj(&page_href(start.saturating_sub(max)), "application/opds+json", None, Some("previous")));
+        links.push(link_obj(
+            &page_href(start.saturating_sub(max)),
+            "application/opds+json",
+            None,
+            Some("previous"),
+        ));
     }
     if start + max < total {
-        links.push(link_obj(&page_href(start + max), "application/opds+json", None, Some("next")));
+        links.push(link_obj(
+            &page_href(start + max),
+            "application/opds+json",
+            None,
+            Some("next"),
+        ));
     }
 
     let feed = json!({
@@ -935,7 +1118,14 @@ async fn feed_json(
 }
 
 /// OPDS 2.0 导航 feed（分组/来源目录）
-fn nav_feed_json(ns: &str, title: &str, id_suffix: &str, self_href: &str, entries: Vec<(String, String)>, base: &str) -> String {
+fn nav_feed_json(
+    ns: &str,
+    title: &str,
+    id_suffix: &str,
+    self_href: &str,
+    entries: Vec<(String, String)>,
+    base: &str,
+) -> String {
     let navigation: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(name, href)| {
@@ -954,31 +1144,85 @@ fn nav_feed_json(ns: &str, title: &str, id_suffix: &str, self_href: &str, entrie
 }
 
 /// OPDS 2.0 书架 feed
-pub async fn shelf_json(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
+pub async fn shelf_json(
+    storage: &Storage,
+    ns: &str,
+    start: usize,
+    max: usize,
+    base: &str,
+) -> Result<String> {
     let books = storage.list_books(ns).await?;
-    feed_json(storage, ns, "书架", "shelf", "/opds/catalog/shelf", "", &books, start, max, base).await
+    feed_json(
+        storage,
+        ns,
+        "书架",
+        "shelf",
+        "/opds/catalog/shelf",
+        "",
+        &books,
+        start,
+        max,
+        base,
+    )
+    .await
 }
 
 /// OPDS 2.0 最近阅读 feed
-pub async fn recent_json(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
+pub async fn recent_json(
+    storage: &Storage,
+    ns: &str,
+    start: usize,
+    max: usize,
+    base: &str,
+) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
         .await?
         .into_iter()
         .filter(|b| b.dur_chapter_time > 0)
         .collect();
-    feed_json(storage, ns, "最近阅读", "recent", "/opds/catalog/recent", "", &books, start, max, base).await
+    feed_json(
+        storage,
+        ns,
+        "最近阅读",
+        "recent",
+        "/opds/catalog/recent",
+        "",
+        &books,
+        start,
+        max,
+        base,
+    )
+    .await
 }
 
 /// OPDS 2.0 本地书 feed
-pub async fn local_json(storage: &Storage, ns: &str, start: usize, max: usize, base: &str) -> Result<String> {
+pub async fn local_json(
+    storage: &Storage,
+    ns: &str,
+    start: usize,
+    max: usize,
+    base: &str,
+) -> Result<String> {
     let books: Vec<Book> = storage
         .list_books(ns)
         .await?
         .into_iter()
         .filter(|b| is_local_book(&b.book_url, &b.origin))
         .collect();
-    feed_json(storage, ns, "本地书", "local", "/opds/catalog/local", "", &books, start, max, base).await
+    feed_json(
+        storage,
+        ns,
+        "本地书",
+        "local",
+        "/opds/catalog/local",
+        "",
+        &books,
+        start,
+        max,
+        base,
+    )
+    .await
 }
 
 /// OPDS 2.0 分组导航
@@ -988,11 +1232,25 @@ pub async fn groups_json(storage: &Storage, ns: &str, base: &str) -> Result<Stri
         .iter()
         .map(|g| (g.name.clone(), format!("/opds/catalog/group/{}", g.id)))
         .collect();
-    Ok(nav_feed_json(ns, "全部分组", "groups", "/opds/catalog/groups", entries, base))
+    Ok(nav_feed_json(
+        ns,
+        "全部分组",
+        "groups",
+        "/opds/catalog/groups",
+        entries,
+        base,
+    ))
 }
 
 /// OPDS 2.0 分组内书籍 feed
-pub async fn group_json(storage: &Storage, ns: &str, id: i64, start: usize, max: usize, base: &str) -> Result<String> {
+pub async fn group_json(
+    storage: &Storage,
+    ns: &str,
+    id: i64,
+    start: usize,
+    max: usize,
+    base: &str,
+) -> Result<String> {
     let groups = storage.list_book_groups(ns).await?;
     let name = groups
         .iter()
@@ -1025,9 +1283,21 @@ pub async fn sources_json(storage: &Storage, ns: &str, base: &str) -> Result<Str
     let books = storage.list_books(ns).await?;
     let entries = source_counts(&books)
         .into_iter()
-        .map(|(name, _)| (name.clone(), format!("/opds/catalog/source/{}", encode_id(&name))))
+        .map(|(name, _)| {
+            (
+                name.clone(),
+                format!("/opds/catalog/source/{}", encode_id(&name)),
+            )
+        })
         .collect();
-    Ok(nav_feed_json(ns, "按来源", "source", "/opds/catalog/source", entries, base))
+    Ok(nav_feed_json(
+        ns,
+        "按来源",
+        "source",
+        "/opds/catalog/source",
+        entries,
+        base,
+    ))
 }
 
 /// OPDS 2.0 某来源书籍 feed
@@ -1046,7 +1316,11 @@ pub async fn source_json(
         .into_iter()
         .filter(|b| source_key(b) == name)
         .collect();
-    let title = if name.is_empty() { "来源".to_string() } else { name.clone() };
+    let title = if name.is_empty() {
+        "来源".to_string()
+    } else {
+        name.clone()
+    };
     feed_json(
         storage,
         ns,
@@ -1115,7 +1389,11 @@ pub async fn acquire(storage: &Storage, ns: &str, book_id: &str) -> Result<(Stri
     if is_local_book(&book.book_url, &book.origin) {
         if let Some(path) = resolve_local_file(storage, ns, &book) {
             let imported = parse_local_file(&path)?;
-            if let Some(first) = imported.chapters.iter().find(|c| !c.content.trim().is_empty()) {
+            if let Some(first) = imported
+                .chapters
+                .iter()
+                .find(|c| !c.content.trim().is_empty())
+            {
                 return Ok((fname, first.content.clone().into_bytes()));
             }
         }
@@ -1248,7 +1526,11 @@ pub async fn download(
 // ---------------- OPDS-PSE（Partial Save Entries） ----------------
 
 /// 当前进度 JSON（GET /opds/save/{bookId} 的 content）
-pub async fn save_entry_json(storage: &Storage, ns: &str, book_id: &str) -> Result<serde_json::Value> {
+pub async fn save_entry_json(
+    storage: &Storage,
+    ns: &str,
+    book_id: &str,
+) -> Result<serde_json::Value> {
     let book = find_book(storage, ns, book_id).await?;
     Ok(json!({
         "bookUrl": book.book_url,
@@ -1264,7 +1546,12 @@ pub async fn save_entry_json(storage: &Storage, ns: &str, book_id: &str) -> Resu
 }
 
 /// 当前进度 Atom entry（OPDS-PSE：entry + link rel=partial-save + content JSON）
-pub async fn save_entry_xml(storage: &Storage, ns: &str, book_id: &str, base: &str) -> Result<String> {
+pub async fn save_entry_xml(
+    storage: &Storage,
+    ns: &str,
+    book_id: &str,
+    base: &str,
+) -> Result<String> {
     let book = find_book(storage, ns, book_id).await?;
     let payload = save_entry_json(storage, ns, book_id).await?;
     let updated = if book.dur_chapter_time > 0 {
@@ -1288,9 +1575,7 @@ pub async fn save_entry_xml(storage: &Storage, ns: &str, book_id: &str, base: &s
             "  <link rel=\"partial-save\" href=\"{}\" type=\"application/atom+xml;type=entry;profile=opds-save\"/>\n",
             xml_escape(&abs_href(base, &format!("/opds/save/{book_id}")))
         )
-        + &format!(
-            "  <category term=\"http://opds-spec.org/save/progress\" label=\"阅读进度\"/>\n"
-        )
+        + "  <category term=\"http://opds-spec.org/save/progress\" label=\"阅读进度\"/>\n"
         + &format!(
             "  <content type=\"application/json\">{}</content>\n</entry>\n",
             xml_escape(&payload.to_string())
@@ -1314,7 +1599,9 @@ pub async fn apply_save(
     let index = chapter_index.unwrap_or(book.dur_chapter_index);
     let title = chapter_title.or_else(|| book.dur_chapter_title.clone());
     let pos = position.unwrap_or(book.dur_chapter_pos);
-    let time = timestamp.filter(|t| *t > 0).unwrap_or_else(|| Utc::now().timestamp_millis());
+    let time = timestamp
+        .filter(|t| *t > 0)
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
 
     storage
         .update_book_progress(ns, &book.book_url, title.as_deref(), index, pos, time)
@@ -1358,10 +1645,8 @@ mod tests {
     const TEST_BASE: &str = "http://reader.example.com";
 
     async fn test_state(tag: &str) -> (Storage, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "reader-opds-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reader-opds-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = crate::AppConfig::from_env();
         config.work_dir = dir.to_string_lossy().into_owned();
@@ -1400,8 +1685,14 @@ mod tests {
     #[tokio::test]
     async fn test_abs_href_and_opds_base() {
         // abs_href：/ 开头拼接；? 查询拼接；http 原样；base 尾斜杠容忍
-        assert_eq!(abs_href("http://a.com", "/opds/shelf"), "http://a.com/opds/shelf");
-        assert_eq!(abs_href("http://a.com/", "/opds/shelf"), "http://a.com/opds/shelf");
+        assert_eq!(
+            abs_href("http://a.com", "/opds/shelf"),
+            "http://a.com/opds/shelf"
+        );
+        assert_eq!(
+            abs_href("http://a.com/", "/opds/shelf"),
+            "http://a.com/opds/shelf"
+        );
         assert_eq!(
             abs_href("http://a.com/opds", "?startIndex=1&maxItems=50"),
             "http://a.com/opds?startIndex=1&maxItems=50"
@@ -1412,36 +1703,57 @@ mod tests {
         );
         // opds_base：Host 头优先（默认 http）
         let mut h = axum::http::HeaderMap::new();
-        h.insert(axum::http::header::HOST, "reader.example.com".parse().unwrap());
+        h.insert(
+            axum::http::header::HOST,
+            "reader.example.com".parse().unwrap(),
+        );
         assert_eq!(opds_base(&h, 8080), "http://reader.example.com");
         // X-Forwarded-Proto: https 切换 scheme
         h.insert("x-forwarded-proto", "https".parse().unwrap());
         assert_eq!(opds_base(&h, 8080), "https://reader.example.com");
         // Host 缺失 → localhost:{port} 默认
-        assert_eq!(opds_base(&axum::http::HeaderMap::new(), 8080), "http://localhost:8080");
+        assert_eq!(
+            opds_base(&axum::http::HeaderMap::new(), 8080),
+            "http://localhost:8080"
+        );
     }
 
     #[tokio::test]
     async fn test_root_navigation_structure() {
         let (storage, dir) = test_state("root").await;
         let ns = "default";
-        seed(&storage, ns, vec![
-            book("https://a.com/1", "书一", "作者甲"),
-            book("local://1111", "本地书", "作者乙"),
-        ])
+        seed(
+            &storage,
+            ns,
+            vec![
+                book("https://a.com/1", "书一", "作者甲"),
+                book("local://1111", "本地书", "作者乙"),
+            ],
+        )
         .await;
         let xml = root(&storage, ns, TEST_BASE).await.unwrap();
         // 命名空间 + 导航类型
         assert!(xml.contains("xmlns:opds=\"http://opds-spec.org/2010/catalog\""));
         assert!(xml.contains("kind=navigation"));
         // 导航入口（绝对 URL）
-        for href in ["/opds/shelf", "/opds/recent", "/opds/groups", "/opds/local", "/opds/source"] {
-            assert!(xml.contains(&format!("href=\"{TEST_BASE}{href}\"")), "缺少导航入口 {href}");
+        for href in [
+            "/opds/shelf",
+            "/opds/recent",
+            "/opds/groups",
+            "/opds/local",
+            "/opds/source",
+        ] {
+            assert!(
+                xml.contains(&format!("href=\"{TEST_BASE}{href}\"")),
+                "缺少导航入口 {href}"
+            );
         }
         // OpenSearch 链接 + 搜索模板（绝对 URL）
         assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/opensearch.xml\"")));
         assert!(xml.contains("type=\"application/opensearchdescription+xml\""));
-        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/search?q={{searchTerms}}\"")));
+        assert!(xml.contains(&format!(
+            "href=\"{TEST_BASE}/opds/search?q={{searchTerms}}\""
+        )));
         // self / start 绝对
         assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds\"")));
         // 无书籍条目（导航 feed 不应出现 acquisition entry）
@@ -1485,7 +1797,9 @@ mod tests {
         // acquisition：获取 + 下载 TXT（绝对 URL）
         let id = encode_id("https://a.com/1");
         assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/acquire/{id}\"")));
-        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/download/{id}?format=txt\"")));
+        assert!(xml.contains(&format!(
+            "href=\"{TEST_BASE}/opds/download/{id}?format=txt\""
+        )));
         // OPDS-PSE 链接
         assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/save/{id}\"")));
         assert!(xml.contains("rel=\"partial-save\""));
@@ -1510,7 +1824,9 @@ mod tests {
         let xml = shelf(&storage, ns, 0, 50, TEST_BASE).await.unwrap();
         assert!(xml.contains("<opds:totalResults>120</opds:totalResults>"));
         assert_eq!(xml.matches("  <entry>\n").count(), 50);
-        assert!(xml.contains(&format!("href=\"{TEST_BASE}/opds/shelf?startIndex=50&amp;maxItems=50\"")));
+        assert!(xml.contains(&format!(
+            "href=\"{TEST_BASE}/opds/shelf?startIndex=50&amp;maxItems=50\""
+        )));
         assert!(xml.contains("rel=\"first\""));
         assert!(!xml.contains("rel=\"previous\""));
 
@@ -1536,37 +1852,53 @@ mod tests {
     async fn test_search_by_name_and_author() {
         let (storage, dir) = test_state("search").await;
         let ns = "default";
-        seed(&storage, ns, vec![
-            book("https://a.com/1", "哈利波特与魔法石", "J.K. Rowling"),
-            book("https://a.com/2", "三体", "刘慈欣"),
-            book("https://a.com/3", "乡村教师", "刘慈欣"),
-        ])
+        seed(
+            &storage,
+            ns,
+            vec![
+                book("https://a.com/1", "哈利波特与魔法石", "J.K. Rowling"),
+                book("https://a.com/2", "三体", "刘慈欣"),
+                book("https://a.com/3", "乡村教师", "刘慈欣"),
+            ],
+        )
         .await;
         // 搜书名
-        let xml = search(&storage, ns, "哈利", 0, 50, TEST_BASE).await.unwrap();
+        let xml = search(&storage, ns, "哈利", 0, 50, TEST_BASE)
+            .await
+            .unwrap();
         assert!(xml.contains("<opds:totalResults>1</opds:totalResults>"));
         assert!(xml.contains("哈利波特与魔法石"));
         assert!(!xml.contains("三体"));
         // 搜作者（ASCII 大小写不敏感）
-        let xml = search(&storage, ns, "j.k. rowling", 0, 50, TEST_BASE).await.unwrap();
+        let xml = search(&storage, ns, "j.k. rowling", 0, 50, TEST_BASE)
+            .await
+            .unwrap();
         assert!(xml.contains("<opds:totalResults>1</opds:totalResults>"));
         assert!(xml.contains("哈利波特与魔法石"));
         // 搜中文作者：命中两本
-        let xml = search(&storage, ns, "刘慈欣", 0, 50, TEST_BASE).await.unwrap();
+        let xml = search(&storage, ns, "刘慈欣", 0, 50, TEST_BASE)
+            .await
+            .unwrap();
         assert!(xml.contains("<opds:totalResults>2</opds:totalResults>"));
         assert!(xml.contains("三体"));
         assert!(xml.contains("乡村教师"));
         // 无结果
-        let xml = search(&storage, ns, "不存在", 0, 50, TEST_BASE).await.unwrap();
+        let xml = search(&storage, ns, "不存在", 0, 50, TEST_BASE)
+            .await
+            .unwrap();
         assert!(xml.contains("<opds:totalResults>0</opds:totalResults>"));
         assert!(!xml.contains("<entry>"));
         // 搜索分页链接带 q（绝对 URL）
-        let xml = search(&storage, ns, "刘慈欣", 0, 1, TEST_BASE).await.unwrap();
+        let xml = search(&storage, ns, "刘慈欣", 0, 1, TEST_BASE)
+            .await
+            .unwrap();
         assert!(xml.contains(&format!(
             "{TEST_BASE}/opds/search?startIndex=1&amp;maxItems=1&amp;q=%E5%88%98%E6%85%88%E6%AC%A3"
         )));
         // 特殊字符 q：feed title / 分页链接均需 XML 转义
-        let xml = search(&storage, ns, "<a&b>", 0, 50, TEST_BASE).await.unwrap();
+        let xml = search(&storage, ns, "<a&b>", 0, 50, TEST_BASE)
+            .await
+            .unwrap();
         assert!(xml.contains("&lt;a&amp;b&gt;"));
         assert!(!xml.contains("<title>搜索：<a"));
         cleanup(storage, dir).await;
@@ -1577,11 +1909,25 @@ mod tests {
         let (storage, dir) = test_state("group").await;
         let ns = "default";
         let g1 = storage
-            .save_book_group(ns, &BookGroup { name: "玄幻".into(), order: 1, ..Default::default() })
+            .save_book_group(
+                ns,
+                &BookGroup {
+                    name: "玄幻".into(),
+                    order: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let g2 = storage
-            .save_book_group(ns, &BookGroup { name: "言情".into(), order: 2, ..Default::default() })
+            .save_book_group(
+                ns,
+                &BookGroup {
+                    name: "言情".into(),
+                    order: 2,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let mut b1 = book("https://a.com/1", "斗破苍穹", "天蚕土豆");
@@ -1619,12 +1965,16 @@ mod tests {
         let mut s2 = book("https://s2.com/book2", "网络书B", "丁");
         s2.origin = "https://s2.com".into();
         s2.origin_name = "源二".into();
-        seed(&storage, ns, vec![
-            book("local://aaaa", "本地TXT", "甲"),
-            book("storage/books/old.txt", "旧本地书", "乙"),
-            s1,
-            s2,
-        ])
+        seed(
+            &storage,
+            ns,
+            vec![
+                book("local://aaaa", "本地TXT", "甲"),
+                book("storage/books/old.txt", "旧本地书", "乙"),
+                s1,
+                s2,
+            ],
+        )
         .await;
         // 本地书 feed
         let xml = local(&storage, ns, 0, 50, TEST_BASE).await.unwrap();
@@ -1651,7 +2001,9 @@ mod tests {
     #[tokio::test]
     async fn test_open_search_description() {
         let xml = open_search_xml(TEST_BASE);
-        assert!(xml.contains("<OpenSearchDescription xmlns=\"http://a9.com/-/spec/opensearch/1.1/\">"));
+        assert!(
+            xml.contains("<OpenSearchDescription xmlns=\"http://a9.com/-/spec/opensearch/1.1/\">")
+        );
         assert!(xml.contains("<ShortName>reader-dev</ShortName>"));
         assert!(xml.contains(&format!(
             "template=\"{TEST_BASE}/opds/search?q={{searchTerms}}\""
@@ -1666,7 +2018,14 @@ mod tests {
         let (storage, dir) = test_state("c2root").await;
         let ns = "default";
         let g = storage
-            .save_book_group(ns, &BookGroup { name: "玄幻".into(), order: 1, ..Default::default() })
+            .save_book_group(
+                ns,
+                &BookGroup {
+                    name: "玄幻".into(),
+                    order: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let mut b = book("https://a.com/1", "斗破苍穹", "天蚕土豆");
@@ -1682,21 +2041,33 @@ mod tests {
         let nav = v["navigation"].as_array().unwrap();
         assert_eq!(nav.len(), 5);
         assert_eq!(nav[0]["metadata"]["title"], "书架");
-        assert_eq!(nav[0]["links"][0]["href"], format!("{TEST_BASE}/opds/catalog/shelf"));
+        assert_eq!(
+            nav[0]["links"][0]["href"],
+            format!("{TEST_BASE}/opds/catalog/shelf")
+        );
         // facets：分组 + 来源
         let facets = v["facets"].as_array().unwrap();
         assert_eq!(facets.len(), 2);
         assert_eq!(facets[0]["metadata"]["title"], "分组");
-        assert_eq!(facets[0]["links"][0]["href"], format!("{TEST_BASE}/opds/catalog/group/{}", g.id));
+        assert_eq!(
+            facets[0]["links"][0]["href"],
+            format!("{TEST_BASE}/opds/catalog/group/{}", g.id)
+        );
         // groups：numberOfItems
         let groups = v["groups"].as_array().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0]["metadata"]["numberOfItems"], 1);
         // links：opensearch + search 模板 + self（绝对 URL）
         let links = v["links"].as_array().unwrap();
-        assert!(links.iter().any(|l| l["href"] == format!("{TEST_BASE}/opds/opensearch.xml")));
-        assert!(links.iter().any(|l| l["href"] == format!("{TEST_BASE}/opds/catalog/search?q={{searchTerms}}")));
-        assert!(links.iter().any(|l| l["rel"] == "self" && l["href"] == format!("{TEST_BASE}/opds/catalog")));
+        assert!(links
+            .iter()
+            .any(|l| l["href"] == format!("{TEST_BASE}/opds/opensearch.xml")));
+        assert!(links
+            .iter()
+            .any(|l| l["href"] == format!("{TEST_BASE}/opds/catalog/search?q={{searchTerms}}")));
+        assert!(links
+            .iter()
+            .any(|l| l["rel"] == "self" && l["href"] == format!("{TEST_BASE}/opds/catalog")));
         cleanup(storage, dir).await;
     }
 
@@ -1718,23 +2089,35 @@ mod tests {
         // 排序为 dur_chapter_time DESC, rowid DESC → 最后插入的书在最前
         let p0 = &pubs[0];
         assert!(p0["metadata"]["title"].as_str().unwrap().starts_with("书"));
-        assert!(p0["metadata"]["identifier"].as_str().unwrap().starts_with("urn:uuid:"));
+        assert!(p0["metadata"]["identifier"]
+            .as_str()
+            .unwrap()
+            .starts_with("urn:uuid:"));
         assert_eq!(p0["metadata"]["authors"][0]["name"], "作者");
         // links：acquisition（获取/下载，绝对 URL）+ partial-save
         let links = p0["links"].as_array().unwrap();
-        assert!(links.iter().any(|l| l["rel"] == "http://opds-spec.org/acquisition"
-            && l["type"] == "text/plain"
-            && l["href"].as_str().unwrap().starts_with(&format!("{TEST_BASE}/opds/acquire/"))));
+        assert!(links
+            .iter()
+            .any(|l| l["rel"] == "http://opds-spec.org/acquisition"
+                && l["type"] == "text/plain"
+                && l["href"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{TEST_BASE}/opds/acquire/"))));
         assert!(links.iter().any(|l| l["rel"] == "partial-save"
-            && l["href"].as_str().unwrap().starts_with(&format!("{TEST_BASE}/opds-save?bookId="))));
+            && l["href"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{TEST_BASE}/opds-save?bookId="))));
         // images 数组（无封面书为空）
         assert!(p0["images"].is_array());
         // 分页 next link（绝对 URL）
         let feed_links = v["links"].as_array().unwrap();
         assert!(feed_links.iter().any(|l| l["rel"] == "next"
             && l["href"] == format!("{TEST_BASE}/opds/catalog/shelf?startIndex=50&maxItems=50")));
-        assert!(feed_links.iter().any(|l| l["rel"] == "self"
-            && l["href"] == format!("{TEST_BASE}/opds/catalog/shelf")));
+        assert!(feed_links
+            .iter()
+            .any(|l| l["rel"] == "self" && l["href"] == format!("{TEST_BASE}/opds/catalog/shelf")));
         cleanup(storage, dir).await;
     }
 
@@ -1754,15 +2137,23 @@ mod tests {
         let imported = ImportedBook {
             meta: Default::default(),
             chapters: vec![
-                crate::service::local_book::Chapter { title: "第一章".into(), content: "第一章正文".into() },
-                crate::service::local_book::Chapter { title: "第二章".into(), content: "第二章正文".into() },
+                crate::service::local_book::Chapter {
+                    title: "第一章".into(),
+                    content: "第一章正文".into(),
+                },
+                crate::service::local_book::Chapter {
+                    title: "第二章".into(),
+                    content: "第二章正文".into(),
+                },
             ],
             cover: None,
             format: "txt".into(),
         };
         storage.save_local_book(ns, &info, &imported).await.unwrap();
 
-        let (fname, bytes) = acquire(&storage, ns, &encode_id("local://bbbb")).await.unwrap();
+        let (fname, bytes) = acquire(&storage, ns, &encode_id("local://bbbb"))
+            .await
+            .unwrap();
         assert_eq!(fname, "本地书.txt");
         assert_eq!(String::from_utf8(bytes).unwrap(), "第一章正文");
         cleanup(storage, dir).await;
@@ -1783,8 +2174,14 @@ mod tests {
         let imported = ImportedBook {
             meta: Default::default(),
             chapters: vec![
-                crate::service::local_book::Chapter { title: "第一章".into(), content: "正文一".into() },
-                crate::service::local_book::Chapter { title: "第二章".into(), content: "正文二".into() },
+                crate::service::local_book::Chapter {
+                    title: "第一章".into(),
+                    content: "正文一".into(),
+                },
+                crate::service::local_book::Chapter {
+                    title: "第二章".into(),
+                    content: "正文二".into(),
+                },
             ],
             cover: None,
             format: "txt".into(),
@@ -1792,17 +2189,26 @@ mod tests {
         storage.save_local_book(ns, &info, &imported).await.unwrap();
 
         // 无原文件 → 章节拼接
-        let (name, bytes, ct) = download(&storage, ns, &encode_id("local://cccc"), "txt", None).await.unwrap();
+        let (name, bytes, ct) = download(&storage, ns, &encode_id("local://cccc"), "txt", None)
+            .await
+            .unwrap();
         assert_eq!(name, "本地书.txt");
         assert_eq!(ct, "text/plain; charset=utf-8");
         let txt = String::from_utf8(bytes).unwrap();
         assert!(txt.contains("正文一") && txt.contains("正文二"));
 
         // 落盘原文件（模拟上传时保存）→ 原样返回
-        let opds_dir = storage.config.storage_dir().join("data").join(ns).join("opds_files");
+        let opds_dir = storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join(ns)
+            .join("opds_files");
         std::fs::create_dir_all(&opds_dir).unwrap();
         std::fs::write(opds_dir.join("cccc.txt"), "原始TXT内容").unwrap();
-        let (name, bytes, ct) = download(&storage, ns, &encode_id("local://cccc"), "txt", None).await.unwrap();
+        let (name, bytes, ct) = download(&storage, ns, &encode_id("local://cccc"), "txt", None)
+            .await
+            .unwrap();
         assert_eq!(name, "cccc.txt");
         assert_eq!(ct, "text/plain; charset=utf-8");
         assert_eq!(String::from_utf8(bytes).unwrap(), "原始TXT内容");
@@ -1810,7 +2216,9 @@ mod tests {
         // EPUB 原文件：application/epub+zip
         let epub_bytes = b"PK\x03\x04fake-epub".to_vec();
         std::fs::write(opds_dir.join("cccc.epub"), &epub_bytes).unwrap();
-        let (_, bytes, ct) = download(&storage, ns, &encode_id("local://cccc"), "epub", None).await.unwrap();
+        let (_, bytes, ct) = download(&storage, ns, &encode_id("local://cccc"), "epub", None)
+            .await
+            .unwrap();
         assert_eq!(ct, "application/epub+zip");
         assert_eq!(bytes, epub_bytes);
         cleanup(storage, dir).await;
@@ -1848,40 +2256,92 @@ mod tests {
 
         // POST：写 dur_chapter_*
         let resp = apply_save(
-            &storage, ns, &id,
-            Some(0.35), Some(700), Some(2000),
-            Some(3), Some("第三章".into()), Some(1_700_200_000_000),
+            &storage,
+            ns,
+            &id,
+            Some(0.35),
+            Some(700),
+            Some(2000),
+            Some(3),
+            Some("第三章".into()),
+            Some(1_700_200_000_000),
         )
         .await
         .unwrap();
         assert_eq!(resp["isSuccess"], true);
         assert_eq!(resp["progress"], 0.35);
-        let book = storage.find_book(ns, "https://a.com/1").await.unwrap().unwrap();
+        let book = storage
+            .find_book(ns, "https://a.com/1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(book.dur_chapter_index, 3);
         assert_eq!(book.dur_chapter_title.as_deref(), Some("第三章"));
         assert_eq!(book.dur_chapter_pos, 700);
         assert_eq!(book.dur_chapter_time, 1_700_200_000_000);
 
         // 仅 position/total → 推算 progress
-        let resp = apply_save(&storage, ns, &id, None, Some(1000), Some(4000), None, None, None).await.unwrap();
+        let resp = apply_save(
+            &storage,
+            ns,
+            &id,
+            None,
+            Some(1000),
+            Some(4000),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!((resp["progress"].as_f64().unwrap() - 0.25).abs() < 1e-9);
 
         // 不存在书籍 → 错误
-        assert!(apply_save(&storage, ns, &encode_id("https://nope.com"), None, None, None, None, None, None).await.is_err());
+        assert!(apply_save(
+            &storage,
+            ns,
+            &encode_id("https://nope.com"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+        .await
+        .is_err());
         cleanup(storage, dir).await;
     }
 
     #[tokio::test]
     async fn test_system_settings_roundtrip() {
         let (storage, dir) = test_state("settings").await;
-        assert!(storage.get_system_setting("opds_username").await.unwrap().is_none());
-        storage.set_system_setting("opds_username", "reader").await.unwrap();
+        assert!(storage
+            .get_system_setting("opds_username")
+            .await
+            .unwrap()
+            .is_none());
+        storage
+            .set_system_setting("opds_username", "reader")
+            .await
+            .unwrap();
         assert_eq!(
-            storage.get_system_setting("opds_username").await.unwrap().as_deref(),
+            storage
+                .get_system_setting("opds_username")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("reader")
         );
-        storage.delete_system_setting("opds_username").await.unwrap();
-        assert!(storage.get_system_setting("opds_username").await.unwrap().is_none());
+        storage
+            .delete_system_setting("opds_username")
+            .await
+            .unwrap();
+        assert!(storage
+            .get_system_setting("opds_username")
+            .await
+            .unwrap()
+            .is_none());
         // OPDS 账号
         let stored = crate::util::sha256::store_password("secret");
         storage.set_opds_account("opds", &stored).await.unwrap();

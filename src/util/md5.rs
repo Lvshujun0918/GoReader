@@ -11,7 +11,11 @@ pub fn md5_encode(input: &str) -> String {
 
 /// legacy 密码加密：md5(md5(password + salt) + salt)
 pub fn gen_encrypted_password(password: &str, salt: &str) -> String {
-    md5_encode(&format!("{}{}", md5_encode(&format!("{password}{salt}")), salt))
+    md5_encode(&format!(
+        "{}{}",
+        md5_encode(&format!("{password}{salt}")),
+        salt
+    ))
 }
 
 /// 章节 URL → 稳定 i64 哈希（md5 前 15 位十六进制 = 60 位，恒为正、跨进程稳定）。

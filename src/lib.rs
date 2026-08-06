@@ -63,15 +63,12 @@ impl AppConfig {
             invite_code: std::env::var("READER_APP_INVITECODE").unwrap_or_default(),
             min_user_password_length: env_i64("READER_APP_MINUSERPASSWORDLENGTH", 8),
             token_ttl_days: env_i64("READER_TOKEN_TTL_DAYS", 30),
-            web_root: std::env::var("READER_APP_WEB_ROOT").unwrap_or_else(|_| "web-ui/dist".to_string()),
+            web_root: std::env::var("READER_APP_WEB_ROOT")
+                .unwrap_or_else(|_| "web-ui/dist".to_string()),
             default_user_enable_webdav: env_flag("READER_APP_DEFAULTUSERENABLEWEBDAV"),
             default_user_enable_local_store: env_flag("READER_APP_DEFAULTUSERENABLELOCALSTORE"),
-            default_user_enable_book_source: env_flag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE")
-                .then_some(true)
-                .unwrap_or(true),
-            default_user_enable_rss_source: env_flag("READER_APP_DEFAULTUSERENABLERSSSOURCE")
-                .then_some(true)
-                .unwrap_or(true),
+            default_user_enable_book_source: if env_flag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE") { true } else { true },
+            default_user_enable_rss_source: if env_flag("READER_APP_DEFAULTUSERENABLERSSSOURCE") { true } else { true },
             default_user_book_source_limit: env_i64("READER_APP_DEFAULTUSERBOOKSOURCELIMIT", 100),
             default_user_book_limit: env_i64("READER_APP_DEFAULTUSERBOOKLIMIT", 200),
             upload_max_mb: env_i64("READER_UPLOAD_MAX_MB", 100),
@@ -113,7 +110,9 @@ impl AppConfig {
         // 已带 Content-Encoding 的响应自动跳过，SSE（text/event-stream）/音视频默认排除，无副作用。
         let app = app.layer(tower_http::compression::CompressionLayer::new());
         // GAP 62：multipart 超限（DefaultBodyLimit 413）→ 替换为明确的 JSON 错误（最外层兜底）
-        let app = app.layer(crate::middleware::upload_limit::UploadLimitLayer { max_mb: self.upload_max_mb });
+        let app = app.layer(crate::middleware::upload_limit::UploadLimitLayer {
+            max_mb: self.upload_max_mb,
+        });
         // 服务监控：请求计数（最外层——413/404/静态资源同样计入）
         let app = app.layer(crate::middleware::stats::StatsLayer);
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));

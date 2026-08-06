@@ -23,7 +23,8 @@ struct Entry {
     locked_until: Option<Instant>,
 }
 
-static FAILS: LazyLock<Mutex<HashMap<String, Entry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static FAILS: LazyLock<Mutex<HashMap<String, Entry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn lock() -> std::sync::MutexGuard<'static, HashMap<String, Entry>> {
     FAILS.lock().unwrap_or_else(|e| e.into_inner())

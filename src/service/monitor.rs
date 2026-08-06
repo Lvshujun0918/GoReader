@@ -343,7 +343,11 @@ mod tests {
         for i in 0..(ENDPOINT_MAP_CAP + 50) {
             c.record(&format!("/p{i}"));
         }
-        assert_eq!(c.snapshot(10_000).2.len(), ENDPOINT_MAP_CAP, "超限不再记录新路径");
+        assert_eq!(
+            c.snapshot(10_000).2.len(),
+            ENDPOINT_MAP_CAP,
+            "超限不再记录新路径"
+        );
     }
 
     #[test]

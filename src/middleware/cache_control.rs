@@ -89,10 +89,8 @@ where
             if let Some(policy) = policy {
                 // 已有 Cache-Control（如未来 ServeDir 显式配置）不覆盖
                 if !resp.headers().contains_key(header::CACHE_CONTROL) {
-                    resp.headers_mut().insert(
-                        header::CACHE_CONTROL,
-                        HeaderValue::from_static(policy),
-                    );
+                    resp.headers_mut()
+                        .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
                 }
             }
             Ok(resp)
@@ -122,14 +120,8 @@ mod tests {
 
     #[test]
     fn assets_user_resources_get_30d() {
-        assert_eq!(
-            cache_policy("/assets/covers/abc123.jpg"),
-            Some(CACHE_30D)
-        );
-        assert_eq!(
-            cache_policy("/assets/books/def456.epub"),
-            Some(CACHE_30D)
-        );
+        assert_eq!(cache_policy("/assets/covers/abc123.jpg"), Some(CACHE_30D));
+        assert_eq!(cache_policy("/assets/books/def456.epub"), Some(CACHE_30D));
     }
 
     #[test]

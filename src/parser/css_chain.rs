@@ -118,10 +118,24 @@ fn step_elements<'a>(
     let (before_rule, exclude, indices) = parse_index_spec(part);
     let mut out: Vec<ElementRef<'a>> = Vec::new();
     if current.is_empty() {
-        out.extend(step_one(doc, None, &before_rule, exclude, &indices, selector_parse_failed));
+        out.extend(step_one(
+            doc,
+            None,
+            &before_rule,
+            exclude,
+            &indices,
+            selector_parse_failed,
+        ));
     } else {
         for e in current {
-            out.extend(step_one(doc, Some(*e), &before_rule, exclude, &indices, selector_parse_failed));
+            out.extend(step_one(
+                doc,
+                Some(*e),
+                &before_rule,
+                exclude,
+                &indices,
+                selector_parse_failed,
+            ));
         }
     }
     out
@@ -146,7 +160,10 @@ fn step_one<'a>(
             "children" => children_one(doc, root),
             "class" if rules.len() > 1 => {
                 let name = rules[1];
-                if let Some(sel) = parse_selector(&format!(".{}", css_escape_ident(name)), selector_parse_failed) {
+                if let Some(sel) = parse_selector(
+                    &format!(".{}", css_escape_ident(name)),
+                    selector_parse_failed,
+                ) {
                     select_one(doc, root, &sel)
                 } else {
                     // CSS 类名转义失败（罕见）→ 按 class 属性 token 过滤
@@ -158,7 +175,10 @@ fn step_one<'a>(
             }
             "id" if rules.len() > 1 => {
                 let name = rules[1];
-                if let Some(sel) = parse_selector(&format!("#{}", css_escape_ident(name)), selector_parse_failed) {
+                if let Some(sel) = parse_selector(
+                    &format!("#{}", css_escape_ident(name)),
+                    selector_parse_failed,
+                ) {
                     select_one(doc, root, &sel)
                 } else {
                     select_all_one(doc, root)
@@ -226,9 +246,7 @@ fn step_one<'a>(
             }
             kept
         } else {
-            set.iter()
-                .filter_map(|&i| els.get(i).copied())
-                .collect()
+            set.iter().filter_map(|&i| els.get(i).copied()).collect()
         }
     } else {
         els
@@ -251,11 +269,12 @@ fn parse_index_spec(part: &str) -> (String, bool, Vec<IndexSpec>) {
         return (String::new(), false, vec![]);
     }
     let bytes = rus.as_bytes();
-    let mut indices: Vec<IndexSpec> = Vec::new();    let mut cur_list: Vec<i64> = Vec::new(); // 当前区间右端/间隔
+    let mut indices: Vec<IndexSpec> = Vec::new();
+    let mut cur_list: Vec<i64> = Vec::new(); // 当前区间右端/间隔
     let mut l = String::new();
     let mut cur_minus = false;
 
-    let mut push_number = |l: &mut String, cur_minus: &mut bool, cur_list: &mut Vec<i64>| {
+    let push_number = |l: &mut String, cur_minus: &mut bool, _cur_list: &mut Vec<i64>| {
         let n: i64 = if l.is_empty() {
             0
         } else {
@@ -285,7 +304,11 @@ fn parse_index_spec(part: &str) -> (String, bool, Vec<IndexSpec>) {
                 let cur_int: Option<i64> = if l.is_empty() {
                     None
                 } else {
-                    Some(if cur_minus { -l.parse::<i64>().unwrap_or(0) } else { l.parse().unwrap_or(0) })
+                    Some(if cur_minus {
+                        -l.parse::<i64>().unwrap_or(0)
+                    } else {
+                        l.parse().unwrap_or(0)
+                    })
                 };
                 l.clear();
                 cur_minus = false;
@@ -302,7 +325,11 @@ fn parse_index_spec(part: &str) -> (String, bool, Vec<IndexSpec>) {
                             }
                         } else {
                             let end = cur_list.pop().unwrap_or(0);
-                            let step = if cur_list.is_empty() { 1 } else { cur_list.pop().unwrap_or(1) };
+                            let step = if cur_list.is_empty() {
+                                1
+                            } else {
+                                cur_list.pop().unwrap_or(1)
+                            };
                             cur_list.clear();
                             bracket_indices.push(IndexSpec::Range(cur_int, Some(end), step));
                         }
@@ -392,7 +419,7 @@ fn parse_index_spec(part: &str) -> (String, bool, Vec<IndexSpec>) {
 /// 解析索引集合并按 legado 语义展开（负数回绕 / 区间 / 反向 / 去重保持书写顺序）
 fn resolve_index_set(len: usize, indices: &[IndexSpec]) -> Vec<usize> {
     let mut set: Vec<usize> = Vec::new();
-    let mut push = |set: &mut Vec<usize>, i: usize| {
+    let push = |set: &mut Vec<usize>, i: usize| {
         if !set.contains(&i) {
             set.push(i);
         }
@@ -462,7 +489,11 @@ fn resolve_index_set(len: usize, indices: &[IndexSpec]) -> Vec<usize> {
 }
 
 /// 单元素/文档选择
-fn select_one<'a>(doc: &'a Html, root: Option<ElementRef<'a>>, sel: &Selector) -> Vec<ElementRef<'a>> {
+fn select_one<'a>(
+    doc: &'a Html,
+    root: Option<ElementRef<'a>>,
+    sel: &Selector,
+) -> Vec<ElementRef<'a>> {
     match root {
         Some(e) => e.select(sel).collect(),
         None => doc.select(sel).collect(),
@@ -561,7 +592,8 @@ fn css_escape_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (i, c) in s.chars().enumerate() {
         let first = i == 0;
-        let ok = c.is_ascii_alphanumeric() || c == '-' || c == '_' || (!first && c.is_ascii_digit());
+        let ok =
+            c.is_ascii_alphanumeric() || c == '-' || c == '_' || (!first && c.is_ascii_digit());
         if ok {
             out.push(c);
         } else {
@@ -861,10 +893,15 @@ mod tests {
 
     #[test]
     fn test_chain_html_extractor_removes_scripts() {
-        let html = r#"<div class="c">正文<script>var x=1;</script><style>.a{}</style><p>内容</p></div>"#;
+        let html =
+            r#"<div class="c">正文<script>var x=1;</script><style>.a{}</style><p>内容</p></div>"#;
         let r = css_chain("class.c@html", html);
         assert_eq!(r.len(), 1);
-        assert!(!r[0].contains("<script>"), "html 提取应移除 script: {}", r[0]);
+        assert!(
+            !r[0].contains("<script>"),
+            "html 提取应移除 script: {}",
+            r[0]
+        );
         assert!(!r[0].contains("<style>"), "html 提取应移除 style: {}", r[0]);
         assert!(r[0].contains("<p>内容</p>"));
         // all 保留 script/style
@@ -874,8 +911,12 @@ mod tests {
 
     #[test]
     fn test_chain_attr_extractors() {
-        let html = r#"<meta name="description" content="简介内容"><img data-src="/a.jpg" src="/b.jpg">"#;
-        assert_eq!(css_chain("meta@content", html), vec!["简介内容".to_string()]);
+        let html =
+            r#"<meta name="description" content="简介内容"><img data-src="/a.jpg" src="/b.jpg">"#;
+        assert_eq!(
+            css_chain("meta@content", html),
+            vec!["简介内容".to_string()]
+        );
         assert_eq!(css_chain("img@data-src", html), vec!["/a.jpg".to_string()]);
         assert_eq!(css_chain("img@src", html), vec!["/b.jpg".to_string()]);
         // 属性去重
@@ -930,32 +971,64 @@ mod tests {
         // [n] 索引
         assert_eq!(css_chain("ul@li[1]@text", html), vec!["二".to_string()]);
         // 区间 [1:3] → 1,2,3（legado Kotlin 区间 end 包含）
-        assert_eq!(css_chain("ul@li[1:3]@text", html), vec!["二".to_string(), "三".to_string(), "四".to_string()]);
+        assert_eq!(
+            css_chain("ul@li[1:3]@text", html),
+            vec!["二".to_string(), "三".to_string(), "四".to_string()]
+        );
         // 排除集 [!0,2]
-        assert_eq!(css_chain("ul@li[!0,2]@text", html), vec!["二".to_string(), "四".to_string()]);
+        assert_eq!(
+            css_chain("ul@li[!0,2]@text", html),
+            vec!["二".to_string(), "四".to_string()]
+        );
         // 反向 [-1:0]（legado 特殊用法：任意位置让列表反向）
         assert_eq!(
             css_chain("ul@li[-1:0]@text", html),
-            vec!["四".to_string(), "三".to_string(), "二".to_string(), "一".to_string()]
+            vec![
+                "四".to_string(),
+                "三".to_string(),
+                "二".to_string(),
+                "一".to_string()
+            ]
         );
         // 步进 [0:4:2] → 0,2
-        assert_eq!(css_chain("ul@li[0:4:2]@text", html), vec!["一".to_string(), "三".to_string()]);
+        assert_eq!(
+            css_chain("ul@li[0:4:2]@text", html),
+            vec!["一".to_string(), "三".to_string()]
+        );
     }
 
     #[test]
     fn test_attr_selectors() {
         let html = r#"<a href="http://a.com/1">1</a><a href="https://b.com/2">2</a><a href="/rel">3</a><a class="x y">4</a><a class="xy">5</a>"#;
         // [a=b]
-        assert_eq!(css_chain("a[href='http://a.com/1']@text", html), vec!["1".to_string()]);
+        assert_eq!(
+            css_chain("a[href='http://a.com/1']@text", html),
+            vec!["1".to_string()]
+        );
         // [a^=b] 前缀
-        assert_eq!(css_chain("a[href^='https']@text", html), vec!["2".to_string()]);
+        assert_eq!(
+            css_chain("a[href^='https']@text", html),
+            vec!["2".to_string()]
+        );
         // [a$=b] 后缀
-        assert_eq!(css_chain("a[href$='.com/2']@text", html), vec!["2".to_string()]);
+        assert_eq!(
+            css_chain("a[href$='.com/2']@text", html),
+            vec!["2".to_string()]
+        );
         // [a*=b] 包含
-        assert_eq!(css_chain("a[href*='b.com']@text", html), vec!["2".to_string()]);
+        assert_eq!(
+            css_chain("a[href*='b.com']@text", html),
+            vec!["2".to_string()]
+        );
         // [a~=b]：jsoup 语义 = 正则匹配（大小写不敏感）
-        assert_eq!(css_chain("a[class~='x']@text", html), vec!["4".to_string(), "5".to_string()]);
-        assert_eq!(css_chain("a[class~='^xy$']@text", html), vec!["5".to_string()]);
+        assert_eq!(
+            css_chain("a[class~='x']@text", html),
+            vec!["4".to_string(), "5".to_string()]
+        );
+        assert_eq!(
+            css_chain("a[class~='^xy$']@text", html),
+            vec!["5".to_string()]
+        );
     }
 
     #[test]
@@ -970,8 +1043,14 @@ mod tests {
     fn test_or_rules() {
         let html = r#"<div class="a">甲</div>"#;
         // || 首个命中即止（真实书源：@@class.h5-4con@html||class.error_msg@text）
-        assert_eq!(css_chain("class.a@text||class.missing@text", html), vec!["甲".to_string()]);
-        assert_eq!(css_chain("class.missing@text||class.a@text", html), vec!["甲".to_string()]);
+        assert_eq!(
+            css_chain("class.a@text||class.missing@text", html),
+            vec!["甲".to_string()]
+        );
+        assert_eq!(
+            css_chain("class.missing@text||class.a@text", html),
+            vec!["甲".to_string()]
+        );
         // || 与 ## 替换共存：替换由 rule.rs apply_post 在结果上应用
     }
 
@@ -981,7 +1060,15 @@ mod tests {
         // 索引逐元素作用：每个 bookinfo 内 a[1]、span[0]
         let html = r#"<div class="bookinfo"><a>甲书</a><a>甲书2</a><span>甲作者</span></div><div class="bookinfo"><a>乙书</a><a>乙书2</a><span>乙作者</span></div>"#;
         let r = css_chain("class.bookinfo@a.1@text%%class.bookinfo@span.0@text", html);
-        assert_eq!(r, vec!["甲书2".to_string(), "甲作者".to_string(), "乙书2".to_string(), "乙作者".to_string()]);
+        assert_eq!(
+            r,
+            vec![
+                "甲书2".to_string(),
+                "甲作者".to_string(),
+                "乙书2".to_string(),
+                "乙作者".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1038,7 +1125,10 @@ mod tests {
         let r = css_chain("<js>result.replace('abc','xyz')</js>@class.b@text", html);
         assert_eq!(r, vec!["xyz123".to_string()]);
         // @js: 贪婪匹配到末尾（legado JS_PATTERN 同语义）——第二个 @js: 并入首个 JS 代码 → JS 语法错误 → 空
-        let r3 = css_chain("class.b@text@js:result.replace('abc','xyz')@js:result.toUpperCase()", html);
+        let r3 = css_chain(
+            "class.b@text@js:result.replace('abc','xyz')@js:result.toUpperCase()",
+            html,
+        );
         assert!(r3.is_empty());
     }
 }

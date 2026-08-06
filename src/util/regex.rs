@@ -28,9 +28,13 @@ impl Regex {
     /// 编译：regex 优先；失败回退 fancy-regex（lookbehind 等）；均失败 → Err
     pub fn new(pattern: &str) -> Result<Self, String> {
         match regex::Regex::new(pattern) {
-            Ok(re) => Ok(Regex { inner: Inner::Std(re) }),
+            Ok(re) => Ok(Regex {
+                inner: Inner::Std(re),
+            }),
             Err(std_err) => match fancy_regex::Regex::new(pattern) {
-                Ok(re) => Ok(Regex { inner: Inner::Fancy(re) }),
+                Ok(re) => Ok(Regex {
+                    inner: Inner::Fancy(re),
+                }),
                 Err(fancy_err) => Err(format!(
                     "正则编译失败: {pattern:?}（regex: {std_err}；fancy-regex: {fancy_err}）"
                 )),
@@ -143,13 +147,15 @@ impl<'t> Iterator for CaptureMatches<'t> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.inner {
-            CaptureMatchesInner::Std(it) => it
-                .next()
-                .map(|c| Captures { inner: CapturesInner::Std(c) }),
+            CaptureMatchesInner::Std(it) => it.next().map(|c| Captures {
+                inner: CapturesInner::Std(c),
+            }),
             CaptureMatchesInner::Fancy(it) => it
                 .next()
                 .and_then(|r| r.ok()) // 单次求值出错跳过（如回溯超限）
-                .map(|c| Captures { inner: CapturesInner::Fancy(c) }),
+                .map(|c| Captures {
+                    inner: CapturesInner::Fancy(c),
+                }),
         }
     }
 }
@@ -182,14 +188,20 @@ impl<'a> RegexBuilder<'a> {
 
     pub fn build(&self) -> Result<Regex, String> {
         let mut sb = regex::RegexBuilder::new(self.pattern);
-        sb.multi_line(self.multi_line).case_insensitive(self.case_insensitive);
+        sb.multi_line(self.multi_line)
+            .case_insensitive(self.case_insensitive);
         match sb.build() {
-            Ok(re) => Ok(Regex { inner: Inner::Std(re) }),
+            Ok(re) => Ok(Regex {
+                inner: Inner::Std(re),
+            }),
             Err(std_err) => {
                 let mut fb = fancy_regex::RegexBuilder::new(self.pattern);
-                fb.multi_line(self.multi_line).case_insensitive(self.case_insensitive);
+                fb.multi_line(self.multi_line)
+                    .case_insensitive(self.case_insensitive);
                 match fb.build() {
-                    Ok(re) => Ok(Regex { inner: Inner::Fancy(re) }),
+                    Ok(re) => Ok(Regex {
+                        inner: Inner::Fancy(re),
+                    }),
                     Err(fancy_err) => Err(format!(
                         "正则编译失败: {:?}（regex: {}；fancy-regex: {}）",
                         self.pattern, std_err, fancy_err
@@ -246,7 +258,10 @@ mod tests {
             .captures_iter("第一章 内容\n中间\n第二章 内容")
             .filter_map(|c| c.get(0).map(|m| m.as_str().to_string()))
             .collect();
-        assert_eq!(caps, vec!["第一章 内容".to_string(), "第二章 内容".to_string()]);
+        assert_eq!(
+            caps,
+            vec!["第一章 内容".to_string(), "第二章 内容".to_string()]
+        );
         // lookbehind + multiline 组合
         let re = RegexBuilder::new(r"(?<=^第)\d+")
             .multi_line(true)
@@ -259,7 +274,10 @@ mod tests {
     fn test_invalid_pattern_returns_clear_error() {
         let err = Regex::new(r"(?<=unclosed").unwrap_err();
         assert!(err.contains("正则编译失败"), "错误信息应明确: {err}");
-        assert!(err.contains("fancy-regex"), "应包含 fancy-regex 原因: {err}");
+        assert!(
+            err.contains("fancy-regex"),
+            "应包含 fancy-regex 原因: {err}"
+        );
     }
 
     #[test]

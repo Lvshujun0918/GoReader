@@ -1,15 +1,16 @@
-//! Headless 浏览器自动化（CDP over WebSocket——轻量实现，复用 tokio-tungstenite）
+//! 浏览器自动化（CDP over WebSocket——轻量实现，复用 tokio-tungstenite）。
+//! **唯一浏览器后端：obscura**（Rust headless 浏览器，stealth 构建含 BoringSSL
+//! TLS 指纹模拟/反检测/追踪器拦截，CDP 兼容——puppeteer/playwright 可连；
+//! https://github.com/h4ckf0r0day/obscura）。无 Chrome/Edge fallback。
 //!
 //! 用于书源登录（mode=browser）：滑块验证码自动拖拽（人类轨迹：贝塞尔曲线 + 随机噪声 +
-//! 微停）、图片验证码截图（前端显示后回填）、登录表单自动填写、CDP 提取 cookie 存库。
+//! 微停）、图片验证码截图（前端显示后回填）、登录表单自动填写、CDP 提取 cookie 存库；
+//! CF 质询/Turnstile 求解（obscura 内置 stealth 指纹 + 本文件 STEALTH_JS 注入双保险）。
 //!
-//! 浏览器发现：`READER_CHROME_PATH` 优先 → Windows 自动检测 Edge/Chrome 常见路径 →
-//! Linux 检测 chromium/chromium-browser/google-chrome；找不到则功能禁用
+//! 后端发现：`READER_OBSCURA_URL`（连接既有 obscura CDP 服务，不接管进程）→
+//! `READER_OBSCURA_BIN`（可执行文件路径）→ 本程序同目录 → 系统 PATH；找到后
+//! spawn `obscura serve --port <随机> --stealth`。找不到则功能禁用
 //! （登录回退手动 Cookie 流程，接口报"未安装浏览器"）。
-//!
-//! 说明：任务原始方案为 chromiumoxide crate；其依赖（websocket 0.27 等）编译重且存在
-//! 工具链兼容风险，故采用**同协议（CDP）的轻量实现**（仅用已在本项目编译的
-//! tokio-tungstenite），功能等价（导航/求值/鼠标拖拽/截图/cookie），编译开销近似为零。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,56 +31,73 @@ const CDP_CMD_TIMEOUT: Duration = Duration::from_secs(20);
 /// 浏览器启动超时
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-// ==================== 浏览器发现 ====================
+// ==================== 浏览器发现（obscura——唯一后端） ====================
 
-/// 候选浏览器路径/命令（环境变量优先，其次平台常见路径）——纯函数，供测试
-pub fn browser_candidates() -> Vec<PathBuf> {
+/// obscura 候选路径（`READER_OBSCURA_BIN` 显式指定优先，其次本程序同目录、系统
+/// PATH 中的 obscura/obscura.exe）——纯函数，供测试。覆盖场景：Docker 镜像
+/// /usr/local/bin 布局、Windows 手工解压目录、cargo install 等
+pub fn obscura_bin_candidates() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = Vec::new();
-    if let Ok(p) = std::env::var("READER_CHROME_PATH") {
+    if let Ok(p) = std::env::var("READER_OBSCURA_BIN") {
         let p = p.trim();
         if !p.is_empty() {
             v.push(PathBuf::from(p));
         }
     }
-    #[cfg(windows)]
-    {
-        for c in [
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ] {
-            v.push(PathBuf::from(c));
+    // 本程序可执行文件同目录（如镜像内 /usr/local/bin/reader-dev + obscura 并列）
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            #[cfg(windows)]
+            v.push(dir.join("obscura.exe"));
+            #[cfg(not(windows))]
+            v.push(dir.join("obscura"));
         }
     }
-    #[cfg(not(windows))]
-    {
-        for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"] {
-            v.push(PathBuf::from(name));
+    // 系统 PATH 探测
+    if let Ok(path) = std::env::var("PATH") {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        for dir in path.split(sep) {
+            let dir = dir.trim();
+            if dir.is_empty() {
+                continue;
+            }
+            #[cfg(windows)]
+            {
+                v.push(PathBuf::from(dir).join("obscura.exe"));
+                v.push(PathBuf::from(dir).join("obscura"));
+            }
+            #[cfg(not(windows))]
+            v.push(PathBuf::from(dir).join("obscura"));
         }
     }
     v
 }
 
-/// 发现可用浏览器（第一个存在的路径；Windows 下命令名也可用 where 探测——
-/// 简化：仅接受存在的文件路径）。未找到 → None（功能禁用）
-pub fn discover_browser() -> Option<PathBuf> {
-    browser_candidates().into_iter().find(|p| p.exists())
+/// 发现可用 obscura 可执行文件（第一个存在的路径）。未找到 → None（功能禁用）
+pub fn discover_obscura_bin() -> Option<PathBuf> {
+    obscura_bin_candidates().into_iter().find(|p| p.exists())
 }
 
-/// 浏览器是否可用（登录接口快速短路用）
+/// 浏览器是否可用（登录接口快速短路用）：`READER_OBSCURA_URL` 已配置 → true
+/// （连接失败在 connect 时报错）；否则要求 obscura 可执行文件可发现
 pub fn is_browser_available() -> bool {
-    discover_browser().is_some()
+    if let Ok(u) = std::env::var("READER_OBSCURA_URL") {
+        if !u.trim().is_empty() {
+            return true;
+        }
+    }
+    discover_obscura_bin().is_some()
 }
 
 // ==================== CDP 客户端 ====================
 
 type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// CDP 浏览器会话（launch → 命令 → drop 时杀进程）
+/// CDP 浏览器会话（launch/connect → 命令 → drop 时杀进程；READER_OBSCURA_URL
+/// 直连路径 child=None——不接管外部进程生命周期）
 pub struct Browser {
+    /// spawn 的 obscura 进程（READER_OBSCURA_URL 直连时为 None，Drop 不杀）
     child: Option<Child>,
-    user_data_dir: PathBuf,
     sink: futures::stream::SplitSink<WsStream, Message>,
     /// 待响应命令表（reader 任务按 id 路由回 oneshot）——Arc 共享，避免跨 await 持有非 Sync 的 Receiver
     pending: std::sync::Arc<std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>>,
@@ -89,272 +107,256 @@ pub struct Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        // 浏览器进程：launcher 可能已 handoff 退出（Windows 下 Chrome/Edge 常见）——
-        // 按 user-data-dir 特征杀干净真实浏览器进程，再杀 launcher 句柄
-        kill_browser_processes(&self.user_data_dir);
+        // obscura serve 单进程（--workers 1 默认）——kill 句柄即清理；无临时目录需回收
         if let Some(child) = &mut self.child {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let _ = std::fs::remove_dir_all(&self.user_data_dir);
     }
 }
 
-/// 杀掉占用指定 user-data-dir 的浏览器进程（Windows：PowerShell CIM 按命令行特征匹配；
-/// 其他平台：无操作——launcher 即浏览器进程，由 child.kill 处理）
-fn kill_browser_processes(user_data_dir: &std::path::Path) {
-    #[cfg(windows)]
-    {
-        let dir = user_data_dir.to_string_lossy();
-        // 命令行包含 --user-data-dir=<dir> 的 msedge/chrome 进程（唯一特征：目录名含进程 id+uuid）
-        let ps = format!(
-            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{dir}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
-        );
-        let _ = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &ps])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+/// CDP 端点 URL 规范化：http(s):// → ws(s)://（无路径时补 /devtools/browser——
+/// Playwright connectOverCDP 的 endpointURL 语义）；ws(s):// 原样返回。纯函数，供测试
+fn normalize_cdp_url(url: &str) -> String {
+    let url = url.trim();
+    let (rest, secure) = if let Some(rest) = url.strip_prefix("https://") {
+        (rest, true)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (rest, false)
+    } else {
+        return url.to_string();
+    };
+    let rest = rest.trim_end_matches('/');
+    let scheme = if secure { "wss://" } else { "ws://" };
+    if rest.contains('/') {
+        format!("{scheme}{rest}")
+    } else {
+        format!("{scheme}{rest}/devtools/browser")
     }
 }
 
-/// 清理残留的 reader-cdp-* 会话（进程被强杀/崩溃时 Drop 不会执行——浏览器与临时目录
-/// 会残留）。目录名带 owner 进程 PID：owner 已死而浏览器仍存活 → 按 user-data-dir
-/// 特征杀浏览器并删目录。每次 launch 前调用（Windows 专用，开销约几十 ms）。
-fn sweep_stale_browser_sessions() {
-    #[cfg(windows)]
-    {
-        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(rest) = name.strip_prefix("reader-cdp-") else { continue };
-            let owner: u32 = match rest.split('-').next().and_then(|p| p.parse().ok()) {
-                Some(p) => p,
-                None => continue,
-            };
-            if owner == std::process::id() {
-                continue; // 本进程自己的会话（存活中）
+/// spawn `obscura serve --port <port> --stealth` → 等待 stdout banner
+/// （`CDP server: ws://127.0.0.1:{port}/devtools/browser`——serve 的 --quiet 只关日志，
+/// banner 无条件打印）→ 连接 → 会话初始化。任何失败均杀进程并返回错误
+/// （launch_with 换随机端口重试）。
+///
+/// 参数说明：obscura 为纯 headless 引擎（**无 --headless 参数**——headless 是其固有
+/// 形态）；`--stealth` 启用反检测 + BoringSSL TLS 指纹模拟（stealth 构建；lean 构建
+/// 传该参数仅打警告、其余功能正常）；`--allow-private-network` 放开本地/内网导航
+/// （obscura 默认禁 RFC1918——与旧 Chrome 路径行为一致，SSRF 面持平）
+async fn spawn_serve_and_connect(exe: &std::path::Path, port: u16) -> Result<Browser> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--stealth")
+        .arg("--allow-private-network")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("启动 obscura 失败（{}）: {e}", exe.display()))?;
+    // 读 stdout banner（banner 先于监听就绪打印——连接阶段有重试）
+    let stdout = child.stdout.take().expect("stdout piped");
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
             }
-            let dir = entry.path();
-            if !dir.is_dir() {
-                continue;
+        }
+    });
+    let ws_url = std::thread::scope(|_| -> Result<String> {
+        let deadline = std::time::Instant::now() + LAUNCH_TIMEOUT;
+        loop {
+            if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+                if let Some(idx) = line.find("CDP server: ws://") {
+                    let url = line[idx + "CDP server: ".len()..].trim().to_string();
+                    if url.starts_with("ws://") {
+                        return Ok(url);
+                    }
+                }
             }
-            // owner 是否存活（tasklist 输出含 pid 即存活；探测失败按存活处理，保守跳过）
-            let owner_alive = Command::new("tasklist")
-                .args(["/FI", &format!("PID eq {owner}"), "/NH"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains(&owner.to_string()))
-                .unwrap_or(true);
-            if owner_alive {
-                continue;
+            if std::time::Instant::now() > deadline {
+                return Err(anyhow!("obscura 启动超时（15s）——未获取到 CDP 地址"));
             }
-            // owner 已死 → 清理残留浏览器进程 + 临时目录
-            kill_browser_processes(&dir);
-            let _ = std::fs::remove_dir_all(&dir);
+            // 提前退出（端口占用/动态库缺失等）→ 非零退出码即失败
+            if let Ok(Some(status)) = child.try_wait() {
+                if !status.success() {
+                    return Err(anyhow!("obscura 进程启动失败（{status}）——端口 {port} 可能被占用"));
+                }
+            }
+        }
+    });
+    let ws_url = match ws_url {
+        Ok(u) => u,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    // banner 打印先于监听就绪——短重试连接（最多 10s；进程提前退出即失败）
+    let mut ws = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while ws.is_none() {
+        match tokio_tungstenite::connect_async(ws_url.clone()).await {
+            Ok(x) => ws = Some(x),
+            Err(e) => {
+                let exited = child.try_wait().ok().flatten();
+                if std::time::Instant::now() > deadline || exited.is_some() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!("obscura CDP 连接失败: {e}"));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     }
+    let mut browser = match init_session(ws.expect("connected").0).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    browser.child = Some(child);
+    Ok(browser)
+}
+
+/// 连接建立后的会话初始化（target 创建/附加、域启用、stealth 注入）——spawn 与
+/// READER_OBSCURA_URL 直连两条路径共用
+async fn init_session(ws: WsStream) -> Result<Browser> {
+    let (sink, stream) = ws.split();
+    // reader 任务：按 id 路由响应到对应 oneshot（events 忽略）
+    let pending: std::sync::Arc<std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let pending_task = std::sync::Arc::clone(&pending);
+    tokio::spawn(async move {
+        let mut stream = stream;
+        while let Some(msg) = stream.next().await {
+            let Ok(msg) = msg else { break };
+            let text = match msg {
+                Message::Text(t) => t.to_string(),
+                Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                _ => continue,
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+            let Some(id) = v.get("id").and_then(|i| i.as_u64()) else { continue };
+            if let Some(tx) = pending_task
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id)
+            {
+                let result = match v.get("error") {
+                    Some(err) => Err(err.to_string()),
+                    None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+                };
+                let _ = tx.send(result);
+            }
+        }
+    });
+
+    let mut browser = Browser {
+        child: None,
+        sink,
+        pending,
+        next_id: 0,
+        session_id: None,
+    };
+    // 创建并附加页面 target（flatten 后命令需带 sessionId——obscura CDP 支持
+    // Target.createTarget/attachToTarget + sessionId 路由，puppeteer 同款协议）
+    let target_id = browser
+        .command("Target.createTarget", json!({ "url": "about:blank" }))
+        .await?
+        .get("targetId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("CDP 创建页面失败"))?
+        .to_string();
+    let session_id = browser
+        .command("Target.attachToTarget", json!({ "targetId": target_id, "flatten": true }))
+        .await?
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("CDP 附加页面失败"))?
+        .to_string();
+    browser.session_id = Some(session_id);
+    let _ = browser.command("Page.enable", json!({})).await;
+    let _ = browser.command("Network.enable", json!({})).await;
+    let _ = browser.command("Runtime.enable", json!({})).await;
+    // stealth 注入（obscura 内置 stealth 之外的第二层）：每次新文档加载前执行
+    // （webdriver 清除、plugins/vendor/languages/hardwareConcurrency/chrome.*/outer
+    // 尺寸/WebGL 厂商模拟——见 STEALTH_JS，puppeteer-extra-plugin-stealth 清单翻译）。
+    // 测试钩子 READER_CDP_NO_STEALTH=1 可跳过注入（过率对比实验用）。
+    let stealth_enabled = std::env::var("READER_CDP_NO_STEALTH")
+        .map(|v| v.trim() != "1")
+        .unwrap_or(true);
+    if stealth_enabled {
+        let _ = browser
+            .command(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": STEALTH_JS }),
+            )
+            .await;
+    }
+    Ok(browser)
 }
 
 impl Browser {
-    /// 启动浏览器（自动发现；未安装 → Err（提示手动 Cookie 流程））
+    /// 启动浏览器（obscura 唯一后端）：`READER_OBSCURA_URL` 已配置 → 连接既有 CDP
+    /// 服务（不 spawn、不接管进程）；否则发现 obscura 可执行文件并 spawn
+    /// `obscura serve --port <随机> --stealth`。未配置/不可用 → Err（提示手动 Cookie 流程）
     pub async fn launch() -> Result<Browser> {
-        let exe = discover_browser()
-            .ok_or_else(|| anyhow!("未安装浏览器（Chrome/Edge）——无法使用浏览器自动登录，请在书源设置中粘贴 Cookie"))?;
+        // ① READER_OBSCURA_URL：连接既有 obscura CDP 服务
+        if let Ok(url) = std::env::var("READER_OBSCURA_URL") {
+            let url = url.trim();
+            if !url.is_empty() {
+                return Browser::connect(url).await;
+            }
+        }
+        // ② spawn obscura serve（stealth 构建）
+        let exe = discover_obscura_bin().ok_or_else(|| {
+            anyhow!(
+                "未安装 obscura 浏览器（唯一浏览器后端）——请下载 stealth 构建并设置 READER_OBSCURA_BIN（或配置 READER_OBSCURA_URL 连接既有 CDP 服务）；未配置时无法使用浏览器自动登录，请在书源设置中粘贴 Cookie"
+            )
+        })?;
         Browser::launch_with(exe).await
     }
 
-    /// 用指定可执行文件启动（测试降级路径用）
+    /// 连接既有 obscura CDP 服务（`READER_OBSCURA_URL` 路径；不接管进程生命周期——
+    /// Drop 不杀进程）。URL 支持 ws:// 直连或 http://（Playwright connectOverCDP
+    /// 风格，自动补 /devtools/browser）
+    pub async fn connect(url: &str) -> Result<Browser> {
+        let ws_url = normalize_cdp_url(url);
+        // 注意必须走 &str/String 路径：tungstenite 0.24 的 `http::Request` 转换是
+        // 恒等（不会补全握手头），只有 Uri/str 路径才会填充 Host/Connection/Upgrade/
+        // Sec-WebSocket-Key 等头；否则 DevTools 会回 400
+        let (ws, _resp) = tokio_tungstenite::connect_async(ws_url.clone())
+            .await
+            .map_err(|e| anyhow!("obscura CDP 连接失败（{ws_url}）: {e}"))?;
+        init_session(ws).await
+    }
+
+    /// 用指定 obscura 可执行文件启动（spawn `serve --port <随机> --stealth`；
+    /// 端口冲突等启动失败自动换随机端口重试，最多 3 次）
     pub async fn launch_with(exe: PathBuf) -> Result<Browser> {
-        // 上次异常退出（进程被强杀/崩溃）残留的浏览器会话先清理
-        sweep_stale_browser_sessions();
         if !exe.exists() {
-            return Err(anyhow!("浏览器可执行文件不存在（{}）——无法使用浏览器自动登录", exe.display()));
+            return Err(anyhow!("obscura 可执行文件不存在（{}）——无法使用浏览器自动登录", exe.display()));
         }
-        // 独立 user-data-dir（避免与用户浏览器冲突；退出时清理）
-        let user_data_dir = std::env::temp_dir().join(format!(
-            "reader-cdp-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        let mut cmd = Command::new(&exe);
-        // READER_CDP_HEADED=1 时移除 --headless=new（headless vs headed 过率对比实验用；
-        // 生产路径永远 headless——服务端静默，绝不弹浏览器给用户）
-        let headed = std::env::var("READER_CDP_HEADED").map(|v| v.trim() == "1").unwrap_or(false);
-        let mut args: Vec<&str> = vec![
-            "--headless=new",
-            "--remote-debugging-port=0",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-gpu",
-            "--disable-extensions",
-            "--disable-dev-shm-usage",
-            "--remote-allow-origins=*",
-            // 反检测启动参数（验证码求解场景：隐藏 CDP 自动化指纹）
-            "--disable-blink-features=AutomationControlled",
-            "--disable-infobars",
-            "--window-size=1280,800",
-            // UA 覆盖：headless 默认 UA 含 HeadlessChrome 标记——CF 风控直接命中；
-            // 用常规 Windows Chrome UA（与 cf_clearance 绑定，后续抓取需同 UA）
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        ];
-        if headed {
-            args.remove(0);
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..3 {
+            // 随机端口（20000-49999）——与已有服务/其他实例冲突时 obscura 退出，
+            // 换端口重试（概率极低，防御性处理）
+            let port = 20000 + rand::random::<u16>() % 30000;
+            match spawn_serve_and_connect(&exe, port).await {
+                Ok(b) => return Ok(b),
+                Err(e) => last_err = Some(e),
+            }
         }
-        cmd.args(args)
-        .arg(format!("--user-data-dir={}", user_data_dir.display()))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-        let spawned = cmd.spawn().map_err(|e| anyhow!("启动浏览器失败（{}）: {e}", exe.display()))?;
-        let mut child = Some(spawned);
-
-        // 从 stderr 或 DevToolsActivePort 解析 DevTools ws 地址：
-        // - 部分版本在 stderr 打印 "DevTools listening on ws://..."（--remote-debugging-port=0
-        //   自动选端口）；现代 Chrome/Edge（151+）launcher 进程会 handoff 后退出、且不一定
-        //   在管道 stderr 打印该行——标准做法是读 user-data-dir/DevToolsActivePort
-        //   （第一行端口、第二行 ws 路径）
-        let stderr = child.as_mut().expect("stderr piped").stderr.take().expect("stderr piped");
-        let (tx, rx) = mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stderr).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let port_file = user_data_dir.join("DevToolsActivePort");
-        let ws_url = std::thread::scope(|_| -> Result<String> {
-            let deadline = std::time::Instant::now() + LAUNCH_TIMEOUT;
-            let mut launcher_exited = false;
-            loop {
-                // ① stderr 行（旧版兼容）
-                if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
-                    if let Some(idx) = line.find("DevTools listening on ws://") {
-                        let url = line[idx + "DevTools listening on ".len()..].trim().to_string();
-                        if url.starts_with("ws://") {
-                            return Ok(url);
-                        }
-                    }
-                }
-                // ② DevToolsActivePort 文件（现代 Chrome/Edge 标准位置）
-                if let Ok(content) = std::fs::read_to_string(&port_file) {
-                    let mut lines = content.lines();
-                    if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
-                        if let Ok(port) = port.trim().parse::<u16>() {
-                            let url = format!("ws://127.0.0.1:{port}{}", path.trim());
-                            if url.starts_with("ws://") {
-                                return Ok(url);
-                            }
-                        }
-                    }
-                }
-                if std::time::Instant::now() > deadline {
-                    return Err(anyhow!("浏览器启动超时（15s）——未获取到 DevTools 地址"));
-                }
-                // launcher 提前退出：非零退出码 = 启动失败；零退出码 = handoff（继续等）
-                if !launcher_exited {
-                    if let Ok(Some(status)) = child.as_mut().expect("child").try_wait() {
-                        if !status.success() {
-                            return Err(anyhow!("浏览器进程启动失败（{status}）"));
-                        }
-                        launcher_exited = true;
-                    }
-                }
-            }
-        });
-        let ws_url = match ws_url {
-            Ok(u) => u,
-            Err(e) => {
-                // launcher 可能已 handoff——按 user-data-dir 特征清理真实浏览器进程
-                kill_browser_processes(&user_data_dir);
-                return Err(e);
-            }
-        };
-
-        // CDP 连接（浏览器级）——注意必须走 &str/String 路径：tungstenite 0.24 的
-        // `http::Request` 转换是恒等（不会补全握手头），只有 Uri/str 路径才会填充
-        // Host/Connection/Upgrade/Sec-WebSocket-Key 等头；否则 DevTools 会回 400
-        let (ws, _resp) = match tokio_tungstenite::connect_async(ws_url).await {
-            Ok(x) => x,
-            Err(e) => {
-                kill_browser_processes(&user_data_dir);
-                return Err(anyhow!("CDP 连接失败: {e}"));
-            }
-        };
-        let (sink, stream) = ws.split();
-        // reader 任务：按 id 路由响应到对应 oneshot（events 忽略）
-        let pending: std::sync::Arc<std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let pending_task = std::sync::Arc::clone(&pending);
-        tokio::spawn(async move {
-            let mut stream = stream;
-            while let Some(msg) = stream.next().await {
-                let Ok(msg) = msg else { break };
-                let text = match msg {
-                    Message::Text(t) => t.to_string(),
-                    Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-                    _ => continue,
-                };
-                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-                let Some(id) = v.get("id").and_then(|i| i.as_u64()) else { continue };
-                if let Some(tx) = pending_task
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id)
-                {
-                    let result = match v.get("error") {
-                        Some(err) => Err(err.to_string()),
-                        None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
-                    };
-                    let _ = tx.send(result);
-                }
-            }
-        });
-
-        let mut browser = Browser {
-            child,
-            user_data_dir,
-            sink,
-            pending,
-            next_id: 0,
-            session_id: None,
-        };
-        // 创建并附加页面 target（flatten 后命令需带 sessionId）
-        let target_id = browser
-            .command("Target.createTarget", json!({ "url": "about:blank" }))
-            .await?
-            .get("targetId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("CDP 创建页面失败"))?
-            .to_string();
-        let session_id = browser
-            .command("Target.attachToTarget", json!({ "targetId": target_id, "flatten": true }))
-            .await?
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("CDP 附加页面失败"))?
-            .to_string();
-        browser.session_id = Some(session_id);
-        let _ = browser.command("Page.enable", json!({})).await;
-        let _ = browser.command("Network.enable", json!({})).await;
-        let _ = browser.command("Runtime.enable", json!({})).await;
-        // stealth 注入（反检测）：每次新文档加载前执行（webdriver 清除、plugins/vendor/
-        // languages/hardwareConcurrency/chrome.*/outer 尺寸/WebGL 厂商模拟——见 STEALTH_JS，
-        // puppeteer-extra-plugin-stealth 清单翻译）。测试钩子 READER_CDP_NO_STEALTH=1
-        // 可跳过注入（过率对比实验用）。
-        let stealth_enabled = std::env::var("READER_CDP_NO_STEALTH")
-            .map(|v| v.trim() != "1")
-            .unwrap_or(true);
-        if stealth_enabled {
-            let _ = browser
-                .command(
-                    "Page.addScriptToEvaluateOnNewDocument",
-                    json!({ "source": STEALTH_JS }),
-                )
-                .await;
-        }
-        Ok(browser)
+        Err(last_err.unwrap_or_else(|| anyhow!("obscura 启动失败（多次尝试）")))
     }
 
     /// 发送 CDP 命令并等待响应（带超时）
@@ -371,7 +373,7 @@ impl Browser {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, tx);
         self.sink
-            .send(Message::Text(msg.to_string().into()))
+            .send(Message::Text(msg.to_string()))
             .await
             .map_err(|e| anyhow!("CDP 发送失败: {e}"))?;
         // 等待 reader 任务路由回响应（oneshot Receiver 为 Send，可安全跨 await）
@@ -398,9 +400,15 @@ impl Browser {
             .await?;
         // 异常时 result 里带 exceptionDetails，value 缺失
         if r.get("exceptionDetails").is_some() {
-            return Err(anyhow!("页面 JS 异常: {}", r.get("exceptionDetails").unwrap_or(&Value::Null)));
+            return Err(anyhow!(
+                "页面 JS 异常: {}",
+                r.get("exceptionDetails").unwrap_or(&Value::Null)
+            ));
         }
-        Ok(r.get("result").and_then(|v| v.get("value")).cloned().unwrap_or(Value::Null))
+        Ok(r.get("result")
+            .and_then(|v| v.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null))
     }
 
     /// 等待 document.readyState == complete（超时 20s）
@@ -410,7 +418,12 @@ impl Browser {
             if std::time::Instant::now() > deadline {
                 return Err(anyhow!("页面加载超时"));
             }
-            let state = self.evaluate("document.readyState").await?.as_str().unwrap_or("").to_string();
+            let state = self
+                .evaluate("document.readyState")
+                .await?
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             if state == "complete" {
                 return Ok(());
             }
@@ -427,7 +440,12 @@ impl Browser {
     }
 
     /// 注入 cookie（name=value 对；domain 为 host，secure 按页面 scheme 决定）
-    pub async fn set_cookies(&mut self, pairs: &[(String, String)], host: &str, secure: bool) -> Result<()> {
+    pub async fn set_cookies(
+        &mut self,
+        pairs: &[(String, String)],
+        host: &str,
+        secure: bool,
+    ) -> Result<()> {
         if pairs.is_empty() {
             return Ok(());
         }
@@ -446,14 +464,18 @@ impl Browser {
                 })
             })
             .collect();
-        self.command("Network.setCookies", json!({ "cookies": cookies })).await?;
+        self.command("Network.setCookies", json!({ "cookies": cookies }))
+            .await?;
         Ok(())
     }
 
     /// Storage.getCookies → cookie 数组（含 httpOnly）
     pub async fn get_cookies(&mut self) -> Result<Vec<Value>> {
         let r = self.command("Storage.getCookies", json!({})).await?;
-        Ok(r.get("cookies").and_then(|c| c.as_array()).cloned().unwrap_or_default())
+        Ok(r.get("cookies")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// cookie 数组 → "a=1; b=2"（按 name 排序，顺序稳定）
@@ -462,7 +484,11 @@ impl Browser {
             .iter()
             .filter_map(|c| {
                 let name = c.get("name").and_then(|v| v.as_str())?.to_string();
-                let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let value = c
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 Some((name, value))
             })
             .collect();
@@ -483,14 +509,26 @@ impl Browser {
         .await?;
         // 人类轨迹：三次贝塞尔 + 随机噪声 + 随机步数/微停
         let steps = 28 + rand::random::<u64>() % 25;
-        let ctrl1 = (x1 + (x2 - x1) * 0.4 + rand::random::<f64>() * 20.0 - 10.0, y1);
-        let ctrl2 = (x1 + (x2 - x1) * 0.6 + rand::random::<f64>() * 20.0 - 10.0, y2);
+        let ctrl1 = (
+            x1 + (x2 - x1) * 0.4 + rand::random::<f64>() * 20.0 - 10.0,
+            y1,
+        );
+        let ctrl2 = (
+            x1 + (x2 - x1) * 0.6 + rand::random::<f64>() * 20.0 - 10.0,
+            y2,
+        );
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
             let inv = 1.0 - t;
             // 三次贝塞尔
-            let x = inv * inv * inv * x1 + 3.0 * inv * inv * t * ctrl1.0 + 3.0 * inv * t * t * ctrl2.0 + t * t * t * x2;
-            let y = inv * inv * inv * y1 + 3.0 * inv * inv * t * ctrl1.1 + 3.0 * inv * t * t * ctrl2.1 + t * t * t * y2;
+            let x = inv * inv * inv * x1
+                + 3.0 * inv * inv * t * ctrl1.0
+                + 3.0 * inv * t * t * ctrl2.0
+                + t * t * t * x2;
+            let y = inv * inv * inv * y1
+                + 3.0 * inv * inv * t * ctrl1.1
+                + 3.0 * inv * t * t * ctrl2.1
+                + t * t * t * y2;
             // 随机噪声（±2px）+ 微停（6-28ms）
             let nx = x + rand::random::<f64>() * 4.0 - 2.0;
             let ny = y + rand::random::<f64>() * 4.0 - 2.0;
@@ -521,7 +559,10 @@ impl Browser {
                 }),
             )
             .await?;
-        let data = r.get("data").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("截图失败"))?;
+        let data = r
+            .get("data")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("截图失败"))?;
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
             .decode(data)
@@ -825,7 +866,14 @@ async fn solve_captcha_inner(
     let result = {
         let session = guard.get_mut(ns).expect("just initialized");
         session.last_used = std::time::Instant::now();
-        solve_with(&mut session.browser, url, cookies, max_wait_ms, include_slider).await
+        solve_with(
+            &mut session.browser,
+            url,
+            cookies,
+            max_wait_ms,
+            include_slider,
+        )
+        .await
     };
     match result {
         Ok(sol) => {
@@ -864,7 +912,9 @@ async fn finish_with_fallback(
 pub async fn evaluate_in_session(ns: &str, expression: &str) -> Result<Value> {
     let mut guard = CF_SESSION.lock().await;
     let Some(session) = guard.get_mut(ns) else {
-        return Err(anyhow!("无浏览器会话——请先调用 solve_cf_challenge/solve_captcha"));
+        return Err(anyhow!(
+            "无浏览器会话——请先调用 solve_cf_challenge/solve_captcha"
+        ));
     };
     session.last_used = std::time::Instant::now();
     session.browser.evaluate(expression).await
@@ -878,8 +928,7 @@ async fn solve_with(
     max_wait_ms: u64,
     include_slider: bool,
 ) -> Result<CfSolution> {
-    let parsed =
-        url::Url::parse(url).map_err(|e| anyhow!("URL 解析失败（{url}）: {e}"))?;
+    let parsed = url::Url::parse(url).map_err(|e| anyhow!("URL 解析失败（{url}）: {e}"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow!("URL 无主机名（{url}）"))?
@@ -899,8 +948,8 @@ async fn solve_with(
     let deadline = std::time::Instant::now() + Duration::from_millis(max_wait_ms);
     // Turnstile token 轮询上限（任务要求最多 30s——仅对真 Turnstile widget 生效；
     // 经典 CF 质询误命中 iframe 特征时不受此限，仍按 max_wait_ms）
-    let turnstile_deadline = std::time::Instant::now()
-        + Duration::from_millis(max_wait_ms.min(TURNSTILE_MAX_WAIT_MS));
+    let turnstile_deadline =
+        std::time::Instant::now() + Duration::from_millis(max_wait_ms.min(TURNSTILE_MAX_WAIT_MS));
     let mut turnstile_mode = false;
     let mut turnstile_widget = false; // 页面确有 Turnstile widget（容器/input/标题/turnstile iframe）
     let mut turnstile_clicked = false;
@@ -925,11 +974,18 @@ async fn solve_with(
 
         // ① 不支持的验证码类型（reCAPTCHA/hCaptcha）——明确错误（不自动求解）
         if let Ok(u) = browser.evaluate(UNSUPPORTED_CAPTCHA_DETECT_JS).await {
-            if u.get("recaptcha").and_then(|v| v.as_bool()).unwrap_or(false) {
-                return Err(anyhow!("该验证码类型不支持（reCAPTCHA）——请手动完成验证或更换书源"));
+            if u.get("recaptcha")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return Err(anyhow!(
+                    "该验证码类型不支持（reCAPTCHA）——请手动完成验证或更换书源"
+                ));
             }
             if u.get("hcaptcha").and_then(|v| v.as_bool()).unwrap_or(false) {
-                return Err(anyhow!("该验证码类型不支持（hCaptcha）——请手动完成验证或更换书源"));
+                return Err(anyhow!(
+                    "该验证码类型不支持（hCaptcha）——请手动完成验证或更换书源"
+                ));
             }
         }
 
@@ -939,25 +995,37 @@ async fn solve_with(
         //    也内嵌该 iframe，误判会触发 30s token 轮询上限并破坏经典质询等待循环）
         if !turnstile_mode {
             if let Ok(d) = browser.evaluate(TURNSTILE_DETECT_JS).await {
-                let ts = d.get("turnstile").and_then(|v| v.as_bool()).unwrap_or(false);
+                let ts = d
+                    .get("turnstile")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if ts {
                     turnstile_mode = true;
-                    turnstile_widget = d.get("hasContainer").and_then(|v| v.as_bool()).unwrap_or(false)
+                    turnstile_widget = d
+                        .get("hasContainer")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
                         || d.get("hasInput").and_then(|v| v.as_bool()).unwrap_or(false)
                         || d.get("hasTitle").and_then(|v| v.as_bool()).unwrap_or(false);
                     tracing::warn!(
                         "Turnstile 检测命中 {url}: container={} input={} title={} iframeTs={}",
-                        d.get("hasContainer").and_then(|v| v.as_bool()).unwrap_or(false),
+                        d.get("hasContainer")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                         d.get("hasInput").and_then(|v| v.as_bool()).unwrap_or(false),
                         d.get("hasTitle").and_then(|v| v.as_bool()).unwrap_or(false),
-                        d.get("iframeIsTurnstile").and_then(|v| v.as_bool()).unwrap_or(false),
+                        d.get("iframeIsTurnstile")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                     );
                 }
             }
         } else if !turnstile_widget {
             // widget 标志升级（script 标签先命中、容器后渲染）
             if let Ok(d) = browser.evaluate(TURNSTILE_DETECT_JS).await {
-                if d.get("hasContainer").and_then(|v| v.as_bool()).unwrap_or(false)
+                if d.get("hasContainer")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
                     || d.get("hasInput").and_then(|v| v.as_bool()).unwrap_or(false)
                     || d.get("hasTitle").and_then(|v| v.as_bool()).unwrap_or(false)
                 {
@@ -1101,7 +1169,11 @@ async fn solve_with(
         })
         .filter_map(|c| {
             let name = c.get("name")?.as_str()?.to_string();
-            let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let value = c
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             Some((name, value))
         })
         .collect();
@@ -1304,19 +1376,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_browser_candidates_env_first() {
+    fn test_obscura_bin_candidates_env_first() {
         // 环境变量优先
-        std::env::set_var("READER_CHROME_PATH", "C:/fake/edge.exe");
-        let c = browser_candidates();
-        assert_eq!(c[0], PathBuf::from("C:/fake/edge.exe"));
-        std::env::remove_var("READER_CHROME_PATH");
+        std::env::set_var("READER_OBSCURA_BIN", "C:/fake/obscura.exe");
+        let c = obscura_bin_candidates();
+        assert_eq!(c[0], PathBuf::from("C:/fake/obscura.exe"));
+        std::env::remove_var("READER_OBSCURA_BIN");
+    }
+
+    #[test]
+    fn test_normalize_cdp_url() {
+        // http(s):// 端点（Playwright connectOverCDP 风格）→ ws(s):// + /devtools/browser
+        assert_eq!(normalize_cdp_url("http://127.0.0.1:9222"), "ws://127.0.0.1:9222/devtools/browser");
+        assert_eq!(normalize_cdp_url("http://127.0.0.1:9222/"), "ws://127.0.0.1:9222/devtools/browser");
+        assert_eq!(normalize_cdp_url("https://obscura.example:9443"), "wss://obscura.example:9443/devtools/browser");
+        // 已带路径 → 仅换 scheme
+        assert_eq!(normalize_cdp_url("http://127.0.0.1:9222/devtools/browser"), "ws://127.0.0.1:9222/devtools/browser");
+        // ws(s):// 直连 → 原样返回（含首尾空白清理）
+        assert_eq!(normalize_cdp_url("ws://127.0.0.1:9222/devtools/browser"), "ws://127.0.0.1:9222/devtools/browser");
+        assert_eq!(normalize_cdp_url("  wss://h:1/devtools/browser  "), "wss://h:1/devtools/browser");
     }
 
     #[test]
     fn test_launch_with_missing_exe_fails() {
         // 降级路径：浏览器不可用 → 明确错误（不 panic、不启动任何进程）
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let r = rt.block_on(Browser::launch_with(PathBuf::from("C:/definitely/not/exists.exe")));
+        let r = rt.block_on(Browser::launch_with(PathBuf::from(
+            "C:/definitely/not/exists.exe",
+        )));
         let err = r.err().expect("启动不存在的浏览器应失败");
         assert!(err.to_string().contains("浏览器"));
     }
@@ -1356,7 +1443,10 @@ mod tests {
             ("TURNSTILE_DETECT_JS", TURNSTILE_DETECT_JS),
             ("TURNSTILE_CLICK_JS", TURNSTILE_CLICK_JS),
             ("TURNSTILE_TOKEN_JS", TURNSTILE_TOKEN_JS),
-            ("UNSUPPORTED_CAPTCHA_DETECT_JS", UNSUPPORTED_CAPTCHA_DETECT_JS),
+            (
+                "UNSUPPORTED_CAPTCHA_DETECT_JS",
+                UNSUPPORTED_CAPTCHA_DETECT_JS,
+            ),
             ("STEALTH_JS", STEALTH_JS),
         ] {
             let r = crate::parser::js::eval_js(js, &vars);
@@ -1367,15 +1457,35 @@ mod tests {
     #[test]
     fn test_unsupported_captcha_kind() {
         // reCAPTCHA：g-recaptcha 容器 / recaptcha/api.js 脚本
-        assert_eq!(unsupported_captcha_kind("<div class=\"g-recaptcha\" data-sitekey=\"x\"></div>"), Some("reCAPTCHA"));
-        assert_eq!(unsupported_captcha_kind("<script src=\"https://www.google.com/recaptcha/api.js\"></script>"), Some("reCAPTCHA"));
+        assert_eq!(
+            unsupported_captcha_kind("<div class=\"g-recaptcha\" data-sitekey=\"x\"></div>"),
+            Some("reCAPTCHA")
+        );
+        assert_eq!(
+            unsupported_captcha_kind(
+                "<script src=\"https://www.google.com/recaptcha/api.js\"></script>"
+            ),
+            Some("reCAPTCHA")
+        );
         // hCaptcha：h-captcha 容器 / hcaptcha.com iframe
-        assert_eq!(unsupported_captcha_kind("<div class=\"h-captcha\" data-sitekey=\"x\"></div>"), Some("hCaptcha"));
-        assert_eq!(unsupported_captcha_kind("<iframe src=\"https://hcaptcha.com/\"></iframe>"), Some("hCaptcha"));
+        assert_eq!(
+            unsupported_captcha_kind("<div class=\"h-captcha\" data-sitekey=\"x\"></div>"),
+            Some("hCaptcha")
+        );
+        assert_eq!(
+            unsupported_captcha_kind("<iframe src=\"https://hcaptcha.com/\"></iframe>"),
+            Some("hCaptcha")
+        );
         // 大小写不敏感
-        assert_eq!(unsupported_captcha_kind("<DIV CLASS=\"G-RECAPTCHA\">"), Some("reCAPTCHA"));
+        assert_eq!(
+            unsupported_captcha_kind("<DIV CLASS=\"G-RECAPTCHA\">"),
+            Some("reCAPTCHA")
+        );
         // 未命中（Turnstile/普通页）→ None
-        assert_eq!(unsupported_captcha_kind("<div class=\"cf-turnstile\"></div>"), None);
+        assert_eq!(
+            unsupported_captcha_kind("<div class=\"cf-turnstile\"></div>"),
+            None
+        );
         assert_eq!(unsupported_captcha_kind("<html>hello</html>"), None);
         assert_eq!(unsupported_captcha_kind(""), None);
     }

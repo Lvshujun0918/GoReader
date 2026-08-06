@@ -104,7 +104,9 @@ pub async fn run_debug(
         "explore" => debug_explore(ns, source, target_url, &mut on_step).await,
         "toc" => debug_toc(ns, source, target_url, &mut on_step).await,
         "content" => debug_content(ns, source, target_url, &mut on_step).await,
-        _ => Err(anyhow::anyhow!("不支持的调试动作（search|explore|toc|content）")),
+        _ => Err(anyhow::anyhow!(
+            "不支持的调试动作（search|explore|toc|content）"
+        )),
     }
 }
 
@@ -136,7 +138,15 @@ async fn debug_fetch(
     let method = suffix.method.as_deref().unwrap_or("GET").to_string();
     let started = Instant::now();
     let result = if method.eq_ignore_ascii_case("POST") {
-        crawler::http_post(ns, url, &headers, 15, post_body.as_deref(), suffix.charset.as_deref()).await
+        crawler::http_post(
+            ns,
+            url,
+            &headers,
+            15,
+            post_body.as_deref(),
+            suffix.charset.as_deref(),
+        )
+        .await
     } else {
         crawler::http_get(ns, url, &headers, 15).await
     };
@@ -210,8 +220,7 @@ async fn debug_search(
         .unwrap_or_default();
     let started = Instant::now();
     // 书源桥接（带用户命名空间：URL 构造 JS 内 java.* 可用）
-    let bridge =
-        crate::parser::js::JsBridge::from_source(source, ns);
+    let bridge = crate::parser::js::JsBridge::from_source(source, ns);
     let (url, suffix) = match crate::service::search::build_request_url(
         &search_url,
         key,
@@ -313,7 +322,12 @@ async fn debug_explore(
     let started = Instant::now();
     let url = raw.replace("{{page}}", "1").replace("{page}", "1");
     let url = if url.starts_with('/') && !url.starts_with("//") {
-        let base = source.book_source_url.split("##").next().unwrap_or("").trim_end_matches('/');
+        let base = source
+            .book_source_url
+            .split("##")
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
         format!("{base}{url}")
     } else {
         url
@@ -372,10 +386,11 @@ async fn debug_toc(
         // 清掉上一页 nextTocUrl 字段求值可能留下的 JS 错误记录（避免错挂到本页步骤）
         let _ = crate::parser::js::take_last_js_error();
         // 抓取目录页
-        let resp = match debug_fetch(ns, &current_url, &UrlSuffix::default(), source, "", on_step).await {
-            Ok(r) => r,
-            Err(e) => return Err(e),
-        };
+        let resp =
+            match debug_fetch(ns, &current_url, &UrlSuffix::default(), source, "", on_step).await {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
         let base = resp.url.clone();
 
         // chapterList 提取（与生产 analyze_toc 同源 toc_items——含 <js>/@js: 兜底，
@@ -469,10 +484,11 @@ async fn debug_content(
     for page in 0..5usize {
         // 清掉上一页 nextContentUrl 字段求值可能留下的 JS 错误记录（避免错挂到本页步骤）
         let _ = crate::parser::js::take_last_js_error();
-        let resp = match debug_fetch(ns, &current_url, &UrlSuffix::default(), source, "", on_step).await {
-            Ok(r) => r,
-            Err(e) => return Err(e),
-        };
+        let resp =
+            match debug_fetch(ns, &current_url, &UrlSuffix::default(), source, "", on_step).await {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
         let base = resp.url.clone();
 
         let mut step = DebugStep::new(format!("content 规则应用（第 {} 页）", page + 1));
@@ -480,7 +496,11 @@ async fn debug_content(
         let content = analyze_content_from(&resp.body, source);
         step.elapsed_ms = started.elapsed().as_millis() as i64;
         step.result_len = content.len();
-        step.error = if content.is_empty() { Some("未提取到正文".into()) } else { None };
+        step.error = if content.is_empty() {
+            Some("未提取到正文".into())
+        } else {
+            None
+        };
         step.detail = json!({ "chars": content.chars().count() });
         // GAP 156：content 规则 JS（<js>/@js: 后缀链）eval 失败 → 错误消息 + JS 片段前 100 字符
         attach_js_error(&mut step, rule.content.as_deref());
@@ -541,7 +561,10 @@ mod tests {
             Some("return 1".to_string())
         );
         // @js: 前缀
-        assert_eq!(extract_js_code("@js:JSON.parse(result)"), Some("JSON.parse(result)".to_string()));
+        assert_eq!(
+            extract_js_code("@js:JSON.parse(result)"),
+            Some("JSON.parse(result)".to_string())
+        );
         // 提取规则 @js: 后缀链（legado）
         assert_eq!(
             extract_js_code("$.path@js:java.aesBase64DecodeToString(v)"),
@@ -567,7 +590,7 @@ mod tests {
     #[test]
     fn test_attach_js_error_records_error_and_snippet() {
         // eval 失败（运行期 throw）——map_js_error 记录线程局部
-        let mut vars = std::collections::HashMap::new();
+        let vars = std::collections::HashMap::new();
         let r = crate::parser::js::eval_js_json("throw new Error('书单解析爆炸')", &vars);
         assert!(r.is_err(), "throw 应失败");
         let raw = crate::parser::js::take_last_js_error().expect("eval 失败应留下错误记录");
@@ -579,18 +602,26 @@ mod tests {
         let mut step = DebugStep::new("规则应用（bookList 字段）");
         attach_js_error(&mut step, Some("<js>throw new Error('书单解析爆炸')</js>"));
         let err = step.error.expect("步骤应带错误");
-        assert!(err.contains("JS 执行失败"), "错误消息含 JS 执行失败前缀: {err}");
+        assert!(
+            err.contains("JS 执行失败"),
+            "错误消息含 JS 执行失败前缀: {err}"
+        );
         assert!(err.contains("书单解析爆炸"), "错误消息含原始错误: {err}");
         assert!(
-            step.detail["jsError"].as_str().unwrap_or("").contains("书单解析爆炸"),
+            step.detail["jsError"]
+                .as_str()
+                .unwrap_or("")
+                .contains("书单解析爆炸"),
             "detail.jsError 含原始错误"
         );
         assert_eq!(
-            step.detail["jsSnippet"],
-            "throw new Error('书单解析爆炸')",
+            step.detail["jsSnippet"], "throw new Error('书单解析爆炸')",
             "JS 片段为规则代码前 100 字符"
         );
-        assert_eq!(step.detail["jsRule"], "<js>throw new Error('书单解析爆炸')</js>");
+        assert_eq!(
+            step.detail["jsRule"],
+            "<js>throw new Error('书单解析爆炸')</js>"
+        );
         // 记录已被取走——再次 attach 不再重复
         let mut step2 = DebugStep::new("x");
         attach_js_error(&mut step2, None);
@@ -600,7 +631,7 @@ mod tests {
     #[test]
     fn test_attach_js_error_ignores_successful_eval() {
         // eval 成功 → 无错误记录 → attach 不改动步骤
-        let mut vars = std::collections::HashMap::new();
+        let vars = std::collections::HashMap::new();
         let r = crate::parser::js::eval_js_json("JSON.stringify([{a:1}])", &vars);
         assert!(r.is_ok());
         assert!(crate::parser::js::take_last_js_error().is_none());

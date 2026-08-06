@@ -108,7 +108,6 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-
 /// 初始化：建目录 + 打开/建库 + 建表
 pub async fn init(config: &AppConfig) -> Result<Storage> {
     let storage_dir = config.storage_dir();
@@ -201,11 +200,10 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     // 兼容旧库：books.local_epub/local_pdf 曾被声明为 TEXT（Book 模型为 bool），
     // TEXT 亲和性会把 bool 存成文本 '0'/'1'，读取时 bool 解码失败（saveBook/进度/书架读回依赖）。
     // 检测到 TEXT 类型则重建表为 INTEGER（幂等，仅执行一次）。
-    let epub_col_type: Option<String> = sqlx::query_scalar(
-        "SELECT type FROM pragma_table_info('books') WHERE name = 'local_epub'",
-    )
-    .fetch_optional(&pool)
-    .await?;
+    let epub_col_type: Option<String> =
+        sqlx::query_scalar("SELECT type FROM pragma_table_info('books') WHERE name = 'local_epub'")
+            .fetch_optional(&pool)
+            .await?;
     if epub_col_type.as_deref() == Some("TEXT") {
         rebuild_books_bool_columns(&pool).await?;
         tracing::info!("books 表重建：local_epub/local_pdf TEXT → INTEGER");
@@ -355,9 +353,10 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     .await?;
 
     // 兼容旧库：rss_articles 缺 read 列时补列（幂等——已存在则跳过）
-    let rss_cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('rss_articles')")
-        .fetch_all(&pool)
-        .await?;
+    let rss_cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('rss_articles')")
+            .fetch_all(&pool)
+            .await?;
     if !rss_cols.iter().any(|c| c == "read") {
         sqlx::query("ALTER TABLE rss_articles ADD COLUMN read INTEGER DEFAULT 0")
             .execute(&pool)
@@ -529,10 +528,34 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
         (
             "books",
             &[
-                "toc_url", "custom_tag", "custom_intro", "latest_chapter_title", "latest_chapter_time",
-                "last_check_time", "last_check_count", "total_chapter_num", "word_count",
-                "order_num", "origin_order", "use_replace_rule", "variable", "read_config",
-                "is_in_shelf", "cbz", "display_cover", "display_intro", "local_epub", "local_pdf", "pdf", "split_long_chapter", "info_html", "toc_html", "language", "publisher", "published_at", "raw_json",
+                "toc_url",
+                "custom_tag",
+                "custom_intro",
+                "latest_chapter_title",
+                "latest_chapter_time",
+                "last_check_time",
+                "last_check_count",
+                "total_chapter_num",
+                "word_count",
+                "order_num",
+                "origin_order",
+                "use_replace_rule",
+                "variable",
+                "read_config",
+                "is_in_shelf",
+                "cbz",
+                "display_cover",
+                "display_intro",
+                "local_epub",
+                "local_pdf",
+                "pdf",
+                "split_long_chapter",
+                "info_html",
+                "toc_html",
+                "language",
+                "publisher",
+                "published_at",
+                "raw_json",
             ][..],
         ),
     ];
@@ -589,10 +612,11 @@ impl Storage {
 
     /// 系统设置读取（无则 None）
     pub async fn get_system_setting(&self, key: &str) -> Result<Option<String>> {
-        let r: Option<(String,)> = sqlx::query_as("SELECT value FROM system_settings WHERE key = ?1")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
+        let r: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM system_settings WHERE key = ?1")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(r.map(|x| x.0))
     }
 
@@ -631,7 +655,8 @@ impl Storage {
     /// OPDS 独立账号写入（password 为已生成的 `salt$hash` 存储串）
     pub async fn set_opds_account(&self, username: &str, stored_password: &str) -> Result<()> {
         self.set_system_setting("opds_username", username).await?;
-        self.set_system_setting("opds_password", stored_password).await?;
+        self.set_system_setting("opds_password", stored_password)
+            .await?;
         Ok(())
     }
 
@@ -708,12 +733,20 @@ impl Storage {
     }
 
     /// 保存书源（INSERT OR REPLACE；raw_json 按 camelCase 重新序列化，与 bookSource.json 字段名一致）
-    pub async fn save_book_source(&self, ns: &str, source: &crate::model::BookSource) -> Result<()> {
+    pub async fn save_book_source(
+        &self,
+        ns: &str,
+        source: &crate::model::BookSource,
+    ) -> Result<()> {
         upsert_book_source(&self.pool, ns, source).await
     }
 
     /// 批量保存书源（单事务：全部成功或全部回滚）
-    pub async fn save_book_sources(&self, ns: &str, sources: &[crate::model::BookSource]) -> Result<()> {
+    pub async fn save_book_sources(
+        &self,
+        ns: &str,
+        sources: &[crate::model::BookSource],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for source in sources {
             upsert_book_source(&mut *tx, ns, source).await?;
@@ -733,11 +766,13 @@ impl Storage {
         .bind(url)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM book_source_cookies WHERE user_namespace = ?1 AND source_url = ?2")
-            .bind(ns)
-            .bind(url)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "DELETE FROM book_source_cookies WHERE user_namespace = ?1 AND source_url = ?2",
+        )
+        .bind(ns)
+        .bind(url)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(r.rows_affected())
     }
@@ -756,7 +791,9 @@ impl Storage {
         let sources = self.get_book_sources(ns).await?;
         let mut groups: Vec<String> = Vec::new();
         for s in sources {
-            let Some(group) = s.book_source_group else { continue };
+            let Some(group) = s.book_source_group else {
+                continue;
+            };
             for part in group.split_whitespace() {
                 if !groups.iter().any(|g| g == part) {
                     groups.push(part.to_string());
@@ -767,7 +804,12 @@ impl Storage {
     }
 
     /// 启停书源（按 URL 精确匹配，仅限本命名空间）；返回受影响行数
-    pub async fn update_book_source_enabled(&self, ns: &str, url: &str, enabled: bool) -> Result<u64> {
+    pub async fn update_book_source_enabled(
+        &self,
+        ns: &str,
+        url: &str,
+        enabled: bool,
+    ) -> Result<u64> {
         let r = sqlx::query(
             "UPDATE book_sources SET enabled = ?1 WHERE user_namespace = ?2 AND book_source_url = ?3",
         )
@@ -840,7 +882,12 @@ impl Storage {
     }
 
     /// 记录书源 user_agent（FlareSolverr 返回 UA 与库中不同时更新——部分站点 UA 绑定 cookie）
-    pub async fn set_cookie_user_agent(&self, ns: &str, source_url: &str, user_agent: &str) -> Result<()> {
+    pub async fn set_cookie_user_agent(
+        &self,
+        ns: &str,
+        source_url: &str,
+        user_agent: &str,
+    ) -> Result<()> {
         if user_agent.trim().is_empty() {
             return Ok(());
         }
@@ -871,7 +918,7 @@ impl Storage {
         .bind(source_url)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(r.map(|(c, ua)| (c, ua)))
+        Ok(r)
     }
 
     /// 按 baseUrl 匹配书源 cookie（crawler 抓取用：请求 URL 的 base 与书源
@@ -890,7 +937,9 @@ impl Storage {
             if cookie.is_empty() {
                 continue;
             }
-            let any_match = source_url.split("##").any(|part| normalize_base(part) == target);
+            let any_match = source_url
+                .split("##")
+                .any(|part| normalize_base(part) == target);
             if any_match {
                 return Ok(Some(cookie));
             }
@@ -974,7 +1023,11 @@ impl Storage {
 
     /// 批量保存 RSS 文章（单事务，INSERT ... ON CONFLICT 按 url 主键去重更新；
     /// 更新时不触碰 read 列——feed 刷新重新入库不清除已读标记）
-    pub async fn save_rss_articles(&self, ns: &str, articles: &[crate::model::RssArticle]) -> Result<()> {
+    pub async fn save_rss_articles(
+        &self,
+        ns: &str,
+        articles: &[crate::model::RssArticle],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for a in articles {
             sqlx::query(
@@ -1041,19 +1094,17 @@ impl Storage {
         let toc_cache_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM toc_cache")
             .fetch_one(&self.pool)
             .await?;
-        let toc_cache_size: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(length(chapters_json)), 0) FROM toc_cache",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let toc_cache_size: i64 =
+            sqlx::query_scalar("SELECT COALESCE(SUM(length(chapters_json)), 0) FROM toc_cache")
+                .fetch_one(&self.pool)
+                .await?;
         let chapter_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters")
             .fetch_one(&self.pool)
             .await?;
-        let chapter_size: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(length(content)), 0) FROM book_chapters",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let chapter_size: i64 =
+            sqlx::query_scalar("SELECT COALESCE(SUM(length(content)), 0) FROM book_chapters")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(CacheInfo {
             toc_cache_count,
             toc_cache_size,
@@ -1106,10 +1157,11 @@ impl Storage {
 
     /// 单书缓存信息：(章节数, 正文近似大小 sum length(content))
     pub async fn book_cache_info(&self, book_url: &str) -> Result<(i64, i64)> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1")
-            .bind(book_url)
-            .fetch_one(&self.pool)
-            .await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1")
+                .bind(book_url)
+                .fetch_one(&self.pool)
+                .await?;
         let size: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(length(content)), 0) FROM book_chapters WHERE book_url = ?1",
         )
@@ -1257,7 +1309,10 @@ impl Storage {
     }
 
     /// 本地书章节列表（含字数：SQLite length() 对 TEXT 按字符数统计正文，避免整章内容回传）
-    pub async fn list_chapters_with_word_count(&self, book_url: &str) -> Result<Vec<(i64, String, i64)>> {
+    pub async fn list_chapters_with_word_count(
+        &self,
+        book_url: &str,
+    ) -> Result<Vec<(i64, String, i64)>> {
         let rows = sqlx::query_as::<_, (i64, String, i64)>(
             "SELECT chapter_index, title, length(content) FROM book_chapters WHERE book_url = ?1 ORDER BY chapter_index",
         )
@@ -1346,7 +1401,9 @@ impl Storage {
     /// 且删除后无其他书引用同一路径时删除文件（最佳努力，失败仅告警）
     async fn cleanup_orphan_cover(&self, ns: &str, cover_url: Option<&str>) {
         let Some(cover_url) = cover_url else { return };
-        let Some(file) = cover_file_name(ns, cover_url) else { return };
+        let Some(file) = cover_file_name(ns, cover_url) else {
+            return;
+        };
         // 其他书（本命名空间内）是否仍引用同一封面
         let refs: i64 = match sqlx::query_scalar(
             "SELECT COUNT(*) FROM books WHERE user_namespace = ?1 AND cover_url = ?2",
@@ -1478,7 +1535,7 @@ impl Storage {
         .bind(b.origin_order)
         .bind(b.use_replace_rule)
         .bind(&b.variable)
-        .bind(&b.read_config.as_ref().map(|v| v.to_string()))
+        .bind(b.read_config.as_ref().map(|v| v.to_string()))
         .bind(b.is_in_shelf)
         .bind(b.cbz)
         .bind(&b.display_cover)
@@ -1519,7 +1576,11 @@ impl Storage {
         let mut first = true;
         let mut any = false;
         for (key, value) in patch {
-            let Some(col) = BOOK_PATCH_COLUMNS.iter().find(|(k, _)| k == key).map(|(_, c)| *c) else {
+            let Some(col) = BOOK_PATCH_COLUMNS
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, c)| *c)
+            else {
                 continue;
             };
             if !first {
@@ -1566,7 +1627,12 @@ impl Storage {
     }
 
     /// F-10 目录缓存写入（getBookToc 成功后调用）
-    pub async fn cache_toc(&self, book_url: &str, toc_url: &str, chapters_json: &str) -> Result<()> {
+    pub async fn cache_toc(
+        &self,
+        book_url: &str,
+        toc_url: &str,
+        chapters_json: &str,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO toc_cache (book_url, toc_url, chapters_json, updated_at)              VALUES (?1, ?2, ?3, ?4)",
         )
@@ -1609,7 +1675,11 @@ impl Storage {
     }
 
     /// 某书的书签列表（按创建时间倒序）
-    pub async fn list_bookmarks(&self, ns: &str, book_url: &str) -> Result<Vec<crate::model::Bookmark>> {
+    pub async fn list_bookmarks(
+        &self,
+        ns: &str,
+        book_url: &str,
+    ) -> Result<Vec<crate::model::Bookmark>> {
         let rows = sqlx::query_as::<_, crate::model::Bookmark>(
             "SELECT * FROM bookmarks WHERE user_namespace = ?1 AND book_url = ?2              ORDER BY created_at DESC, rowid DESC",
         )
@@ -1645,7 +1715,11 @@ impl Storage {
     }
 
     /// 保存分组：id > 0 按 id 覆盖，否则自增新建；返回带 id 的分组
-    pub async fn save_book_group(&self, ns: &str, group: &crate::model::BookGroup) -> Result<crate::model::BookGroup> {
+    pub async fn save_book_group(
+        &self,
+        ns: &str,
+        group: &crate::model::BookGroup,
+    ) -> Result<crate::model::BookGroup> {
         let mut g = group.clone();
         g.user_namespace = ns.to_string();
         if g.id > 0 {
@@ -1698,37 +1772,40 @@ impl Storage {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, name, order, book_count)| crate::model::BookGroupWithCount {
-                id,
-                name,
-                order,
-                order_num: order,
-                book_count,
-            })
+            .map(
+                |(id, name, order, book_count)| crate::model::BookGroupWithCount {
+                    id,
+                    name,
+                    order,
+                    order_num: order,
+                    book_count,
+                },
+            )
             .collect())
     }
 
     /// 分组重命名（仅改 name，保留 order 与 id；不存在返回 0 行）
     pub async fn rename_book_group(&self, ns: &str, id: i64, name: &str) -> Result<u64> {
-        let r = sqlx::query(
-            "UPDATE book_groups SET name = ?3 WHERE user_namespace = ?1 AND id = ?2",
-        )
-        .bind(ns)
-        .bind(id)
-        .bind(name)
-        .execute(&self.pool)
-        .await?;
+        let r =
+            sqlx::query("UPDATE book_groups SET name = ?3 WHERE user_namespace = ?1 AND id = ?2")
+                .bind(ns)
+                .bind(id)
+                .bind(name)
+                .execute(&self.pool)
+                .await?;
         Ok(r.rows_affected())
     }
 
     /// 删除分组（事务：组内书 group_name 置 0 后删分组）；返回删除的分组行数
     pub async fn delete_book_group(&self, ns: &str, id: i64) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE books SET group_name = 0 WHERE user_namespace = ?1 AND group_name = ?2")
-            .bind(ns)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE books SET group_name = 0 WHERE user_namespace = ?1 AND group_name = ?2",
+        )
+        .bind(ns)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         let r = sqlx::query("DELETE FROM book_groups WHERE user_namespace = ?1 AND id = ?2")
             .bind(ns)
             .bind(id)
@@ -1806,7 +1883,8 @@ impl Storage {
         if book_urls.is_empty() {
             return Ok(0);
         }
-        let mut qb = sqlx::QueryBuilder::new("UPDATE books SET group_name = 0 WHERE user_namespace = ");
+        let mut qb =
+            sqlx::QueryBuilder::new("UPDATE books SET group_name = 0 WHERE user_namespace = ");
         qb.push_bind(ns).push(" AND book_url IN (");
         let mut sep = qb.separated(", ");
         for url in book_urls {
@@ -1837,7 +1915,11 @@ impl Storage {
     }
 
     /// 批量保存书签（单事务，INSERT OR REPLACE 按 book_url+title 主键去重）
-    pub async fn save_bookmarks(&self, ns: &str, bookmarks: &[crate::model::Bookmark]) -> Result<()> {
+    pub async fn save_bookmarks(
+        &self,
+        ns: &str,
+        bookmarks: &[crate::model::Bookmark],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for b in bookmarks {
             sqlx::query(
@@ -1876,7 +1958,11 @@ impl Storage {
     }
 
     /// 批量保存 RSS 源（单事务，INSERT OR REPLACE 按 rss_source_url 主键覆盖）
-    pub async fn save_rss_sources(&self, ns: &str, sources: &[crate::model::RssSource]) -> Result<()> {
+    pub async fn save_rss_sources(
+        &self,
+        ns: &str,
+        sources: &[crate::model::RssSource],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for s in sources {
             sqlx::query(
@@ -1899,13 +1985,12 @@ impl Storage {
 
     /// 读取用户配置（无则 None）
     pub async fn get_user_config(&self, ns: &str, key: &str) -> Result<Option<String>> {
-        let r: Option<(String,)> = sqlx::query_as(
-            "SELECT config FROM user_config WHERE user_namespace = ?1 AND ns = ?2",
-        )
-        .bind(ns)
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
+        let r: Option<(String,)> =
+            sqlx::query_as("SELECT config FROM user_config WHERE user_namespace = ?1 AND ns = ?2")
+                .bind(ns)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(r.map(|x| x.0))
     }
 
@@ -2044,7 +2129,11 @@ impl Storage {
     }
 
     /// 保存单条替换规则（INSERT OR REPLACE，按 id 主键覆盖）
-    pub async fn save_replace_rule(&self, ns: &str, rule: &crate::model::ReplaceRule) -> Result<()> {
+    pub async fn save_replace_rule(
+        &self,
+        ns: &str,
+        rule: &crate::model::ReplaceRule,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO replace_rules (id, name, find, replace, enable, order_num, user_namespace)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
@@ -2061,7 +2150,11 @@ impl Storage {
     }
 
     /// 批量保存替换规则（单事务：全部成功或全部回滚）
-    pub async fn save_replace_rules(&self, ns: &str, rules: &[crate::model::ReplaceRule]) -> Result<()> {
+    pub async fn save_replace_rules(
+        &self,
+        ns: &str,
+        rules: &[crate::model::ReplaceRule],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for rule in rules {
             sqlx::query(
@@ -2155,7 +2248,11 @@ impl Storage {
     }
 
     /// 批量保存 HttpTTS（单事务：全部成功或全部回滚）
-    pub async fn save_http_tts_multi(&self, ns: &str, items: &[crate::model::HttpTts]) -> Result<()> {
+    pub async fn save_http_tts_multi(
+        &self,
+        ns: &str,
+        items: &[crate::model::HttpTts],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for tts in items {
             sqlx::query(
@@ -2444,7 +2541,11 @@ impl Storage {
     }
 
     /// 替换本地书全部章节（重扫用：事务内先删后插——旧章残留清理，新章序从 0 开始）
-    pub async fn replace_chapters(&self, book_url: &str, chapters: &[(String, String)]) -> Result<()> {
+    pub async fn replace_chapters(
+        &self,
+        book_url: &str,
+        chapters: &[(String, String)],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
             .bind(book_url)
@@ -2477,18 +2578,25 @@ impl Storage {
     }
 
     /// 更新封面 URL（导入后写封面文件）
-    pub async fn update_book_cover(&self, ns: &str, book_url: &str, cover_url: &str) -> Result<u64> {
-        let r = sqlx::query("UPDATE books SET cover_url = ?3 WHERE user_namespace = ?1 AND book_url = ?2")
-            .bind(ns)
-            .bind(book_url)
-            .bind(cover_url)
-            .execute(&self.pool)
-            .await?;
+    pub async fn update_book_cover(
+        &self,
+        ns: &str,
+        book_url: &str,
+        cover_url: &str,
+    ) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE books SET cover_url = ?3 WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .bind(cover_url)
+        .execute(&self.pool)
+        .await?;
         Ok(r.rows_affected())
     }
 
     /// 本地书入库（books + 章节）
-        /// 用户总数（注册上限校验）
+    /// 用户总数（注册上限校验）
     pub async fn count_users(&self) -> Result<i64> {
         let count = sqlx::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(&self.pool)
@@ -2547,7 +2655,12 @@ impl Storage {
     }
 
     /// 登录成功：刷新 token + last_login_at
-    pub async fn update_user_session(&self, username: &str, token: &str, last_login_at: i64) -> Result<()> {
+    pub async fn update_user_session(
+        &self,
+        username: &str,
+        token: &str,
+        last_login_at: i64,
+    ) -> Result<()> {
         sqlx::query("UPDATE users SET token = ?1, last_login_at = ?2 WHERE username = ?3")
             .bind(token)
             .bind(last_login_at)
@@ -2560,19 +2673,26 @@ impl Storage {
     // ---------------- GAP 59 多设备 token（users.token_map） ----------------
 
     /// 登录：追加 token 到 token_map（JSON 数组，上限 5，最旧被丢），同时刷新主 token 与 last_login_at
-    pub async fn add_user_token(&self, username: &str, token: &str, last_login_at: i64) -> Result<()> {
+    pub async fn add_user_token(
+        &self,
+        username: &str,
+        token: &str,
+        last_login_at: i64,
+    ) -> Result<()> {
         let user = self.find_user(username).await?;
         let map_json = crate::model::user::token_map_push(
             &user.as_ref().and_then(|u| u.token_map.clone()),
             token,
         );
-        sqlx::query("UPDATE users SET token = ?1, token_map = ?2, last_login_at = ?3 WHERE username = ?4")
-            .bind(token)
-            .bind(&map_json)
-            .bind(last_login_at)
-            .bind(username)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE users SET token = ?1, token_map = ?2, last_login_at = ?3 WHERE username = ?4",
+        )
+        .bind(token)
+        .bind(&map_json)
+        .bind(last_login_at)
+        .bind(username)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -2581,8 +2701,7 @@ impl Storage {
     pub async fn remove_user_token(&self, username: &str, token: &str) -> Result<u64> {
         let user = self.find_user(username).await?;
         let Some(user) = user else { return Ok(0) };
-        let (map_json, removed) =
-            crate::model::user::token_map_remove(&user.token_map, token);
+        let (map_json, removed) = crate::model::user::token_map_remove(&user.token_map, token);
         let clear_main = !user.token.is_empty() && user.token == token;
         let main_token = if clear_main { "" } else { user.token.as_str() };
         sqlx::query("UPDATE users SET token = ?1, token_map = ?2 WHERE username = ?3")
@@ -2614,23 +2733,20 @@ impl Storage {
 
     /// 某命名空间现有书源数（仅用户自有书源，不含 default 回退）
     pub async fn count_book_sources(&self, ns: &str) -> Result<i64> {
-        let count = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM book_sources WHERE user_namespace = ?1",
-        )
-        .bind(ns)
-        .fetch_one(&self.pool)
-        .await?;
+        let count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM book_sources WHERE user_namespace = ?1")
+                .bind(ns)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(count)
     }
 
     /// 用户书源上限（users.book_source_limit；用户不存在返回 None——非 secure 模式不限制）
     pub async fn book_source_limit_for(&self, ns: &str) -> Result<Option<i64>> {
-        let limit = sqlx::query_scalar(
-            "SELECT book_source_limit FROM users WHERE username = ?1",
-        )
-        .bind(ns)
-        .fetch_optional(&self.pool)
-        .await?;
+        let limit = sqlx::query_scalar("SELECT book_source_limit FROM users WHERE username = ?1")
+            .bind(ns)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(limit)
     }
 
@@ -2648,7 +2764,11 @@ impl Storage {
     /// F-34 清理不活跃用户：删除 last_login_at < before_ms 的 users 行（简化：仅删用户行，
     /// 用户数据目录/命名空间数据保留；except 用户受保护不删）。返回被删用户名列表
     /// GAP #95：清理不活跃用户（users 行 + 用户级数据行 + 数据目录；except 用户除外）
-    pub async fn clear_inactive_users(&self, before_ms: i64, except: Option<&str>) -> Result<Vec<String>> {
+    pub async fn clear_inactive_users(
+        &self,
+        before_ms: i64,
+        except: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
         let rows: Vec<String> =
             sqlx::query_scalar("SELECT username FROM users WHERE last_login_at < ?1")
@@ -2794,12 +2914,14 @@ impl Storage {
         salt: &str,
         encrypted_password: &str,
     ) -> Result<u64> {
-        let r = sqlx::query("UPDATE users SET password = ?1, salt = ?2, token = '' WHERE username = ?3")
-            .bind(encrypted_password)
-            .bind(salt)
-            .bind(username)
-            .execute(&self.pool)
-            .await?;
+        let r = sqlx::query(
+            "UPDATE users SET password = ?1, salt = ?2, token = '' WHERE username = ?3",
+        )
+        .bind(encrypted_password)
+        .bind(salt)
+        .bind(username)
+        .execute(&self.pool)
+        .await?;
         Ok(r.rows_affected())
     }
 
@@ -2872,11 +2994,31 @@ impl Storage {
 
         let file = std::fs::File::create(&zip_path)?;
         let mut writer = zip::ZipWriter::new(file);
-        write_zip_entry(&mut writer, "bookshelf.json", &serde_json::to_vec_pretty(&books)?)?;
-        write_zip_entry(&mut writer, "bookSource.json", &serde_json::to_vec_pretty(&sources)?)?;
-        write_zip_entry(&mut writer, "bookmark.json", &serde_json::to_vec_pretty(&bookmarks)?)?;
-        write_zip_entry(&mut writer, "bookGroup.json", &serde_json::to_vec_pretty(&groups)?)?;
-        write_zip_entry(&mut writer, "rssSources.json", &serde_json::to_vec_pretty(&rss_sources)?)?;
+        write_zip_entry(
+            &mut writer,
+            "bookshelf.json",
+            &serde_json::to_vec_pretty(&books)?,
+        )?;
+        write_zip_entry(
+            &mut writer,
+            "bookSource.json",
+            &serde_json::to_vec_pretty(&sources)?,
+        )?;
+        write_zip_entry(
+            &mut writer,
+            "bookmark.json",
+            &serde_json::to_vec_pretty(&bookmarks)?,
+        )?;
+        write_zip_entry(
+            &mut writer,
+            "bookGroup.json",
+            &serde_json::to_vec_pretty(&groups)?,
+        )?;
+        write_zip_entry(
+            &mut writer,
+            "rssSources.json",
+            &serde_json::to_vec_pretty(&rss_sources)?,
+        )?;
         writer.finish()?;
 
         tracing::info!("备份完成 [{ns}]: {}", zip_path.display());
@@ -2956,7 +3098,8 @@ impl Storage {
         let mut archive = zip::ZipArchive::new(cursor)
             .map_err(|e| anyhow::anyhow!("备份文件不是有效的 zip：{e}"))?;
         // 预读全部条目到内存（zip 读取是同步 IO，避免跨 await 持有 archive）
-        let mut entries: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        let mut entries: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
         use std::io::Read;
         for i in 0..archive.len() {
             let mut f = archive.by_index(i)?;
@@ -3166,7 +3309,8 @@ impl Storage {
             match serde_json::from_slice::<serde_json::Value>(bytes) {
                 Ok(serde_json::Value::Array(arr)) => {
                     for v in arr {
-                        let mut s: crate::model::RssSource = match serde_json::from_value(v.clone()) {
+                        let mut s: crate::model::RssSource = match serde_json::from_value(v.clone())
+                        {
                             Ok(s) => s,
                             Err(_) => {
                                 report.skipped.rss += 1;
@@ -3398,7 +3542,9 @@ pub async fn run_shelf_update(storage: &Storage) -> Result<usize> {
         else {
             continue;
         };
-        match crate::service::book::analyze_toc(&book.user_namespace, &book.toc_url, &source, 20).await {
+        match crate::service::book::analyze_toc(&book.user_namespace, &book.toc_url, &source, 20)
+            .await
+        {
             Ok(chapters) if !chapters.is_empty() => {
                 let non_volume: Vec<&crate::model::book_chapter::BookChapter> =
                     chapters.iter().filter(|c| !c.is_volume).collect();
@@ -3503,11 +3649,7 @@ async fn ensure_column(pool: &SqlitePool, table: &str, column: &str) -> anyhow::
 fn cover_file_name(ns: &str, cover_url: &str) -> Option<String> {
     let prefix = format!("/assets/{ns}/covers/");
     let file = cover_url.strip_prefix(&prefix)?;
-    if file.is_empty()
-        || file.contains('/')
-        || file.contains('\\')
-        || file.contains("..")
-    {
+    if file.is_empty() || file.contains('/') || file.contains('\\') || file.contains("..") {
         return None;
     }
     Some(file.to_string())
@@ -3520,9 +3662,11 @@ async fn ensure_column_typed(
     column: &str,
     sql_type: &str,
 ) -> anyhow::Result<()> {
-    let row: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"))
-        .fetch_one(pool)
-        .await?;
+    let row: (i64,) = sqlx::query_as(&format!(
+        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"
+    ))
+    .fetch_one(pool)
+    .await?;
     if row.0 == 0 {
         let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}");
         sqlx::query(&sql).execute(pool).await?;
@@ -3622,7 +3766,11 @@ async fn rebuild_books_bool_columns(pool: &SqlitePool) -> anyhow::Result<()> {
 /// 用 INSERT ... ON CONFLICT DO UPDATE 而非 INSERT OR REPLACE：
 /// REPLACE 会先删后插，未列出的列（use_count/use_ts 使用统计）会被重置为默认值；
 /// DO UPDATE 只覆盖客户端字段，统计列保持不变（客户端保存/导入不会清零计数）。
-async fn upsert_book_source<'e, E>(executor: E, ns: &str, source: &crate::model::BookSource) -> Result<()>
+async fn upsert_book_source<'e, E>(
+    executor: E,
+    ns: &str,
+    source: &crate::model::BookSource,
+) -> Result<()>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
@@ -3802,10 +3950,8 @@ mod tests {
 
     /// 独立临时目录初始化存储（避免污染真实 storage/reader.db）
     async fn test_storage(tag: &str) -> Storage {
-        let dir = std::env::temp_dir().join(format!(
-            "reader-storage-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reader-storage-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = AppConfig::from_env();
         config.work_dir = dir.to_string_lossy().into_owned();
@@ -3815,10 +3961,8 @@ mod tests {
     /// 释放连接池并清理临时目录
     async fn cleanup(storage: Storage, tag: &str) {
         storage.pool.close().await;
-        let dir = std::env::temp_dir().join(format!(
-            "reader-storage-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reader-storage-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3851,13 +3995,22 @@ mod tests {
         assert_eq!(got.book_source_name, "A源");
         assert_eq!(got.book_source_group.as_deref(), Some("小说 玄幻"));
         assert_eq!(got.user_namespace, "default");
-        assert_eq!(got.rule_search, Some(serde_json::json!({ "bookList": "$.data" })));
+        assert_eq!(
+            got.rule_search,
+            Some(serde_json::json!({ "bookList": "$.data" }))
+        );
 
         // raw_json：camelCase、含规则字段、可反序列化回 BookSource
         let raw = got.raw_json.as_deref().expect("raw_json 应已写入");
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        assert!(v.get("bookSourceUrl").is_some(), "raw_json 应为 camelCase: {raw}");
-        assert!(v.get("book_source_url").is_none(), "raw_json 不应含 snake_case: {raw}");
+        assert!(
+            v.get("bookSourceUrl").is_some(),
+            "raw_json 应为 camelCase: {raw}"
+        );
+        assert!(
+            v.get("book_source_url").is_none(),
+            "raw_json 不应含 snake_case: {raw}"
+        );
         assert!(v.get("bookSourceName").is_some());
         assert_eq!(v["enabled"], serde_json::Value::Bool(true));
         let roundtrip: BookSource = serde_json::from_str(raw).unwrap();
@@ -3876,7 +4029,10 @@ mod tests {
         assert!(!got2.enabled);
 
         // 删除 → 查不到
-        let affected = storage.delete_book_source("default", "https://a.com").await.unwrap();
+        let affected = storage
+            .delete_book_source("default", "https://a.com")
+            .await
+            .unwrap();
         assert_eq!(affected, 1);
         assert!(storage
             .get_book_source("default", "https://a.com")
@@ -3938,11 +4094,17 @@ mod tests {
             source("https://c.com", "C", None),
             source("https://d.com", "D", Some("")),
         ];
-        storage.save_book_sources("default", &sources).await.unwrap();
+        storage
+            .save_book_sources("default", &sources)
+            .await
+            .unwrap();
 
         let all = storage.get_book_sources("default").await.unwrap();
         assert_eq!(all.len(), 4);
-        assert!(all.iter().all(|s| s.raw_json.is_some()), "批量保存应写入 raw_json");
+        assert!(
+            all.iter().all(|s| s.raw_json.is_some()),
+            "批量保存应写入 raw_json"
+        );
 
         // 保序去重；空串/None 分组不产生条目
         let groups = storage.list_book_source_groups("default").await.unwrap();
@@ -4070,8 +4232,14 @@ mod tests {
         let db_path = dir.join("storage").join("reader.db");
         std::fs::create_dir_all(dir.join("storage")).unwrap();
         {
-            let opts = SqliteConnectOptions::new().filename(&db_path).create_if_missing(true);
-            let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+            let opts = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
             sqlx::query(
                 "CREATE TABLE books (
                     book_url TEXT PRIMARY KEY, name TEXT DEFAULT '', author TEXT DEFAULT '',
@@ -4106,13 +4274,21 @@ mod tests {
             .update_book_progress("default", "https://old.com/a", Some("第1章"), 0, 0, 1)
             .await
             .unwrap();
-        let again = storage.find_book("default", "https://old.com/a").await.unwrap().unwrap();
+        let again = storage
+            .find_book("default", "https://old.com/a")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(again.dur_chapter_title.as_deref(), Some("第1章"));
         assert!(again.local_epub);
 
         // 3. 幂等：再次 init 不报错、不重复重建
         let storage2 = init(&config).await.unwrap();
-        assert!(storage2.find_book("default", "https://old.com/a").await.unwrap().is_some());
+        assert!(storage2
+            .find_book("default", "https://old.com/a")
+            .await
+            .unwrap()
+            .is_some());
 
         storage.pool.close().await;
         storage2.pool.close().await;
@@ -4141,7 +4317,10 @@ mod tests {
         assert_eq!(bob[0].book_source_name, "默认源");
         // 删除只影响本命名空间
         assert_eq!(
-            storage.delete_book_source("alice", "https://b.com").await.unwrap(),
+            storage
+                .delete_book_source("alice", "https://b.com")
+                .await
+                .unwrap(),
             1
         );
         assert!(storage
@@ -4169,12 +4348,14 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert!(!storage
-            .get_book_source("default", "https://a.com")
-            .await
-            .unwrap()
-            .unwrap()
-            .enabled);
+        assert!(
+            !storage
+                .get_book_source("default", "https://a.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
 
         cleanup(storage, "ns").await;
     }
@@ -4200,13 +4381,20 @@ mod tests {
     async fn test_book_save_progress_flow() {
         let storage = test_storage("book").await;
         let url = "https://book.com/a";
-        assert!(storage.find_book("default", url).await.unwrap().is_none(), "初始不在书架");
+        assert!(
+            storage.find_book("default", url).await.unwrap().is_none(),
+            "初始不在书架"
+        );
 
         // F-9 新增入架（全量 INSERT）
         let mut book = shelf_book(url, "书名");
         book.total_chapter_num = 100;
         storage.upsert_book("default", &book).await.unwrap();
-        let got = storage.find_book("default", url).await.unwrap().expect("入架后应可查到");
+        let got = storage
+            .find_book("default", url)
+            .await
+            .unwrap()
+            .expect("入架后应可查到");
         assert_eq!(got.name, "书名");
         assert_eq!(got.origin, "https://src.com");
         assert_eq!(got.total_chapter_num, 100);
@@ -4230,10 +4418,19 @@ mod tests {
         assert_eq!(got2.total_chapter_num, 100, "未提供的字段应保持原值");
         // 未知键忽略 + 空 patch → 0 行
         let junk: serde_json::Map<String, serde_json::Value> =
-            serde_json::json!({ "unknownKey": 1 }).as_object().unwrap().clone();
+            serde_json::json!({ "unknownKey": 1 })
+                .as_object()
+                .unwrap()
+                .clone();
         assert_eq!(storage.patch_book("default", url, &junk).await.unwrap(), 0);
         // 不存在的书 patch → 0 行
-        assert_eq!(storage.patch_book("default", "https://nope.com", &patch).await.unwrap(), 0);
+        assert_eq!(
+            storage
+                .patch_book("default", "https://nope.com", &patch)
+                .await
+                .unwrap(),
+            0
+        );
 
         // F-9 覆盖：upsert 全字段更新
         let mut book2 = shelf_book(url, "书名v3");
@@ -4279,14 +4476,39 @@ mod tests {
     async fn test_toc_cache_roundtrip() {
         let storage = test_storage("toccache").await;
         let toc_url = "https://book.com/toc";
-        assert!(storage.get_toc_cache(toc_url, 300_000).await.unwrap().is_none(), "未缓存时应未命中");
+        assert!(
+            storage
+                .get_toc_cache(toc_url, 300_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "未缓存时应未命中"
+        );
 
-        storage.cache_toc(toc_url, toc_url, r#"[{"title":"第一章","url":"https://book.com/1"}]"#).await.unwrap();
-        let cached = storage.get_toc_cache(toc_url, 300_000).await.unwrap().expect("缓存后应命中");
+        storage
+            .cache_toc(
+                toc_url,
+                toc_url,
+                r#"[{"title":"第一章","url":"https://book.com/1"}]"#,
+            )
+            .await
+            .unwrap();
+        let cached = storage
+            .get_toc_cache(toc_url, 300_000)
+            .await
+            .unwrap()
+            .expect("缓存后应命中");
         assert!(cached.contains("第一章"));
         // 同 book_url 覆盖写
-        storage.cache_toc(toc_url, toc_url, r#"[{"title":"新目录"}]"#).await.unwrap();
-        let cached2 = storage.get_toc_cache(toc_url, 300_000).await.unwrap().unwrap();
+        storage
+            .cache_toc(toc_url, toc_url, r#"[{"title":"新目录"}]"#)
+            .await
+            .unwrap();
+        let cached2 = storage
+            .get_toc_cache(toc_url, 300_000)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(cached2.contains("新目录"));
         // 过期（把 updated_at 置 0）→ 未命中
         sqlx::query("UPDATE toc_cache SET updated_at = 0 WHERE book_url = ?1")
@@ -4294,7 +4516,14 @@ mod tests {
             .execute(&storage.pool)
             .await
             .unwrap();
-        assert!(storage.get_toc_cache(toc_url, 300_000).await.unwrap().is_none(), "TTL 过期应未命中");
+        assert!(
+            storage
+                .get_toc_cache(toc_url, 300_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "TTL 过期应未命中"
+        );
 
         cleanup(storage, "toccache").await;
     }
@@ -4314,14 +4543,17 @@ mod tests {
         };
         storage.save_bookmark("default", &bm).await.unwrap();
         storage
-            .save_bookmark("default", &crate::model::Bookmark {
-                book_url: url.into(),
-                title: "标记2".into(),
-                paragraph_index: 7,
-                chapter_index: 1,
-                created_at: 2000,
-                ..Default::default()
-            })
+            .save_bookmark(
+                "default",
+                &crate::model::Bookmark {
+                    book_url: url.into(),
+                    title: "标记2".into(),
+                    paragraph_index: 7,
+                    chapter_index: 1,
+                    created_at: 2000,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -4330,19 +4562,30 @@ mod tests {
         assert_eq!(list[0].title, "标记2", "按创建时间倒序");
         assert_eq!(list[1].paragraph_index, 42);
         // 他书/他命名空间隔离
-        assert!(storage.list_bookmarks("default", "https://other.com").await.unwrap().is_empty());
-        assert!(storage.list_bookmarks("alice", url).await.unwrap().is_empty());
+        assert!(storage
+            .list_bookmarks("default", "https://other.com")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .list_bookmarks("alice", url)
+            .await
+            .unwrap()
+            .is_empty());
 
         // 同 title 覆盖保存
         storage
-            .save_bookmark("default", &crate::model::Bookmark {
-                book_url: url.into(),
-                title: "标记1".into(),
-                paragraph_index: 99,
-                chapter_index: 3,
-                created_at: 3000,
-                ..Default::default()
-            })
+            .save_bookmark(
+                "default",
+                &crate::model::Bookmark {
+                    book_url: url.into(),
+                    title: "标记1".into(),
+                    paragraph_index: 99,
+                    chapter_index: 3,
+                    created_at: 3000,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let list2 = storage.list_bookmarks("default", url).await.unwrap();
@@ -4350,9 +4593,24 @@ mod tests {
         assert_eq!(list2[0].paragraph_index, 99);
 
         // 删除
-        assert_eq!(storage.delete_bookmark("default", url, "标记1").await.unwrap(), 1);
-        assert_eq!(storage.list_bookmarks("default", url).await.unwrap().len(), 1);
-        assert_eq!(storage.delete_bookmark("default", url, "不存在").await.unwrap(), 0);
+        assert_eq!(
+            storage
+                .delete_bookmark("default", url, "标记1")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage.list_bookmarks("default", url).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .delete_bookmark("default", url, "不存在")
+                .await
+                .unwrap(),
+            0
+        );
 
         cleanup(storage, "bookmark").await;
     }
@@ -4362,20 +4620,26 @@ mod tests {
     async fn test_book_group_flow() {
         let storage = test_storage("bookgroup").await;
         let g1 = storage
-            .save_book_group("default", &crate::model::BookGroup {
-                name: "玄幻".into(),
-                order: 1,
-                ..Default::default()
-            })
+            .save_book_group(
+                "default",
+                &crate::model::BookGroup {
+                    name: "玄幻".into(),
+                    order: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(g1.id > 0, "新建应返回自增 id");
         let g2 = storage
-            .save_book_group("default", &crate::model::BookGroup {
-                name: "言情".into(),
-                order: 2,
-                ..Default::default()
-            })
+            .save_book_group(
+                "default",
+                &crate::model::BookGroup {
+                    name: "言情".into(),
+                    order: 2,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(g2.id > g1.id);
@@ -4388,12 +4652,15 @@ mod tests {
 
         // 按 id 覆盖（改名 + 排序）
         let updated = storage
-            .save_book_group("default", &crate::model::BookGroup {
-                id: g1.id,
-                name: "玄幻v2".into(),
-                order: 5,
-                ..Default::default()
-            })
+            .save_book_group(
+                "default",
+                &crate::model::BookGroup {
+                    id: g1.id,
+                    name: "玄幻v2".into(),
+                    order: 5,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.id, g1.id);
@@ -4403,10 +4670,33 @@ mod tests {
 
         // 书设分组（books.group_name）
         let url = "https://book.com/a";
-        storage.upsert_book("default", &shelf_book(url, "书名")).await.unwrap();
-        assert_eq!(storage.update_book_group_id("default", url, g1.id).await.unwrap(), 1);
-        assert_eq!(storage.find_book("default", url).await.unwrap().unwrap().group, g1.id);
-        assert_eq!(storage.update_book_group_id("default", "https://nope.com", g1.id).await.unwrap(), 0);
+        storage
+            .upsert_book("default", &shelf_book(url, "书名"))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .update_book_group_id("default", url, g1.id)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .find_book("default", url)
+                .await
+                .unwrap()
+                .unwrap()
+                .group,
+            g1.id
+        );
+        assert_eq!(
+            storage
+                .update_book_group_id("default", "https://nope.com", g1.id)
+                .await
+                .unwrap(),
+            0
+        );
 
         cleanup(storage, "bookgroup").await;
     }
@@ -4464,7 +4754,10 @@ mod tests {
 
         // 删除 → 查不到
         assert_eq!(
-            storage.delete_rss_source("default", "https://feed.example.com/rss").await.unwrap(),
+            storage
+                .delete_rss_source("default", "https://feed.example.com/rss")
+                .await
+                .unwrap(),
             1
         );
         assert!(storage
@@ -4473,7 +4766,10 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(
-            storage.delete_rss_source("default", "https://feed.example.com/rss").await.unwrap(),
+            storage
+                .delete_rss_source("default", "https://feed.example.com/rss")
+                .await
+                .unwrap(),
             0,
             "重复删除影响 0 行"
         );
@@ -4495,10 +4791,20 @@ mod tests {
             cover: Some("https://img.example.com/1.jpg".into()),
             ..Default::default()
         };
-        let articles = vec![article("https://feed.example.com/a", "甲", 1000), article("https://feed.example.com/b", "乙", 2000)];
-        storage.save_rss_articles("default", &articles).await.unwrap();
+        let articles = vec![
+            article("https://feed.example.com/a", "甲", 1000),
+            article("https://feed.example.com/b", "乙", 2000),
+        ];
+        storage
+            .save_rss_articles("default", &articles)
+            .await
+            .unwrap();
 
-        let got = storage.get_rss_article("https://feed.example.com/a").await.unwrap().unwrap();
+        let got = storage
+            .get_rss_article("https://feed.example.com/a")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.title, "甲");
         assert_eq!(got.source_url, "https://feed.example.com/rss");
         assert_eq!(got.time, 1000);
@@ -4508,36 +4814,81 @@ mod tests {
 
         // 同 url 覆盖（刷新 feed 时去重更新）
         storage
-            .save_rss_articles("default", &[article("https://feed.example.com/a", "甲v2", 3000)])
+            .save_rss_articles(
+                "default",
+                &[article("https://feed.example.com/a", "甲v2", 3000)],
+            )
             .await
             .unwrap();
-        let again = storage.get_rss_article("https://feed.example.com/a").await.unwrap().unwrap();
+        let again = storage
+            .get_rss_article("https://feed.example.com/a")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(again.title, "甲v2");
         assert_eq!(again.time, 3000);
-        assert_eq!(storage.get_rss_article("https://feed.example.com/b").await.unwrap().unwrap().title, "乙");
+        assert_eq!(
+            storage
+                .get_rss_article("https://feed.example.com/b")
+                .await
+                .unwrap()
+                .unwrap()
+                .title,
+            "乙"
+        );
 
         // 已读标记：标记已读 → 重新入库（feed 刷新）不清除
-        storage.set_rss_article_read("https://feed.example.com/a", true).await.unwrap();
         storage
-            .save_rss_articles("default", &[article("https://feed.example.com/a", "甲v3", 4000)])
+            .set_rss_article_read("https://feed.example.com/a", true)
             .await
             .unwrap();
-        let marked = storage.get_rss_article("https://feed.example.com/a").await.unwrap().unwrap();
+        storage
+            .save_rss_articles(
+                "default",
+                &[article("https://feed.example.com/a", "甲v3", 4000)],
+            )
+            .await
+            .unwrap();
+        let marked = storage
+            .get_rss_article("https://feed.example.com/a")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(marked.read, "重新入库不应清除已读标记");
         assert_eq!(marked.title, "甲v3");
         // 标回未读
-        storage.set_rss_article_read("https://feed.example.com/a", false).await.unwrap();
-        assert!(!storage.get_rss_article("https://feed.example.com/a").await.unwrap().unwrap().read);
+        storage
+            .set_rss_article_read("https://feed.example.com/a", false)
+            .await
+            .unwrap();
+        assert!(
+            !storage
+                .get_rss_article("https://feed.example.com/a")
+                .await
+                .unwrap()
+                .unwrap()
+                .read
+        );
         // 已读标记批量查询（仅本命名空间 + 本源的 url）
-        let flags = storage.get_rss_article_read_flags("default", "https://feed.example.com/rss").await.unwrap();
+        let flags = storage
+            .get_rss_article_read_flags("default", "https://feed.example.com/rss")
+            .await
+            .unwrap();
         assert_eq!(flags.len(), 2);
         assert!(!flags["https://feed.example.com/a"]);
         assert!(!flags["https://feed.example.com/b"]);
-        let other = storage.get_rss_article_read_flags("other", "https://feed.example.com/rss").await.unwrap();
+        let other = storage
+            .get_rss_article_read_flags("other", "https://feed.example.com/rss")
+            .await
+            .unwrap();
         assert!(other.is_empty(), "其他命名空间看不到该源的已读标记");
 
         // 不存在的 url
-        assert!(storage.get_rss_article("https://feed.example.com/nope").await.unwrap().is_none());
+        assert!(storage
+            .get_rss_article("https://feed.example.com/nope")
+            .await
+            .unwrap()
+            .is_none());
 
         cleanup(storage, "rssart").await;
     }
@@ -4554,7 +4905,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(storage.book_source_limit_for("alice").await.unwrap(), Some(5));
+        assert_eq!(
+            storage.book_source_limit_for("alice").await.unwrap(),
+            Some(5)
+        );
         assert_eq!(storage.book_source_limit_for("ghost").await.unwrap(), None);
         for i in 0..3 {
             storage
@@ -4563,7 +4917,11 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(storage.count_book_sources("alice").await.unwrap(), 3);
-        assert_eq!(storage.count_book_sources("default").await.unwrap(), 0, "计数不含 default 回退");
+        assert_eq!(
+            storage.count_book_sources("default").await.unwrap(),
+            0,
+            "计数不含 default 回退"
+        );
         cleanup(storage, "bslimit").await;
     }
 
@@ -4580,7 +4938,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(storage.logout_user("alice").await.unwrap(), 1);
-        assert!(storage.find_user("alice").await.unwrap().unwrap().token.is_empty());
+        assert!(storage
+            .find_user("alice")
+            .await
+            .unwrap()
+            .unwrap()
+            .token
+            .is_empty());
         assert_eq!(storage.logout_user("ghost").await.unwrap(), 0);
         cleanup(storage, "logout").await;
     }
@@ -4599,14 +4963,24 @@ mod tests {
             .unwrap();
         // 追加 6 个 token → 上限 5，最旧被丢
         for i in 1..=6 {
-            storage.add_user_token("alice", &format!("tok-{i}"), 1000 + i).await.unwrap();
+            storage
+                .add_user_token("alice", &format!("tok-{i}"), 1000 + i)
+                .await
+                .unwrap();
         }
         let user = storage.find_user("alice").await.unwrap().unwrap();
         assert_eq!(user.token, "tok-6", "主 token 为最新");
         let list = crate::model::user::token_map_list(&user.token_map);
-        assert_eq!(list, vec!["tok-2", "tok-3", "tok-4", "tok-5", "tok-6"], "上限 5 且最旧被丢");
+        assert_eq!(
+            list,
+            vec!["tok-2", "tok-3", "tok-4", "tok-5", "tok-6"],
+            "上限 5 且最旧被丢"
+        );
         // 重新登录同一 token → 去重（不重复计数）
-        storage.add_user_token("alice", "tok-5", 9999).await.unwrap();
+        storage
+            .add_user_token("alice", "tok-5", 9999)
+            .await
+            .unwrap();
         let user = storage.find_user("alice").await.unwrap().unwrap();
         let list = crate::model::user::token_map_list(&user.token_map);
         assert_eq!(list.iter().filter(|t| *t == "tok-5").count(), 1, "去重");
@@ -4640,7 +5014,10 @@ mod tests {
             .execute(&storage.pool)
             .await
             .unwrap();
-        storage.add_user_token("legacy", "new-1", 2000).await.unwrap();
+        storage
+            .add_user_token("legacy", "new-1", 2000)
+            .await
+            .unwrap();
         let user = storage.find_user("legacy").await.unwrap().unwrap();
         let list = crate::model::user::token_map_list(&user.token_map);
         assert!(list.contains(&"old-1".to_string()) && list.contains(&"new-1".to_string()));
@@ -4687,10 +5064,18 @@ mod tests {
         assert!(storage.find_user("new").await.unwrap().is_some());
         // 用户级数据行 + 目录已清理
         assert!(storage.list_books("old").await.unwrap().is_empty());
-        assert!(!storage.config.storage_dir().join("data").join("old").exists());
+        assert!(!storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join("old")
+            .exists());
 
         // except 用户受保护
-        let deleted = storage.clear_inactive_users(99999, Some("new")).await.unwrap();
+        let deleted = storage
+            .clear_inactive_users(99999, Some("new"))
+            .await
+            .unwrap();
         assert!(deleted.is_empty());
         assert!(storage.find_user("new").await.unwrap().is_some());
         cleanup(storage, "inactive").await;
@@ -4750,8 +5135,14 @@ mod tests {
             )
             .await
             .unwrap();
-        storage.set_cookie("alice", "https://a.com/src", "sid=1").await.unwrap();
-        storage.save_user_config("alice", "reader", "{}").await.unwrap();
+        storage
+            .set_cookie("alice", "https://a.com/src", "sid=1")
+            .await
+            .unwrap();
+        storage
+            .save_user_config("alice", "reader", "{}")
+            .await
+            .unwrap();
         storage
             .record_reading_stats("alice", "https://a.com/only", "2025-01-01", 60, 1000)
             .await
@@ -4796,7 +5187,11 @@ mod tests {
         // 数据目录（含 webdav 子目录）
         let alice_dir = storage.config.storage_dir().join("data").join("alice");
         std::fs::create_dir_all(alice_dir.join("webdav").join("legado")).unwrap();
-        std::fs::write(alice_dir.join("webdav").join("legado").join("backup-1.zip"), "zip").unwrap();
+        std::fs::write(
+            alice_dir.join("webdav").join("legado").join("backup-1.zip"),
+            "zip",
+        )
+        .unwrap();
         std::fs::create_dir_all(alice_dir.join("opds_files")).unwrap();
         std::fs::write(alice_dir.join("opds_files").join("f.txt"), "f").unwrap();
 
@@ -4807,50 +5202,68 @@ mod tests {
         // 用户级表行清空
         assert!(storage.list_books("alice").await.unwrap().is_empty());
         assert!(storage.get_book_sources("alice").await.unwrap().is_empty());
-        assert!(storage.get_cookie("alice", "https://a.com/src").await.unwrap().is_none());
-        let cfg: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_config WHERE user_namespace = 'alice'")
-            .fetch_one(&storage.pool)
+        assert!(storage
+            .get_cookie("alice", "https://a.com/src")
             .await
-            .unwrap();
+            .unwrap()
+            .is_none());
+        let cfg: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_config WHERE user_namespace = 'alice'")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
         assert_eq!(cfg, 0);
-        let stats: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reading_stats WHERE user_namespace = 'alice'")
-            .fetch_one(&storage.pool)
-            .await
-            .unwrap();
+        let stats: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM reading_stats WHERE user_namespace = 'alice'")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
         assert_eq!(stats, 0);
-        let bm: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks WHERE user_namespace = 'alice'")
-            .fetch_one(&storage.pool)
-            .await
-            .unwrap();
+        let bm: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM bookmarks WHERE user_namespace = 'alice'")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
         assert_eq!(bm, 0);
-        let subs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_subs WHERE user_namespace = 'alice'")
-            .fetch_one(&storage.pool)
-            .await
-            .unwrap();
+        let subs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM source_subs WHERE user_namespace = 'alice'")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
         assert_eq!(subs, 0);
-        let rss_src: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_sources WHERE user_namespace = 'alice'")
-            .fetch_one(&storage.pool)
-            .await
-            .unwrap();
+        let rss_src: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM rss_sources WHERE user_namespace = 'alice'")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
         assert_eq!(rss_src, 0);
-        let rss_art: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_articles WHERE user_namespace = 'alice'")
-            .fetch_one(&storage.pool)
-            .await
-            .unwrap();
+        let rss_art: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM rss_articles WHERE user_namespace = 'alice'")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
         assert_eq!(rss_art, 0);
         // 章节：独有书章节删除；共享书章节保留（bob 仍拥有）
-        let shared_ch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = 'https://s.com/shared'")
-            .fetch_one(&storage.pool)
-            .await
-            .unwrap();
+        let shared_ch: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM book_chapters WHERE book_url = 'https://s.com/shared'",
+        )
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
         assert_eq!(shared_ch, 1, "共享书章节应保留");
-        let only_ch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = 'https://a.com/only'")
-            .fetch_one(&storage.pool)
-            .await
-            .unwrap();
+        let only_ch: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM book_chapters WHERE book_url = 'https://a.com/only'",
+        )
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
         assert_eq!(only_ch, 0, "独有书章节应删除");
         // bob 数据不受影响
-        assert!(storage.find_book("bob", "https://s.com/shared").await.unwrap().is_some());
+        assert!(storage
+            .find_book("bob", "https://s.com/shared")
+            .await
+            .unwrap()
+            .is_some());
         // 目录递归删除（含 webdav/opds_files）
         assert!(!alice_dir.exists(), "数据目录应被递归删除");
 
@@ -4884,10 +5297,19 @@ mod tests {
             .join("legado");
 
         // 首次：生成 auto-YYYYMMDD.zip
-        assert_eq!(crate::service::schedule::run_auto_backup(&storage).await.unwrap(), 1);
+        assert_eq!(
+            crate::service::schedule::run_auto_backup(&storage)
+                .await
+                .unwrap(),
+            1
+        );
         let today = chrono::Local::now().format("%Y%m%d").to_string();
         let auto_file = legado.join(format!("auto-{today}.zip"));
-        assert!(auto_file.exists(), "自动备份文件应生成: {}", auto_file.display());
+        assert!(
+            auto_file.exists(),
+            "自动备份文件应生成: {}",
+            auto_file.display()
+        );
 
         // 同日再跑：幂等跳过（不重复生成）
         let files_after_first: Vec<_> = std::fs::read_dir(&legado)
@@ -4895,13 +5317,22 @@ mod tests {
             .flatten()
             .map(|e| e.file_name())
             .collect();
-        assert_eq!(crate::service::schedule::run_auto_backup(&storage).await.unwrap(), 0);
+        assert_eq!(
+            crate::service::schedule::run_auto_backup(&storage)
+                .await
+                .unwrap(),
+            0
+        );
         let files_after_second: Vec<_> = std::fs::read_dir(&legado)
             .unwrap()
             .flatten()
             .map(|e| e.file_name())
             .collect();
-        assert_eq!(files_after_first.len(), files_after_second.len(), "同日不应重复备份");
+        assert_eq!(
+            files_after_first.len(),
+            files_after_second.len(),
+            "同日不应重复备份"
+        );
 
         // 保留最近 7 份：伪造 12 个历史 auto-*.zip → prune 后剩 7（今天的保留）
         for i in 1..=12 {
@@ -4916,8 +5347,14 @@ mod tests {
             .filter(|n| n.starts_with("auto-") && n.ends_with(".zip"))
             .collect();
         assert_eq!(remaining.len(), 7);
-        assert!(remaining.iter().any(|n| *n == format!("auto-{today}.zip")), "今天的备份应保留");
-        assert!(remaining.iter().all(|n| n.as_str() >= "auto-20250107.zip"), "只保留最新的 7 份: {remaining:?}");
+        assert!(
+            remaining.iter().any(|n| *n == format!("auto-{today}.zip")),
+            "今天的备份应保留"
+        );
+        assert!(
+            remaining.iter().all(|n| n.as_str() >= "auto-20250107.zip"),
+            "只保留最新的 7 份: {remaining:?}"
+        );
 
         // 手动备份不受影响（backup-*.zip 不参与 auto 清理）
         storage.create_backup_zip("default").await.unwrap();
@@ -4963,24 +5400,19 @@ mod tests {
 
         // 部分字段更新（None 不覆盖）
         let n = storage
-            .update_user_permissions(
-                "alice",
-                Some(true),
-                None,
-                Some(false),
-                None,
-                Some(99),
-                None,
-            )
+            .update_user_permissions("alice", Some(true), None, Some(false), None, Some(99), None)
             .await
             .unwrap();
         assert_eq!(n, 1);
         let alice = storage.find_user("alice").await.unwrap().unwrap();
         assert!(alice.enable_webdav, "enable_webdav 应更新为 true");
-        assert!(!alice.enable_book_source, "enable_book_source 应更新为 false");
+        assert!(
+            !alice.enable_book_source,
+            "enable_book_source 应更新为 false"
+        );
         assert_eq!(alice.book_source_limit, 99);
         assert_eq!(alice.book_limit, 20, "未提供的字段应保持原值");
-        assert_eq!(alice.enable_local_store, false);
+        assert!(!alice.enable_local_store);
         // 不存在的用户 → 0 行
         assert_eq!(
             storage
@@ -4998,13 +5430,22 @@ mod tests {
         // 重置密码：新密码可校验、token 清空
         let salt = "newsalt";
         let encrypted = crate::util::md5::gen_encrypted_password("新密码123", salt);
-        assert_eq!(storage.reset_user_password("alice", salt, &encrypted).await.unwrap(), 1);
+        assert_eq!(
+            storage
+                .reset_user_password("alice", salt, &encrypted)
+                .await
+                .unwrap(),
+            1
+        );
         let alice = storage.find_user("alice").await.unwrap().unwrap();
         assert_eq!(alice.password, encrypted);
         assert_eq!(alice.salt, salt);
         assert!(alice.token.is_empty(), "重置密码后旧 token 应失效");
         assert_eq!(
-            storage.reset_user_password("ghost", salt, &encrypted).await.unwrap(),
+            storage
+                .reset_user_password("ghost", salt, &encrypted)
+                .await
+                .unwrap(),
             0
         );
 
@@ -5031,7 +5472,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(affected, 1);
-        let book = storage.find_book("default", "https://book.com/a").await.unwrap().unwrap();
+        let book = storage
+            .find_book("default", "https://book.com/a")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(book.latest_chapter_title.as_deref(), Some("第99章"));
         assert_eq!(book.total_chapter_num, 99);
         assert_eq!(book.latest_chapter_time, 123456);
@@ -5043,7 +5488,11 @@ mod tests {
             .update_book_update_info("default", "https://book.com/a", None, 99, 888888)
             .await
             .unwrap();
-        let book = storage.find_book("default", "https://book.com/a").await.unwrap().unwrap();
+        let book = storage
+            .find_book("default", "https://book.com/a")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(book.latest_chapter_title.as_deref(), Some("第99章"));
         assert_eq!(book.latest_chapter_time, 123456);
         assert_eq!(book.last_check_time, 888888);
@@ -5076,9 +5525,16 @@ mod tests {
         let zip_path = std::path::PathBuf::from(&path);
         assert!(zip_path.exists(), "zip 文件应已生成: {path}");
         let name = zip_path.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.starts_with("backup-") && name.ends_with(".zip"), "文件名应为 backup-*.zip: {name}");
         assert!(
-            zip_path.parent().and_then(|p| p.file_name()).map(|n| n == "legado").unwrap_or(false),
+            name.starts_with("backup-") && name.ends_with(".zip"),
+            "文件名应为 backup-*.zip: {name}"
+        );
+        assert!(
+            zip_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n == "legado")
+                .unwrap_or(false),
             "zip 应在 webdav/legado 下: {path}"
         );
 
@@ -5087,8 +5543,17 @@ mod tests {
         let names: Vec<String> = (0..archive.len())
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .collect();
-        for expect in ["bookshelf.json", "bookSource.json", "bookmark.json", "bookGroup.json", "rssSources.json"] {
-            assert!(names.iter().any(|n| n == expect), "zip 应含 {expect}: {names:?}");
+        for expect in [
+            "bookshelf.json",
+            "bookSource.json",
+            "bookmark.json",
+            "bookGroup.json",
+            "rssSources.json",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expect),
+                "zip 应含 {expect}: {names:?}"
+            );
         }
         let mut entry = archive.by_name("bookshelf.json").unwrap();
         let mut content = String::new();
@@ -5149,10 +5614,7 @@ mod tests {
                 "rssSources.json",
                 r#"[{"sourceUrl":"https://rss.com/feed","sourceName":"RSS源","header":"UA:1"}]"#,
             ),
-            (
-                "userConfig.json",
-                r#"{"theme":"dark","fontSize":"18"}"#,
-            ),
+            ("userConfig.json", r#"{"theme":"dark","fontSize":"18"}"#),
             (
                 "httpTTS.json",
                 r#"[{"url":"https://tts.com/api","name":"TTS源","type":0}]"#,
@@ -5164,7 +5626,10 @@ mod tests {
         ]);
 
         // 首次恢复：全部 restored
-        let report = storage.restore_backup_zip("default", &zip, false).await.unwrap();
+        let report = storage
+            .restore_backup_zip("default", &zip, false)
+            .await
+            .unwrap();
         assert_eq!(report.restored.sources, 1);
         assert_eq!(report.restored.books, 1);
         assert_eq!(report.restored.groups, 1);
@@ -5206,22 +5671,36 @@ mod tests {
             "RSS raw_json 应保留未知字段"
         );
         assert_eq!(
-            storage.get_user_config("default", "theme").await.unwrap().as_deref(),
+            storage
+                .get_user_config("default", "theme")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("dark")
         );
         assert_eq!(
-            storage.get_user_config("default", "fontSize").await.unwrap().as_deref(),
+            storage
+                .get_user_config("default", "fontSize")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("18")
         );
         let tts = storage.get_http_tts_list("default").await.unwrap();
         assert_eq!(tts.len(), 1);
         assert_eq!(tts[0].url, "https://tts.com/api");
-        let bookmarks = storage.list_bookmarks("default", "https://b1.com").await.unwrap();
+        let bookmarks = storage
+            .list_bookmarks("default", "https://b1.com")
+            .await
+            .unwrap();
         assert_eq!(bookmarks.len(), 1);
         assert_eq!(bookmarks[0].chapter_index, 2);
 
         // 幂等：overwrite=false 再恢复 → 全部 skipped
-        let report = storage.restore_backup_zip("default", &zip, false).await.unwrap();
+        let report = storage
+            .restore_backup_zip("default", &zip, false)
+            .await
+            .unwrap();
         assert_eq!(report.restored.sources, 0);
         assert_eq!(report.skipped.sources, 1);
         assert_eq!(report.skipped.books, 1);
@@ -5235,7 +5714,10 @@ mod tests {
         assert_eq!(report.restored.config, 0);
 
         // overwrite=true → 全部覆盖 restored
-        let report = storage.restore_backup_zip("default", &zip, true).await.unwrap();
+        let report = storage
+            .restore_backup_zip("default", &zip, true)
+            .await
+            .unwrap();
         assert_eq!(report.restored.sources, 1);
         assert_eq!(report.restored.books, 1);
         assert_eq!(report.restored.groups, 1);
@@ -5246,27 +5728,48 @@ mod tests {
         assert_eq!(report.restored.tts, 1);
         assert_eq!(report.restored.bookmarks, 1);
         assert_eq!(report.skipped.sources, 0);
-        assert_eq!(storage.get_book_sources("default").await.unwrap().len(), 1, "覆盖不应产生重复行");
+        assert_eq!(
+            storage.get_book_sources("default").await.unwrap().len(),
+            1,
+            "覆盖不应产生重复行"
+        );
 
         // 命名空间隔离：恢复进 alice 命名空间互不影响 default
         // （book_sources 表主键为 book_source_url（全局），跨用户恢复需用不同 URL）
-        storage.insert_user(&User {
-            username: "alice".into(),
-            ..Default::default()
-        }).await.unwrap();
+        storage
+            .insert_user(&User {
+                username: "alice".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         let zip_alice = make_backup_zip(&[
             (
                 "bookSource.json",
                 r#"[{"bookSourceUrl":"https://s5.com","bookSourceName":"源5"}]"#,
             ),
-            ("bookshelf.json", r#"[{"bookUrl":"https://b5.com","name":"书5"}]"#),
+            (
+                "bookshelf.json",
+                r#"[{"bookUrl":"https://b5.com","name":"书5"}]"#,
+            ),
         ]);
-        let report = storage.restore_backup_zip("alice", &zip_alice, false).await.unwrap();
+        let report = storage
+            .restore_backup_zip("alice", &zip_alice, false)
+            .await
+            .unwrap();
         assert_eq!(report.restored.sources, 1);
         assert_eq!(report.restored.books, 1);
         assert_eq!(storage.get_book_sources("alice").await.unwrap().len(), 1);
-        assert_eq!(storage.get_book_sources("default").await.unwrap().len(), 1, "default 不受影响");
-        assert_eq!(storage.list_books("default").await.unwrap().len(), 1, "default 书架不受影响");
+        assert_eq!(
+            storage.get_book_sources("default").await.unwrap().len(),
+            1,
+            "default 不受影响"
+        );
+        assert_eq!(
+            storage.list_books("default").await.unwrap().len(),
+            1,
+            "default 书架不受影响"
+        );
 
         cleanup(storage, "restore").await;
     }
@@ -5289,7 +5792,10 @@ mod tests {
                 r#"[{"id":7,"name":"legacy分组","order":0}]"#,
             ),
         ]);
-        let report = storage.restore_backup_zip("default", &zip, false).await.unwrap();
+        let report = storage
+            .restore_backup_zip("default", &zip, false)
+            .await
+            .unwrap();
         assert_eq!(report.restored.sources, 1);
         assert_eq!(report.restored.books, 1);
         assert_eq!(report.restored.groups, 1);
@@ -5300,30 +5806,54 @@ mod tests {
 
         // 条目同时存在于根与 config/ 时优先根（当前布局覆盖 legacy）
         let zip2 = make_backup_zip(&[
-            ("bookSource.json", r#"[{"bookSourceUrl":"https://s3.com","bookSourceName":"根源"}]"#),
-            ("config/bookSource.json", r#"[{"bookSourceUrl":"https://s4.com","bookSourceName":"config源"}]"#),
+            (
+                "bookSource.json",
+                r#"[{"bookSourceUrl":"https://s3.com","bookSourceName":"根源"}]"#,
+            ),
+            (
+                "config/bookSource.json",
+                r#"[{"bookSourceUrl":"https://s4.com","bookSourceName":"config源"}]"#,
+            ),
         ]);
-        let report = storage.restore_backup_zip("default", &zip2, true).await.unwrap();
+        let report = storage
+            .restore_backup_zip("default", &zip2, true)
+            .await
+            .unwrap();
         assert_eq!(report.restored.sources, 1);
-        assert_eq!(storage.get_book_sources("default").await.unwrap()[0].book_source_url, "https://s3.com");
+        assert_eq!(
+            storage.get_book_sources("default").await.unwrap()[0].book_source_url,
+            "https://s3.com"
+        );
 
         // 无效条目（空 url/空名）计入 skipped
         let zip3 = make_backup_zip(&[
-            ("bookSource.json", r#"[{"bookSourceName":"没URL"},{"bookSourceUrl":"https://ok.com","bookSourceName":"OK"}]"#),
+            (
+                "bookSource.json",
+                r#"[{"bookSourceName":"没URL"},{"bookSourceUrl":"https://ok.com","bookSourceName":"OK"}]"#,
+            ),
             ("bookshelf.json", r#"[{"name":"没URL"}]"#),
             ("httpTTS.json", r#"[{"name":"没URL"}]"#),
         ]);
-        let report = storage.restore_backup_zip("default", &zip3, false).await.unwrap();
+        let report = storage
+            .restore_backup_zip("default", &zip3, false)
+            .await
+            .unwrap();
         assert_eq!(report.restored.sources, 1);
         assert_eq!(report.skipped.sources, 1);
         assert_eq!(report.skipped.books, 1);
         assert_eq!(report.skipped.tts, 1);
 
         // 非 zip 字节 → Err
-        assert!(storage.restore_backup_zip("default", b"not a zip file", false).await.is_err());
+        assert!(storage
+            .restore_backup_zip("default", b"not a zip file", false)
+            .await
+            .is_err());
         // 合法 zip 但无识别条目 → Err
         let empty = make_backup_zip(&[("readme.txt", "hi")]);
-        assert!(storage.restore_backup_zip("default", &empty, false).await.is_err());
+        assert!(storage
+            .restore_backup_zip("default", &empty, false)
+            .await
+            .is_err());
 
         cleanup(storage, "restorelegacy").await;
     }
@@ -5349,7 +5879,11 @@ mod tests {
 
         // 不应报错、不应更新任何书
         assert_eq!(run_shelf_update(&storage).await.unwrap(), 0);
-        let book = storage.find_book("default", "https://book.com/nosrc").await.unwrap().unwrap();
+        let book = storage
+            .find_book("default", "https://book.com/nosrc")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(book.last_check_count, 0);
         cleanup(storage, "shelfrun").await;
     }
@@ -5370,8 +5904,14 @@ mod tests {
         };
 
         // 保存两条（order 逆序）→ 按 order_num 排序返回
-        storage.save_replace_rule("default", &rule("r1", "一", 2)).await.unwrap();
-        storage.save_replace_rule("default", &rule("r2", "二", 1)).await.unwrap();
+        storage
+            .save_replace_rule("default", &rule("r1", "一", 2))
+            .await
+            .unwrap();
+        storage
+            .save_replace_rule("default", &rule("r2", "二", 1))
+            .await
+            .unwrap();
         let list = storage.get_replace_rules("default").await.unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].id, "r2", "应按 order_num 排序");
@@ -5396,13 +5936,25 @@ mod tests {
         assert_eq!(storage.get_replace_rules("default").await.unwrap().len(), 4);
 
         // 删除
-        assert_eq!(storage.delete_replace_rule("default", "r3").await.unwrap(), 1);
-        assert_eq!(storage.delete_replace_rule("default", "ghost").await.unwrap(), 0);
+        assert_eq!(
+            storage.delete_replace_rule("default", "r3").await.unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .delete_replace_rule("default", "ghost")
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(storage.get_replace_rules("default").await.unwrap().len(), 3);
 
         // 命名空间隔离：alice 无规则时回退 default
         assert_eq!(storage.get_replace_rules("alice").await.unwrap().len(), 3);
-        storage.save_replace_rule("alice", &rule("a1", "爱丽丝", 0)).await.unwrap();
+        storage
+            .save_replace_rule("alice", &rule("a1", "爱丽丝", 0))
+            .await
+            .unwrap();
         let alice = storage.get_replace_rules("alice").await.unwrap();
         assert_eq!(alice.len(), 1);
         assert_eq!(alice[0].name, "爱丽丝");
@@ -5425,8 +5977,14 @@ mod tests {
             ..Default::default()
         };
 
-        storage.save_http_tts("default", &tts("https://tts.example.com/a", "引擎甲", 0)).await.unwrap();
-        storage.save_http_tts("default", &tts("https://tts.example.com/b", "引擎乙", 1)).await.unwrap();
+        storage
+            .save_http_tts("default", &tts("https://tts.example.com/a", "引擎甲", 0))
+            .await
+            .unwrap();
+        storage
+            .save_http_tts("default", &tts("https://tts.example.com/b", "引擎乙", 1))
+            .await
+            .unwrap();
         let list = storage.get_http_tts_list("default").await.unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].name, "引擎乙", "应按名称排序");
@@ -5434,20 +5992,42 @@ mod tests {
         assert_eq!(list[1].url, "https://tts.example.com/a");
 
         // 同 url 覆盖
-        storage.save_http_tts("default", &tts("https://tts.example.com/a", "引擎甲v2", 0)).await.unwrap();
+        storage
+            .save_http_tts("default", &tts("https://tts.example.com/a", "引擎甲v2", 0))
+            .await
+            .unwrap();
         let list = storage.get_http_tts_list("default").await.unwrap();
         assert_eq!(list.len(), 2);
         assert!(list.iter().any(|t| t.name == "引擎甲v2"));
 
         // 删除
-        assert_eq!(storage.delete_http_tts("default", "https://tts.example.com/a").await.unwrap(), 1);
+        assert_eq!(
+            storage
+                .delete_http_tts("default", "https://tts.example.com/a")
+                .await
+                .unwrap(),
+            1
+        );
         assert_eq!(storage.get_http_tts_list("default").await.unwrap().len(), 1);
 
         // 命名空间隔离 + default 回退
-        assert_eq!(storage.get_http_tts_list("alice").await.unwrap().len(), 1, "空命名空间回退 default");
-        storage.save_http_tts("alice", &tts("https://tts.example.com/x", "爱丽丝引擎", 0)).await.unwrap();
+        assert_eq!(
+            storage.get_http_tts_list("alice").await.unwrap().len(),
+            1,
+            "空命名空间回退 default"
+        );
+        storage
+            .save_http_tts("alice", &tts("https://tts.example.com/x", "爱丽丝引擎", 0))
+            .await
+            .unwrap();
         assert_eq!(storage.get_http_tts_list("alice").await.unwrap().len(), 1);
-        assert_eq!(storage.delete_http_tts("alice", "https://tts.example.com/b").await.unwrap(), 0);
+        assert_eq!(
+            storage
+                .delete_http_tts("alice", "https://tts.example.com/b")
+                .await
+                .unwrap(),
+            0
+        );
 
         cleanup(storage, "httptts").await;
     }
@@ -5467,11 +6047,21 @@ mod tests {
         };
 
         // 初始无用户规则
-        assert!(storage.get_txt_toc_rules("default").await.unwrap().is_empty());
+        assert!(storage
+            .get_txt_toc_rules("default")
+            .await
+            .unwrap()
+            .is_empty());
 
         // 保存（乱序 serialNumber → 按序返回）
-        storage.save_txt_toc_rule("default", &rule("t1", "自定义A", r"^第.+章$", 5)).await.unwrap();
-        storage.save_txt_toc_rule("default", &rule("t2", "自定义B", r"^楔子$", 1)).await.unwrap();
+        storage
+            .save_txt_toc_rule("default", &rule("t1", "自定义A", r"^第.+章$", 5))
+            .await
+            .unwrap();
+        storage
+            .save_txt_toc_rule("default", &rule("t2", "自定义B", r"^楔子$", 1))
+            .await
+            .unwrap();
         let list = storage.get_txt_toc_rules("default").await.unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].id, "t2", "应按 serial_number 排序");
@@ -5486,17 +6076,36 @@ mod tests {
         assert!(!list[1].enable);
 
         // 删除
-        assert_eq!(storage.delete_txt_toc_rule("default", "t2").await.unwrap(), 1);
+        assert_eq!(
+            storage.delete_txt_toc_rule("default", "t2").await.unwrap(),
+            1
+        );
         assert_eq!(storage.get_txt_toc_rules("default").await.unwrap().len(), 1);
 
         // 导入默认规则（幂等）
-        let count = storage.import_default_txt_toc_rules("default").await.unwrap();
+        let count = storage
+            .import_default_txt_toc_rules("default")
+            .await
+            .unwrap();
         assert_eq!(count, crate::service::local_book::DEFAULT_TOC_RULES.len());
         let list = storage.get_txt_toc_rules("default").await.unwrap();
         let default_ids = list.iter().filter(|r| r.id.starts_with("default-")).count();
-        assert_eq!(default_ids, crate::service::local_book::DEFAULT_TOC_RULES.len());
-        assert_eq!(storage.import_default_txt_toc_rules("default").await.unwrap(), count, "重复导入不新增");
-        assert_eq!(storage.get_txt_toc_rules("default").await.unwrap().len(), list.len());
+        assert_eq!(
+            default_ids,
+            crate::service::local_book::DEFAULT_TOC_RULES.len()
+        );
+        assert_eq!(
+            storage
+                .import_default_txt_toc_rules("default")
+                .await
+                .unwrap(),
+            count,
+            "重复导入不新增"
+        );
+        assert_eq!(
+            storage.get_txt_toc_rules("default").await.unwrap().len(),
+            list.len()
+        );
 
         // 命名空间隔离：alice 无规则（不查 default）
         assert!(storage.get_txt_toc_rules("alice").await.unwrap().is_empty());
@@ -5542,7 +6151,11 @@ mod tests {
     #[tokio::test]
     async fn test_count_active_tokens() {
         let storage = test_storage("activetok").await;
-        assert_eq!(storage.count_active_tokens().await.unwrap(), 0, "无用户 → 0");
+        assert_eq!(
+            storage.count_active_tokens().await.unwrap(),
+            0,
+            "无用户 → 0"
+        );
 
         // 无 token 用户
         storage
@@ -5562,14 +6175,27 @@ mod tests {
             .await
             .unwrap();
         // 多设备：add_user_token 推入 token_map（主 token = 最近一个）
-        storage.insert_user(&User {
-            username: "multi".into(),
-            ..Default::default()
-        }).await.unwrap();
-        storage.add_user_token("multi", "t-dev1", 1000).await.unwrap();
-        storage.add_user_token("multi", "t-dev2", 2000).await.unwrap();
+        storage
+            .insert_user(&User {
+                username: "multi".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        storage
+            .add_user_token("multi", "t-dev1", 1000)
+            .await
+            .unwrap();
+        storage
+            .add_user_token("multi", "t-dev2", 2000)
+            .await
+            .unwrap();
 
-        assert_eq!(storage.count_active_tokens().await.unwrap(), 3, "单设备 1 + 多设备 2");
+        assert_eq!(
+            storage.count_active_tokens().await.unwrap(),
+            3,
+            "单设备 1 + 多设备 2"
+        );
 
         // 登出（清主 token）后多设备仍在线
         storage.logout_user("single").await.unwrap();
@@ -5591,19 +6217,40 @@ mod tests {
         assert_eq!(info.total_size, 0);
 
         // 写入目录缓存 2 条 + 章节 3 条
-        storage.cache_toc("https://book.com/a", "https://book.com/toc", "[{\"title\":\"第一章\"}]").await.unwrap();
-        storage.cache_toc("https://book.com/b", "https://book.com/toc2", "[{\"title\":\"第二章\"}]").await.unwrap();
-        storage.save_chapters("local://book1", &[
-            ("第一章".to_string(), "正文一甲乙丙丁".to_string()),
-            ("第二章".to_string(), "正文二戊己庚辛壬癸".to_string()),
-            ("第三章".to_string(), "正文三子丑寅卯".to_string()),
-        ])
-        .await
-        .unwrap();
+        storage
+            .cache_toc(
+                "https://book.com/a",
+                "https://book.com/toc",
+                "[{\"title\":\"第一章\"}]",
+            )
+            .await
+            .unwrap();
+        storage
+            .cache_toc(
+                "https://book.com/b",
+                "https://book.com/toc2",
+                "[{\"title\":\"第二章\"}]",
+            )
+            .await
+            .unwrap();
+        storage
+            .save_chapters(
+                "local://book1",
+                &[
+                    ("第一章".to_string(), "正文一甲乙丙丁".to_string()),
+                    ("第二章".to_string(), "正文二戊己庚辛壬癸".to_string()),
+                    ("第三章".to_string(), "正文三子丑寅卯".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
 
         let info = storage.get_cache_info().await.unwrap();
         assert_eq!(info.toc_cache_count, 2);
-        assert_eq!(info.toc_cache_size, 34, "SQLite length() 按字符计，两条各 17 字符");
+        assert_eq!(
+            info.toc_cache_size, 34,
+            "SQLite length() 按字符计，两条各 17 字符"
+        );
         assert_eq!(info.chapter_count, 3);
         assert_eq!(info.chapter_size, 23, "7+9+7 字符");
         assert_eq!(info.total_size, info.toc_cache_size + info.chapter_size);
@@ -5625,8 +6272,17 @@ mod tests {
         assert_eq!(info.total_size, 0);
 
         // all：全清（再写入后验证）
-        storage.cache_toc("https://book.com/a", "https://book.com/toc", "[]").await.unwrap();
-        storage.save_chapters("local://book1", &[("第四章".to_string(), "正文四".to_string())]).await.unwrap();
+        storage
+            .cache_toc("https://book.com/a", "https://book.com/toc", "[]")
+            .await
+            .unwrap();
+        storage
+            .save_chapters(
+                "local://book1",
+                &[("第四章".to_string(), "正文四".to_string())],
+            )
+            .await
+            .unwrap();
         let (toc_del, chap_del) = storage.clear_cache("all").await.unwrap();
         assert_eq!(toc_del, 1);
         assert_eq!(chap_del, 1);
@@ -5668,7 +6324,10 @@ mod tests {
             .await
             .unwrap();
         storage
-            .save_chapters("https://book.com/b", &[("第一章".to_string(), "另一本".to_string())])
+            .save_chapters(
+                "https://book.com/b",
+                &[("第一章".to_string(), "另一本".to_string())],
+            )
             .await
             .unwrap();
         storage
@@ -5692,10 +6351,19 @@ mod tests {
         assert_eq!((count, size), (0, 0));
 
         // 删单书缓存：只删 A 的章节，B 不受影响、书架行保留
-        let deleted = storage.delete_book_cache("https://book.com/a").await.unwrap();
+        let deleted = storage
+            .delete_book_cache("https://book.com/a")
+            .await
+            .unwrap();
         assert_eq!(deleted, 3);
-        assert_eq!(storage.count_chapters("https://book.com/a").await.unwrap(), 0);
-        assert_eq!(storage.count_chapters("https://book.com/b").await.unwrap(), 1);
+        assert_eq!(
+            storage.count_chapters("https://book.com/a").await.unwrap(),
+            0
+        );
+        assert_eq!(
+            storage.count_chapters("https://book.com/b").await.unwrap(),
+            1
+        );
         assert!(
             storage
                 .find_book("default", "https://book.com/a")
@@ -5705,7 +6373,13 @@ mod tests {
             "删除缓存不应影响书架"
         );
         // 再删空书 → 0 行
-        assert_eq!(storage.delete_book_cache("https://ghost.com").await.unwrap(), 0);
+        assert_eq!(
+            storage
+                .delete_book_cache("https://ghost.com")
+                .await
+                .unwrap(),
+            0
+        );
 
         cleanup(storage, "bookcache").await;
     }
@@ -5728,7 +6402,10 @@ mod tests {
         assert_eq!(timeout, 5000, "busy_timeout 应为 5000ms");
         // WAL 副作用文件存在（reader.db-wal 惰性创建——写一次触发）
         storage
-            .save_chapters("local://waltest", &[("第一章".to_string(), "正文".to_string())])
+            .save_chapters(
+                "local://waltest",
+                &[("第一章".to_string(), "正文".to_string())],
+            )
             .await
             .unwrap();
         let db_path = storage.config.storage_dir().join("reader.db");
@@ -5766,21 +6443,28 @@ mod tests {
             .unwrap();
         // 连接 B：写入
         let mut conn_b = storage.pool.acquire().await.unwrap();
-        sqlx::query("INSERT INTO books (book_url, name, user_namespace) VALUES (?1, ?2, 'default')")
-            .bind("https://snap.com/a")
-            .bind("快照书")
-            .execute(&mut *conn_b)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO books (book_url, name, user_namespace) VALUES (?1, ?2, 'default')",
+        )
+        .bind("https://snap.com/a")
+        .bind("快照书")
+        .execute(&mut *conn_b)
+        .await
+        .unwrap();
         drop(conn_b);
         // 连接 A：再次读取——必须能看到写入（快照已刷新）
-        let found: Option<(String,)> =
-            sqlx::query_as("SELECT name FROM books WHERE book_url = ?1 AND user_namespace = 'default'")
-                .bind("https://snap.com/a")
-                .fetch_optional(&mut *conn_a)
-                .await
-                .unwrap();
-        assert_eq!(found.map(|r| r.0), Some("快照书".to_string()), "WAL 下旧读快照导致跨连接读不到新数据");
+        let found: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM books WHERE book_url = ?1 AND user_namespace = 'default'",
+        )
+        .bind("https://snap.com/a")
+        .fetch_optional(&mut *conn_a)
+        .await
+        .unwrap();
+        assert_eq!(
+            found.map(|r| r.0),
+            Some("快照书".to_string()),
+            "WAL 下旧读快照导致跨连接读不到新数据"
+        );
         drop(conn_a);
         cleanup(storage, "snaprepro").await;
     }
@@ -5809,7 +6493,10 @@ mod tests {
             .unwrap();
 
         // 命中两章，按章节序返回
-        let hits = storage.search_book_content("local://book1", "关键词", 50).await.unwrap();
+        let hits = storage
+            .search_book_content("local://book1", "关键词", 50)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].chapter_index, 0);
         assert_eq!(hits[0].title, "第一章");
@@ -5817,28 +6504,52 @@ mod tests {
         assert!(hits[0].snippet.starts_with("这是第一章"));
         assert_eq!(hits[1].chapter_index, 2);
         assert!(hits[1].snippet.contains("关键词"));
-        assert!(hits[1].snippet.starts_with("…"), "超长段落应截断补省略号: {}", hits[1].snippet);
+        assert!(
+            hits[1].snippet.starts_with("…"),
+            "超长段落应截断补省略号: {}",
+            hits[1].snippet
+        );
 
         // 其他书不串
-        let hits = storage.search_book_content("local://book2", "关键词", 50).await.unwrap();
+        let hits = storage
+            .search_book_content("local://book2", "关键词", 50)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "第一章");
 
         // 无命中 / 书不存在
-        assert!(storage.search_book_content("local://book1", "不存在词", 50).await.unwrap().is_empty());
-        assert!(storage.search_book_content("local://ghost", "关键词", 50).await.unwrap().is_empty());
+        assert!(storage
+            .search_book_content("local://book1", "不存在词", 50)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .search_book_content("local://ghost", "关键词", 50)
+            .await
+            .unwrap()
+            .is_empty());
 
         // 大小写不敏感（ASCII）
         storage
-            .save_chapters("local://book3", &[("Ch1".to_string(), "Hello World here".to_string())])
+            .save_chapters(
+                "local://book3",
+                &[("Ch1".to_string(), "Hello World here".to_string())],
+            )
             .await
             .unwrap();
-        let hits = storage.search_book_content("local://book3", "world", 50).await.unwrap();
+        let hits = storage
+            .search_book_content("local://book3", "world", 50)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.contains("World"));
 
         // limit 生效
-        let hits = storage.search_book_content("local://book1", "关键词", 1).await.unwrap();
+        let hits = storage
+            .search_book_content("local://book1", "关键词", 1)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
 
         // %/_ 作为字面量转义（不当作 LIKE 通配符）
@@ -5852,16 +6563,36 @@ mod tests {
             )
             .await
             .unwrap();
-        let hits = storage.search_book_content("local://book4", "5_0%", 10).await.unwrap();
+        let hits = storage
+            .search_book_content("local://book4", "5_0%", 10)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1, "% 应转义为字面量");
         assert_eq!(hits[0].title, "C1");
-        let hits = storage.search_book_content("local://book4", "5_", 10).await.unwrap();
+        let hits = storage
+            .search_book_content("local://book4", "5_", 10)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1, "_ 应转义为字面量");
-        let hits = storage.search_book_content("local://book4", "%", 10).await.unwrap();
-        assert_eq!(hits.len(), 1, "% 转义后只匹配含字面 % 的行（未转义会匹配全部）");
+        let hits = storage
+            .search_book_content("local://book4", "%", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "% 转义后只匹配含字面 % 的行（未转义会匹配全部）"
+        );
         assert_eq!(hits[0].title, "C1");
-        let hits = storage.search_book_content("local://book4", "_", 10).await.unwrap();
-        assert_eq!(hits.len(), 1, "_ 转义后只匹配含字面 _ 的行（未转义会匹配全部）");
+        let hits = storage
+            .search_book_content("local://book4", "_", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "_ 转义后只匹配含字面 _ 的行（未转义会匹配全部）"
+        );
         assert_eq!(hits[0].title, "C1");
         assert_eq!(storage.count_chapters("local://book4").await.unwrap(), 2);
         assert_eq!(storage.count_chapters("local://ghost").await.unwrap(), 0);
@@ -5876,7 +6607,10 @@ mod tests {
         let raw = r#"[{"bookSourceUrl":"https://s1.com","bookSourceName":"源1"}]"#;
 
         // 保存 → 查询往返（raw_json 原文保留）
-        storage.save_source_sub("default", "https://sub.com/all.json", "全部书源", raw).await.unwrap();
+        storage
+            .save_source_sub("default", "https://sub.com/all.json", "全部书源", raw)
+            .await
+            .unwrap();
         let list = storage.get_source_subs("default").await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].url, "https://sub.com/all.json");
@@ -5886,29 +6620,73 @@ mod tests {
         assert_eq!(list[0].user_namespace, "default");
 
         // 覆盖保存（改名）
-        storage.save_source_sub("default", "https://sub.com/all.json", "全部书源v2", raw).await.unwrap();
+        storage
+            .save_source_sub("default", "https://sub.com/all.json", "全部书源v2", raw)
+            .await
+            .unwrap();
         let list = storage.get_source_subs("default").await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "全部书源v2");
 
         // 按 URL 查找
-        let sub = storage.find_source_sub("default", "https://sub.com/all.json").await.unwrap().unwrap();
+        let sub = storage
+            .find_source_sub("default", "https://sub.com/all.json")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(sub.name, "全部书源v2");
-        assert!(storage.find_source_sub("default", "https://sub.com/ghost").await.unwrap().is_none());
+        assert!(storage
+            .find_source_sub("default", "https://sub.com/ghost")
+            .await
+            .unwrap()
+            .is_none());
 
         // 命名空间隔离 + default 回退
-        assert_eq!(storage.get_source_subs("alice").await.unwrap().len(), 1, "alice 无订阅回退 default");
-        assert!(storage.find_source_sub("alice", "https://sub.com/all.json").await.unwrap().is_some());
-        storage.save_source_sub("alice", "https://sub.com/a.json", "爱丽丝订阅", raw).await.unwrap();
+        assert_eq!(
+            storage.get_source_subs("alice").await.unwrap().len(),
+            1,
+            "alice 无订阅回退 default"
+        );
+        assert!(storage
+            .find_source_sub("alice", "https://sub.com/all.json")
+            .await
+            .unwrap()
+            .is_some());
+        storage
+            .save_source_sub("alice", "https://sub.com/a.json", "爱丽丝订阅", raw)
+            .await
+            .unwrap();
         let alice = storage.get_source_subs("alice").await.unwrap();
         assert_eq!(alice.len(), 1, "有自有订阅后不再回退 default");
         assert_eq!(alice[0].name, "爱丽丝订阅");
 
         // 删除：只影响本命名空间；不存在返回 0 行
-        assert_eq!(storage.delete_source_sub("alice", "https://sub.com/all.json").await.unwrap(), 0);
-        assert_eq!(storage.delete_source_sub("alice", "https://sub.com/a.json").await.unwrap(), 1);
-        assert_eq!(storage.get_source_subs("alice").await.unwrap().len(), 1, "回退 default");
-        assert_eq!(storage.delete_source_sub("default", "https://sub.com/all.json").await.unwrap(), 1);
+        assert_eq!(
+            storage
+                .delete_source_sub("alice", "https://sub.com/all.json")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            storage
+                .delete_source_sub("alice", "https://sub.com/a.json")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage.get_source_subs("alice").await.unwrap().len(),
+            1,
+            "回退 default"
+        );
+        assert_eq!(
+            storage
+                .delete_source_sub("default", "https://sub.com/all.json")
+                .await
+                .unwrap(),
+            1
+        );
         assert!(storage.get_source_subs("default").await.unwrap().is_empty());
 
         cleanup(storage, "subs").await;
@@ -5933,7 +6711,11 @@ mod tests {
             .unwrap();
         let got = storage.get_chapter_content(book_url, idx1).await.unwrap();
         assert_eq!(got.as_deref(), Some("第一章正文内容。"));
-        assert_eq!(storage.get_chapter_content(book_url, idx2).await.unwrap(), None, "未缓存键应无命中");
+        assert_eq!(
+            storage.get_chapter_content(book_url, idx2).await.unwrap(),
+            None,
+            "未缓存键应无命中"
+        );
 
         // 覆盖写（同一 chapterUrl 再次缓存更新正文）
         storage
@@ -5941,7 +6723,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            storage.get_chapter_content(book_url, idx1).await.unwrap().as_deref(),
+            storage
+                .get_chapter_content(book_url, idx1)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("更新后的正文。")
         );
 
@@ -5950,13 +6736,25 @@ mod tests {
             .save_chapters(book_url, &[("本地1".to_string(), "本地内容1".to_string())])
             .await
             .unwrap();
-        assert_eq!(storage.count_chapters(book_url).await.unwrap(), 2, "缓存行 + 本地行共存");
         assert_eq!(
-            storage.get_chapter_content(book_url, 0).await.unwrap().as_deref(),
+            storage.count_chapters(book_url).await.unwrap(),
+            2,
+            "缓存行 + 本地行共存"
+        );
+        assert_eq!(
+            storage
+                .get_chapter_content(book_url, 0)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("本地内容1")
         );
         assert_eq!(
-            storage.get_chapter_content(book_url, idx1).await.unwrap().as_deref(),
+            storage
+                .get_chapter_content(book_url, idx1)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("更新后的正文。")
         );
 
@@ -5966,11 +6764,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            storage.get_chapter_content("https://book.com/a", idx1).await.unwrap().as_deref(),
+            storage
+                .get_chapter_content("https://book.com/a", idx1)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("更新后的正文。")
         );
         assert_eq!(
-            storage.get_chapter_content("https://book.com/b", idx1).await.unwrap().as_deref(),
+            storage
+                .get_chapter_content("https://book.com/b", idx1)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("B 书正文。")
         );
 
@@ -5982,32 +6788,62 @@ mod tests {
     async fn test_book_group_count_rename_delete() {
         let storage = test_storage("grpfin").await;
         let g1 = storage
-            .save_book_group("default", &crate::model::BookGroup {
-                name: "玄幻".into(),
-                order: 1,
-                ..Default::default()
-            })
+            .save_book_group(
+                "default",
+                &crate::model::BookGroup {
+                    name: "玄幻".into(),
+                    order: 1,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let g2 = storage
-            .save_book_group("default", &crate::model::BookGroup {
-                name: "言情".into(),
-                order: 2,
-                ..Default::default()
-            })
+            .save_book_group(
+                "default",
+                &crate::model::BookGroup {
+                    name: "言情".into(),
+                    order: 2,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         // 书：g1 两本、g2 一本、未分组一本（group 0 不计入任何组）
-        storage.upsert_book("default", &shelf_book("https://b.com/1", "书1")).await.unwrap();
-        storage.upsert_book("default", &shelf_book("https://b.com/2", "书2")).await.unwrap();
-        storage.upsert_book("default", &shelf_book("https://b.com/3", "书3")).await.unwrap();
-        storage.upsert_book("default", &shelf_book("https://b.com/4", "书4")).await.unwrap();
-        storage.update_book_group_id("default", "https://b.com/1", g1.id).await.unwrap();
-        storage.update_book_group_id("default", "https://b.com/2", g1.id).await.unwrap();
-        storage.update_book_group_id("default", "https://b.com/3", g2.id).await.unwrap();
+        storage
+            .upsert_book("default", &shelf_book("https://b.com/1", "书1"))
+            .await
+            .unwrap();
+        storage
+            .upsert_book("default", &shelf_book("https://b.com/2", "书2"))
+            .await
+            .unwrap();
+        storage
+            .upsert_book("default", &shelf_book("https://b.com/3", "书3"))
+            .await
+            .unwrap();
+        storage
+            .upsert_book("default", &shelf_book("https://b.com/4", "书4"))
+            .await
+            .unwrap();
+        storage
+            .update_book_group_id("default", "https://b.com/1", g1.id)
+            .await
+            .unwrap();
+        storage
+            .update_book_group_id("default", "https://b.com/2", g1.id)
+            .await
+            .unwrap();
+        storage
+            .update_book_group_id("default", "https://b.com/3", g2.id)
+            .await
+            .unwrap();
 
         // 带书数列表（bookCount + orderNum 别名）
-        let list = storage.list_book_groups_with_count("default").await.unwrap();
+        let list = storage
+            .list_book_groups_with_count("default")
+            .await
+            .unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].name, "玄幻");
         assert_eq!(list[0].book_count, 2);
@@ -6017,31 +6853,74 @@ mod tests {
         assert_eq!(list[1].book_count, 1);
 
         // 重命名：仅改 name，order/id 保留；不存在返回 0 行
-        assert_eq!(storage.rename_book_group("default", g1.id, "玄幻v2").await.unwrap(), 1);
-        assert_eq!(storage.rename_book_group("default", 9999, "幽灵").await.unwrap(), 0);
-        let list = storage.list_book_groups_with_count("default").await.unwrap();
+        assert_eq!(
+            storage
+                .rename_book_group("default", g1.id, "玄幻v2")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .rename_book_group("default", 9999, "幽灵")
+                .await
+                .unwrap(),
+            0
+        );
+        let list = storage
+            .list_book_groups_with_count("default")
+            .await
+            .unwrap();
         assert_eq!(list[0].name, "玄幻v2");
         assert_eq!(list[0].order, 1, "重命名保留 order");
         assert_eq!(list[0].id, g1.id, "重命名保留 id");
         assert_eq!(list[0].book_count, 2, "重命名不影响书数");
 
         // 删除 g1：组内书置 0，组删除；g2 与书不受影响
-        assert_eq!(storage.delete_book_group("default", g1.id).await.unwrap(), 1);
-        assert_eq!(storage.delete_book_group("default", g1.id).await.unwrap(), 0, "重复删除 0 行");
-        let list = storage.list_book_groups_with_count("default").await.unwrap();
+        assert_eq!(
+            storage.delete_book_group("default", g1.id).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            storage.delete_book_group("default", g1.id).await.unwrap(),
+            0,
+            "重复删除 0 行"
+        );
+        let list = storage
+            .list_book_groups_with_count("default")
+            .await
+            .unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "言情");
-        let b1 = storage.find_book("default", "https://b.com/1").await.unwrap().unwrap();
+        let b1 = storage
+            .find_book("default", "https://b.com/1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(b1.group, 0, "组内书应置 0（未分组）");
-        let b2 = storage.find_book("default", "https://b.com/2").await.unwrap().unwrap();
+        let b2 = storage
+            .find_book("default", "https://b.com/2")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(b2.group, 0);
-        let b3 = storage.find_book("default", "https://b.com/3").await.unwrap().unwrap();
+        let b3 = storage
+            .find_book("default", "https://b.com/3")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(b3.group, g2.id, "其他组书不受影响");
 
         // 命名空间隔离：alice 删除不了 default 的分组
         assert_eq!(storage.delete_book_group("alice", g2.id).await.unwrap(), 0);
         assert_eq!(storage.list_book_groups("default").await.unwrap().len(), 1);
-        assert_eq!(storage.rename_book_group("alice", g2.id, "越权改名").await.unwrap(), 0);
+        assert_eq!(
+            storage
+                .rename_book_group("alice", g2.id, "越权改名")
+                .await
+                .unwrap(),
+            0
+        );
 
         cleanup(storage, "grpfin").await;
     }
@@ -6054,7 +6933,10 @@ mod tests {
 
         // 初始无 cookie
         assert_eq!(
-            storage.get_cookie("default", "https://a.com").await.unwrap(),
+            storage
+                .get_cookie("default", "https://a.com")
+                .await
+                .unwrap(),
             None
         );
 
@@ -6064,25 +6946,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            storage.get_cookie("default", "https://a.com").await.unwrap(),
+            storage
+                .get_cookie("default", "https://a.com")
+                .await
+                .unwrap(),
             Some("sid=abc; token=xyz".to_string())
         );
 
         // 覆盖写
-        storage.set_cookie("default", "https://a.com", "sid=def").await.unwrap();
+        storage
+            .set_cookie("default", "https://a.com", "sid=def")
+            .await
+            .unwrap();
         assert_eq!(
-            storage.get_cookie("default", "https://a.com").await.unwrap(),
+            storage
+                .get_cookie("default", "https://a.com")
+                .await
+                .unwrap(),
             Some("sid=def".to_string())
         );
 
         // 按用户隔离：alice 读不到 default 的 cookie
-        assert_eq!(storage.get_cookie("alice", "https://a.com").await.unwrap(), None);
+        assert_eq!(
+            storage.get_cookie("alice", "https://a.com").await.unwrap(),
+            None
+        );
         storage
             .set_cookie("alice", "https://a.com", "sid=alice")
             .await
             .unwrap();
         assert_eq!(
-            storage.get_cookie("default", "https://a.com").await.unwrap(),
+            storage
+                .get_cookie("default", "https://a.com")
+                .await
+                .unwrap(),
             Some("sid=def".to_string())
         );
         assert_eq!(
@@ -6091,9 +6988,24 @@ mod tests {
         );
 
         // 清除
-        assert_eq!(storage.clear_cookie("alice", "https://a.com").await.unwrap(), 1);
-        assert_eq!(storage.get_cookie("alice", "https://a.com").await.unwrap(), None);
-        assert_eq!(storage.clear_cookie("alice", "https://a.com").await.unwrap(), 0);
+        assert_eq!(
+            storage
+                .clear_cookie("alice", "https://a.com")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage.get_cookie("alice", "https://a.com").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            storage
+                .clear_cookie("alice", "https://a.com")
+                .await
+                .unwrap(),
+            0
+        );
 
         cleanup(storage, "cookie").await;
     }
@@ -6113,28 +7025,58 @@ mod tests {
 
         // 请求 URL 的 base 命中书源 source_url base（含端口/路径差异）
         assert_eq!(
-            storage.get_cookie_by_base("default", "https://a.com").await.unwrap(),
+            storage
+                .get_cookie_by_base("default", "https://a.com")
+                .await
+                .unwrap(),
             Some("sid=abc".to_string())
         );
         assert_eq!(
-            storage.get_cookie_by_base("default", "https://a.com/book/1?x=2").await.unwrap(),
+            storage
+                .get_cookie_by_base("default", "https://a.com/book/1?x=2")
+                .await
+                .unwrap(),
             Some("sid=abc".to_string())
         );
         assert_eq!(
-            storage.get_cookie_by_base("default", "https://b2.com/path").await.unwrap(),
+            storage
+                .get_cookie_by_base("default", "https://b2.com/path")
+                .await
+                .unwrap(),
             Some("sid=bbb".to_string())
         );
         // 不匹配
-        assert_eq!(storage.get_cookie_by_base("default", "https://c.com").await.unwrap(), None);
-        assert_eq!(storage.get_cookie_by_base("alice", "https://a.com").await.unwrap(), None);
+        assert_eq!(
+            storage
+                .get_cookie_by_base("default", "https://c.com")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            storage
+                .get_cookie_by_base("alice", "https://a.com")
+                .await
+                .unwrap(),
+            None
+        );
         // 端口不同不命中
         storage
             .set_cookie("default", "https://d.com:8443", "sid=dd")
             .await
             .unwrap();
-        assert_eq!(storage.get_cookie_by_base("default", "https://d.com").await.unwrap(), None);
         assert_eq!(
-            storage.get_cookie_by_base("default", "https://d.com:8443/x").await.unwrap(),
+            storage
+                .get_cookie_by_base("default", "https://d.com")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            storage
+                .get_cookie_by_base("default", "https://d.com:8443/x")
+                .await
+                .unwrap(),
             Some("sid=dd".to_string())
         );
 
@@ -6144,7 +7086,10 @@ mod tests {
     #[tokio::test]
     async fn test_cookie_user_agent_record() {
         let storage = test_storage("cookieua").await;
-        storage.set_cookie("default", "https://a.com", "sid=1").await.unwrap();
+        storage
+            .set_cookie("default", "https://a.com", "sid=1")
+            .await
+            .unwrap();
         storage
             .set_cookie_user_agent("default", "https://a.com", "fs-ua/1.0")
             .await
@@ -6157,7 +7102,10 @@ mod tests {
         assert_eq!(cookie, "sid=1");
         assert_eq!(ua, "fs-ua/1.0");
         // set_cookie 覆盖不丢 UA
-        storage.set_cookie("default", "https://a.com", "sid=2").await.unwrap();
+        storage
+            .set_cookie("default", "https://a.com", "sid=2")
+            .await
+            .unwrap();
         let (cookie, ua) = storage
             .get_source_session("default", "https://a.com")
             .await
@@ -6178,8 +7126,20 @@ mod tests {
         let s = source("https://a.com", "A源", None);
         storage.save_book_source("default", &s).await.unwrap();
 
-        assert_eq!(storage.delete_book_source("default", "https://a.com").await.unwrap(), 1);
-        assert_eq!(storage.get_cookie("default", "https://a.com").await.unwrap(), None);
+        assert_eq!(
+            storage
+                .delete_book_source("default", "https://a.com")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            storage
+                .get_cookie("default", "https://a.com")
+                .await
+                .unwrap(),
+            None
+        );
 
         // delete_all 清理
         storage
@@ -6190,24 +7150,57 @@ mod tests {
             .set_cookie("default", "https://b.com", "sid=3")
             .await
             .unwrap();
-        storage.save_book_source("default", &source("https://a.com", "A", None)).await.unwrap();
-        storage.save_book_source("default", &source("https://b.com", "B", None)).await.unwrap();
+        storage
+            .save_book_source("default", &source("https://a.com", "A", None))
+            .await
+            .unwrap();
+        storage
+            .save_book_source("default", &source("https://b.com", "B", None))
+            .await
+            .unwrap();
         storage.delete_all_book_sources("default").await.unwrap();
-        assert_eq!(storage.get_cookie("default", "https://a.com").await.unwrap(), None);
-        assert_eq!(storage.get_cookie("default", "https://b.com").await.unwrap(), None);
+        assert_eq!(
+            storage
+                .get_cookie("default", "https://a.com")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            storage
+                .get_cookie("default", "https://b.com")
+                .await
+                .unwrap(),
+            None
+        );
 
         cleanup(storage, "cookiedel").await;
     }
 
     #[test]
     fn test_normalize_base() {
-        assert_eq!(normalize_base("https://a.com").as_deref(), Some("https://a.com"));
-        assert_eq!(normalize_base("https://a.com/").as_deref(), Some("https://a.com"));
-        assert_eq!(normalize_base("https://a.com/book/1?x=2").as_deref(), Some("https://a.com"));
-        assert_eq!(normalize_base("https://a.com:8443/x").as_deref(), Some("https://a.com:8443"));
-        assert_eq!(normalize_base("http://a.com").as_deref(), Some("http://a.com"));
+        assert_eq!(
+            normalize_base("https://a.com").as_deref(),
+            Some("https://a.com")
+        );
+        assert_eq!(
+            normalize_base("https://a.com/").as_deref(),
+            Some("https://a.com")
+        );
+        assert_eq!(
+            normalize_base("https://a.com/book/1?x=2").as_deref(),
+            Some("https://a.com")
+        );
+        assert_eq!(
+            normalize_base("https://a.com:8443/x").as_deref(),
+            Some("https://a.com:8443")
+        );
+        assert_eq!(
+            normalize_base("http://a.com").as_deref(),
+            Some("http://a.com")
+        );
         assert_eq!(normalize_base("a.com").as_deref(), Some("https://a.com"));
-        assert_eq!(normalize_base("").is_none(), true);
+        assert!(normalize_base("").is_none());
     }
 
     // ---------------- GAP 44：RSS 分组 ----------------
@@ -6232,7 +7225,11 @@ mod tests {
             .into_iter()
             .find(|x| x.source_url == "https://r.com/feed.xml")
             .expect("保存后应能查到");
-        assert_eq!(got.source_group.as_deref(), Some("科技"), "group 应落库并读回");
+        assert_eq!(
+            got.source_group.as_deref(),
+            Some("科技"),
+            "group 应落库并读回"
+        );
         assert_eq!(got.source_name, "科技资讯");
 
         // 覆盖保存：改 group
@@ -6246,7 +7243,10 @@ mod tests {
         assert_eq!(got.source_group.as_deref(), Some("新闻 综合"));
 
         // 删除
-        storage.delete_rss_source("default", "https://r.com/feed.xml").await.unwrap();
+        storage
+            .delete_rss_source("default", "https://r.com/feed.xml")
+            .await
+            .unwrap();
         assert!(storage
             .get_rss_sources("default")
             .await
@@ -6278,38 +7278,80 @@ mod tests {
             ("https://b3.com", cover_b),
         ] {
             storage
-                .upsert_book("default", &crate::model::Book { book_url: url.into(), name: url.into(), cover_url: Some(cover.into()), ..Default::default() })
+                .upsert_book(
+                    "default",
+                    &crate::model::Book {
+                        book_url: url.into(),
+                        name: url.into(),
+                        cover_url: Some(cover.into()),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
         }
 
         // 删 b1（cover_a 仍被 b2 引用 → 文件保留）
-        storage.delete_book("default", "https://b1.com").await.unwrap();
+        storage
+            .delete_book("default", "https://b1.com")
+            .await
+            .unwrap();
         assert!(cover_dir.join("a1.jpg").exists(), "共享封面不应删除");
         // 删 b2 → cover_a 无引用 → 文件清理
-        storage.delete_book("default", "https://b2.com").await.unwrap();
+        storage
+            .delete_book("default", "https://b2.com")
+            .await
+            .unwrap();
         assert!(!cover_dir.join("a1.jpg").exists(), "无引用封面应清理");
         // 删 b3 → cover_b 清理
-        storage.delete_book("default", "https://b3.com").await.unwrap();
+        storage
+            .delete_book("default", "https://b3.com")
+            .await
+            .unwrap();
         assert!(!cover_dir.join("a2.jpg").exists());
 
         // 批量删除也清理
         std::fs::write(cover_dir.join("a3.jpg"), b"cover-c").unwrap();
         for url in ["https://c1.com", "https://c2.com"] {
             storage
-                .upsert_book("default", &crate::model::Book { book_url: url.into(), name: url.into(), cover_url: Some("/assets/default/covers/a3.jpg".into()), ..Default::default() })
+                .upsert_book(
+                    "default",
+                    &crate::model::Book {
+                        book_url: url.into(),
+                        name: url.into(),
+                        cover_url: Some("/assets/default/covers/a3.jpg".into()),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
         }
-        storage.delete_books("default", &["https://c1.com".into(), "https://c2.com".into()]).await.unwrap();
+        storage
+            .delete_books(
+                "default",
+                &["https://c1.com".into(), "https://c2.com".into()],
+            )
+            .await
+            .unwrap();
         assert!(!cover_dir.join("a3.jpg").exists(), "批量删除后封面应清理");
 
         // 封面路径穿越样式（.. / 反斜杠）→ 不删除任何文件
         storage
-            .upsert_book("default", &crate::model::Book { book_url: "https://d1.com".into(), name: "d".into(), cover_url: Some("/assets/default/covers/../a1.jpg".into()), ..Default::default() })
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "https://d1.com".into(),
+                    name: "d".into(),
+                    cover_url: Some("/assets/default/covers/../a1.jpg".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
-        storage.delete_book("default", "https://d1.com").await.unwrap();
+        storage
+            .delete_book("default", "https://d1.com")
+            .await
+            .unwrap();
 
         cleanup(storage, "coverclean").await;
     }

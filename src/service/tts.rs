@@ -55,32 +55,152 @@ pub fn edge_voices_cached() -> std::sync::Arc<Vec<EdgeVoice>> {
 pub fn edge_voices() -> &'static [EdgeVoice] {
     &[
         // zh-CN 女声
-        EdgeVoice { name: "晓晓", value: "zh-CN-XiaoxiaoNeural", locale: "zh-CN", gender: "Female" },
-        EdgeVoice { name: "晓伊", value: "zh-CN-XiaoyiNeural", locale: "zh-CN", gender: "Female" },
-        EdgeVoice { name: "晓辰", value: "zh-CN-XiaochenNeural", locale: "zh-CN", gender: "Female" },
-        EdgeVoice { name: "晓涵", value: "zh-CN-XiaohanNeural", locale: "zh-CN", gender: "Female" },
-        EdgeVoice { name: "晓墨", value: "zh-CN-XiaomoNeural", locale: "zh-CN", gender: "Female" },
-        EdgeVoice { name: "晓萱", value: "zh-CN-XiaoxuanNeural", locale: "zh-CN", gender: "Female" },
-        EdgeVoice { name: "晓颜", value: "zh-CN-XiaoyanNeural", locale: "zh-CN", gender: "Female" },
-        EdgeVoice { name: "晓悠", value: "zh-CN-XiaoyouNeural", locale: "zh-CN", gender: "Female" },
-        EdgeVoice { name: "晓梦", value: "zh-CN-XiaomengNeural", locale: "zh-CN", gender: "Female" },
-        EdgeVoice { name: "晓双", value: "zh-CN-XiaoshuangNeural", locale: "zh-CN", gender: "Female" },
+        EdgeVoice {
+            name: "晓晓",
+            value: "zh-CN-XiaoxiaoNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "晓伊",
+            value: "zh-CN-XiaoyiNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "晓辰",
+            value: "zh-CN-XiaochenNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "晓涵",
+            value: "zh-CN-XiaohanNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "晓墨",
+            value: "zh-CN-XiaomoNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "晓萱",
+            value: "zh-CN-XiaoxuanNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "晓颜",
+            value: "zh-CN-XiaoyanNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "晓悠",
+            value: "zh-CN-XiaoyouNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "晓梦",
+            value: "zh-CN-XiaomengNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "晓双",
+            value: "zh-CN-XiaoshuangNeural",
+            locale: "zh-CN",
+            gender: "Female",
+        },
         // zh-CN 男声
-        EdgeVoice { name: "云希", value: "zh-CN-YunxiNeural", locale: "zh-CN", gender: "Male" },
-        EdgeVoice { name: "云扬", value: "zh-CN-YunyangNeural", locale: "zh-CN", gender: "Male" },
-        EdgeVoice { name: "云健", value: "zh-CN-YunjianNeural", locale: "zh-CN", gender: "Male" },
-        EdgeVoice { name: "云夏", value: "zh-CN-YunxiaNeural", locale: "zh-CN", gender: "Male" },
-        EdgeVoice { name: "云枫", value: "zh-CN-YunfengNeural", locale: "zh-CN", gender: "Male" },
+        EdgeVoice {
+            name: "云希",
+            value: "zh-CN-YunxiNeural",
+            locale: "zh-CN",
+            gender: "Male",
+        },
+        EdgeVoice {
+            name: "云扬",
+            value: "zh-CN-YunyangNeural",
+            locale: "zh-CN",
+            gender: "Male",
+        },
+        EdgeVoice {
+            name: "云健",
+            value: "zh-CN-YunjianNeural",
+            locale: "zh-CN",
+            gender: "Male",
+        },
+        EdgeVoice {
+            name: "云夏",
+            value: "zh-CN-YunxiaNeural",
+            locale: "zh-CN",
+            gender: "Male",
+        },
+        EdgeVoice {
+            name: "云枫",
+            value: "zh-CN-YunfengNeural",
+            locale: "zh-CN",
+            gender: "Male",
+        },
         // en-US
-        EdgeVoice { name: "Aria", value: "en-US-AriaNeural", locale: "en-US", gender: "Female" },
-        EdgeVoice { name: "Jenny", value: "en-US-JennyNeural", locale: "en-US", gender: "Female" },
-        EdgeVoice { name: "Ana", value: "en-US-AnaNeural", locale: "en-US", gender: "Female" },
-        EdgeVoice { name: "Michelle", value: "en-US-MichelleNeural", locale: "en-US", gender: "Female" },
-        EdgeVoice { name: "Guy", value: "en-US-GuyNeural", locale: "en-US", gender: "Male" },
-        EdgeVoice { name: "Christopher", value: "en-US-ChristopherNeural", locale: "en-US", gender: "Male" },
-        EdgeVoice { name: "Eric", value: "en-US-EricNeural", locale: "en-US", gender: "Male" },
-        EdgeVoice { name: "Roger", value: "en-US-RogerNeural", locale: "en-US", gender: "Male" },
-        EdgeVoice { name: "Steffan", value: "en-US-SteffanNeural", locale: "en-US", gender: "Male" },
+        EdgeVoice {
+            name: "Aria",
+            value: "en-US-AriaNeural",
+            locale: "en-US",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "Jenny",
+            value: "en-US-JennyNeural",
+            locale: "en-US",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "Ana",
+            value: "en-US-AnaNeural",
+            locale: "en-US",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "Michelle",
+            value: "en-US-MichelleNeural",
+            locale: "en-US",
+            gender: "Female",
+        },
+        EdgeVoice {
+            name: "Guy",
+            value: "en-US-GuyNeural",
+            locale: "en-US",
+            gender: "Male",
+        },
+        EdgeVoice {
+            name: "Christopher",
+            value: "en-US-ChristopherNeural",
+            locale: "en-US",
+            gender: "Male",
+        },
+        EdgeVoice {
+            name: "Eric",
+            value: "en-US-EricNeural",
+            locale: "en-US",
+            gender: "Male",
+        },
+        EdgeVoice {
+            name: "Roger",
+            value: "en-US-RogerNeural",
+            locale: "en-US",
+            gender: "Male",
+        },
+        EdgeVoice {
+            name: "Steffan",
+            value: "en-US-SteffanNeural",
+            locale: "en-US",
+            gender: "Male",
+        },
     ]
 }
 
@@ -96,7 +216,8 @@ const TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 /// FILETIME 偏移：1601-01-01 → 1970-01-01 的 100ns 间隔数
 const FILETIME_EPOCH_OFFSET_TICKS: i64 = 116_444_736_000_000_000;
 /// WSS 端点
-const EDGE_WSS_URL: &str = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
+const EDGE_WSS_URL: &str =
+    "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
 /// 输出音频格式（MP3）
 const OUTPUT_FORMAT: &str = "audio-24khz-48kbitrate-mono-mp3";
 
@@ -104,13 +225,21 @@ const OUTPUT_FORMAT: &str = "audio-24khz-48kbitrate-mono-mp3";
 /// 返回 (Sec-MS-GEC, Sec-MS-GEC-Version)
 pub fn sec_ms_gec_at(unix_secs: i64) -> (String, String) {
     let ticks = unix_secs * 10_000_000 + FILETIME_EPOCH_OFFSET_TICKS;
-    let stamp = ticks.to_le_bytes().iter().map(|b| format!("{b:02X}")).collect::<String>();
+    let stamp = ticks
+        .to_le_bytes()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<String>();
     // Version：次日日期整数（YYYYMMDD+1）编码为 FILETIME 样式（edge-tts 同款算法）
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(unix_secs, 0)
         .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
     let date_int: i64 = dt.format("%Y%m%d").to_string().parse().unwrap_or(19700101);
     let ticks_v = (date_int + 1) * 10_000_000 + FILETIME_EPOCH_OFFSET_TICKS;
-    let stamp_v = ticks_v.to_le_bytes().iter().map(|b| format!("{b:02X}")).collect::<String>();
+    let stamp_v = ticks_v
+        .to_le_bytes()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<String>();
     (stamp, stamp_v)
 }
 
@@ -129,7 +258,8 @@ pub fn edge_wss_url(connection_id: &str) -> String {
 
 /// Edge 时间戳头格式（edge-tts date_to_string：GMT+0000 (Coordinated Universal Time)）
 pub fn edge_date_string(now: chrono::DateTime<chrono::Utc>) -> String {
-    now.format("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)").to_string()
+    now.format("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)")
+        .to_string()
 }
 
 /// speech.config 消息（连接后第一条）
@@ -157,7 +287,9 @@ pub fn sanitize_xml_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         let c = ch as u32;
-        if c == 0x9 || c == 0xA || c == 0xD
+        if c == 0x9
+            || c == 0xA
+            || c == 0xD
             || (0x20..=0xD7FF).contains(&c)
             || (0xE000..=0xFFFD).contains(&c)
             || (0x10000..=0x10FFFF).contains(&c)
@@ -300,7 +432,12 @@ pub async fn edge_synthesize(text: &str, voice: &str, rate: &str, pitch: &str) -
 }
 
 /// 单块 Edge TTS 合成（一次 WSS 会话）
-async fn edge_synthesize_chunk(text: &str, voice: &str, rate: &str, pitch: &str) -> Result<Vec<u8>> {
+async fn edge_synthesize_chunk(
+    text: &str,
+    voice: &str,
+    rate: &str,
+    pitch: &str,
+) -> Result<Vec<u8>> {
     let connection_id = uuid::Uuid::new_v4();
     let url = edge_wss_url(&connection_id.to_string());
 
@@ -308,7 +445,10 @@ async fn edge_synthesize_chunk(text: &str, voice: &str, rate: &str, pitch: &str)
         .uri(&url)
         .header("Pragma", "no-cache")
         .header("Cache-Control", "no-cache")
-        .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
+        .header(
+            "Origin",
+            "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+        )
         .body(())
         .map_err(|e| anyhow!("构造 WSS 请求失败: {e}"))?;
 
@@ -320,14 +460,14 @@ async fn edge_synthesize_chunk(text: &str, voice: &str, rate: &str, pitch: &str)
     // 1. speech.config
     let date = edge_date_string(chrono::Utc::now());
     sink.send(tokio_tungstenite::tungstenite::Message::Text(
-        build_speech_config(&date).into(),
+        build_speech_config(&date),
     ))
     .await
     .map_err(|e| anyhow!("发送 speech.config 失败: {e}"))?;
 
     // 2. SSML 合成请求
     sink.send(tokio_tungstenite::tungstenite::Message::Text(
-        build_ssml(text, voice, rate, pitch).into(),
+        build_ssml(text, voice, rate, pitch),
     ))
     .await
     .map_err(|e| anyhow!("发送合成请求失败: {e}"))?;
@@ -464,7 +604,9 @@ mod tests {
     fn test_edge_voices() {
         let voices = edge_voices();
         assert!(!voices.is_empty());
-        assert!(voices.iter().any(|v| v.value == "zh-CN-XiaoxiaoNeural" && v.name == "晓晓"));
+        assert!(voices
+            .iter()
+            .any(|v| v.value == "zh-CN-XiaoxiaoNeural" && v.name == "晓晓"));
         assert!(voices.iter().any(|v| v.value == "en-US-AriaNeural"));
         for v in voices {
             assert!(!v.value.is_empty() && !v.locale.is_empty() && !v.gender.is_empty());
@@ -491,7 +633,10 @@ mod tests {
     fn test_sanitize_and_escape() {
         let s = sanitize_xml_text("a\u{0}\u{1}b\u{7f}\t\n\u{8}");
         assert_eq!(s, "ab\u{7f}\t\n");
-        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
     }
 
     /// Sec-MS-GEC：已知时刻的确定性输出（16 位大写十六进制）
@@ -500,16 +645,29 @@ mod tests {
         let (stamp, stamp_v) = sec_ms_gec_at(0);
         assert_eq!(stamp.len(), 16);
         assert_eq!(stamp_v.len(), 16);
-        assert!(stamp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
-        assert!(stamp_v.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+        assert!(stamp
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+        assert!(stamp_v
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
         assert_eq!(sec_ms_gec_at(0), sec_ms_gec_at(0), "同一时刻输出应确定");
         // unix=0 → FILETIME 偏移量本体
-        assert_eq!(stamp, 116444736000000000i64.to_le_bytes().iter().map(|b| format!("{b:02X}")).collect::<String>());
+        assert_eq!(
+            stamp,
+            116444736000000000i64
+                .to_le_bytes()
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<String>()
+        );
         // Version 基于次日日期，应大于 Stamp 数值编码
         assert_ne!(stamp, stamp_v);
         // WSS URL 含鉴权参数
         let url = edge_wss_url("conn-1");
-        assert!(url.starts_with("wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?"));
+        assert!(url.starts_with(
+            "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?"
+        ));
         assert!(url.contains("TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4"));
         assert!(url.contains("Sec-MS-GEC=") && url.contains("Sec-MS-GEC-Version="));
         assert!(url.contains("ConnectionId=conn-1"));
@@ -518,8 +676,11 @@ mod tests {
     /// speech.config：输出格式 audio-24khz-48kbitrate-mono-mp3
     #[test]
     fn test_build_speech_config() {
-        let msg = build_speech_config("Fri Sep 13 2024 08:00:00 GMT+0000 (Coordinated Universal Time)");
-        assert!(msg.starts_with("X-Timestamp:Fri Sep 13 2024 08:00:00 GMT+0000 (Coordinated Universal Time)"));
+        let msg =
+            build_speech_config("Fri Sep 13 2024 08:00:00 GMT+0000 (Coordinated Universal Time)");
+        assert!(msg.starts_with(
+            "X-Timestamp:Fri Sep 13 2024 08:00:00 GMT+0000 (Coordinated Universal Time)"
+        ));
         assert!(msg.contains("Path:speech.config"));
         assert!(msg.contains("audio-24khz-48kbitrate-mono-mp3"));
         assert!(msg.contains("outputFormat"));
@@ -597,7 +758,8 @@ mod tests {
         let no_ph = build_http_tts_url("https://tts.example.com/say", "你好", None, None, None);
         assert_eq!(no_ph, "https://tts.example.com/say?text=%E4%BD%A0%E5%A5%BD");
 
-        let with_query = build_http_tts_url("https://tts.example.com/say?a=1", "hi", None, None, None);
+        let with_query =
+            build_http_tts_url("https://tts.example.com/say?a=1", "hi", None, None, None);
         assert_eq!(with_query, "https://tts.example.com/say?a=1&text=hi");
 
         // 未提供的可选占位符不追加

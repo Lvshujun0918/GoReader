@@ -90,7 +90,9 @@ fn extract_all_tags(xml: &str, tag: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = xml;
     loop {
-        let Some(start) = rest.find(&format!("<{tag}")) else { break };
+        let Some(start) = rest.find(&format!("<{tag}")) else {
+            break;
+        };
         let after = &rest[start..];
         let Some(gt) = after.find('>') else { break };
         // 跳过自闭合
@@ -99,7 +101,9 @@ fn extract_all_tags(xml: &str, tag: &str) -> Vec<String> {
             continue;
         }
         let close = format!("</{tag}>");
-        let Some(end) = after[gt + 1..].find(&close) else { break };
+        let Some(end) = after[gt + 1..].find(&close) else {
+            break;
+        };
         let content = &after[gt + 1..gt + 1 + end];
         let text = content
             .trim()
@@ -116,12 +120,22 @@ fn extract_all_tags(xml: &str, tag: &str) -> Vec<String> {
 }
 
 /// 提取带属性条件的标签 href：<item id="cover" href="...">
-fn extract_attr(xml: &str, tag: &str, attr_key: &str, attr_val: &str, want: &str) -> Option<String> {
+fn extract_attr(
+    xml: &str,
+    tag: &str,
+    attr_key: &str,
+    attr_val: &str,
+    want: &str,
+) -> Option<String> {
     let mut rest = xml;
     loop {
-        let Some(start) = rest.find(&format!("<{tag}")) else { return None };
+        let Some(start) = rest.find(&format!("<{tag}")) else {
+            return None;
+        };
         let after = &rest[start..];
-        let Some(gt) = after.find('>') else { return None };
+        let Some(gt) = after.find('>') else {
+            return None;
+        };
         let tag_block = &after[..gt + 1];
         // 检查 attr_key="attr_val"（宽容：引号单双）
         let pattern_attr = format!("{attr_key}=\"{attr_val}\"");
@@ -189,7 +203,11 @@ mod tests {
         assert_eq!(meta.author, "汐尺");
         assert_eq!(meta.language.as_deref(), Some("zho"));
         assert_eq!(meta.publisher.as_deref(), Some("起点中文网"));
-        assert!(meta.published_at.as_deref().unwrap().starts_with("2025-02-13"));
+        assert!(meta
+            .published_at
+            .as_deref()
+            .unwrap()
+            .starts_with("2025-02-13"));
         assert!(meta.description.as_deref().unwrap().contains("姬明欢"));
         assert_eq!(meta.subjects.len(), 4, "多 subject 不丢");
         assert_eq!(meta.identifiers.len(), 4, "多 identifier 不丢");

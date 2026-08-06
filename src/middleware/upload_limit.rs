@@ -91,7 +91,7 @@ mod tests {
                     .unwrap(),
             )
         });
-        let mut layer_svc = UploadLimitLayer { max_mb: 100 }.layer(svc);
+        let layer_svc = UploadLimitLayer { max_mb: 100 }.layer(svc);
         let resp = layer_svc
             .oneshot(
                 Request::builder()
@@ -109,7 +109,10 @@ mod tests {
             json["errorMsg"].as_str().unwrap().contains("100 MB"),
             "错误文案应含上限: {json}"
         );
-        assert!(json["errorMsg"].as_str().unwrap().contains("READER_UPLOAD_MAX_MB"));
+        assert!(json["errorMsg"]
+            .as_str()
+            .unwrap()
+            .contains("READER_UPLOAD_MAX_MB"));
     }
 
     /// 非 413 响应原样透传
@@ -123,7 +126,7 @@ mod tests {
                     .unwrap(),
             )
         });
-        let mut layer_svc = UploadLimitLayer { max_mb: 100 }.layer(svc);
+        let layer_svc = UploadLimitLayer { max_mb: 100 }.layer(svc);
         let resp = layer_svc
             .oneshot(Request::builder().body(Body::empty()).unwrap())
             .await

@@ -166,12 +166,24 @@ pub async fn list(
     let home = str_param(&params, body_json.as_ref(), "home");
     let user = state.storage.find_user(&ns).await.ok().flatten();
     let manager = manager_ok(&state.storage.config, &params, body_json.as_ref());
-    let base = match file_home(&state.storage.config, &ns, &home, false, false, manager, user.as_ref()) {
+    let base = match file_home(
+        &state.storage.config,
+        &ns,
+        &home,
+        false,
+        false,
+        manager,
+        user.as_ref(),
+    ) {
         Ok(b) => b,
         Err(ret) => return Json(ret),
     };
     let path = str_param(&params, body_json.as_ref(), "path");
-    let path = if path.is_empty() { "/".to_string() } else { path };
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path
+    };
     let Some(file) = resolve_secure_path(&base, &path) else {
         return Json(ReturnData::err("路径不存在"));
     };
@@ -226,7 +238,15 @@ pub async fn get(
     let home = str_param(&params, body_json.as_ref(), "home");
     let user = state.storage.find_user(&ns).await.ok().flatten();
     let manager = manager_ok(&state.storage.config, &params, body_json.as_ref());
-    let base = match file_home(&state.storage.config, &ns, &home, false, false, manager, user.as_ref()) {
+    let base = match file_home(
+        &state.storage.config,
+        &ns,
+        &home,
+        false,
+        false,
+        manager,
+        user.as_ref(),
+    ) {
         Ok(b) => b,
         Err(ret) => return Json(ret),
     };
@@ -267,7 +287,15 @@ pub async fn save(
     let home = str_param(&params, body_json.as_ref(), "home");
     let user = state.storage.find_user(&ns).await.ok().flatten();
     let manager = manager_ok(&state.storage.config, &params, body_json.as_ref());
-    let base = match file_home(&state.storage.config, &ns, &home, true, false, manager, user.as_ref()) {
+    let base = match file_home(
+        &state.storage.config,
+        &ns,
+        &home,
+        true,
+        false,
+        manager,
+        user.as_ref(),
+    ) {
         Ok(b) => b,
         Err(ret) => return Json(ret),
     };
@@ -306,7 +334,15 @@ pub async fn mkdir(
     let home = str_param(&params, body_json.as_ref(), "home");
     let user = state.storage.find_user(&ns).await.ok().flatten();
     let manager = manager_ok(&state.storage.config, &params, body_json.as_ref());
-    let base = match file_home(&state.storage.config, &ns, &home, true, false, manager, user.as_ref()) {
+    let base = match file_home(
+        &state.storage.config,
+        &ns,
+        &home,
+        true,
+        false,
+        manager,
+        user.as_ref(),
+    ) {
         Ok(b) => b,
         Err(ret) => return Json(ret),
     };
@@ -348,7 +384,15 @@ pub async fn download(
     let home = str_param(&params, body_json.as_ref(), "home");
     let user = state.storage.find_user(&ns).await.ok().flatten();
     let manager = manager_ok(&state.storage.config, &params, body_json.as_ref());
-    let base = match file_home(&state.storage.config, &ns, &home, false, false, manager, user.as_ref()) {
+    let base = match file_home(
+        &state.storage.config,
+        &ns,
+        &home,
+        false,
+        false,
+        manager,
+        user.as_ref(),
+    ) {
         Ok(b) => b,
         Err(ret) => return Json(ret).into_response(),
     };
@@ -365,7 +409,11 @@ pub async fn download(
     let stream = params
         .get("stream")
         .and_then(|v| v.parse::<i64>().ok())
-        .or_else(|| body_json.as_ref().and_then(|b| b.get("stream").and_then(|v| v.as_i64())))
+        .or_else(|| {
+            body_json
+                .as_ref()
+                .and_then(|b| b.get("stream").and_then(|v| v.as_i64()))
+        })
         .unwrap_or(0);
     match tokio::fs::read(&file).await {
         Ok(bytes) => {
@@ -409,7 +457,8 @@ pub async fn upload(
     let max_bytes = state.storage.config.upload_max_bytes();
     let max_mb = state.storage.config.upload_max_mb;
     // GAP 62：Content-Length 预检（超限 → 明确错误）
-    if let Some(msg) = crate::api::router::check_upload_content_length(&headers, max_bytes, max_mb) {
+    if let Some(msg) = crate::api::router::check_upload_content_length(&headers, max_bytes, max_mb)
+    {
         return Json(ReturnData::err(msg));
     }
     loop {
@@ -428,7 +477,11 @@ pub async fn upload(
                 Some("file") => {
                     let name = field.file_name().unwrap_or("file").to_string();
                     // GAP 62：显式字段大小上限（超限 → 明确错误）
-                    match crate::api::router::read_multipart_field_limited(&mut field, max_bytes, max_mb).await {
+                    match crate::api::router::read_multipart_field_limited(
+                        &mut field, max_bytes, max_mb,
+                    )
+                    .await
+                    {
                         Ok(bytes) => files.push((name, bytes)),
                         Err(msg) => return Json(ReturnData::err(msg)),
                     }
@@ -447,11 +500,23 @@ pub async fn upload(
     }
     let user = state.storage.find_user(&ns).await.ok().flatten();
     let manager = manager_ok(&state.storage.config, &params, None);
-    let base = match file_home(&state.storage.config, &ns, &home, true, false, manager, user.as_ref()) {
+    let base = match file_home(
+        &state.storage.config,
+        &ns,
+        &home,
+        true,
+        false,
+        manager,
+        user.as_ref(),
+    ) {
         Ok(b) => b,
         Err(ret) => return Json(ret),
     };
-    let path = if path.is_empty() { "/".to_string() } else { path };
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path
+    };
     let Some(target_dir) = resolve_secure_path(&base, &path) else {
         return Json(ReturnData::err("路径不存在"));
     };
@@ -478,7 +543,13 @@ pub async fn upload(
         if std::fs::write(&dest, &bytes).is_err() {
             continue;
         }
-        items.push(entry_json(&base_abs, &dest, false, bytes.len() as u64, last_modified_millis(&dest)));
+        items.push(entry_json(
+            &base_abs,
+            &dest,
+            false,
+            bytes.len() as u64,
+            last_modified_millis(&dest),
+        ));
     }
     Json(ReturnData::ok(Value::Array(items)))
 }
@@ -498,7 +569,15 @@ pub async fn delete(
     let home = str_param(&params, body_json.as_ref(), "home");
     let user = state.storage.find_user(&ns).await.ok().flatten();
     let manager = manager_ok(&state.storage.config, &params, body_json.as_ref());
-    let base = match file_home(&state.storage.config, &ns, &home, false, true, manager, user.as_ref()) {
+    let base = match file_home(
+        &state.storage.config,
+        &ns,
+        &home,
+        false,
+        true,
+        manager,
+        user.as_ref(),
+    ) {
         Ok(b) => b,
         Err(ret) => return Json(ret),
     };
@@ -543,13 +622,24 @@ pub async fn delete_multi(
     let home = str_param(&params, body_json.as_ref(), "home");
     let user = state.storage.find_user(&ns).await.ok().flatten();
     let manager = manager_ok(&state.storage.config, &params, body_json.as_ref());
-    let base = match file_home(&state.storage.config, &ns, &home, false, true, manager, user.as_ref()) {
+    let base = match file_home(
+        &state.storage.config,
+        &ns,
+        &home,
+        false,
+        true,
+        manager,
+        user.as_ref(),
+    ) {
         Ok(b) => b,
         Err(ret) => return Json(ret),
     };
     let paths: Vec<String> = match &body_json {
         Some(Value::Object(obj)) => {
-            let arr = obj.get("paths").or_else(|| obj.get("path")).and_then(|v| v.as_array());
+            let arr = obj
+                .get("paths")
+                .or_else(|| obj.get("path"))
+                .and_then(|v| v.as_array());
             match arr {
                 Some(arr) => arr
                     .iter()
@@ -570,7 +660,9 @@ pub async fn delete_multi(
             continue;
         }
         // 非法（防穿越）路径静默跳过（legacy：resolveSecurePath 失败即跳过）
-        let Some(file) = resolve_secure_path(&base, &path) else { continue };
+        let Some(file) = resolve_secure_path(&base, &path) else {
+            continue;
+        };
         if !file.exists() {
             continue;
         }
@@ -587,7 +679,9 @@ pub async fn delete_multi(
             }
         }
     }
-    Json(ReturnData::ok(json!({ "deleted": deleted, "failed": failed })))
+    Json(ReturnData::ok(
+        json!({ "deleted": deleted, "failed": failed }),
+    ))
 }
 
 #[cfg(test)]
@@ -596,10 +690,8 @@ mod tests {
     use axum::body::Bytes;
 
     async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "reader-files-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reader-files-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = AppConfig::from_env();
         config.work_dir = dir.to_string_lossy().into_owned();
@@ -609,7 +701,13 @@ mod tests {
             dir.join("storage").join("cache").join("images"),
             1024 * 1024,
         );
-        (AppState { storage, image_cache }, dir)
+        (
+            AppState {
+                storage,
+                image_cache,
+            },
+            dir,
+        )
     }
 
     async fn cleanup(state: AppState, dir: std::path::PathBuf) {
@@ -637,7 +735,10 @@ mod tests {
             base_abs.join("a.txt"),
             "绝对路径按相对处理（legacy removePrefix）"
         );
-        assert!(resolve_secure_path(&base, "../escape.txt").is_none(), "越出 base 应拒绝");
+        assert!(
+            resolve_secure_path(&base, "../escape.txt").is_none(),
+            "越出 base 应拒绝"
+        );
         assert!(
             resolve_secure_path(&base, "a/../../escape.txt").is_none(),
             "多次 .. 越出 base 应拒绝"
@@ -668,14 +769,26 @@ mod tests {
             storage_dir.join("data/alice/webdav")
         );
         assert_eq!(
-            file_home(&config, "alice", "__LOCAL_STORE__", false, false, true, None).unwrap(),
+            file_home(
+                &config,
+                "alice",
+                "__LOCAL_STORE__",
+                false,
+                false,
+                true,
+                None
+            )
+            .unwrap(),
             storage_dir.join("localStore")
         );
         assert_eq!(
             file_home(&config, "alice", "__STORAGE__", false, false, true, None).unwrap(),
             storage_dir
         );
-        assert!(file_home(&config, "alice", "__OTHER__", false, false, true, None).is_err(), "未知 home 应拒绝");
+        assert!(
+            file_home(&config, "alice", "__OTHER__", false, false, true, None).is_err(),
+            "未知 home 应拒绝"
+        );
 
         // secure：__STORAGE__ 与 __LOCAL_STORE__ 写/删需管理密码
         config.secure = true;
@@ -688,9 +801,36 @@ mod tests {
         };
         assert!(file_home(&config, "alice", "__STORAGE__", false, false, false, None).is_err());
         assert!(file_home(&config, "alice", "__STORAGE__", false, false, true, None).is_ok());
-        assert!(file_home(&config, "alice", "__LOCAL_STORE__", true, false, false, Some(&user_ok)).is_err());
-        assert!(file_home(&config, "alice", "__LOCAL_STORE__", false, true, false, Some(&user_ok)).is_err());
-        assert!(file_home(&config, "alice", "__LOCAL_STORE__", true, false, true, Some(&user_ok)).is_ok());
+        assert!(file_home(
+            &config,
+            "alice",
+            "__LOCAL_STORE__",
+            true,
+            false,
+            false,
+            Some(&user_ok)
+        )
+        .is_err());
+        assert!(file_home(
+            &config,
+            "alice",
+            "__LOCAL_STORE__",
+            false,
+            true,
+            false,
+            Some(&user_ok)
+        )
+        .is_err());
+        assert!(file_home(
+            &config,
+            "alice",
+            "__LOCAL_STORE__",
+            true,
+            false,
+            true,
+            Some(&user_ok)
+        )
+        .is_ok());
         // secure：未开启 webdav/本地书仓 → 拒绝
         let user = crate::model::User {
             username: "alice".into(),
@@ -698,15 +838,42 @@ mod tests {
             enable_local_store: true,
             ..Default::default()
         };
-        assert!(file_home(&config, "alice", "__WEBDAV__", false, false, true, Some(&user)).is_err());
+        assert!(file_home(
+            &config,
+            "alice",
+            "__WEBDAV__",
+            false,
+            false,
+            true,
+            Some(&user)
+        )
+        .is_err());
         let user = crate::model::User {
             username: "alice".into(),
             enable_webdav: true,
             enable_local_store: false,
             ..Default::default()
         };
-        assert!(file_home(&config, "alice", "__LOCAL_STORE__", false, false, true, Some(&user)).is_err());
-        assert!(file_home(&config, "alice", "__WEBDAV__", false, false, true, Some(&user_ok)).is_ok());
+        assert!(file_home(
+            &config,
+            "alice",
+            "__LOCAL_STORE__",
+            false,
+            false,
+            true,
+            Some(&user)
+        )
+        .is_err());
+        assert!(file_home(
+            &config,
+            "alice",
+            "__WEBDAV__",
+            false,
+            false,
+            true,
+            Some(&user_ok)
+        )
+        .is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -718,40 +885,83 @@ mod tests {
 
         // save 写文件
         let body = Bytes::from(r#"{"path":"/docs/a.txt","content":"hello"}"#);
-        let ret = save(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        let ret = save(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers.clone(),
+            Some(body),
+        )
+        .await;
         assert!(ret.0.is_success, "save 应成功: {}", ret.0.error_msg);
 
         // get 读回
-        let params: HashMap<String, String> = [("path".into(), "/docs/a.txt".into())].into_iter().collect();
+        let params: HashMap<String, String> = [("path".into(), "/docs/a.txt".into())]
+            .into_iter()
+            .collect();
         let ret = get(State(state.clone()), Query(params), headers.clone(), None).await;
         assert!(ret.0.is_success);
         assert_eq!(ret.0.data, json!("hello"));
 
         // list 列目录（含 docs）
-        let ret = list(State(state.clone()), Query(HashMap::new()), headers.clone(), None).await;
+        let ret = list(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers.clone(),
+            None,
+        )
+        .await;
         assert!(ret.0.is_success);
         let arr = ret.0.data.as_array().unwrap();
-        assert!(arr.iter().any(|v| v["name"] == "docs"), "列表应含 docs: {arr:?}");
+        assert!(
+            arr.iter().any(|v| v["name"] == "docs"),
+            "列表应含 docs: {arr:?}"
+        );
 
         // mkdir + 重复建报路径已存在
         let body = Bytes::from(r#"{"path":"/","name":"sub"}"#);
-        let ret = mkdir(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        let ret = mkdir(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers.clone(),
+            Some(body),
+        )
+        .await;
         assert!(ret.0.is_success);
         let body = Bytes::from(r#"{"path":"/","name":"sub"}"#);
-        let ret = mkdir(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        let ret = mkdir(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers.clone(),
+            Some(body),
+        )
+        .await;
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "路径已存在");
 
         // 穿越路径拒绝（save 到 ../ 外）
         let body = Bytes::from(r#"{"path":"/../../evil.txt","content":"x"}"#);
-        let ret = save(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        let ret = save(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers.clone(),
+            Some(body),
+        )
+        .await;
         assert!(!ret.0.is_success, "穿越路径应拒绝");
 
         // delete 目录（递归）
         let body = Bytes::from(r#"{"path":"/docs"}"#);
-        let ret = delete(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        let ret = delete(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers.clone(),
+            Some(body),
+        )
+        .await;
         assert!(ret.0.is_success);
-        let params: HashMap<String, String> = [("path".into(), "/docs/a.txt".into())].into_iter().collect();
+        let params: HashMap<String, String> = [("path".into(), "/docs/a.txt".into())]
+            .into_iter()
+            .collect();
         let ret = get(State(state.clone()), Query(params), headers, None).await;
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "路径不存在");
@@ -766,7 +976,12 @@ mod tests {
         let headers = HeaderMap::new();
 
         // 准备：a.txt / b.txt / docs/c.txt / 外部 escape.txt
-        let base = state.storage.config.storage_dir().join("data").join("default");
+        let base = state
+            .storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join("default");
         std::fs::create_dir_all(base.join("docs")).unwrap();
         std::fs::write(base.join("a.txt"), "a").unwrap();
         std::fs::write(base.join("b.txt"), "b").unwrap();
@@ -778,9 +993,19 @@ mod tests {
         let body = Bytes::from(
             r#"{"paths":["/a.txt","/docs","/missing.txt","/../escape.txt"],"home":""}"#,
         );
-        let ret = delete_multi(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        let ret = delete_multi(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers.clone(),
+            Some(body),
+        )
+        .await;
         assert!(ret.0.is_success, "deleteMulti 应成功: {}", ret.0.error_msg);
-        assert_eq!(ret.0.data["deleted"], 2, "应删除 a.txt + docs 目录: {:?}", ret.0.data);
+        assert_eq!(
+            ret.0.data["deleted"], 2,
+            "应删除 a.txt + docs 目录: {:?}",
+            ret.0.data
+        );
         assert!(!base.join("a.txt").exists());
         assert!(!base.join("docs").exists());
         assert!(outside.exists(), "外部文件不应被删");
@@ -788,18 +1013,36 @@ mod tests {
 
         // legacy `path` 键（数组）兼容
         let body = Bytes::from(r#"{"path":["/b.txt"],"home":""}"#);
-        let ret = delete_multi(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        let ret = delete_multi(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers.clone(),
+            Some(body),
+        )
+        .await;
         assert!(ret.0.is_success);
         assert_eq!(ret.0.data["deleted"], 1);
         assert!(!base.join("b.txt").exists());
 
         // 缺 paths/path 键 → 参数错误；空数组 → 参数错误
         let body = Bytes::from(r#"{"home":""}"#);
-        let ret = delete_multi(State(state.clone()), Query(HashMap::new()), headers.clone(), Some(body)).await;
+        let ret = delete_multi(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers.clone(),
+            Some(body),
+        )
+        .await;
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "参数错误");
         let body = Bytes::from(r#"{"paths":[],"home":""}"#);
-        let ret = delete_multi(State(state.clone()), Query(HashMap::new()), headers, Some(body)).await;
+        let ret = delete_multi(
+            State(state.clone()),
+            Query(HashMap::new()),
+            headers,
+            Some(body),
+        )
+        .await;
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "参数错误");
 

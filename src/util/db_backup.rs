@@ -93,10 +93,8 @@ mod tests {
 
     /// 构造临时 storage 目录（带测试数据库文件）——每测试独立子目录（并行测试不串扰）
     fn temp_storage(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "reader-db-backup-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reader-db-backup-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -110,14 +108,23 @@ mod tests {
         for ts in ["20240101000000", "20240102000000", "20240103000000"] {
             std::fs::write(dir.join(format!("reader.db.bak-{ts}")), b"old").unwrap();
         }
-        let backup = backup_reader_db(&dir).await.expect("备份应成功").expect("应生成备份");
+        let backup = backup_reader_db(&dir)
+            .await
+            .expect("备份应成功")
+            .expect("应生成备份");
         let name = backup.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("reader.db.bak-"), "命名: {name}");
         assert_eq!(std::fs::read(&backup).unwrap(), b"db-bytes", "内容一致");
         // 保留最近 5 份：3 旧 + 1 新 = 4 份，无删除
         let count = std::fs::read_dir(&dir)
             .unwrap()
-            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("reader.db.bak-"))
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("reader.db.bak-")
+            })
             .count();
         assert_eq!(count, 4);
         // 再备份 2 次 → 共 6 份 → 删最旧 1 份，剩 5（毫秒级时间戳避免同秒覆盖）
@@ -156,7 +163,12 @@ mod tests {
     #[test]
     fn test_prune_backups_keep_count() {
         let dir = temp_storage("prune");
-        for ts in ["20240101000000", "20240102000000", "20240103000000", "20240104000000"] {
+        for ts in [
+            "20240101000000",
+            "20240102000000",
+            "20240103000000",
+            "20240104000000",
+        ] {
             std::fs::write(dir.join(format!("reader.db.bak-{ts}")), b"old").unwrap();
         }
         // 无关文件不受影响
@@ -169,7 +181,10 @@ mod tests {
             .collect();
         assert_eq!(remaining.len(), 2);
         assert!(remaining.iter().any(|n| n.contains("20240104000000")));
-        assert!(std::fs::read_dir(&dir).unwrap().count() >= 3, "reader.db 不受影响");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().count() >= 3,
+            "reader.db 不受影响"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

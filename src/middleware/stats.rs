@@ -48,6 +48,6 @@ where
         let path = req.uri().path().to_string();
         crate::service::monitor::record_request(&path);
         let fut = self.inner.call(req);
-        Box::pin(async move { fut.await })
+        Box::pin(fut)
     }
 }

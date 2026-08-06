@@ -117,7 +117,10 @@ pub async fn run_auto_backup(storage: &Storage) -> Result<usize> {
         if legado.join(format!("auto-{today}.zip")).exists() {
             continue;
         }
-        match storage.write_backup_zip(&ns, &format!("auto-{today}")).await {
+        match storage
+            .write_backup_zip(&ns, &format!("auto-{today}"))
+            .await
+        {
             Ok(path) => {
                 tracing::info!("自动备份 [{ns}]: {}", path);
                 done += 1;
@@ -188,11 +191,23 @@ pub async fn run_rss_refresh(storage: &Storage) -> Result<usize> {
 /// 抓取订阅 URL → 校验书源数组 → 订阅入库（raw_json 存原文）→ 批量导入书源
 /// （已存在覆盖；书源数上限整批拒绝）。错误信息即对外文案：
 /// "远程书源链接错误" / "书源数据格式错误" / "超过书源数上限" / "保存失败"。
-pub async fn refresh_source_sub_core(storage: &Storage, ns: &str, url: &str, name: &str) -> Result<usize> {
+pub async fn refresh_source_sub_core(
+    storage: &Storage,
+    ns: &str,
+    url: &str,
+    name: &str,
+) -> Result<usize> {
     let headers_map: HashMap<String, String> = HashMap::new();
-    let resp = crate::service::crawler::fetch(url, &headers_map, SUB_FETCH_TIMEOUT_SECS, "GET", None, None)
-        .await
-        .map_err(|_| anyhow!("远程书源链接错误"))?;
+    let resp = crate::service::crawler::fetch(
+        url,
+        &headers_map,
+        SUB_FETCH_TIMEOUT_SECS,
+        "GET",
+        None,
+        None,
+    )
+    .await
+    .map_err(|_| anyhow!("远程书源链接错误"))?;
     // 校验：必须是书源数组（每项含非空 bookSourceUrl）
     let json: serde_json::Value =
         serde_json::from_str(&resp.body).map_err(|_| anyhow!("书源数据格式错误"))?;
@@ -239,14 +254,12 @@ pub async fn refresh_source_sub_core(storage: &Storage, ns: &str, url: &str, nam
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BookSource, RssSource};
+    use crate::model::RssSource;
     use crate::storage::Storage;
 
     async fn test_storage(tag: &str) -> (Storage, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "reader-schedule-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reader-schedule-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = crate::AppConfig::from_env();
         config.work_dir = dir.to_string_lossy().into_owned();
@@ -270,7 +283,9 @@ mod tests {
                 .map(|(p, b)| (p.to_string(), b.to_string()))
                 .collect();
             for _ in 0..10 {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let mut buf = [0u8; 4096];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -323,8 +338,16 @@ mod tests {
         assert_eq!(sources[0].book_source_url, "https://x.com");
         assert_eq!(sources[0].book_source_name, "X源");
         // 订阅 raw_json 已覆盖
-        let sub = storage.find_source_sub("default", &sub_url).await.unwrap().unwrap();
-        assert!(sub.raw_json.as_deref().unwrap_or("").contains("bookSourceUrl"));
+        let sub = storage
+            .find_source_sub("default", &sub_url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(sub
+            .raw_json
+            .as_deref()
+            .unwrap_or("")
+            .contains("bookSourceUrl"));
         cleanup(storage, dir).await;
     }
 
@@ -382,7 +405,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1);
-        let art = storage.get_rss_article("https://e.com/1").await.unwrap().unwrap();
+        let art = storage
+            .get_rss_article("https://e.com/1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(art.title, "文章1");
         cleanup(storage, dir).await;
     }

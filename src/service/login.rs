@@ -38,7 +38,11 @@ pub enum LoginOutcome {
     /// 登录成功（cookie 已存库，按用户）
     Success { cookie: String },
     /// 需要图片验证码：captcha_url 给前端（页面提取 URL 或浏览器截图 data URI）
-    NeedImageCaptcha { captcha_url: String, captcha_id: String, message: String },
+    NeedImageCaptcha {
+        captcha_url: String,
+        captcha_id: String,
+        message: String,
+    },
     /// 点击类验证码无法自动处理/失败/超时 → 引导手动 Cookie
     NeedManualCookie { message: String },
     /// 登录失败（loginCheckJs 未通过，无验证码）
@@ -49,7 +53,12 @@ pub enum LoginOutcome {
 
 /// loginUrl/loginBody 占位符替换：{user}/{pass}/{captcha}/{username}/{password} 及双花括号变体。
 /// 双花括号优先（避免 `{{user}}` 被 `{user}` 二次替换错位）。
-pub fn replace_login_placeholders(s: &str, username: &str, password: &str, captcha: &str) -> String {
+pub fn replace_login_placeholders(
+    s: &str,
+    username: &str,
+    password: &str,
+    captcha: &str,
+) -> String {
     let mut out = s.to_string();
     out = out
         .replace("{{user}}", username)
@@ -78,8 +87,16 @@ pub fn build_login_form(source: &BookSource, req: &LoginRequest) -> String {
             items
                 .iter()
                 .map(|it| {
-                    let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let typ = it.get("type").and_then(|v| v.as_str()).unwrap_or("text").to_string();
+                    let name = it
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let typ = it
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("text")
+                        .to_string();
                     (name, typ)
                 })
                 .collect()
@@ -104,8 +121,12 @@ pub fn build_login_form(source: &BookSource, req: &LoginRequest) -> String {
         let n = name.to_lowercase();
         let value = if t.contains("password") {
             req.password.clone()
-        } else if n.contains("captcha") || n.contains("vcode") || n.contains("verify") || n.contains("checkcode")
-            || t.contains("captcha") || t.contains("verify")
+        } else if n.contains("captcha")
+            || n.contains("vcode")
+            || n.contains("verify")
+            || n.contains("checkcode")
+            || t.contains("captcha")
+            || t.contains("verify")
         {
             req.captcha.clone()
         } else if !user_done {
@@ -153,7 +174,9 @@ pub fn merge_cookie(existing: &str, set_cookies: &[String]) -> String {
     }
     for sc in set_cookies {
         let first = sc.split(';').next().unwrap_or("").trim();
-        let Some((k, v)) = first.split_once('=') else { continue };
+        let Some((k, v)) = first.split_once('=') else {
+            continue;
+        };
         let k = k.trim().to_string();
         if k.is_empty() {
             continue;
@@ -184,15 +207,37 @@ pub fn merge_cookie(existing: &str, set_cookies: &[String]) -> String {
 pub fn detect_click_captcha(html: &str) -> Option<&'static str> {
     let lower = html.to_lowercase();
     let slider_markers = [
-        "geetest", "极验", "gt.js", "gt4", "滑块", "滑动验证", "slide-verify", "slider-verify",
-        "tcaptcha", "nc_1_n1z", "aliyun", "阿里云验证码", "拖动滑块", "拼图", "jigsaw",
-        "dx-captcha", "顶象", "dragverify", "slidercaptcha",
+        "geetest",
+        "极验",
+        "gt.js",
+        "gt4",
+        "滑块",
+        "滑动验证",
+        "slide-verify",
+        "slider-verify",
+        "tcaptcha",
+        "nc_1_n1z",
+        "aliyun",
+        "阿里云验证码",
+        "拖动滑块",
+        "拼图",
+        "jigsaw",
+        "dx-captcha",
+        "顶象",
+        "dragverify",
+        "slidercaptcha",
     ];
     if slider_markers.iter().any(|m| lower.contains(m)) {
         return Some("slider");
     }
     let click_markers = [
-        "点选", "click-verify", "clickcaptcha", "verify-point", "字符点选", "语序点选", "points-verify",
+        "点选",
+        "click-verify",
+        "clickcaptcha",
+        "verify-point",
+        "字符点选",
+        "语序点选",
+        "points-verify",
     ];
     if click_markers.iter().any(|m| lower.contains(m)) {
         return Some("click");
@@ -207,7 +252,14 @@ pub fn extract_image_captcha_url(html: &str, base_url: &str) -> Option<String> {
         let tag = cap.get(0)?.as_str();
         let ctx = tag.to_lowercase();
         let has_feature = [
-            "captcha", "vcode", "verify", "yzm", "checkcode", "验证码", "randimg", "kaptcha",
+            "captcha",
+            "vcode",
+            "verify",
+            "yzm",
+            "checkcode",
+            "验证码",
+            "randimg",
+            "kaptcha",
         ]
         .iter()
         .any(|k| ctx.contains(k));
@@ -245,12 +297,7 @@ static CAPTCHA_SESSIONS: LazyLock<Mutex<HashMap<String, CaptchaSession>>> =
 
 const CAPTCHA_TTL: Duration = Duration::from_secs(300);
 
-fn new_captcha_session(
-    ns: &str,
-    source: &BookSource,
-    kind: &str,
-    req: &LoginRequest,
-) -> String {
+fn new_captcha_session(ns: &str, source: &BookSource, kind: &str, req: &LoginRequest) -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let mut guard = CAPTCHA_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     // 过期清理
@@ -305,7 +352,12 @@ pub async fn login_http(
 
     let method = suffix.method.as_deref().unwrap_or("GET").to_string();
     let body = if let Some(b) = &suffix.body {
-        Some(replace_login_placeholders(b, &req.username, &req.password, &req.captcha))
+        Some(replace_login_placeholders(
+            b,
+            &req.username,
+            &req.password,
+            &req.captcha,
+        ))
     } else if method.eq_ignore_ascii_case("POST") {
         Some(build_login_form(source, req))
     } else {
@@ -317,7 +369,15 @@ pub async fn login_http(
             "Content-Type".to_string(),
             "application/x-www-form-urlencoded".to_string(),
         );
-        crawler::http_post(ns, &url, &req_headers, 20, body.as_deref(), suffix.charset.as_deref()).await?
+        crawler::http_post(
+            ns,
+            &url,
+            &req_headers,
+            20,
+            body.as_deref(),
+            suffix.charset.as_deref(),
+        )
+        .await?
     } else {
         crawler::http_get(ns, &url, &req_headers, 20).await?
     };
@@ -332,7 +392,9 @@ pub async fn login_http(
     let existing = storage.get_cookie(ns, &source.book_source_url).await?;
     let merged = merge_cookie(existing.as_deref().unwrap_or(""), &set_cookies);
     if !merged.is_empty() {
-        storage.set_cookie(ns, &source.book_source_url, &merged).await?;
+        storage
+            .set_cookie(ns, &source.book_source_url, &merged)
+            .await?;
     }
 
     // loginCheckJs
@@ -348,13 +410,16 @@ pub async fn login_http(
     if let Some(kind) = detect_click_captcha(&resp.body) {
         // 点击类验证码：浏览器可用 → 自动切换浏览器流（滑块自动拖）；否则手动 Cookie
         if browser::is_browser_available() {
-            tracing::info!("书源 [{}] 检测到{kind}验证码——切换浏览器自动登录", source.book_source_name);
+            tracing::info!(
+                "书源 [{}] 检测到{kind}验证码——切换浏览器自动登录",
+                source.book_source_name
+            );
             return login_browser(storage, ns, source, req).await;
         }
         let kind_cn = if kind == "slider" { "滑块" } else { "点选" };
         return Ok(LoginOutcome::NeedManualCookie {
             message: format!(
-                "检测到{kind_cn}验证码：请在浏览器登录该书源后，在书源设置粘贴 Cookie（安装 Chrome/Edge 后可使用浏览器自动登录）"
+                "检测到{kind_cn}验证码：请在浏览器登录该书源后，在书源设置粘贴 Cookie（安装/配置 obscura 浏览器后可使用浏览器自动登录）"
             ),
         });
     }
@@ -432,7 +497,11 @@ async fn browser_login_inner(
         if det.is_null() {
             break;
         }
-        let kind = det.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+        let kind = det
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("")
+            .to_string();
         match kind.as_str() {
             "image" => {
                 let (x, y, w, h) = rect_of(&det);
@@ -495,7 +564,11 @@ async fn browser_login_inner(
     // ③ 提交后可能再现验证码 → 滑块再拖一次 / 图片截图 / 点选降级
     let det2 = b.evaluate(browser::DETECT_CAPTCHA_JS).await?;
     if !det2.is_null() {
-        let kind = det2.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+        let kind = det2
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("")
+            .to_string();
         match kind.as_str() {
             "slider" if slider_attempts < 2 => {
                 let (bx, by, bw, _bh) = rect_of(&det2);
@@ -541,14 +614,21 @@ async fn browser_login_inner(
         let cookies = b.get_cookies().await?;
         browser::Browser::cookies_to_string(&cookies)
     };
-    let page_url = b.evaluate("location.href").await?.as_str().unwrap_or("").to_string();
+    let page_url = b
+        .evaluate("location.href")
+        .await?
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     let ok = match &source.login_check_js {
         Some(js) => check_login(js, &cookie_str, &html, &page_url)?,
         None => true,
     };
     if ok {
         if !cookie_str.is_empty() {
-            storage.set_cookie(ns, &source.book_source_url, &cookie_str).await?;
+            storage
+                .set_cookie(ns, &source.book_source_url, &cookie_str)
+                .await?;
         }
         tracing::info!("书源 [{}] 浏览器自动登录成功", source.book_source_name);
         return Ok(LoginOutcome::Success { cookie: cookie_str });
@@ -578,7 +658,8 @@ async fn inject_cookies(
     let parsed = url::Url::parse(url).map_err(|e| anyhow!("loginUrl 解析失败: {e}"))?;
     let host = parsed.host_str().unwrap_or("").to_string();
     let secure = parsed.scheme() == "https";
-    b.set_cookies(&crawler::parse_cookie_string(&cookie), &host, secure).await?;
+    b.set_cookies(&crawler::parse_cookie_string(&cookie), &host, secure)
+        .await?;
     Ok(())
 }
 
@@ -595,14 +676,10 @@ fn rect_of(det: &Value) -> (f64, f64, f64, f64) {
 
 /// POST /reader3/getCaptcha：重新触发登录页 → 检测验证码 → 返回
 /// {captchaType: image|slider|click|none, captchaUrl(data URI), captchaId, pageUrl}
-pub async fn get_captcha(
-    storage: &Storage,
-    ns: &str,
-    source: &BookSource,
-) -> Result<Value> {
+pub async fn get_captcha(storage: &Storage, ns: &str, source: &BookSource) -> Result<Value> {
     if !browser::is_browser_available() {
         return Err(anyhow!(
-            "未安装浏览器（Chrome/Edge）——请在书源设置粘贴 Cookie（手动流程）"
+            "未安装浏览器（obscura）——请在书源设置粘贴 Cookie（手动流程；配置 READER_OBSCURA_BIN/READER_OBSCURA_URL 后可使用浏览器自动登录）"
         ));
     }
     let login_url = source
@@ -620,8 +697,17 @@ pub async fn get_captcha(
     if det.is_null() {
         return Ok(json!({ "captchaType": "none", "message": "未检测到验证码" }));
     }
-    let kind = det.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
-    let page_url = b.evaluate("location.href").await?.as_str().unwrap_or("").to_string();
+    let kind = det
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("")
+        .to_string();
+    let page_url = b
+        .evaluate("location.href")
+        .await?
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     match kind.as_str() {
         "image" => {
             let (x, y, w, h) = rect_of(&det);
@@ -631,8 +717,7 @@ pub async fn get_captcha(
                 "data:image/png;base64,{}",
                 base64::engine::general_purpose::STANDARD.encode(&png)
             );
-            let captcha_id =
-                new_captcha_session(ns, source, "image", &LoginRequest::default());
+            let captcha_id = new_captcha_session(ns, source, "image", &LoginRequest::default());
             Ok(json!({
                 "captchaType": "image",
                 "captchaUrl": data_uri,
@@ -693,7 +778,11 @@ pub async fn submit_captcha(
             LoginOutcome::Success { cookie } => {
                 json!({ "isLogin": true, "cookie": cookie, "needCaptcha": false })
             }
-            LoginOutcome::NeedImageCaptcha { captcha_url, captcha_id, message } => json!({
+            LoginOutcome::NeedImageCaptcha {
+                captcha_url,
+                captcha_id,
+                message,
+            } => json!({
                 "isLogin": false, "needCaptcha": true, "captchaUrl": captcha_url,
                 "captchaId": captcha_id, "message": message
             }),
@@ -730,8 +819,8 @@ async fn submit_captcha_inner(
     b.navigate(&url).await?;
 
     // 填验证码输入框
-    let fill_captcha_js = browser::FILL_CAPTCHA_JS
-        .replace("'CAPTCHA'", &serde_json::to_string(&req.captcha)?);
+    let fill_captcha_js =
+        browser::FILL_CAPTCHA_JS.replace("'CAPTCHA'", &serde_json::to_string(&req.captcha)?);
     let fc = b.evaluate(&fill_captcha_js).await?;
     if fc.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return Ok(LoginOutcome::Failed {
@@ -780,14 +869,21 @@ async fn submit_captcha_inner(
         let cookies = b.get_cookies().await?;
         browser::Browser::cookies_to_string(&cookies)
     };
-    let page_url = b.evaluate("location.href").await?.as_str().unwrap_or("").to_string();
+    let page_url = b
+        .evaluate("location.href")
+        .await?
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     let ok = match &source.login_check_js {
         Some(js) => check_login(js, &cookie_str, &html, &page_url)?,
         None => true,
     };
     if ok {
         if !cookie_str.is_empty() {
-            storage.set_cookie(ns, &source.book_source_url, &cookie_str).await?;
+            storage
+                .set_cookie(ns, &source.book_source_url, &cookie_str)
+                .await?;
         }
         return Ok(LoginOutcome::Success { cookie: cookie_str });
     }
@@ -812,7 +908,11 @@ mod tests {
             book_source_url: "https://src.test".to_string(),
             book_source_name: "测试源".to_string(),
             login_url: Some(login_url.to_string()),
-            login_check_js: if login_check_js.is_empty() { None } else { Some(login_check_js.to_string()) },
+            login_check_js: if login_check_js.is_empty() {
+                None
+            } else {
+                Some(login_check_js.to_string())
+            },
             ..Default::default()
         }
     }
@@ -821,11 +921,21 @@ mod tests {
     fn test_replace_placeholders() {
         // 双花括号优先 + 单花括号 + 各字段
         assert_eq!(
-            replace_login_placeholders("https://a.com/login?u={{user}}&p={{pass}}&c={{captcha}}", "u1", "p1", "c1"),
+            replace_login_placeholders(
+                "https://a.com/login?u={{user}}&p={{pass}}&c={{captcha}}",
+                "u1",
+                "p1",
+                "c1"
+            ),
             "https://a.com/login?u=u1&p=p1&c=c1"
         );
         assert_eq!(
-            replace_login_placeholders("https://a.com/login?u={user}&p={pass}&c={captcha}", "u1", "p1", "c1"),
+            replace_login_placeholders(
+                "https://a.com/login?u={user}&p={pass}&c={captcha}",
+                "u1",
+                "p1",
+                "c1"
+            ),
             "https://a.com/login?u=u1&p=p1&c=c1"
         );
         // 未提供字段 → 空串
@@ -835,7 +945,12 @@ mod tests {
         );
         // username/password 别名
         assert_eq!(
-            replace_login_placeholders("https://a.com/{{username}}/{{password}}", "alice", "pw", ""),
+            replace_login_placeholders(
+                "https://a.com/{{username}}/{{password}}",
+                "alice",
+                "pw",
+                ""
+            ),
             "https://a.com/alice/pw"
         );
     }
@@ -845,9 +960,27 @@ mod tests {
         // 空脚本 = 成功（legacy 语义）
         assert!(check_login("", "a=1", "body", "https://a.com").unwrap());
         // true/1 → 成功
-        assert!(check_login("result.indexOf('ok') >= 0", "a=1", "ok body", "https://a.com").unwrap());
-        assert!(!check_login("result.indexOf('ok') >= 0", "a=1", "bad body", "https://a.com").unwrap());
-        assert!(check_login("cookie.indexOf('sid') >= 0", "sid=1; a=2", "x", "https://a.com").unwrap());
+        assert!(check_login(
+            "result.indexOf('ok') >= 0",
+            "a=1",
+            "ok body",
+            "https://a.com"
+        )
+        .unwrap());
+        assert!(!check_login(
+            "result.indexOf('ok') >= 0",
+            "a=1",
+            "bad body",
+            "https://a.com"
+        )
+        .unwrap());
+        assert!(check_login(
+            "cookie.indexOf('sid') >= 0",
+            "sid=1; a=2",
+            "x",
+            "https://a.com"
+        )
+        .unwrap());
         assert!(!check_login("cookie.indexOf('sid') >= 0", "a=2", "x", "https://a.com").unwrap());
         // 布尔表达式直返
         assert!(check_login("true", "", "", "").unwrap());
@@ -859,11 +992,17 @@ mod tests {
         // 新 Set-Cookie 覆盖同名、不同名保留、空值删除、顺序稳定
         let merged = merge_cookie(
             "sid=old; theme=dark",
-            &["sid=new; Path=/; HttpOnly".to_string(), "token=abc".to_string()],
+            &[
+                "sid=new; Path=/; HttpOnly".to_string(),
+                "token=abc".to_string(),
+            ],
         );
         assert_eq!(merged, "sid=new; theme=dark; token=abc");
         // 空值删除
-        let merged = merge_cookie("sid=old; theme=dark", &["sid=; Expires=Thu, 01 Jan 1970".to_string()]);
+        let merged = merge_cookie(
+            "sid=old; theme=dark",
+            &["sid=; Expires=Thu, 01 Jan 1970".to_string()],
+        );
         assert_eq!(merged, "theme=dark");
         // 无既有 + 无 Set-Cookie
         assert_eq!(merge_cookie("", &[]), "");
@@ -874,22 +1013,46 @@ mod tests {
     #[test]
     fn test_build_login_form() {
         let src = source_with_login("https://a.com/login", "");
-        let req = LoginRequest { username: "u1".into(), password: "p1".into(), captcha: "".into() };
+        let req = LoginRequest {
+            username: "u1".into(),
+            password: "p1".into(),
+            captcha: "".into(),
+        };
         assert_eq!(build_login_form(&src, &req), "username=u1&password=p1");
         // 带验证码 → 追加 captcha 字段
-        let req = LoginRequest { username: "u1".into(), password: "p1".into(), captcha: "c1".into() };
-        assert_eq!(build_login_form(&src, &req), "username=u1&password=p1&captcha=c1");
+        let req = LoginRequest {
+            username: "u1".into(),
+            password: "p1".into(),
+            captcha: "c1".into(),
+        };
+        assert_eq!(
+            build_login_form(&src, &req),
+            "username=u1&password=p1&captcha=c1"
+        );
         // loginUi 字段名优先
         let mut src2 = src.clone();
         src2.login_ui = Some(r#"[{"name":"loginName","type":"text"},{"name":"loginPassword","type":"password"},{"name":"vcode","type":"text"}]"#.into());
-        let req = LoginRequest { username: "u2".into(), password: "p2".into(), captcha: "v2".into() };
-        assert_eq!(build_login_form(&src2, &req), "loginName=u2&loginPassword=p2&vcode=v2");
+        let req = LoginRequest {
+            username: "u2".into(),
+            password: "p2".into(),
+            captcha: "v2".into(),
+        };
+        assert_eq!(
+            build_login_form(&src2, &req),
+            "loginName=u2&loginPassword=p2&vcode=v2"
+        );
     }
 
     #[test]
     fn test_detect_click_captcha() {
-        assert_eq!(detect_click_captcha("<html>geetest slider</html>"), Some("slider"));
-        assert_eq!(detect_click_captcha("<html>滑动验证</html>"), Some("slider"));
+        assert_eq!(
+            detect_click_captcha("<html>geetest slider</html>"),
+            Some("slider")
+        );
+        assert_eq!(
+            detect_click_captcha("<html>滑动验证</html>"),
+            Some("slider")
+        );
         assert_eq!(detect_click_captcha("<html>点选验证</html>"), Some("click"));
         assert_eq!(detect_click_captcha("<html>normal page</html>"), None);
         // 图片验证码页（img captcha）不算点击类
@@ -901,7 +1064,8 @@ mod tests {
 
     #[test]
     fn test_extract_image_captcha_url() {
-        let html = r#"<html><img src="/captcha.png"><img id="vcode" src="https://a.com/c.png"></html>"#;
+        let html =
+            r#"<html><img src="/captcha.png"><img id="vcode" src="https://a.com/c.png"></html>"#;
         assert_eq!(
             extract_image_captcha_url(html, "https://a.com/login").as_deref(),
             Some("https://a.com/captcha.png")
@@ -913,13 +1077,20 @@ mod tests {
             Some("https://a.com/api/code?t=1")
         );
         // 无验证码图 → None
-        assert_eq!(extract_image_captcha_url("<img src='/logo.png'>", "https://a.com"), None);
+        assert_eq!(
+            extract_image_captcha_url("<img src='/logo.png'>", "https://a.com"),
+            None
+        );
     }
 
     #[test]
     fn test_captcha_session_ttl_and_match() {
         let src = source_with_login("https://a.com/login", "");
-        let req = LoginRequest { username: "u".into(), password: "p".into(), captcha: "".into() };
+        let req = LoginRequest {
+            username: "u".into(),
+            password: "p".into(),
+            captcha: "".into(),
+        };
         let id = new_captcha_session("default", &src, "image", &req);
         let s = get_captcha_session(&id).unwrap();
         assert_eq!(s.ns, "default");

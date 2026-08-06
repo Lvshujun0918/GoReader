@@ -26,7 +26,11 @@ pub fn build_feed_url(source: &RssSource, page: i64) -> String {
     let mut url = source.source_url.clone();
     if let Some(sort_url) = source.sort_url().filter(|s| !s.trim().is_empty()) {
         // 兼容 legacy sortUrls()：每段 "name::url"（JS 前缀 v1 不执行），取首个含 :: 的段
-        for seg in sort_url.split(['\n', '&']).map(str::trim).filter(|s| !s.is_empty()) {
+        for seg in sort_url
+            .split(['\n', '&'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             if let Some((_, u)) = seg.split_once("::") {
                 if !u.trim().is_empty() {
                     url = u.trim().to_string();
@@ -72,7 +76,11 @@ fn article_from_entry(entry: &feed_rs::model::Entry, source: &RssSource) -> RssA
             }
         })
         .unwrap_or_default();
-    let title = entry.title.as_ref().map(|t| t.content.clone()).unwrap_or_default();
+    let title = entry
+        .title
+        .as_ref()
+        .map(|t| t.content.clone())
+        .unwrap_or_default();
     // 作者：feed-rs 的 RSS2 <author> 解析为 name="author" + email=原文（如“作者乙”），
     // 因此 name 为占位符“author”或空时回退 email；Atom/dc:creator 直接用 name
     let author = entry
@@ -145,7 +153,9 @@ pub fn extract_web_content(html: &str) -> String {
         "main",
     ];
     for sel in CANDIDATES {
-        let Ok(selector) = scraper::Selector::parse(sel) else { continue };
+        let Ok(selector) = scraper::Selector::parse(sel) else {
+            continue;
+        };
         if let Some(node) = doc.select(&selector).next() {
             let text = visible_text(&node);
             if !text.is_empty() {
@@ -247,7 +257,10 @@ mod tests {
         assert_eq!(articles[0].content.as_deref(), Some("第二篇摘要"));
         assert_eq!(articles[1].title, "第一篇");
         assert_eq!(articles[1].author, "作者甲");
-        assert_eq!(articles[1].content.as_deref(), Some("<p>第一篇文章摘要</p>"));
+        assert_eq!(
+            articles[1].content.as_deref(),
+            Some("<p>第一篇文章摘要</p>")
+        );
         assert_eq!(articles[1].source_url, "https://example.com/feed.xml");
     }
 
@@ -304,8 +317,10 @@ mod tests {
     fn test_build_feed_url() {
         let mut s = source();
         assert_eq!(build_feed_url(&s, 1), "https://example.com/feed.xml");
-        s.raw_json =
-            Some(r#"{"sortUrl":"列表::https://example.com/list\n详情::https://example.com/detail"}"#.into());
+        s.raw_json = Some(
+            r#"{"sortUrl":"列表::https://example.com/list\n详情::https://example.com/detail"}"#
+                .into(),
+        );
         assert_eq!(build_feed_url(&s, 1), "https://example.com/list");
         // 无 :: 的段被丢弃 → 回退 sourceUrl（legacy sortUrls 语义）
         s.raw_json = Some(r#"{"sortUrl":"https://example.com/page/{{page}}.xml"}"#.into());
@@ -341,6 +356,9 @@ mod tests {
         let bare = extract_web_content("<html><body><p>只有一段</p></body></html>");
         assert_eq!(bare, "只有一段");
         // 完全无文本
-        assert_eq!(extract_web_content("<html><body><script>var a=1;</script></body></html>"), "");
+        assert_eq!(
+            extract_web_content("<html><body><script>var a=1;</script></body></html>"),
+            ""
+        );
     }
 }

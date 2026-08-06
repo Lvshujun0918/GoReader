@@ -26,7 +26,10 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
     let data_dir = storage.config.storage_dir().join("data");
     let users_path = data_dir.join("users.json");
     if !users_path.exists() {
-        tracing::info!("未发现 legacy JSON 数据（{} 不存在），跳过迁移", users_path.display());
+        tracing::info!(
+            "未发现 legacy JSON 数据（{} 不存在），跳过迁移",
+            users_path.display()
+        );
         return Ok(());
     }
     let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
@@ -113,7 +116,10 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
 
     // 1. 迁移前备份 storage/data → storage/backup-before-migrate-{ts}/
     let ts = Utc::now().format("%Y%m%d%H%M%S");
-    let backup_dir = storage.config.storage_dir().join(format!("backup-before-migrate-{ts}"));
+    let backup_dir = storage
+        .config
+        .storage_dir()
+        .join(format!("backup-before-migrate-{ts}"));
     copy_dir_recursive(&data_dir, &backup_dir)
         .with_context(|| format!("备份 storage/data → {} 失败", backup_dir.display()))?;
     tracing::info!("已备份 storage/data → {}", backup_dir.display());
@@ -170,10 +176,10 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
 
 /// users.json（Map<username, User>）→ users 表（全字段 + raw_json 原文保底）；返回迁移的用户名列表
 async fn migrate_users(pool: &SqlitePool, path: &Path) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("读取 {} 失败", path.display()))?;
-    let user_map: HashMap<String, serde_json::Value> = serde_json::from_str(&text)
-        .with_context(|| format!("解析 {} 失败", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("读取 {} 失败", path.display()))?;
+    let user_map: HashMap<String, serde_json::Value> =
+        serde_json::from_str(&text).with_context(|| format!("解析 {} 失败", path.display()))?;
 
     let mut usernames = Vec::with_capacity(user_map.len());
     let mut tx = pool.begin().await?;
@@ -182,7 +188,10 @@ async fn migrate_users(pool: &SqlitePool, path: &Path) -> Result<Vec<String>> {
             Ok(u) => u,
             Err(e) => {
                 tracing::warn!("解析用户 {} 失败（{}），保留 raw_json", key, e);
-                User { username: key.clone(), ..Default::default() }
+                User {
+                    username: key.clone(),
+                    ..Default::default()
+                }
             }
         };
         if user.username.is_empty() {
@@ -228,7 +237,11 @@ async fn migrate_users(pool: &SqlitePool, path: &Path) -> Result<Vec<String>> {
 }
 
 /// 各命名空间 bookshelf.json → books 表；返回迁移的书籍总数
-async fn migrate_bookshelves(pool: &SqlitePool, data_dir: &Path, namespaces: &[String]) -> Result<usize> {
+async fn migrate_bookshelves(
+    pool: &SqlitePool,
+    data_dir: &Path,
+    namespaces: &[String],
+) -> Result<usize> {
     let mut total = 0usize;
     for ns in namespaces {
         let path = data_dir.join(ns).join("bookshelf.json");
@@ -312,13 +325,13 @@ async fn migrate_bookshelves(pool: &SqlitePool, data_dir: &Path, namespaces: &[S
             .bind(book.origin_order)
             .bind(book.use_replace_rule)
             .bind(&book.variable)
-            .bind(&book.read_config.as_ref().map(|v| v.to_string()))
+            .bind(book.read_config.as_ref().map(|v| v.to_string()))
             .bind(book.is_in_shelf)
             .bind(book.cbz)
             .bind(&book.display_cover)
             .bind(&book.display_intro)
-            .bind(&book.local_epub)
-            .bind(&book.local_pdf)
+            .bind(book.local_epub)
+            .bind(book.local_pdf)
             .bind(book.pdf)
             .bind(book.split_long_chapter)
             .bind(&book.last_check_error)
@@ -433,21 +446,21 @@ async fn migrate_book_sources(
             .bind(src.weight)
             .bind(&src.explore_url)
             .bind(&src.search_url)
-            .bind(&val(&src.rule_explore))
-            .bind(&val(&src.rule_search))
-            .bind(&val(&src.rule_book_info))
-            .bind(&val(&src.rule_toc))
-            .bind(&val(&src.rule_content))
-            .bind(&val(&src.rule_related))
-            .bind(&val(&src.search_rule))
-            .bind(&val(&src.explore_rule))
-            .bind(&val(&src.book_info_rule))
-            .bind(&val(&src.toc_rule))
-            .bind(&val(&src.content_rule))
+            .bind(val(&src.rule_explore))
+            .bind(val(&src.rule_search))
+            .bind(val(&src.rule_book_info))
+            .bind(val(&src.rule_toc))
+            .bind(val(&src.rule_content))
+            .bind(val(&src.rule_related))
+            .bind(val(&src.search_rule))
+            .bind(val(&src.explore_rule))
+            .bind(val(&src.book_info_rule))
+            .bind(val(&src.toc_rule))
+            .bind(val(&src.content_rule))
             .bind(&src.key)
             .bind(&src.tag)
-            .bind(&val(&src.logger))
-            .bind(&val(&src.variable))
+            .bind(val(&src.logger))
+            .bind(val(&src.variable))
             .bind(&src.user_namespace)
             .bind(&src.raw_json)
             .execute(&mut *tx)
@@ -625,7 +638,11 @@ async fn migrate_bookmarks(
         let mut tx = pool.begin().await?;
         for value in items {
             let get_str = |k: &str| {
-                value.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                value
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
             };
             let book_url = get_str("bookUrl");
             let title = get_str("title");
@@ -639,7 +656,10 @@ async fn migrate_bookmarks(
                 .and_then(|v| v.as_i64())
                 .or_else(|| value.get("content").and_then(|v| v.as_i64()))
                 .unwrap_or(0);
-            let chapter_index = value.get("chapterIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+            let chapter_index = value
+                .get("chapterIndex")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             let created_at = value
                 .get("createdAt")
                 .and_then(|v| v.as_i64())
@@ -710,7 +730,11 @@ async fn migrate_replace_rules(
         let mut tx = pool.begin().await?;
         for value in items {
             let get_str = |k: &str| {
-                value.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                value
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
             };
             let name = get_str("name");
             let find = get_str("find");
@@ -777,7 +801,10 @@ async fn migrate_txt_toc_rules(
         .fetch_one(pool)
         .await?;
     if existing > 0 {
-        tracing::info!("txt_toc_rules 表已有 {} 条记录，跳过 TXT 目录规则迁移", existing);
+        tracing::info!(
+            "txt_toc_rules 表已有 {} 条记录，跳过 TXT 目录规则迁移",
+            existing
+        );
         return Ok(0);
     }
     let mut total = 0usize;
@@ -805,7 +832,11 @@ async fn migrate_txt_toc_rules(
         let mut tx = pool.begin().await?;
         for value in items {
             let get_str = |k: &str| {
-                value.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                value
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
             };
             let name = get_str("name");
             let rule = get_str("rule");
@@ -830,7 +861,10 @@ async fn migrate_txt_toc_rules(
                 .or_else(|| value.get("enabled"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            let serial_number = value.get("serialNumber").and_then(|v| v.as_i64()).unwrap_or(0);
+            let serial_number = value
+                .get("serialNumber")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             sqlx::query(
                 r#"
                 INSERT OR REPLACE INTO txt_toc_rules
@@ -867,7 +901,10 @@ async fn migrate_http_tts(
         .fetch_one(pool)
         .await?;
     if existing > 0 {
-        tracing::info!("http_tts_list 表已有 {} 条记录，跳过 HttpTTS 迁移", existing);
+        tracing::info!(
+            "http_tts_list 表已有 {} 条记录，跳过 HttpTTS 迁移",
+            existing
+        );
         return Ok(0);
     }
     let mut total = 0usize;
@@ -895,7 +932,11 @@ async fn migrate_http_tts(
         let mut tx = pool.begin().await?;
         for value in items {
             let get_str = |k: &str| {
-                value.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                value
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
             };
             let url = get_str("url");
             let name = get_str("name");
@@ -1103,10 +1144,7 @@ mod tests {
 
     /// 独立临时目录（避免污染真实 storage/reader.db）
     fn test_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "reader-migrate-test-{}-{tag}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("reader-migrate-test-{}-{tag}", std::process::id()))
     }
 
     /// 构造最小 legacy data 目录（users.json + 各命名空间 legacy 文件）
@@ -1235,7 +1273,10 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap();
-        assert!(raw.contains("这是书签内容"), "legacy content 应保底在 raw_json: {raw}");
+        assert!(
+            raw.contains("这是书签内容"),
+            "legacy content 应保底在 raw_json: {raw}"
+        );
         let ns: String =
             sqlx::query_scalar("SELECT user_namespace FROM bookmarks WHERE title = ?1")
                 .bind("第一章 起点")
@@ -1251,46 +1292,42 @@ mod tests {
             .await
             .unwrap();
         assert!(!id.is_empty(), "legacy 无 id 应补 uuid");
-        let (find, enable, order_num): (String, i64, i64) = sqlx::query_as(
-            "SELECT find, enable, order_num FROM replace_rules WHERE name = ?1",
-        )
-        .bind("净化")
-        .fetch_one(pool)
-        .await
-        .unwrap();
+        let (find, enable, order_num): (String, i64, i64) =
+            sqlx::query_as("SELECT find, enable, order_num FROM replace_rules WHERE name = ?1")
+                .bind("净化")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         assert_eq!(find, "旧排版");
         assert_eq!((enable, order_num), (0, 2));
 
         // TXT 目录规则：legacy Long id → 字符串化
-        let (id, serial_number, enable): (String, i64, i64) = sqlx::query_as(
-            "SELECT id, serial_number, enable FROM txt_toc_rules WHERE name = ?1",
-        )
-        .bind("章节")
-        .fetch_one(pool)
-        .await
-        .unwrap();
+        let (id, serial_number, enable): (String, i64, i64) =
+            sqlx::query_as("SELECT id, serial_number, enable FROM txt_toc_rules WHERE name = ?1")
+                .bind("章节")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         assert_eq!(id, "1");
         assert_eq!((serial_number, enable), (0, 1));
 
         // HttpTTS：url 主键 + type 映射
-        let (name, tts_type): (String, i64) = sqlx::query_as(
-            "SELECT name, type FROM http_tts_list WHERE url = ?1",
-        )
-        .bind("https://tts.example.com/synth")
-        .fetch_one(pool)
-        .await
-        .unwrap();
+        let (name, tts_type): (String, i64) =
+            sqlx::query_as("SELECT name, type FROM http_tts_list WHERE url = ?1")
+                .bind("https://tts.example.com/synth")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         assert_eq!(name, "在线TTS");
         assert_eq!(tts_type, 0);
 
         // 分组：legacy id 保留
-        let (id, order_num): (i64, i64) = sqlx::query_as(
-            "SELECT id, order_num FROM book_groups WHERE name = ?1",
-        )
-        .bind("玄幻")
-        .fetch_one(pool)
-        .await
-        .unwrap();
+        let (id, order_num): (i64, i64) =
+            sqlx::query_as("SELECT id, order_num FROM book_groups WHERE name = ?1")
+                .bind("玄幻")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         assert_eq!((id, order_num), (1, 0));
 
         // 用户配置：对象 map（default）+ 数组（alice）
@@ -1353,7 +1390,11 @@ mod tests {
         write_legacy_files(&storage.config.storage_dir().join("data"));
         migrate_if_needed(&storage).await.unwrap();
         let pool = &storage.pool;
-        assert_eq!(count(pool, "bookmarks").await, 1, "bookmarks 非空应跳过迁移");
+        assert_eq!(
+            count(pool, "bookmarks").await,
+            1,
+            "bookmarks 非空应跳过迁移"
+        );
         let title: String = sqlx::query_scalar("SELECT title FROM bookmarks")
             .fetch_one(pool)
             .await
@@ -1367,4 +1408,3 @@ mod tests {
         cleanup(storage, "skip").await;
     }
 }
-

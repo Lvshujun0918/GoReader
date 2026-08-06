@@ -3,12 +3,11 @@
 //! 根目录：storage/data/{user}/webdav（secure 模式按 Basic 认证用户；非 secure 用 default）
 //! 支持：OPTIONS / PROPFIND / GET / PUT / MKCOL / DELETE / MOVE / COPY / LOCK / UNLOCK
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 
 use crate::storage::Storage;
 use crate::util::md5::gen_encrypted_password;
@@ -26,15 +25,21 @@ pub async fn handle(
         return Response::builder()
             .status(StatusCode::OK)
             .header("DAV", "1,2")
-            .header("Allow", "OPTIONS,DELETE,GET,PUT,PROPFIND,MKCOL,MOVE,COPY,LOCK,UNLOCK")
+            .header(
+                "Allow",
+                "OPTIONS,DELETE,GET,PUT,PROPFIND,MKCOL,MOVE,COPY,LOCK,UNLOCK",
+            )
             .header("Access-Control-Allow-Origin", "*")
             .body(Body::empty())
             .unwrap();
     }
 
     // 2. Basic 认证
-    let Some((username, _ns, home)) = authenticate(storage, headers).await else {
-        return webdav_status(StatusCode::UNAUTHORIZED, Some(("WWW-Authenticate", "Basic realm=\"reader\"")));
+    let Some((_username, _ns, home)) = authenticate(storage, headers).await else {
+        return webdav_status(
+            StatusCode::UNAUTHORIZED,
+            Some(("WWW-Authenticate", "Basic realm=\"reader\"")),
+        );
     };
 
     // 3. 路径解析（webdav 根目录下）
@@ -43,7 +48,7 @@ pub async fn handle(
     };
 
     match method.as_str() {
-        "PROPFIND" => propfind(&file, &path, &home).await,
+        "PROPFIND" => propfind(&file, path, &home).await,
         "GET" | "HEAD" => get_file(&file).await,
         "PUT" => put_file(&file, body).await,
         "MKCOL" => mkcol(&file).await,
@@ -57,9 +62,17 @@ pub async fn handle(
 }
 
 /// Basic 认证 → (username, user_namespace, user_home)
-pub(crate) async fn authenticate(storage: &Storage, headers: &HeaderMap) -> Option<(String, String, PathBuf)> {
+pub(crate) async fn authenticate(
+    storage: &Storage,
+    headers: &HeaderMap,
+) -> Option<(String, String, PathBuf)> {
     if !storage.config.secure {
-        let home = storage.config.storage_dir().join("data").join("default").join("webdav");
+        let home = storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join("default")
+            .join("webdav");
         return Some(("default".into(), "default".into(), home));
     }
     let auth = headers
@@ -139,12 +152,17 @@ async fn propfind(file: &Path, request_path: &str, _home: &Path) -> Response {
     if !file.exists() {
         return webdav_status(StatusCode::NOT_FOUND, None);
     }
-    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n");
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n",
+    );
     let base = request_path.trim_end_matches('/');
     let url_encode = |s: &str| s.replace(' ', "%20");
 
     // 自身
-    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     xml.push_str(&entry_xml(base, &name, file, true));
     // 子项（仅一级）
     if file.is_dir() {
@@ -265,7 +283,9 @@ async fn move_copy(file: &Path, headers: &HeaderMap, copy: bool) -> Response {
         }
         home = p.to_path_buf();
     }
-    let rel = dest_path.trim_start_matches("/reader3/webdav").trim_start_matches('/');
+    let rel = dest_path
+        .trim_start_matches("/reader3/webdav")
+        .trim_start_matches('/');
     let target = home.join(rel);
     // 安全校验：目标必须在 webdav 根内（防路径穿越任意写入）
     let home_abs = home.canonicalize().unwrap_or_else(|_| home.clone());

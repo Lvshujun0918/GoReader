@@ -23,7 +23,7 @@ use mongodb::Client;
 use serde_json::{json, Value};
 
 use crate::model::{
-    Book, BookGroup, Bookmark, BookSource, HttpTts, ReplaceRule, RssSource, TxtTocRule, User,
+    Book, BookGroup, BookSource, Bookmark, HttpTts, ReplaceRule, RssSource, TxtTocRule, User,
 };
 use crate::storage::Storage;
 
@@ -171,11 +171,12 @@ pub async fn backup_to_mongodb(storage: &Storage, ns: &str, uri: &str, db: &str)
     report.insert("bookGroups".into(), json!(n));
 
     // replace_rules（精确取本命名空间行——不走 get_replace_rules 的 default 回退）
-    let rules: Vec<ReplaceRule> =
-        sqlx::query_as("SELECT * FROM replace_rules WHERE user_namespace = ?1 ORDER BY order_num, id")
-            .bind(ns)
-            .fetch_all(&storage.pool)
-            .await?;
+    let rules: Vec<ReplaceRule> = sqlx::query_as(
+        "SELECT * FROM replace_rules WHERE user_namespace = ?1 ORDER BY order_num, id",
+    )
+    .bind(ns)
+    .fetch_all(&storage.pool)
+    .await?;
     let items = rules
         .iter()
         .map(|r| Ok((r.id.clone(), to_document(r)?)))
@@ -218,12 +219,11 @@ pub async fn backup_to_mongodb(storage: &Storage, ns: &str, uri: &str, db: &str)
     report.insert("txtTocRules".into(), json!(n));
 
     // http_tts_list（精确取本命名空间行）
-    let tts: Vec<HttpTts> = sqlx::query_as(
-        "SELECT * FROM http_tts_list WHERE user_namespace = ?1 ORDER BY name",
-    )
-    .bind(ns)
-    .fetch_all(&storage.pool)
-    .await?;
+    let tts: Vec<HttpTts> =
+        sqlx::query_as("SELECT * FROM http_tts_list WHERE user_namespace = ?1 ORDER BY name")
+            .bind(ns)
+            .fetch_all(&storage.pool)
+            .await?;
     let items = tts
         .iter()
         .map(|t| Ok((t.url.clone(), to_document(t)?)))
@@ -232,12 +232,11 @@ pub async fn backup_to_mongodb(storage: &Storage, ns: &str, uri: &str, db: &str)
     report.insert("httpTts".into(), json!(n));
 
     // user_config（(user_namespace, ns) 双主键）
-    let configs: Vec<(String, String)> = sqlx::query_as(
-        "SELECT ns, config FROM user_config WHERE user_namespace = ?1 ORDER BY ns",
-    )
-    .bind(ns)
-    .fetch_all(&storage.pool)
-    .await?;
+    let configs: Vec<(String, String)> =
+        sqlx::query_as("SELECT ns, config FROM user_config WHERE user_namespace = ?1 ORDER BY ns")
+            .bind(ns)
+            .fetch_all(&storage.pool)
+            .await?;
     let items = configs
         .iter()
         .map(|(k, v)| {
@@ -256,7 +255,12 @@ pub async fn backup_to_mongodb(storage: &Storage, ns: &str, uri: &str, db: &str)
 }
 
 /// 恢复：从集合读回并幂等 upsert 到 SQLite。返回各集合恢复计数。
-pub async fn restore_from_mongodb(storage: &Storage, ns: &str, uri: &str, db: &str) -> Result<Value> {
+pub async fn restore_from_mongodb(
+    storage: &Storage,
+    ns: &str,
+    uri: &str,
+    db: &str,
+) -> Result<Value> {
     let client = connect(uri).await?;
     let mut report = serde_json::Map::new();
 
@@ -416,19 +420,13 @@ mod tests {
     #[test]
     fn resolve_uri_precedence() {
         // body uri 优先
-        assert_eq!(
-            resolve_uri(Some("mongodb://a:1")).unwrap(),
-            "mongodb://a:1"
-        );
+        assert_eq!(resolve_uri(Some("mongodb://a:1")).unwrap(), "mongodb://a:1");
         // body 空白 → 忽略
         assert!(resolve_uri(Some("   ")).is_err());
 
         // env 兜底
         std::env::set_var("READER_MONGODB_URI", "mongodb://env:27017");
-        assert_eq!(
-            resolve_uri(None).unwrap(),
-            "mongodb://env:27017"
-        );
+        assert_eq!(resolve_uri(None).unwrap(), "mongodb://env:27017");
         // body 优先于 env
         assert_eq!(
             resolve_uri(Some("mongodb://body:27017")).unwrap(),

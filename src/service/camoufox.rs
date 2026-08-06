@@ -29,9 +29,7 @@ const DEFAULT_SOLVE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleW
 pub fn solve_ua() -> String {
     std::env::var("READER_CAMOUFOX_UA")
         .map(|v| v.trim().to_string())
-        .into_iter()
-        .filter(|v| !v.is_empty())
-        .next()
+        .into_iter().find(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_SOLVE_UA.to_string())
 }
 
@@ -39,9 +37,7 @@ pub fn solve_ua() -> String {
 pub fn server_url() -> String {
     std::env::var("READER_CAMOUFOX_URL")
         .map(|v| v.trim().trim_end_matches('/').to_string())
-        .into_iter()
-        .filter(|v| !v.is_empty())
-        .next()
+        .into_iter().find(|v| !v.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:8196".to_string())
 }
 
@@ -104,10 +100,18 @@ pub async fn solve(
         let diag = v.get("diagnostics").cloned().unwrap_or(Value::Null);
         return Err(anyhow!(
             "camoufox 求解失败: {err}{}",
-            if diag.is_object() { format!("（诊断: {diag}）") } else { String::new() }
+            if diag.is_object() {
+                format!("（诊断: {diag}）")
+            } else {
+                String::new()
+            }
         ));
     }
-    let html = v.get("html").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let html = v
+        .get("html")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     if html.is_empty() {
         return Err(anyhow!("camoufox 响应缺少 html 字段"));
     }
@@ -128,7 +132,11 @@ pub async fn solve(
     Ok(CfSolution {
         html,
         cookies: cookies_out,
-        user_agent: v.get("userAgent").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        user_agent: v
+            .get("userAgent")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         turnstile_token: v
             .get("turnstileToken")
             .and_then(|x| x.as_str())
@@ -209,7 +217,10 @@ mod tests {
         std::env::remove_var("READER_CAMOUFOX_UA");
         let d = solve_ua();
         assert!(d.contains("Chrome/"), "默认 UA 应为 Chrome: {d}");
-        std::env::set_var("READER_CAMOUFOX_UA", "Mozilla/5.0 (X11; Linux x86_64) Firefox/143.0");
+        std::env::set_var(
+            "READER_CAMOUFOX_UA",
+            "Mozilla/5.0 (X11; Linux x86_64) Firefox/143.0",
+        );
         assert_eq!(solve_ua(), "Mozilla/5.0 (X11; Linux x86_64) Firefox/143.0");
         std::env::set_var("READER_CAMOUFOX_UA", "  ");
         assert!(solve_ua().contains("Chrome/"), "空白 env 回退默认");
@@ -225,7 +236,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let r = rt.block_on(fallback("https://a.test/", &[], 1000, &cdp));
         std::env::remove_var("READER_CAMOUFOX_DISABLE");
-        let err = r.err().expect("禁用时应失败");
+        let err = r.expect_err("禁用时应失败");
         assert!(err.to_string().contains("内置浏览器求解失败"));
         assert!(err.to_string().contains("内置浏览器超时"));
     }

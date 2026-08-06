@@ -39,12 +39,12 @@ pub struct Chapter {
 
 /// EPUB 解析
 pub fn parse_epub(bytes: &[u8]) -> Result<ImportedBook> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .context("EPUB 不是有效的 zip")?;
+    let mut zip =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("EPUB 不是有效的 zip")?;
 
     // 1. container.xml → OPF 路径
-    let container = read_zip(&mut zip, "META-INF/container.xml")
-        .context("缺少 META-INF/container.xml")?;
+    let container =
+        read_zip(&mut zip, "META-INF/container.xml").context("缺少 META-INF/container.xml")?;
     let container_str = String::from_utf8_lossy(&container);
     let opf_path = extract_attr_simple(&container_str, "rootfile", "full-path")
         .context("container.xml 缺少 rootfile")?;
@@ -114,22 +114,29 @@ fn opf_chapters<R: std::io::Read + std::io::Seek>(
     let manifest: std::collections::HashMap<String, (String, String)> = extract_manifest(opf_str);
     let mut chapters = Vec::new();
     for idref in &spine_refs {
-        let Some((href, mediatype)) = manifest.get(idref) else { continue };
+        let Some((href, mediatype)) = manifest.get(idref) else {
+            continue;
+        };
         if !mediatype.contains("xhtml") && !mediatype.contains("html") {
             continue;
         }
         let full_path = resolve_opf_path(opf_path, href);
-        let Ok(content_bytes) = read_zip(zip, &full_path) else { continue };
+        let Ok(content_bytes) = read_zip(zip, &full_path) else {
+            continue;
+        };
         let html = String::from_utf8_lossy(&content_bytes);
         let text = html_to_text(&html);
         if text.trim().is_empty() {
             continue;
         }
         let title = extract_title(&html).unwrap_or_else(|| format!("第 {} 节", chapters.len() + 1));
-        chapters.push(Chapter { title, content: text });
+        chapters.push(Chapter {
+            title,
+            content: text,
+        });
     }
     if chapters.is_empty() {
-        for ((href, mediatype)) in manifest.values() {
+        for (href, mediatype) in manifest.values() {
             if !mediatype.contains("xhtml") && !mediatype.contains("html") {
                 continue;
             }
@@ -140,7 +147,10 @@ fn opf_chapters<R: std::io::Read + std::io::Seek>(
                 if !text.trim().is_empty() {
                     let title = extract_title(&html)
                         .unwrap_or_else(|| format!("第 {} 节", chapters.len() + 1));
-                    chapters.push(Chapter { title, content: text });
+                    chapters.push(Chapter {
+                        title,
+                        content: text,
+                    });
                 }
             }
         }
@@ -224,7 +234,10 @@ fn split_by_rules(text: &str, rules: &[String]) -> Vec<Chapter> {
     let mut matches: Vec<(usize, usize, String)> = Vec::new();
     for rule in rules {
         // GAP 153：TXT 目录规则经兼容层编译（lookbehind 自动升级 fancy-regex）
-        match crate::util::regex::RegexBuilder::new(rule).multi_line(true).build() {
+        match crate::util::regex::RegexBuilder::new(rule)
+            .multi_line(true)
+            .build()
+        {
             Ok(re) => {
                 for cap in re.captures_iter(text) {
                     if let Some(m) = cap.get(0) {
@@ -272,7 +285,10 @@ pub fn parse_txt_file(path: &std::path::Path) -> Result<ImportedBook> {
 }
 
 /// 读 TXT 文件并分章（用户自定义规则版本）
-pub fn parse_txt_file_with_rules(path: &std::path::Path, user_rules: &[String]) -> Result<ImportedBook> {
+pub fn parse_txt_file_with_rules(
+    path: &std::path::Path,
+    user_rules: &[String],
+) -> Result<ImportedBook> {
     let bytes = std::fs::read(path)?;
     parse_txt_with_rules(&bytes, user_rules)
 }
@@ -362,7 +378,11 @@ fn parse_mobi_impl(bytes: &[u8], format: &str) -> Result<ImportedBook> {
     }
     meta.language = Some(format!("{:?}", book.language()));
     // 封面：首个图片记录（MOBI 约定 record 0 为封面）
-    let cover = book.image_records().into_iter().next().map(|r| r.content.to_vec());
+    let cover = book
+        .image_records()
+        .into_iter()
+        .next()
+        .map(|r| r.content.to_vec());
     Ok(ImportedBook {
         meta,
         chapters,
@@ -407,14 +427,21 @@ pub fn parse_pdf(bytes: &[u8]) -> Result<ImportedBook> {
     }
     // 元数据（Info 字典）
     let mut meta = OpfMeta::default();
-    if let Ok(info_id) = doc.trailer.get(b"Info").map(|o| o.as_reference()).unwrap_or(Err(lopdf::Error::ObjectType {
-        expected: "reference",
-        found: "none",
-    })) {
+    if let Ok(info_id) = doc
+        .trailer
+        .get(b"Info")
+        .map(|o| o.as_reference())
+        .unwrap_or(Err(lopdf::Error::ObjectType {
+            expected: "reference",
+            found: "none",
+        }))
+    {
         if let Ok(info) = doc.get_dictionary(info_id) {
             meta.title = pdf_meta_string(info.get(b"Title"));
             meta.author = pdf_meta_string(info.get(b"Author"));
-            meta.description = Some(pdf_meta_string(info.get(b"Subject").or_else(|_| info.get(b"Keywords"))));
+            meta.description = Some(pdf_meta_string(
+                info.get(b"Subject").or_else(|_| info.get(b"Keywords")),
+            ));
         }
     }
     let chapters = chapters_from_pages(pages);
@@ -510,75 +537,83 @@ pub fn parse_fb2(bytes: &[u8]) -> Result<ImportedBook> {
     loop {
         buf.clear();
         match reader.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Start(e)) => match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
-                "body" => {
-                    if body_count == 0 {
-                        in_main_body = true;
-                    }
-                    body_count += 1;
-                }
-                "section" => {
-                    if in_main_body {
-                        if section_depth == 0 {
-                            flush_section!();
-                            cur = Some((String::new(), String::new()));
+            Ok(quick_xml::events::Event::Start(e)) => {
+                match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
+                    "body" => {
+                        if body_count == 0 {
+                            in_main_body = true;
                         }
-                        section_depth += 1;
+                        body_count += 1;
                     }
-                }
-                "title" => {
-                    if in_main_body && section_depth > 0 {
-                        in_title = true;
+                    "section" => {
+                        if in_main_body {
+                            if section_depth == 0 {
+                                flush_section!();
+                                cur = Some((String::new(), String::new()));
+                            }
+                            section_depth += 1;
+                        }
                     }
-                }
-                "p" | "subtitle" | "cite" | "poem" | "stanza" | "epigraph" | "text-author" => {
-                    if in_main_body && section_depth > 0 {
-                        in_para = true;
-                        para_break = true;
+                    "title" => {
+                        if in_main_body && section_depth > 0 {
+                            in_title = true;
+                        }
                     }
-                }
-                "book-title" => in_book_title = true,
-                "annotation" => in_annotation = true,
-                "first-name" | "last-name" | "middle-name" | "nickname" => {
-                    in_author_field = true;
-                }
-                "FictionBook" => {
-                    for attr in e.attributes().flatten() {
-                        if std::str::from_utf8(attr.key.local_name().as_ref()).unwrap_or("") == "lang" {
-                            if let Ok(v) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
-                                meta.language = Some(v.into_owned());
+                    "p" | "subtitle" | "cite" | "poem" | "stanza" | "epigraph" | "text-author" => {
+                        if in_main_body && section_depth > 0 {
+                            in_para = true;
+                            para_break = true;
+                        }
+                    }
+                    "book-title" => in_book_title = true,
+                    "annotation" => in_annotation = true,
+                    "first-name" | "last-name" | "middle-name" | "nickname" => {
+                        in_author_field = true;
+                    }
+                    "FictionBook" => {
+                        for attr in e.attributes().flatten() {
+                            if std::str::from_utf8(attr.key.local_name().as_ref()).unwrap_or("")
+                                == "lang"
+                            {
+                                if let Ok(v) =
+                                    attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                {
+                                    meta.language = Some(v.into_owned());
+                                }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
-            },
-            Ok(quick_xml::events::Event::End(e)) => match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
-                "body" => {
-                    if in_main_body {
-                        flush_section!();
-                        in_main_body = false;
-                    }
-                }
-                "section" => {
-                    if in_main_body && section_depth > 0 {
-                        section_depth -= 1;
-                        if section_depth == 0 {
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
+                    "body" => {
+                        if in_main_body {
                             flush_section!();
+                            in_main_body = false;
                         }
                     }
+                    "section" => {
+                        if in_main_body && section_depth > 0 {
+                            section_depth -= 1;
+                            if section_depth == 0 {
+                                flush_section!();
+                            }
+                        }
+                    }
+                    "title" => in_title = false,
+                    "p" | "subtitle" | "cite" | "poem" | "stanza" | "epigraph" | "text-author" => {
+                        in_para = false;
+                    }
+                    "book-title" => in_book_title = false,
+                    "annotation" => in_annotation = false,
+                    "first-name" | "last-name" | "middle-name" | "nickname" => {
+                        in_author_field = false;
+                    }
+                    _ => {}
                 }
-                "title" => in_title = false,
-                "p" | "subtitle" | "cite" | "poem" | "stanza" | "epigraph" | "text-author" => {
-                    in_para = false;
-                }
-                "book-title" => in_book_title = false,
-                "annotation" => in_annotation = false,
-                "first-name" | "last-name" | "middle-name" | "nickname" => {
-                    in_author_field = false;
-                }
-                _ => {}
-            },
+            }
             Ok(quick_xml::events::Event::Text(t)) => {
                 let Ok(s) = t.xml10_content() else { continue };
                 if s.trim().is_empty() {
@@ -587,7 +622,9 @@ pub fn parse_fb2(bytes: &[u8]) -> Result<ImportedBook> {
                 if in_book_title {
                     meta.title.push_str(&s);
                 } else if in_annotation {
-                    meta.description.get_or_insert_with(String::new).push_str(&s);
+                    meta.description
+                        .get_or_insert_with(String::new)
+                        .push_str(&s);
                 } else if in_author_field {
                     author_parts.push(s.trim().to_string());
                 } else if in_main_body && section_depth > 0 {
@@ -609,7 +646,9 @@ pub fn parse_fb2(bytes: &[u8]) -> Result<ImportedBook> {
                 if in_book_title {
                     meta.title.push_str(&s);
                 } else if in_annotation {
-                    meta.description.get_or_insert_with(String::new).push_str(&s);
+                    meta.description
+                        .get_or_insert_with(String::new)
+                        .push_str(&s);
                 } else if in_author_field {
                     author_parts.push(s.trim().to_string());
                 } else if in_main_body && section_depth > 0 {
@@ -626,15 +665,19 @@ pub fn parse_fb2(bytes: &[u8]) -> Result<ImportedBook> {
                 let s = if r.is_char_ref() {
                     r.resolve_char_ref().ok().flatten().map(|c| c.to_string())
                 } else {
-                    r.decode()
-                        .ok()
-                        .and_then(|name| quick_xml::escape::unescape(&format!("&{name};")).ok().map(|c| c.into_owned()))
+                    r.decode().ok().and_then(|name| {
+                        quick_xml::escape::unescape(&format!("&{name};"))
+                            .ok()
+                            .map(|c| c.into_owned())
+                    })
                 };
                 if let Some(s) = s {
                     if in_book_title {
                         meta.title.push_str(&s);
                     } else if in_annotation {
-                        meta.description.get_or_insert_with(String::new).push_str(&s);
+                        meta.description
+                            .get_or_insert_with(String::new)
+                            .push_str(&s);
                     } else if in_author_field {
                         author_parts.push(s);
                     } else if in_main_body && section_depth > 0 {
@@ -682,8 +725,10 @@ pub fn parse_fb2(bytes: &[u8]) -> Result<ImportedBook> {
 
 /// DOCX 解析：zip + word/document.xml → 段落（含标题样式）→ 标题样式分章；无标题样式时回退纯文本规则分章
 pub fn parse_docx(bytes: &[u8]) -> Result<ImportedBook> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("DOCX 不是有效的 zip")?;
-    let document = read_zip(&mut zip, "word/document.xml").context("DOCX 缺少 word/document.xml")?;
+    let mut zip =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("DOCX 不是有效的 zip")?;
+    let document =
+        read_zip(&mut zip, "word/document.xml").context("DOCX 缺少 word/document.xml")?;
     // 元数据（可选 docProps/core.xml）
     let mut meta = OpfMeta::default();
     if let Ok(core) = read_zip(&mut zip, "docProps/core.xml") {
@@ -704,47 +749,54 @@ pub fn parse_docx(bytes: &[u8]) -> Result<ImportedBook> {
     loop {
         buf.clear();
         match reader.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Start(e)) => match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
-                "p" => {
-                    in_p = true;
-                    p_style = None;
-                    p_buf.clear();
-                }
-                "pStyle" => {
-                    if in_p {
-                        for attr in e.attributes().flatten() {
-                            if std::str::from_utf8(attr.key.local_name().as_ref()).unwrap_or("") == "val" {
-                                if let Ok(v) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
-                                    p_style = Some(v.into_owned());
+            Ok(quick_xml::events::Event::Start(e)) => {
+                match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
+                    "p" => {
+                        in_p = true;
+                        p_style = None;
+                        p_buf.clear();
+                    }
+                    "pStyle" => {
+                        if in_p {
+                            for attr in e.attributes().flatten() {
+                                if std::str::from_utf8(attr.key.local_name().as_ref()).unwrap_or("")
+                                    == "val"
+                                {
+                                    if let Ok(v) =
+                                        attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                    {
+                                        p_style = Some(v.into_owned());
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                "t" => in_t = true,
-                "tab" => {
-                    if in_p {
-                        p_buf.push('\t');
+                    "t" => in_t = true,
+                    "tab" => {
+                        if in_p {
+                            p_buf.push('\t');
+                        }
                     }
+                    "br" | "cr"
+                        if in_p => {
+                            p_buf.push('\n');
+                        }
+                    _ => {}
                 }
-                "br" | "cr" => {
-                    if in_p {
-                        p_buf.push('\n');
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
+                    "p" => {
+                        in_p = false;
+                        let text = p_buf.trim().to_string();
+                        if !text.is_empty() {
+                            paras.push((p_style.take(), text));
+                        }
                     }
+                    "t" => in_t = false,
+                    _ => {}
                 }
-                _ => {}
-            },
-            Ok(quick_xml::events::Event::End(e)) => match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
-                "p" => {
-                    in_p = false;
-                    let text = p_buf.trim().to_string();
-                    if !text.is_empty() {
-                        paras.push((p_style.take(), text));
-                    }
-                }
-                "t" => in_t = false,
-                _ => {}
-            },
+            }
             Ok(quick_xml::events::Event::Text(t)) => {
                 if in_p && in_t {
                     if let Ok(s) = t.xml10_content() {
@@ -757,9 +809,11 @@ pub fn parse_docx(bytes: &[u8]) -> Result<ImportedBook> {
                     let s = if r.is_char_ref() {
                         r.resolve_char_ref().ok().flatten().map(|c| c.to_string())
                     } else {
-                        r.decode()
-                            .ok()
-                            .and_then(|name| quick_xml::escape::unescape(&format!("&{name};")).ok().map(|c| c.into_owned()))
+                        r.decode().ok().and_then(|name| {
+                            quick_xml::escape::unescape(&format!("&{name};"))
+                                .ok()
+                                .map(|c| c.into_owned())
+                        })
                     };
                     if let Some(s) = s {
                         p_buf.push_str(&s);
@@ -772,12 +826,18 @@ pub fn parse_docx(bytes: &[u8]) -> Result<ImportedBook> {
         }
     }
 
-    let has_heading = paras.iter().any(|(s, _)| s.as_deref().map(is_heading_style).unwrap_or(false));
+    let has_heading = paras
+        .iter()
+        .any(|(s, _)| s.as_deref().map(is_heading_style).unwrap_or(false));
     let chapters = if has_heading {
         docx_heading_chapters(&paras)
     } else {
         // 无标题样式：纯文本规则分章（或按字数分块）
-        let joined = paras.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n\n");
+        let joined = paras
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         chapters_from_plain_text(&joined)
     };
     if chapters.is_empty() {
@@ -796,7 +856,11 @@ fn is_heading_style(style: &str) -> bool {
     let s = style.trim().to_lowercase();
     s.starts_with("heading")
         || s.starts_with("标题")
-        || (s.len() == 1 && s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+        || (s.len() == 1
+            && s.chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false))
 }
 
 /// 按标题样式段落分章：标题段落开启新章节，其余段落并入当前章节
@@ -846,16 +910,20 @@ fn docx_core_meta(xml: &str) -> (String, String) {
     loop {
         buf.clear();
         match reader.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Start(e)) => match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
-                "title" => in_title = true,
-                "creator" => in_creator = true,
-                _ => {}
-            },
-            Ok(quick_xml::events::Event::End(e)) => match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
-                "title" => in_title = false,
-                "creator" => in_creator = false,
-                _ => {}
-            },
+            Ok(quick_xml::events::Event::Start(e)) => {
+                match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
+                    "title" => in_title = true,
+                    "creator" => in_creator = true,
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                match std::str::from_utf8(e.local_name().as_ref()).unwrap_or("") {
+                    "title" => in_title = false,
+                    "creator" => in_creator = false,
+                    _ => {}
+                }
+            }
             Ok(quick_xml::events::Event::Text(t)) => {
                 if let Ok(s) = t.xml10_content() {
                     if in_title {
@@ -946,7 +1014,8 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// （`![页名](data:image/jpeg;base64,...)`）。前端 ReaderView 的 singleImageUrl
 /// 识别该形式并直接渲染 <img>，data URI 无需额外图片服务路由，导入/导出/重扫自包含。
 pub fn parse_cbz(bytes: &[u8]) -> Result<ImportedBook> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("CBZ 不是有效的 zip")?;
+    let mut zip =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("CBZ 不是有效的 zip")?;
     let mut pages: Vec<(String, usize)> = Vec::new();
     for i in 0..zip.len() {
         let Ok(f) = zip.by_index(i) else { continue };
@@ -982,7 +1051,7 @@ pub fn parse_cbz(bytes: &[u8]) -> Result<ImportedBook> {
         let mime = image_mime(&name).unwrap_or("image/jpeg");
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         // alt 文本避免前端 singleImageUrl 正则的 `]` 边界字符
-        let alt = file_name.replace(']', "-").replace(')', "-");
+        let alt = file_name.replace([']', ')'], "-");
         chapters.push(Chapter {
             title: file_name.clone(),
             content: format!("![{alt}](data:{mime};base64,{b64})"),
@@ -1158,8 +1227,7 @@ pub fn parse_umd(bytes: &[u8]) -> Result<ImportedBook> {
                 132 => {
                     if additional_check != check {
                         // 正文块：zlib 解压后按序拼接
-                        let compressed =
-                            cur.bytes(block_len as usize).context("UMD 正文块损坏")?;
+                        let compressed = cur.bytes(block_len as usize).context("UMD 正文块损坏")?;
                         let mut out = Vec::new();
                         flate2::read::ZlibDecoder::new(&compressed[..])
                             .read_to_end(&mut out)
@@ -1207,7 +1275,11 @@ pub fn parse_umd(bytes: &[u8]) -> Result<ImportedBook> {
     let total = total_content_len.unwrap_or(contents.len());
     let mut chapters = Vec::with_capacity(titles.len());
     for (idx, title) in titles.iter().enumerate() {
-        let start = content_lengths.get(idx).copied().unwrap_or(0).min(contents.len());
+        let start = content_lengths
+            .get(idx)
+            .copied()
+            .unwrap_or(0)
+            .min(contents.len());
         let end = if idx + 1 < content_lengths.len() {
             content_lengths[idx + 1]
         } else {
@@ -1236,7 +1308,10 @@ pub fn parse_umd(bytes: &[u8]) -> Result<ImportedBook> {
             } else {
                 meta.title.clone()
             };
-            chapters.push(Chapter { title, content: text });
+            chapters.push(Chapter {
+                title,
+                content: text,
+            });
         }
     }
     if chapters.is_empty() {
@@ -1317,7 +1392,9 @@ pub fn is_local_book(book_url: &str, origin: &str) -> bool {
 }
 
 /// 支持的本地书扩展名白名单（上传 / getBookToc / getBookContent 分派共用）
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx", "zip", "cbz", "umd"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "epub", "txt", "mobi", "azw3", "pdf", "fb2", "docx", "zip", "cbz", "umd",
+];
 
 /// 取文件名/路径的小写扩展名（不含点；无扩展名返回空串）
 pub fn file_ext(name: &str) -> String {
@@ -1374,7 +1451,9 @@ fn read_zip<R: std::io::Read + std::io::Seek>(
 /// 提取第一个指定属性（如 <rootfile full-path="content.opf">）
 fn extract_attr_simple(xml: &str, tag: &str, attr: &str) -> Option<String> {
     // 匹配 <tag 后跟 空格/>/换行（排除 <tags> 等更长标签名）
-    let idx = xml.find(&format!("<{tag} ")).or_else(|| xml.find(&format!("<{tag}>")))?;
+    let idx = xml
+        .find(&format!("<{tag} "))
+        .or_else(|| xml.find(&format!("<{tag}>")))?;
     let rest = &xml[idx..];
     let end = rest.find('>')?;
     let block = &rest[..end];
@@ -1384,7 +1463,10 @@ fn extract_attr_simple(xml: &str, tag: &str, attr: &str) -> Option<String> {
         return block[i + pat.len()..].split('"').next().map(str::to_string);
     }
     if let Some(i) = block.find(&pat2) {
-        return block[i + pat2.len()..].split('\'').next().map(str::to_string);
+        return block[i + pat2.len()..]
+            .split('\'')
+            .next()
+            .map(str::to_string);
     }
     None
 }
@@ -1434,7 +1516,10 @@ fn attr_value(block: &str, attr: &str) -> Option<String> {
         return block[i + pat.len()..].split('"').next().map(str::to_string);
     }
     if let Some(i) = block.find(&pat2) {
-        return block[i + pat2.len()..].split('\'').next().map(str::to_string);
+        return block[i + pat2.len()..]
+            .split('\'')
+            .next()
+            .map(str::to_string);
     }
     None
 }
@@ -1478,7 +1563,12 @@ fn html_to_text(html: &str) -> String {
     }
     if parts.is_empty() {
         // fallback：body 全部文本
-        return doc.root_element().text().collect::<String>().trim().to_string();
+        return doc
+            .root_element()
+            .text()
+            .collect::<String>()
+            .trim()
+            .to_string();
     }
     parts.join("\n\n")
 }
@@ -1512,7 +1602,8 @@ mod tests {
             let mut zip = zip::ZipWriter::new(&mut buf);
             let opts = zip::write::FileOptions::default();
             zip.start_file("book.opf", opts).unwrap();
-            zip.write_all(r#"<?xml version="1.0"?>
+            zip.write_all(
+                r#"<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
   <metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">OPF测试书</dc:title></metadata>
   <manifest>
@@ -1522,11 +1613,22 @@ mod tests {
   <spine>
     <itemref idref="c1"/><itemref idref="c2"/>
   </spine>
-</package>"#.as_bytes()).unwrap();
+</package>"#
+                    .as_bytes(),
+            )
+            .unwrap();
             zip.start_file("chap1.xhtml", opts).unwrap();
-            zip.write_all("<html><head><title>第一章</title></head><body><p>第一段内容</p></body></html>".as_bytes()).unwrap();
+            zip.write_all(
+                "<html><head><title>第一章</title></head><body><p>第一段内容</p></body></html>"
+                    .as_bytes(),
+            )
+            .unwrap();
             zip.start_file("chap2.xhtml", opts).unwrap();
-            zip.write_all("<html><head><title>第二章</title></head><body><p>第二段内容</p></body></html>".as_bytes()).unwrap();
+            zip.write_all(
+                "<html><head><title>第二章</title></head><body><p>第二段内容</p></body></html>"
+                    .as_bytes(),
+            )
+            .unwrap();
             zip.finish().unwrap();
         }
         let bytes = buf.into_inner();
@@ -1544,7 +1646,8 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut zip = zip::ZipWriter::new(&mut buf);
-            zip.start_file("readme.txt", zip::write::FileOptions::default()).unwrap();
+            zip.start_file("readme.txt", zip::write::FileOptions::default())
+                .unwrap();
             zip.write_all(b"no opf here").unwrap();
             zip.finish().unwrap();
         }
@@ -1578,7 +1681,9 @@ mod tests {
     #[test]
     fn test_parse_txt_custom_rules() {
         // 用户规则只匹配「第X章」（不匹配尾声）→ 尾声并入上一章
-        let rules = vec![r"^\s*第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节卷回集部篇].*".to_string()];
+        let rules = vec![
+            r"^\s*第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节卷回集部篇].*".to_string(),
+        ];
         let book = parse_txt_with_rules(SAMPLE.as_bytes(), &rules).unwrap();
         let titles: Vec<&str> = book.chapters.iter().map(|c| c.title.as_str()).collect();
         assert_eq!(titles, vec!["第一章 起点", "第二章 成长"]);
@@ -1599,7 +1704,10 @@ mod tests {
         let body = "字".repeat(25_000);
         let book = parse_txt(body.as_bytes()).unwrap();
         assert_eq!(book.chapters.len(), 3);
-        assert!(book.chapters.iter().all(|c| c.title.starts_with("第 ") && c.title.ends_with(" 部分")));
+        assert!(book
+            .chapters
+            .iter()
+            .all(|c| c.title.starts_with("第 ") && c.title.ends_with(" 部分")));
     }
 
     /// GBK 编码文本可解析
@@ -1619,8 +1727,14 @@ mod tests {
     fn test_parse_mobi_garbage_friendly_error() {
         let err = parse_mobi(b"not a mobi file at all").unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("MOBI") || msg.contains("mobi"), "错误应提及 MOBI：{msg}");
-        assert!(parse_azw3(b"garbage").is_err(), "azw3 兼容层对垃圾数据应报错");
+        assert!(
+            msg.contains("MOBI") || msg.contains("mobi"),
+            "错误应提及 MOBI：{msg}"
+        );
+        assert!(
+            parse_azw3(b"garbage").is_err(),
+            "azw3 兼容层对垃圾数据应报错"
+        );
     }
 
     /// 分派：mobi/azw3 走兼容层，未知扩展名报“不支持的格式”
@@ -1630,7 +1744,10 @@ mod tests {
         assert!(parse_file_bytes(b"x", "azw3", &[]).is_err());
         let err = parse_file_bytes(b"x", "epub", &[]).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("EPUB") || msg.contains("zip"), "EPUB 错误应友好：{msg}");
+        assert!(
+            msg.contains("EPUB") || msg.contains("zip"),
+            "EPUB 错误应友好：{msg}"
+        );
         let err = parse_file_bytes(b"x", "rar", &[]).unwrap_err();
         assert!(format!("{err:#}").contains("不支持的格式"));
     }
@@ -1675,7 +1792,7 @@ mod tests {
         pdb.extend_from_slice(&3u16.to_be_bytes()); // record_count
         pdb.extend_from_slice(&4096u16.to_be_bytes()); // record_size
         pdb.extend_from_slice(&[0u8; 4]); // encryption(0) + unused
-        // MobiHeader（232B）："MOBI" + header_length + 224B payload
+                                          // MobiHeader（232B）："MOBI" + header_length + 224B payload
         pdb.extend_from_slice(b"MOBI");
         pdb.extend_from_slice(&232u32.to_be_bytes());
         let mut mobi = vec![0u8; 224];
@@ -1735,7 +1852,10 @@ mod tests {
     /// 标题分章：跨页出现“第一章/第二章”时按标题分章而非按页（标题前内容归入“正文”章）
     #[test]
     fn test_chapters_from_pages_title_split() {
-        let pages = vec!["序言\n第一章 起点\n内容一。".into(), "第二章 成长\n内容二。".into()];
+        let pages = vec![
+            "序言\n第一章 起点\n内容一。".into(),
+            "第二章 成长\n内容二。".into(),
+        ];
         let chapters = chapters_from_pages(pages);
         let titles: Vec<&str> = chapters.iter().map(|c| c.title.as_str()).collect();
         assert_eq!(titles, vec!["正文", "第一章 起点", "第二章 成长"]);
@@ -1745,9 +1865,15 @@ mod tests {
     #[test]
     fn test_pdf_meta_string_decode() {
         use lopdf::Object;
-        let utf16 = Object::String(b"\xFE\xFF\x00T\x00e\x00s\x00t".to_vec(), lopdf::StringFormat::Literal);
+        let utf16 = Object::String(
+            b"\xFE\xFF\x00T\x00e\x00s\x00t".to_vec(),
+            lopdf::StringFormat::Literal,
+        );
         assert_eq!(pdf_meta_string(Ok(&utf16)), "Test");
-        let utf8 = Object::String(b"\xEF\xBB\xBF\xE4\xB9\xA6".to_vec(), lopdf::StringFormat::Literal);
+        let utf8 = Object::String(
+            b"\xEF\xBB\xBF\xE4\xB9\xA6".to_vec(),
+            lopdf::StringFormat::Literal,
+        );
         assert_eq!(pdf_meta_string(Ok(&utf8)), "书");
         let plain = Object::String(b"plain".to_vec(), lopdf::StringFormat::Literal);
         assert_eq!(pdf_meta_string(Ok(&plain)), "plain");
@@ -1785,11 +1911,19 @@ mod tests {
         assert_eq!(book.meta.title, "三体");
         assert_eq!(book.meta.author, "刘 慈欣");
         assert_eq!(book.meta.language.as_deref(), Some("zh"));
-        assert!(book.meta.description.as_deref().unwrap().contains("黑暗森林"));
+        assert!(book
+            .meta
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("黑暗森林"));
         assert_eq!(book.format, "fb2");
         let titles: Vec<&str> = book.chapters.iter().map(|c| c.title.as_str()).collect();
         assert_eq!(titles, vec!["第一章 起点", "第二章 成长"]);
-        assert!(book.chapters[1].content.contains("内容二") && book.chapters[1].content.contains("第二段"));
+        assert!(
+            book.chapters[1].content.contains("内容二")
+                && book.chapters[1].content.contains("第二段")
+        );
     }
 
     /// FB2 实体引用（&amp; 等）正确解码
@@ -1880,18 +2014,25 @@ mod tests {
     fn test_parse_docx_garbage_friendly_error() {
         let err = parse_docx(b"not a zip").unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("DOCX") || msg.contains("zip"), "错误应提及 DOCX/zip：{msg}");
+        assert!(
+            msg.contains("DOCX") || msg.contains("zip"),
+            "错误应提及 DOCX/zip：{msg}"
+        );
         // 合法 zip 但缺 document.xml
         use std::io::Write;
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut zw = zip::ZipWriter::new(&mut cursor);
-            zw.start_file("other.txt", zip::write::FileOptions::default()).unwrap();
+            zw.start_file("other.txt", zip::write::FileOptions::default())
+                .unwrap();
             zw.write_all(b"x").unwrap();
             zw.finish().unwrap();
         }
         let err = parse_docx(&cursor.into_inner()).unwrap_err();
-        assert!(format!("{err:#}").contains("document.xml"), "应提示缺少 document.xml");
+        assert!(
+            format!("{err:#}").contains("document.xml"),
+            "应提示缺少 document.xml"
+        );
     }
 
     /// 扩展名工具与白名单
@@ -2025,13 +2166,13 @@ mod tests {
         out.extend_from_slice(&0u32.to_be_bytes()); // uid seed
         out.extend_from_slice(&0u32.to_be_bytes()); // next record list
         out.extend_from_slice(&3u16.to_be_bytes()); // 记录数
-        // 记录表
+                                                    // 记录表
         for off in [rec0_off, rec1_off, rec2_off] {
             out.extend_from_slice(&(off as u32).to_be_bytes());
             out.extend_from_slice(&0u32.to_be_bytes()); // id
         }
         out.extend_from_slice(&0u16.to_be_bytes()); // extra bytes（mobi crate 读取）
-        // 记录体
+                                                    // 记录体
         out.extend_from_slice(&rec0);
         out.extend_from_slice(text_bytes);
         out.push(0); // 占位记录（空）
@@ -2046,10 +2187,22 @@ mod tests {
         let book = parse_mobi(&bytes).expect("最小 MOBI 应可解析");
         assert_eq!(book.meta.title, "测试书");
         assert_eq!(book.meta.author, "作者甲");
-        assert!(book.chapters.len() >= 2, "应分出章节: {:?}", book.chapters.len());
-        let ch1 = book.chapters.iter().find(|c| c.title == "第一章").expect("含第一章");
+        assert!(
+            book.chapters.len() >= 2,
+            "应分出章节: {:?}",
+            book.chapters.len()
+        );
+        let ch1 = book
+            .chapters
+            .iter()
+            .find(|c| c.title == "第一章")
+            .expect("含第一章");
         assert!(ch1.content.contains("这里是正文一"));
-        let ch2 = book.chapters.iter().find(|c| c.title == "第二章").expect("含第二章");
+        let ch2 = book
+            .chapters
+            .iter()
+            .find(|c| c.title == "第二章")
+            .expect("含第二章");
         assert!(ch2.content.contains("这里是正文二"));
         assert_eq!(book.format, "mobi");
     }
@@ -2068,7 +2221,10 @@ mod tests {
     #[test]
     fn parse_mobi_invalid_bytes_errors() {
         let err = parse_mobi(b"not a mobi file at all").unwrap_err();
-        assert!(format!("{err:#}").contains("MOBI"), "应提示 MOBI 相关错误: {err:#}");
+        assert!(
+            format!("{err:#}").contains("MOBI"),
+            "应提示 MOBI 相关错误: {err:#}"
+        );
         assert!(parse_azw3(b"").is_err());
     }
 
@@ -2118,16 +2274,29 @@ mod tests {
         let titles: Vec<&str> = book.chapters.iter().map(|c| c.title.as_str()).collect();
         assert_eq!(titles, vec!["cover.jpg", "1.png", "2.jpg", "10.png"]);
         // 正文 = markdown 图片 + base64 data URI，可还原原始字节
-        let first = book.chapters.iter().find(|c| c.title == "1.png").expect("含 1.png 页");
+        let first = book
+            .chapters
+            .iter()
+            .find(|c| c.title == "1.png")
+            .expect("含 1.png 页");
         assert!(first.content.starts_with("![1.png](data:image/png;base64,"));
         use base64::Engine;
-        let b64 = first.content.trim_start_matches("![1.png](data:image/png;base64,").trim_end_matches(')');
+        let b64 = first
+            .content
+            .trim_start_matches("![1.png](data:image/png;base64,")
+            .trim_end_matches(')');
         assert_eq!(
-            base64::engine::general_purpose::STANDARD.decode(b64).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
             PNG_1PX,
             "base64 应还原原始图片字节"
         );
-        let jpeg = book.chapters.iter().find(|c| c.title == "2.jpg").expect("含 2.jpg 页");
+        let jpeg = book
+            .chapters
+            .iter()
+            .find(|c| c.title == "2.jpg")
+            .expect("含 2.jpg 页");
         assert!(jpeg.content.contains("data:image/jpeg;base64,"));
     }
 
@@ -2135,25 +2304,49 @@ mod tests {
     #[test]
     fn parse_cbz_errors() {
         let err = parse_cbz(b"not a zip").unwrap_err();
-        assert!(format!("{err:#}").contains("zip"), "应提示 zip 错误: {err:#}");
+        assert!(
+            format!("{err:#}").contains("zip"),
+            "应提示 zip 错误: {err:#}"
+        );
         let bytes = build_cbz(&[("readme.txt", b"hi")]);
         let err = parse_cbz(&bytes).unwrap_err();
-        assert!(format!("{err:#}").contains("未找到图片"), "应提示无图片: {err:#}");
+        assert!(
+            format!("{err:#}").contains("未找到图片"),
+            "应提示无图片: {err:#}"
+        );
     }
 
     /// 自然排序：数字段按数值；数字 < 字母（p2 < pa）；大小写不敏感
     #[test]
     fn natural_sort_order() {
-        let mut v = vec!["page10.png", "page2.jpg", "page1.png", "Page2.png", "p2a.png", "p2b.png"];
+        let mut v = vec![
+            "page10.png",
+            "page2.jpg",
+            "page1.png",
+            "Page2.png",
+            "p2a.png",
+            "p2b.png",
+        ];
         v.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(
             v,
-            vec!["p2a.png", "p2b.png", "page1.png", "page2.jpg", "Page2.png", "page10.png"],
+            vec![
+                "p2a.png",
+                "p2b.png",
+                "page1.png",
+                "page2.jpg",
+                "Page2.png",
+                "page10.png"
+            ],
             "数字段按数值且数字先于字母"
         );
         let mut v2 = vec!["01.png", "1.png", "2.png"];
         v2.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(v2, vec!["1.png", "01.png", "2.png"], "前导零等值时按完整串长稳定排序");
+        assert_eq!(
+            v2,
+            vec!["1.png", "01.png", "2.png"],
+            "前导零等值时按完整串长稳定排序"
+        );
     }
 
     // ---------- UMD ----------
@@ -2167,9 +2360,8 @@ mod tests {
         with_cover: bool,
     ) -> Vec<u8> {
         use std::io::Write;
-        let utf16 = |s: &str| -> Vec<u8> {
-            s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
-        };
+        let utf16 =
+            |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect() };
         let mut out = Vec::new();
         out.extend_from_slice(&[0x89, 0x9B, 0x9A, 0xDE]);
         // 头部 section：'#' + 0x01 00 00 08 + 类型(1=文本) + 2 随机
@@ -2270,7 +2462,10 @@ mod tests {
         assert!(book.meta.subjects.iter().any(|s| s == "都市"));
         assert_eq!(book.chapters.len(), 2);
         assert_eq!(book.chapters[0].title, "第一章");
-        assert_eq!(book.chapters[0].content, "第一段正文。\n第二段正文。", "U+2029 应替换为换行");
+        assert_eq!(
+            book.chapters[0].content, "第一段正文。\n第二段正文。",
+            "U+2029 应替换为换行"
+        );
         assert_eq!(book.chapters[1].title, "第二章");
         assert_eq!(book.chapters[1].content, "第二章正文内容。");
         assert_eq!(book.cover.as_deref(), Some(PNG_1PX), "封面应提取");
@@ -2279,9 +2474,8 @@ mod tests {
     /// 构造无 0x84 标题的 UMD 变体（有 0x83 偏移 + 正文块）：验证单章兜底
     fn build_umd_no_titles(title: &str, content: &str) -> Vec<u8> {
         use std::io::Write;
-        let utf16 = |s: &str| -> Vec<u8> {
-            s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
-        };
+        let utf16 =
+            |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect() };
         let mut out = Vec::new();
         out.extend_from_slice(&[0x89, 0x9B, 0x9A, 0xDE]);
         out.extend_from_slice(&[0x23, 0x01, 0x00, 0x00, 0x08, 0x01, 0x12, 0x34]);
@@ -2339,7 +2533,10 @@ mod tests {
         let mut bad = build_umd("t", "a", &[], false);
         bad[0] = 0x00;
         let err = parse_umd(&bad).unwrap_err();
-        assert!(format!("{err:#}").contains("魔数"), "应提示魔数错误: {err:#}");
+        assert!(
+            format!("{err:#}").contains("魔数"),
+            "应提示魔数错误: {err:#}"
+        );
 
         // 截断（正文块中间切断）→ 报错
         let full = build_umd("t", "a", &[("c", "内容")], false);
@@ -2350,7 +2547,10 @@ mod tests {
         let mut comic = build_umd("t", "a", &[], false);
         comic[9] = 0x02;
         let err = parse_umd(&comic).unwrap_err();
-        assert!(format!("{err:#}").contains("漫画"), "应提示漫画不支持: {err:#}");
+        assert!(
+            format!("{err:#}").contains("漫画"),
+            "应提示漫画不支持: {err:#}"
+        );
     }
 
     /// 真实 UMD 样本回归（样本在 target/search-test/samples/——缺失时跳过）：
@@ -2394,7 +2594,10 @@ mod tests {
         // cbz：合法 zip 无图片 → CBZ 解析器错误（而非“不支持的格式”）
         let zip_bytes = build_cbz(&[("a.txt", b"x")]);
         let err = parse_file_bytes(&zip_bytes, "cbz", &[]).unwrap_err();
-        assert!(format!("{err:#}").contains("未找到图片"), "cbz 应走 parse_cbz: {err:#}");
+        assert!(
+            format!("{err:#}").contains("未找到图片"),
+            "cbz 应走 parse_cbz: {err:#}"
+        );
         // umd：坏文件 → UMD 解析器错误（魔数/长度）
         let err = parse_file_bytes(b"garbage", "umd", &[]).unwrap_err();
         assert!(format!("{err:#}").contains("UMD") || format!("{err:#}").contains("过短"));
@@ -2403,5 +2606,3 @@ mod tests {
         assert!(format!("{err:#}").contains("不支持的格式"));
     }
 }
-
-

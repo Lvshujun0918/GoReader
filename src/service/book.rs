@@ -55,7 +55,11 @@ pub struct ContentRule {
 
 /// 抓取（复用搜索的 URL 附加参数处理；自动带书源 cookie——按用户命名空间）
 pub async fn fetch_url(ns: &str, url: &str, source: &BookSource) -> Result<crawler::FetchResponse> {
-    let headers = source.header.as_deref().map(crawler::parse_header).unwrap_or_default();
+    let headers = source
+        .header
+        .as_deref()
+        .map(crawler::parse_header)
+        .unwrap_or_default();
     crawler::http_get(ns, url, &headers, 15).await
 }
 
@@ -72,7 +76,11 @@ pub struct RelatedRule {
 
 /// 相关推荐解析（GAP 17b）：ruleRelated 应用详情页 HTML，同 ruleExplore 风格
 /// （bookList CSS 链式 + 字段规则）→ [{name, author, bookUrl, coverUrl}]
-pub fn analyze_related_books(html: &str, base_url: &str, source: &BookSource) -> Vec<crate::model::book_chapter::RelatedBook> {
+pub fn analyze_related_books(
+    html: &str,
+    base_url: &str,
+    source: &BookSource,
+) -> Vec<crate::model::book_chapter::RelatedBook> {
     let rule: RelatedRule = source
         .rule_related
         .as_ref()
@@ -90,19 +98,30 @@ pub fn analyze_related_books(html: &str, base_url: &str, source: &BookSource) ->
         cover_url: rule.cover_url,
         ..Default::default()
     };
-    crate::service::search::analyze_book_list_for_explore(html, base_url, source, &search_rule, &book_list_rule)
-        .into_iter()
-        .map(|b| crate::model::book_chapter::RelatedBook {
-            name: b.name,
-            author: b.author,
-            book_url: b.book_url,
-            cover_url: b.cover_url,
-        })
-        .collect()
+    crate::service::search::analyze_book_list_for_explore(
+        html,
+        base_url,
+        source,
+        &search_rule,
+        &book_list_rule,
+    )
+    .into_iter()
+    .map(|b| crate::model::book_chapter::RelatedBook {
+        name: b.name,
+        author: b.author,
+        book_url: b.book_url,
+        cover_url: b.cover_url,
+    })
+    .collect()
 }
 
 /// 详情解析（ruleBookInfo 字段应用于详情页 HTML）
-pub fn analyze_book_info(html: &str, base_url: &str, source: &BookSource, book_url: &str) -> BookInfo {
+pub fn analyze_book_info(
+    html: &str,
+    base_url: &str,
+    source: &BookSource,
+    book_url: &str,
+) -> BookInfo {
     let rule: BookInfoRule = source
         .rule_book_info
         .as_ref()
@@ -179,11 +198,7 @@ pub async fn analyze_toc(
 }
 
 /// 单页目录解析（ruleToc 应用一次——getChapterListByRule 调试接口复用）
-pub async fn parse_toc_page(
-    ns: &str,
-    url: &str,
-    source: &BookSource,
-) -> Result<Vec<BookChapter>> {
+pub async fn parse_toc_page(ns: &str, url: &str, source: &BookSource) -> Result<Vec<BookChapter>> {
     let resp = fetch_url(ns, url, source).await?;
     let base = resp.url.clone();
     let rule: TocRule = source
@@ -380,11 +395,7 @@ fn collect_urls(value: &str, out: &mut Vec<String>) {
 
 /// 媒体 URL 提取（音频/视频/文件书共用）：ruleContent.content 规则应用到章节页 → URL；
 /// 规则缺失或提取为空 → 章节 URL 本身（音频书章节 URL 常即音频流 URL 直链）。
-pub async fn analyze_media_url(
-    ns: &str,
-    chapter_url: &str,
-    source: &BookSource,
-) -> Result<String> {
+pub async fn analyze_media_url(ns: &str, chapter_url: &str, source: &BookSource) -> Result<String> {
     let rule: ContentRule = source
         .rule_content
         .as_ref()
@@ -458,9 +469,11 @@ pub async fn analyze_comic_images(
 /// 是否为图片直链（按扩展名判断，忽略查询串）
 fn looks_like_image_url(url: &str) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
-    [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".svg"]
-        .iter()
-        .any(|ext| path.ends_with(ext))
+    [
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".svg",
+    ]
+    .iter()
+    .any(|ext| path.ends_with(ext))
 }
 
 /// 正文解析（ruleContent：content 字段 + sourceRegex 清洗 + 多页）
@@ -570,7 +583,12 @@ mod tests {
     fn test_analyze_info() {
         let html = r#"<h1 class="bookname">测试书</h1><p class="author">作者X</p>
             <div class="intro">简介内容</div><img class="cover" src="/cover.jpg">"#;
-        let info = analyze_book_info(html, "http://127.0.0.1:9999/book/1", &test_source(), "http://127.0.0.1:9999/book/1");
+        let info = analyze_book_info(
+            html,
+            "http://127.0.0.1:9999/book/1",
+            &test_source(),
+            "http://127.0.0.1:9999/book/1",
+        );
         assert_eq!(info.name, "测试书");
         assert_eq!(info.author, "作者X");
         assert_eq!(info.intro.as_deref(), Some("简介内容"));
@@ -580,7 +598,8 @@ mod tests {
 
     #[test]
     fn test_analyze_content_from() {
-        let html = r#"<html><div class="content">第一章正文内容测试。</div><script>干扰</script></html>"#;
+        let html =
+            r#"<html><div class="content">第一章正文内容测试。</div><script>干扰</script></html>"#;
         let content = analyze_content_from(html, &test_source());
         assert_eq!(content, "第一章正文内容测试。");
     }
@@ -600,7 +619,8 @@ mod tests {
     /// chapterList JS 规则（JSON.parse(result).data 数组）→ 章节上下文列表
     #[test]
     fn test_toc_items_js_array() {
-        let body = r#"{"data":[{"title":"第一章","href":"/c/1"},{"title":"第二章","href":"/c/2"}]}"#;
+        let body =
+            r#"{"data":[{"title":"第一章","href":"/c/1"},{"title":"第二章","href":"/c/2"}]}"#;
         let items = toc_items("@js:JSON.parse(result).data", body);
         assert_eq!(items.len(), 2, "JS chapterList 应解析出 2 项");
         assert!(items[0].contains("第一章"));
@@ -656,7 +676,10 @@ mod tests {
         assert_eq!(related[0].author, "作者甲");
         assert_eq!(related[0].book_url, "http://127.0.0.1:9999/r/1");
         // coverUrl 经 field_url 绝对化（与 ruleExplore 书单一致）
-        assert_eq!(related[0].cover_url.as_deref(), Some("http://127.0.0.1:9999/c1.jpg"));
+        assert_eq!(
+            related[0].cover_url.as_deref(),
+            Some("http://127.0.0.1:9999/c1.jpg")
+        );
         assert_eq!(related[1].name, "推荐书2");
         // 无 ruleRelated / 无 bookList → 空
         assert!(analyze_related_books(html, "http://x", &test_source()).is_empty());
@@ -676,7 +699,12 @@ mod tests {
         }));
         let html = r#"<h1 class="bookname">测试书</h1><p class="author">作者X</p>
             <ul class="related"><li><a href="/r/9">推荐书9</a></li></ul>"#;
-        let info = analyze_book_info(html, "http://127.0.0.1:9999/book/1", &src, "http://127.0.0.1:9999/book/1");
+        let info = analyze_book_info(
+            html,
+            "http://127.0.0.1:9999/book/1",
+            &src,
+            "http://127.0.0.1:9999/book/1",
+        );
         assert_eq!(info.related_books.len(), 1);
         assert_eq!(info.related_books[0].name, "推荐书9");
         assert_eq!(info.related_books[0].book_url, "http://127.0.0.1:9999/r/9");
@@ -712,8 +740,14 @@ mod tests {
             content.contains("<p>第一段</p><br><p>第二段</p>"),
             "HTML 标签应原样保留: {content}"
         );
-        assert!(content.contains("<p>") && content.contains("<br>"), "<p>/<br> 不应被剥离: {content}");
-        assert!(content.contains("<div"), "@html 含匹配元素外层标签（前端纯文本渲染无影响）: {content}");
+        assert!(
+            content.contains("<p>") && content.contains("<br>"),
+            "<p>/<br> 不应被剥离: {content}"
+        );
+        assert!(
+            content.contains("<div"),
+            "@html 含匹配元素外层标签（前端纯文本渲染无影响）: {content}"
+        );
 
         // 无 @ 的裸选择器（legacy 兼容）→ 取纯文本（仅此处剥离，规则显式 @html 时保留）
         src.rule_content = Some(serde_json::json!({ "content": "div.content" }));
@@ -727,7 +761,10 @@ mod tests {
             "replaceRegex": "第一段##甲段"
         }));
         let content = analyze_content_from(html, &src);
-        assert!(content.contains("<p>甲段</p><br><p>第二段</p>"), "{content}");
+        assert!(
+            content.contains("<p>甲段</p><br><p>第二段</p>"),
+            "{content}"
+        );
     }
 
     /// GAP 109：contentReplace/replaceRegex 在 ruleContent 解析已应用——
@@ -749,9 +786,15 @@ mod tests {
             r#"<p>正文第二段。</p></div>"#
         );
         let content = analyze_content_from(html, &src);
-        assert!(!content.contains("【广告】"), "广告行应被 replaceRegex 清除: {content}");
+        assert!(
+            !content.contains("【广告】"),
+            "广告行应被 replaceRegex 清除: {content}"
+        );
         assert!(!content.contains("（推广）"), "推广行应被清除: {content}");
-        assert!(content.contains("正文第一段。") && content.contains("正文第二段。"), "正文应保留: {content}");
+        assert!(
+            content.contains("正文第一段。") && content.contains("正文第二段。"),
+            "正文应保留: {content}"
+        );
 
         // sourceRegex（删除型）同样应用于正文
         src.rule_content = Some(serde_json::json!({
@@ -760,7 +803,10 @@ mod tests {
         }));
         let html = r#"<div class="content">正文甲。【广告】这是一条广告】正文乙。</div>"#;
         let content = analyze_content_from(html, &src);
-        assert!(!content.contains("广告"), "sourceRegex 应删除广告片段: {content}");
+        assert!(
+            !content.contains("广告"),
+            "sourceRegex 应删除广告片段: {content}"
+        );
         assert!(content.contains("正文甲。") && content.contains("正文乙。"));
     }
 
@@ -773,7 +819,9 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             for _ in 0..10 {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
                 let head = format!(
@@ -782,7 +830,7 @@ mod tests {
                 );
                 let mut resp = head.into_bytes();
                 resp.extend_from_slice(body.as_bytes());
-                let _ = sock.write_all(&mut resp).await;
+                let _ = sock.write_all(&resp).await;
             }
         });
         format!("http://{addr}")
@@ -791,7 +839,9 @@ mod tests {
     /// 音频书：ruleContent.content 提取音频 URL → analyze_media_url 返回音频流直链
     #[tokio::test]
     async fn test_analyze_media_url_audio() {
-        let base = serve(r#"<html><div class="player"><audio src="/stream/1.mp3"></audio></div></html>"#).await;
+        let base =
+            serve(r#"<html><div class="player"><audio src="/stream/1.mp3"></audio></div></html>"#)
+                .await;
         let mut src = test_source();
         src.rule_content = Some(serde_json::json!({
             "content": "div.player audio@src"
@@ -799,10 +849,17 @@ mod tests {
         let url = analyze_media_url("default", &format!("{base}/chapter/1"), &src)
             .await
             .unwrap();
-        assert_eq!(url, format!("{base}/stream/1.mp3"), "音频 URL 应提取并绝对化");
+        assert_eq!(
+            url,
+            format!("{base}/stream/1.mp3"),
+            "音频 URL 应提取并绝对化"
+        );
         // contentType 映射
         assert_eq!(audio_content_type(&url), "audio/mpeg");
-        assert_eq!(audio_content_type("https://x/a.m3u8?t=1"), "application/vnd.apple.mpegurl");
+        assert_eq!(
+            audio_content_type("https://x/a.m3u8?t=1"),
+            "application/vnd.apple.mpegurl"
+        );
         assert_eq!(audio_content_type("https://x/a.m4a"), "audio/mp4");
     }
 
@@ -872,7 +929,10 @@ mod tests {
         let images2 = analyze_comic_images("default", "https://img.example.com/comic/5.jpg", &src2)
             .await
             .unwrap();
-        assert_eq!(images2, vec!["https://img.example.com/comic/5.jpg".to_string()]);
+        assert_eq!(
+            images2,
+            vec!["https://img.example.com/comic/5.jpg".to_string()]
+        );
     }
 
     /// collect_urls 纯函数：URL 文本 / JSON 字符串数组 / 对象数组 / 空
@@ -881,7 +941,10 @@ mod tests {
         let mut out = Vec::new();
         collect_urls("https://a.mp3", &mut out);
         collect_urls(r#"["https://b.jpg","/c.png"]"#, &mut out);
-        collect_urls(r#"[{"url":"https://d.webp"},{"src":"https://e.avif"}]"#, &mut out);
+        collect_urls(
+            r#"[{"url":"https://d.webp"},{"src":"https://e.avif"}]"#,
+            &mut out,
+        );
         collect_urls("  ", &mut out);
         assert_eq!(
             out,
@@ -899,4 +962,3 @@ mod tests {
         assert_eq!(out2, vec!["/h/1"]);
     }
 }
-

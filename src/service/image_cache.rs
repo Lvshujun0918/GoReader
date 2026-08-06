@@ -140,7 +140,10 @@ impl ImageCache {
 
     /// 当前缓存总字节数（测试断言用）
     pub fn total_bytes(&self) -> u64 {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).total_bytes
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .total_bytes
     }
 
     /// 取图片：磁盘命中直接返回；未命中回源（同 URL 并发去重）并写入缓存。
@@ -324,7 +327,9 @@ mod tests {
 
     /// mock 图片服务器：每收到一个请求计数 +1；按路径返回不同内容；delay_ms > 0 时
     /// 延迟响应（并发去重测试用，保证请求重叠）。
-    async fn mock_server(delay_ms: u64) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    async fn mock_server(
+        delay_ms: u64,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::AtomicUsize;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -412,7 +417,11 @@ mod tests {
         assert_eq!(key.len(), 16);
         let path = cache.dir().join(format!("{key}.png"));
         assert!(path.exists(), "首次拉取应写缓存文件: {path:?}");
-        assert_eq!(std::fs::read(&path).unwrap(), expected, "缓存内容 = 上游字节");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected,
+            "缓存内容 = 上游字节"
+        );
 
         // 二次请求：磁盘命中，不再回源
         let (bytes2, ct2, status2, from_cache2) = cache
@@ -536,7 +545,10 @@ mod tests {
         assert_eq!(ct.as_deref(), Some("text/plain"));
         assert_eq!(bytes, b"not-an-image");
         assert!(
-            !cache.dir().join(format!("{}.txt", cache_key(&url))).exists(),
+            !cache
+                .dir()
+                .join(format!("{}.txt", cache_key(&url)))
+                .exists(),
             "白名单外类型不应落盘"
         );
         // 再次请求仍回源（未缓存）
@@ -554,7 +566,10 @@ mod tests {
             .unwrap();
         assert_eq!(status, 404);
         assert!(
-            !cache.dir().join(format!("{}.png", cache_key(&url))).exists(),
+            !cache
+                .dir()
+                .join(format!("{}.png", cache_key(&url)))
+                .exists(),
             "非 200 不应落盘"
         );
         let _ = std::fs::remove_dir_all(&dir);

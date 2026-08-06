@@ -26,8 +26,8 @@ pub struct FetchResponse {
 /// 按 charset 解码字节（GB2312/GBK/UTF-8 等，encoding_rs）
 pub fn decode_bytes(bytes: &[u8], charset: Option<&str>) -> String {
     let charset = charset.unwrap_or("utf-8");
-    let encoding = encoding_rs::Encoding::for_label(charset.as_bytes())
-        .unwrap_or(encoding_rs::UTF_8);
+    let encoding =
+        encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
     let (text, _, _) = encoding.decode(bytes);
     text.into_owned()
 }
@@ -64,15 +64,29 @@ pub async fn fetch(
     let resp_headers: Vec<(String, String)> = resp
         .headers()
         .iter()
-        .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or_default().to_string()))
+        .map(|(k, v)| {
+            (
+                k.as_str().to_lowercase(),
+                v.to_str().unwrap_or_default().to_string(),
+            )
+        })
         .collect();
     let bytes = resp.bytes().await?;
     let body = decode_bytes(&bytes, charset);
-    Ok(FetchResponse { body, url: final_url, headers: resp_headers, status })
+    Ok(FetchResponse {
+        body,
+        url: final_url,
+        headers: resp_headers,
+        status,
+    })
 }
 
 /// 兼容旧签名（GET）
-pub async fn fetch_get(url: &str, headers: &HashMap<String, String>, timeout_secs: u64) -> Result<FetchResponse> {
+pub async fn fetch_get(
+    url: &str,
+    headers: &HashMap<String, String>,
+    timeout_secs: u64,
+) -> Result<FetchResponse> {
     fetch(url, headers, timeout_secs, "GET", None, None).await
 }
 
@@ -159,14 +173,20 @@ pub fn base_url_of(url: &str) -> Option<String> {
 /// 按命名空间 + 请求 URL 查书源 cookie（无注册/未命中 → None）
 pub async fn cookie_for(ns: &str, url: &str) -> Option<String> {
     let base = base_url_of(url)?;
-    let storage = COOKIE_STORAGE.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let storage = COOKIE_STORAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
     storage.get_cookie_by_base(ns, &base).await.ok().flatten()
 }
 
 /// 按命名空间 + 请求 URL 查书源登录态（cookie + user_agent）
 pub async fn session_for(ns: &str, url: &str) -> Option<(String, String)> {
     let base = base_url_of(url)?;
-    let storage = COOKIE_STORAGE.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let storage = COOKIE_STORAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT source_url, cookie, user_agent FROM book_source_cookies WHERE user_namespace = ?1",
     )
@@ -177,7 +197,9 @@ pub async fn session_for(ns: &str, url: &str) -> Option<(String, String)> {
     let target = crate::storage::normalize_base(&base)?;
     for (source_url, cookie, ua) in rows {
         // `##` 后缀：主地址/备用地址任一段命中即可（与 book_sources 语义一致）
-        let any_match = source_url.split("##").any(|part| crate::storage::normalize_base(part) == Some(target.clone()));
+        let any_match = source_url
+            .split("##")
+            .any(|part| crate::storage::normalize_base(part) == Some(target.clone()));
         if any_match {
             return Some((cookie, ua));
         }
@@ -225,7 +247,10 @@ async fn http_fetch(
     if !cookie.is_empty() {
         req_headers.insert("Cookie".to_string(), cookie.clone());
     }
-    if !stored_ua.is_empty() && !req_headers.contains_key("User-Agent") && !req_headers.contains_key("user-agent") {
+    if !stored_ua.is_empty()
+        && !req_headers.contains_key("User-Agent")
+        && !req_headers.contains_key("user-agent")
+    {
         req_headers.insert("User-Agent".to_string(), stored_ua);
     }
 
@@ -234,8 +259,11 @@ async fn http_fetch(
     let resp = match fetch(url, &req_headers, timeout_secs, method, body, charset).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("http_fetch 直连失败 {url}: {e:?} source={:?}", e.source().map(|s| s.to_string()));
-            return Err(e.into());
+            tracing::error!(
+                "http_fetch 直连失败 {url}: {e:?} source={:?}",
+                e.source().map(|s| s.to_string())
+            );
+            return Err(e);
         }
     };
 
@@ -248,26 +276,35 @@ async fn http_fetch(
         tracing::debug!("http_fetch 命中 CF 质询 status={} url={url}", resp.status);
         // 求解：返回兜底响应 + 合并后 cookie 串（内存直传重试——不依赖 storage 注册状态/
         // 并发覆盖）+ 浏览器 UA
-        let (fallback, merged_cookie, solved_ua) =
-            if let Some(fs) = flaresolverr_request(url, &cookie, method, body, timeout_secs).await? {
-                // FS 解成功：cookie 与用户原 cookie 按 name 合并后存库（按用户）+ UA 记录
-                let fs_pairs: Vec<(String, String)> =
-                    fs.cookies.iter().map(|c| (c.name.clone(), c.value.clone())).collect();
-                let merged = store_solution_session(ns, url, &cookie, &fs_pairs, &fs.user_agent, None).await;
-                (
-                    FetchResponse {
-                        body: fs.response,
-                        url: if fs.url.is_empty() { url.to_string() } else { fs.url },
-                        headers: Vec::new(),
-                        status: fs.status,
+        let (fallback, merged_cookie, solved_ua) = if let Some(fs) =
+            flaresolverr_request(url, &cookie, method, body, timeout_secs).await?
+        {
+            // FS 解成功：cookie 与用户原 cookie 按 name 合并后存库（按用户）+ UA 记录
+            let fs_pairs: Vec<(String, String)> = fs
+                .cookies
+                .iter()
+                .map(|c| (c.name.clone(), c.value.clone()))
+                .collect();
+            let merged =
+                store_solution_session(ns, url, &cookie, &fs_pairs, &fs.user_agent, None).await;
+            (
+                FetchResponse {
+                    body: fs.response,
+                    url: if fs.url.is_empty() {
+                        url.to_string()
+                    } else {
+                        fs.url
                     },
-                    merged,
-                    fs.user_agent,
-                )
-            } else {
-                // 未配置 FLARESOLVERR_URL → 内置浏览器求解（进程内 CDP，不依赖外部容器）
-                solve_cf_builtin(ns, url, &cookie).await?
-            };
+                    headers: Vec::new(),
+                    status: fs.status,
+                },
+                merged,
+                fs.user_agent,
+            )
+        } else {
+            // 未配置 FLARESOLVERR_URL → 内置浏览器求解（进程内 CDP，不依赖外部容器）
+            solve_cf_builtin(ns, url, &cookie).await?
+        };
 
         // ④ 重试原请求（原 method/body/headers + 求解后的 cookie——POST 场景关键：
         //    浏览器求解只会 GET 首页，重试才能让 POST（如 69shuba search.php）拿到真实
@@ -301,19 +338,25 @@ async fn http_fetch(
 /// 无既有 cookie 行时回退用请求 baseUrl 作为键（get_cookie_by_base 按 base 命中，不影响查找）。
 async fn resolve_source_url(ns: &str, url: &str) -> Option<String> {
     let base = base_url_of(url)?;
-    let Some(storage) = COOKIE_STORAGE.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+    let Some(storage) = COOKIE_STORAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    else {
         return Some(base);
     };
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT source_url FROM book_source_cookies WHERE user_namespace = ?1",
-    )
-    .bind(ns)
-    .fetch_all(&storage.pool)
-    .await
-    .ok()?;
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT source_url FROM book_source_cookies WHERE user_namespace = ?1")
+            .bind(ns)
+            .fetch_all(&storage.pool)
+            .await
+            .ok()?;
     let target = crate::storage::normalize_base(&base)?;
     rows.into_iter()
-        .find(|su| su.split("##").any(|part| crate::storage::normalize_base(part) == Some(target.clone())))
+        .find(|su| {
+            su.split("##")
+                .any(|part| crate::storage::normalize_base(part) == Some(target.clone()))
+        })
         .or(Some(base))
 }
 
@@ -369,7 +412,10 @@ pub struct FsSolution {
 
 /// FlareSolverr 请求配置（环境变量 FLARESOLVERR_URL，默认空 = 禁用）
 pub fn flaresolverr_base() -> Option<String> {
-    let v = std::env::var("FLARESOLVERR_URL").unwrap_or_default().trim().to_string();
+    let v = std::env::var("FLARESOLVERR_URL")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if v.is_empty() {
         None
     } else {
@@ -393,9 +439,7 @@ pub async fn flaresolverr_request(
     // 用户 cookie（"a=1; b=2"）→ FS cookies 数组（name/value/domain/path）
     let cookies: Vec<serde_json::Value> = parse_cookie_string(cookie)
         .into_iter()
-        .map(|(name, value)| {
-            serde_json::json!({ "name": name, "value": value })
-        })
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
         .collect();
     let mut payload = serde_json::json!({
         "cmd": "request.get",
@@ -428,7 +472,9 @@ pub async fn flaresolverr_request(
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("未知错误");
-        return Err(anyhow!("FlareSolverr 解质询失败（{base}，HTTP {status}）: {msg}"));
+        return Err(anyhow!(
+            "FlareSolverr 解质询失败（{base}，HTTP {status}）: {msg}"
+        ));
     }
     let solution = json.get("solution").cloned().unwrap_or_default();
     let response = solution
@@ -451,9 +497,16 @@ pub async fn flaresolverr_request(
         .and_then(|s| s.as_u64())
         .unwrap_or(200)
         .min(u16::MAX as u64) as u16;
-    let cookies: Vec<FsCookie> = serde_json::from_value(solution.get("cookies").cloned().unwrap_or_default())
-        .unwrap_or_default();
-    Ok(Some(FsSolution { response, cookies, user_agent, url: final_url, status }))
+    let cookies: Vec<FsCookie> =
+        serde_json::from_value(solution.get("cookies").cloned().unwrap_or_default())
+            .unwrap_or_default();
+    Ok(Some(FsSolution {
+        response,
+        cookies,
+        user_agent,
+        url: final_url,
+        status,
+    }))
 }
 
 // ==================== 内置浏览器 CF 质询求解（进程内 CDP） ====================
@@ -508,9 +561,10 @@ async fn solve_cf_builtin(
             .await
             .map_err(|e| anyhow!("解 CF 质询失败（{url}）: {e:#}"))?
     } else {
-        let solution = crate::service::browser::solve_cf_challenge(ns, url, &cookies, CF_SOLVE_MAX_WAIT_MS)
-            .await
-            .map_err(|e| anyhow!("内置浏览器解 CF 质询失败（{url}）: {e:#}"))?;
+        let solution =
+            crate::service::browser::solve_cf_challenge(ns, url, &cookies, CF_SOLVE_MAX_WAIT_MS)
+                .await
+                .map_err(|e| anyhow!("内置浏览器解 CF 质询失败（{url}）: {e:#}"))?;
         solution
     };
     let merged = store_solution_session(
@@ -550,7 +604,12 @@ async fn store_solution_session(
     }
     let fs_cookies: Vec<FsCookie> = solution_cookies
         .iter()
-        .map(|(n, v)| FsCookie { name: n.clone(), value: v.clone(), domain: None, path: None })
+        .map(|(n, v)| FsCookie {
+            name: n.clone(),
+            value: v.clone(),
+            domain: None,
+            path: None,
+        })
         .collect();
     let mut merged = merge_fs_cookies(user_cookie, &fs_cookies);
     // Turnstile token 随 cookie 串存库（书源级按用户）——选择随 cookie 串而非新增表列：
@@ -562,8 +621,10 @@ async fn store_solution_session(
     }
     // 注意：先解引用再 clone 出 Storage（句柄 Clone 廉价）——MutexGuard 不能跨 await 存活
     // （非 Send——router 的 tokio::spawn 会因此编译失败）
-    let storage_opt: Option<crate::storage::Storage> =
-        COOKIE_STORAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let storage_opt: Option<crate::storage::Storage> = COOKIE_STORAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if let Some(storage) = storage_opt {
         if let Some(su) = resolve_source_url(ns, url).await {
             if !merged.is_empty() {
@@ -724,9 +785,19 @@ mod tests {
     async fn fetch_69shuba_post() {
         use std::collections::HashMap;
         let mut h = HashMap::new();
-        h.insert("User-Agent".to_string(), "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/125.0 Mobile Safari/537.36".to_string());
-        h.insert("Referer".to_string(), "https://www.69shuba.com/".to_string());
-        h.insert("Content-Type".to_string(), "application/x-www-form-urlencoded; charset=gbk".to_string());
+        h.insert(
+            "User-Agent".to_string(),
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/125.0 Mobile Safari/537.36"
+                .to_string(),
+        );
+        h.insert(
+            "Referer".to_string(),
+            "https://www.69shuba.com/".to_string(),
+        );
+        h.insert(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded; charset=gbk".to_string(),
+        );
         let url = "https://www.69shuba.com/modules/article/search.php";
         let body = "searchkey=%E8%AF%A1%E7%A7%98%E4%B9%8B%E4%B8%BB&searchtype=all&page=1";
         match fetch(url, &h, 30, "POST", Some(body), Some("gbk")).await {
@@ -737,8 +808,14 @@ mod tests {
 
     #[test]
     fn test_base_url_of() {
-        assert_eq!(base_url_of("https://a.com/book/1?x=2").as_deref(), Some("https://a.com"));
-        assert_eq!(base_url_of("https://a.com:8443/x").as_deref(), Some("https://a.com:8443"));
+        assert_eq!(
+            base_url_of("https://a.com/book/1?x=2").as_deref(),
+            Some("https://a.com")
+        );
+        assert_eq!(
+            base_url_of("https://a.com:8443/x").as_deref(),
+            Some("https://a.com:8443")
+        );
         assert_eq!(base_url_of("http://a.com").as_deref(), Some("http://a.com"));
         assert_eq!(base_url_of("not a url"), None);
     }
@@ -758,15 +835,24 @@ mod tests {
             503,
             "<html>Just a moment...<script src=\"/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1\"></script>"
         ));
-        assert!(is_cloudflare_challenge(503, "__cf_chl_opt_tKb6Qe=...; cf-browser-gesture"));
+        assert!(is_cloudflare_challenge(
+            503,
+            "__cf_chl_opt_tKb6Qe=...; cf-browser-gesture"
+        ));
         // 403 + 特征（69shuba 等强质询）→ true
-        assert!(is_cloudflare_challenge(403, "<title>Just a moment...</title> challenge-platform"));
+        assert!(is_cloudflare_challenge(
+            403,
+            "<title>Just a moment...</title> challenge-platform"
+        ));
         // Turnstile 特征（challenges.cloudflare.com/turnstile、cf-turnstile、turnstile/api.js）
         assert!(is_cloudflare_challenge(
             503,
             "<script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script>"
         ));
-        assert!(is_cloudflare_challenge(503, "<div class=\"cf-turnstile\" data-sitekey=\"0x4AAAAAAA\"></div>"));
+        assert!(is_cloudflare_challenge(
+            503,
+            "<div class=\"cf-turnstile\" data-sitekey=\"0x4AAAAAAA\"></div>"
+        ));
         assert!(is_cloudflare_challenge(403, "turnstile/api.js"));
         // 非 503/403 → false（即使含特征）
         assert!(!is_cloudflare_challenge(200, "Just a moment"));
@@ -777,8 +863,14 @@ mod tests {
 
     #[test]
     fn test_parse_cookie_string() {
-        assert_eq!(parse_cookie_string("a=1; b=2"), vec![("a".into(), "1".into()), ("b".into(), "2".into())]);
-        assert_eq!(parse_cookie_string("a=1;; b="), vec![("a".into(), "1".into())]);
+        assert_eq!(
+            parse_cookie_string("a=1; b=2"),
+            vec![("a".into(), "1".into()), ("b".into(), "2".into())]
+        );
+        assert_eq!(
+            parse_cookie_string("a=1;; b="),
+            vec![("a".into(), "1".into())]
+        );
         assert_eq!(parse_cookie_string(""), Vec::<(String, String)>::new());
     }
 
@@ -787,8 +879,18 @@ mod tests {
     fn test_merge_fs_cookies() {
         let user = "sid=abc; theme=dark";
         let fs = vec![
-            FsCookie { name: "cf_clearance".into(), value: "xyz".into(), domain: None, path: None },
-            FsCookie { name: "theme".into(), value: "light".into(), domain: None, path: None },
+            FsCookie {
+                name: "cf_clearance".into(),
+                value: "xyz".into(),
+                domain: None,
+                path: None,
+            },
+            FsCookie {
+                name: "theme".into(),
+                value: "light".into(),
+                domain: None,
+                path: None,
+            },
         ];
         let merged = merge_fs_cookies(user, &fs);
         assert_eq!(merged, "sid=abc; theme=light; cf_clearance=xyz");
@@ -796,9 +898,12 @@ mod tests {
 
     #[test]
     fn test_merge_fs_cookies_empty_user() {
-        let fs = vec![
-            FsCookie { name: "cf_clearance".into(), value: "xyz".into(), domain: None, path: None },
-        ];
+        let fs = vec![FsCookie {
+            name: "cf_clearance".into(),
+            value: "xyz".into(),
+            domain: None,
+            path: None,
+        }];
         assert_eq!(merge_fs_cookies("", &fs), "cf_clearance=xyz");
         assert_eq!(merge_fs_cookies("a=1", &[]), "a=1");
         assert_eq!(merge_fs_cookies("", &[]), "");
@@ -811,7 +916,10 @@ mod tests {
             merge_turnstile_token("sid=abc", "tok-1"),
             "sid=abc; cf_turnstile_token=tok-1"
         );
-        assert_eq!(merge_turnstile_token("", "tok-1"), "cf_turnstile_token=tok-1");
+        assert_eq!(
+            merge_turnstile_token("", "tok-1"),
+            "cf_turnstile_token=tok-1"
+        );
         assert_eq!(
             merge_turnstile_token("sid=abc; cf_turnstile_token=old", "new"),
             "sid=abc; cf_turnstile_token=new"
@@ -823,7 +931,13 @@ mod tests {
         // 未配置 FLARESOLVERR_URL → Ok(None)（降级直连，不影响现有路径）
         std::env::remove_var("FLARESOLVERR_URL");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let r = rt.block_on(flaresolverr_request("https://a.com", "a=1", "GET", None, 15));
+        let r = rt.block_on(flaresolverr_request(
+            "https://a.com",
+            "a=1",
+            "GET",
+            None,
+            15,
+        ));
         assert!(r.is_ok());
         assert!(r.unwrap().is_none());
     }
@@ -835,7 +949,11 @@ mod tests {
         std::env::set_var("READER_CAMOUFOX_DISABLE", "1");
         force_cf_browser_available(Some(false));
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let r = rt.block_on(solve_cf_builtin("default", "https://cf.example.com/book/1", "sid=abc"));
+        let r = rt.block_on(solve_cf_builtin(
+            "default",
+            "https://cf.example.com/book/1",
+            "sid=abc",
+        ));
         force_cf_browser_available(None);
         std::env::remove_var("READER_CAMOUFOX_DISABLE");
         let err = r.err().expect("浏览器不可用应返回错误");
@@ -861,7 +979,9 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             for _ in 0..10 {
-                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
                 let mut buf = [0u8; 4096];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -887,22 +1007,34 @@ mod tests {
         let png = vec![0x89u8, b'P', b'N', b'G', 1, 2, 3, 4];
         let url = serve_image(200, "image/png", png.clone(), captured.clone()).await;
 
-        let (bytes, content_type, status) =
-            fetch_image("default", &url, Some("https://src.com/book/1"), 10, 5 * 1024 * 1024)
-                .await
-                .unwrap();
+        let (bytes, content_type, status) = fetch_image(
+            "default",
+            &url,
+            Some("https://src.com/book/1"),
+            10,
+            5 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
         assert_eq!(bytes, png, "图片字节应原样透传");
-        assert_eq!(content_type.as_deref(), Some("image/png"), "Content-Type 透传");
+        assert_eq!(
+            content_type.as_deref(),
+            Some("image/png"),
+            "Content-Type 透传"
+        );
         assert_eq!(status, 200);
         let req = captured.lock().unwrap()[0].clone();
         assert!(
-            req.to_lowercase().contains("referer: https://src.com/book/1"),
+            req.to_lowercase()
+                .contains("referer: https://src.com/book/1"),
             "应携带 Referer（防盗链绕过）: {req}"
         );
 
         // 非 200 状态透传
         let url = serve_image(404, "text/plain", b"nf".to_vec(), captured.clone()).await;
-        let (bytes, _, status) = fetch_image("default", &url, None, 10, 5 * 1024 * 1024).await.unwrap();
+        let (bytes, _, status) = fetch_image("default", &url, None, 10, 5 * 1024 * 1024)
+            .await
+            .unwrap();
         assert_eq!(status, 404);
         assert_eq!(bytes, b"nf");
     }
@@ -913,13 +1045,20 @@ mod tests {
         clear_cookie_storage();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let body = vec![b'x'; 2048];
-        let url = serve_image(200, "application/octet-stream", body.clone(), captured.clone()).await;
+        let url = serve_image(
+            200,
+            "application/octet-stream",
+            body.clone(),
+            captured.clone(),
+        )
+        .await;
         // Content-Length 预检：声明 2048 > 上限 100 → 拒绝
-        let err = fetch_image("default", &url, None, 10, 100).await.unwrap_err();
+        let err = fetch_image("default", &url, None, 10, 100)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("图片超过大小上限"), "{err}");
         // 正常上限内通过
         let (bytes, _, _) = fetch_image("default", &url, None, 10, 4096).await.unwrap();
         assert_eq!(bytes, body);
     }
 }
-

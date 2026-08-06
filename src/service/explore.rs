@@ -21,11 +21,28 @@ pub struct ExploreEntry {
 /// 判断分类类型：外部链接（群/导入/渠道/发布等）vs 书单
 fn entry_type(title: &str, url: &str) -> String {
     let t = title.to_lowercase();
-    let keywords = ["导入", "群", "发布", "渠道", "交流", "更新", "关注", "频道", "公众号"];
+    let keywords = [
+        "导入",
+        "群",
+        "发布",
+        "渠道",
+        "交流",
+        "更新",
+        "关注",
+        "频道",
+        "公众号",
+    ];
     if keywords.iter().any(|k| t.contains(k)) {
         return "link".to_string();
     }
-    let domains = ["qm.qq.com", "bilibili.com", "mp.weixin.qq.com", "shuyuan-api", "yckceo.com", "t.me"];
+    let domains = [
+        "qm.qq.com",
+        "bilibili.com",
+        "mp.weixin.qq.com",
+        "shuyuan-api",
+        "yckceo.com",
+        "t.me",
+    ];
     if domains.iter().any(|d| url.contains(d)) {
         return "link".to_string();
     }
@@ -51,8 +68,10 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
                 // 独立行：后续所有行拼接为代码
                 let rest = &lines[i + 1..];
                 i = lines.len();
-                rest.join("
-")
+                rest.join(
+                    "
+",
+                )
             } else {
                 i += 1;
                 line[4..].to_string()
@@ -77,7 +96,11 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
                             .unwrap_or("")
                             .to_string();
                         if !url.is_empty() {
-                            entries.push(ExploreEntry { title: title.clone(), url: url.clone(), r#type: entry_type(&title, &url) });
+                            entries.push(ExploreEntry {
+                                title: title.clone(),
+                                url: url.clone(),
+                                r#type: entry_type(&title, &url),
+                            });
                         }
                     }
                     i = lines.len();
@@ -99,10 +122,22 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
             i = j;
             if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
                 for item in list {
-                    let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let title = item
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let url = item
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if !url.is_empty() {
-                        entries.push(ExploreEntry { title: title.clone(), url: url.clone(), r#type: entry_type(&title, &url) });
+                        entries.push(ExploreEntry {
+                            title: title.clone(),
+                            url: url.clone(),
+                            r#type: entry_type(&title, &url),
+                        });
                     }
                 }
                 continue;
@@ -114,13 +149,17 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
             let title = title.trim().to_string();
             let url = url.trim().to_string();
             if !url.is_empty() {
-                entries.push(ExploreEntry { title: title.clone(), url: url.clone(), r#type: entry_type(&title, &url) });
+                entries.push(ExploreEntry {
+                    title: title.clone(),
+                    url: url.clone(),
+                    r#type: entry_type(&title, &url),
+                });
                 i += 1;
                 continue;
             }
         }
         // 普通 URL 行：title 从尾部提取
-        let title = url_title(&line);
+        let title = url_title(line);
         entries.push(ExploreEntry {
             title: title.clone(),
             url: line.to_string(),
@@ -202,14 +241,23 @@ pub async fn explore_url(
     let url = build_explore_url(url, page);
     // 相对 URL 拼书源 baseUrl
     let raw_url = if url.starts_with('/') && !url.starts_with("//") {
-        let base = source.book_source_url.split("##").next().unwrap_or("").trim_end_matches('/');
+        let base = source
+            .book_source_url
+            .split("##")
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
         format!("{base}{url}")
     } else {
         url.to_string()
     };
     // URL 后缀（,{...}：charset/method/body——对齐搜索链路）
     let (final_url, suffix) = crate::service::search::split_url_suffix(&raw_url);
-    let mut headers = source.header.as_deref().map(crawler::parse_header).unwrap_or_default();
+    let mut headers = source
+        .header
+        .as_deref()
+        .map(crawler::parse_header)
+        .unwrap_or_default();
     if let Some(extra) = &suffix.headers {
         for (k, v) in extra {
             headers.insert(k.clone(), v.clone());
@@ -219,7 +267,15 @@ pub async fn explore_url(
     // 书源抓取（自动带书源 cookie——按用户命名空间）
     let method = suffix.method.as_deref().unwrap_or("GET");
     let resp = if method.eq_ignore_ascii_case("POST") {
-        crawler::http_post(ns, &final_url, &headers, 15, post_body.as_deref(), suffix.charset.as_deref()).await
+        crawler::http_post(
+            ns,
+            &final_url,
+            &headers,
+            15,
+            post_body.as_deref(),
+            suffix.charset.as_deref(),
+        )
+        .await
     } else {
         crawler::http_get(ns, &final_url, &headers, 15).await
     }
@@ -366,7 +422,8 @@ mod tests {
     /// 输出 "[object Object]" 导致条目解析为空
     #[test]
     fn test_parse_js_entries_array_literal() {
-        let js = "@js:[{title:'分类X',url:'https://a.com/x'},{title:'分类Y',url:'https://a.com/y'}]";
+        let js =
+            "@js:[{title:'分类X',url:'https://a.com/x'},{title:'分类Y',url:'https://a.com/y'}]";
         let parsed = parse_explore_entries(js);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].title, "分类X");
@@ -386,11 +443,23 @@ mod tests {
     /// GAP #51：分页变量替换（{{page}}/{page} 双格式，URL 与 POST body 一致）
     #[test]
     fn test_build_explore_url_page() {
-        assert_eq!(build_explore_url("https://a.com/list/{{page}}", 3), "https://a.com/list/3");
-        assert_eq!(build_explore_url("https://a.com/list/{page}", 2), "https://a.com/list/2");
-        assert_eq!(build_explore_url("https://a.com/list?p={{page}}", 7), "https://a.com/list?p=7");
+        assert_eq!(
+            build_explore_url("https://a.com/list/{{page}}", 3),
+            "https://a.com/list/3"
+        );
+        assert_eq!(
+            build_explore_url("https://a.com/list/{page}", 2),
+            "https://a.com/list/2"
+        );
+        assert_eq!(
+            build_explore_url("https://a.com/list?p={{page}}", 7),
+            "https://a.com/list?p=7"
+        );
         // 无占位符：原样返回
-        assert_eq!(build_explore_url("https://a.com/list", 5), "https://a.com/list");
+        assert_eq!(
+            build_explore_url("https://a.com/list", 5),
+            "https://a.com/list"
+        );
     }
 
     /// GAP #51：hasMore 启发式（本页达到阈值且非空 → 可能有下一页）
@@ -401,8 +470,14 @@ mod tests {
             book_url: format!("https://a.com/b{i}"),
             ..Default::default()
         };
-        assert!(!has_more(&(0..10).map(book).collect::<Vec<_>>()), "不足阈值无更多");
-        assert!(has_more(&(0..EXPLORE_PAGE_SIZE).map(book).collect::<Vec<_>>()), "满页可能有更多");
+        assert!(
+            !has_more(&(0..10).map(book).collect::<Vec<_>>()),
+            "不足阈值无更多"
+        );
+        assert!(
+            has_more(&(0..EXPLORE_PAGE_SIZE).map(book).collect::<Vec<_>>()),
+            "满页可能有更多"
+        );
         assert!(has_more(&(0..30).map(book).collect::<Vec<_>>()));
     }
 
@@ -411,7 +486,11 @@ mod tests {
     #[test]
     fn test_builtin_explore_sources_parse() {
         let sources = builtin_explore_sources();
-        assert!(sources.len() >= 2, "内置探索源应 >= 2 个（当前 {}）", sources.len());
+        assert!(
+            sources.len() >= 2,
+            "内置探索源应 >= 2 个（当前 {}）",
+            sources.len()
+        );
         for s in &sources {
             assert!(!s.book_source_url.is_empty(), "书源 URL 必填");
             assert!(!s.book_source_name.is_empty());
@@ -419,16 +498,28 @@ mod tests {
             assert!(s.enabled_explore, "探索源应启用 enabledExplore");
             // 探索入口：解析出条目且非空
             let entries = parse_explore_entries(s.explore_url.as_deref().unwrap_or(""));
-            assert!(entries.len() >= 4, "{} 探索分类应 >= 4（当前 {}）", s.book_source_name, entries.len());
+            assert!(
+                entries.len() >= 4,
+                "{} 探索分类应 >= 4（当前 {}）",
+                s.book_source_name,
+                entries.len()
+            );
             assert!(entries.iter().all(|e| e.r#type == "book"), "分类应为书单型");
             // 规则完整性：ruleExplore bookList + 字段规则；ruleToc/ruleContent 齐备
             let explore: crate::service::search::SearchRule =
                 serde_json::from_value(s.rule_explore.clone().unwrap()).unwrap();
             assert!(explore.book_list.is_some(), "ruleExplore.bookList 必填");
-            assert!(explore.name.is_some() && explore.book_url.is_some(), "name/bookUrl 字段规则必填");
+            assert!(
+                explore.name.is_some() && explore.book_url.is_some(),
+                "name/bookUrl 字段规则必填"
+            );
             let toc: crate::service::book::TocRule =
                 serde_json::from_value(s.rule_toc.clone().unwrap()).unwrap();
-            assert!(toc.chapter_list.is_some() && toc.chapter_name.is_some() && toc.chapter_url.is_some());
+            assert!(
+                toc.chapter_list.is_some()
+                    && toc.chapter_name.is_some()
+                    && toc.chapter_url.is_some()
+            );
             let content: crate::service::book::ContentRule =
                 serde_json::from_value(s.rule_content.clone().unwrap()).unwrap();
             assert!(content.content.is_some(), "ruleContent.content 必填");

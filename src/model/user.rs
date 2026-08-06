@@ -120,7 +120,7 @@ mod tests {
         assert!(token_map_contains(&m, "t1"));
         assert!(token_map_contains(&m, "t2"));
         assert!(!token_map_contains(&m, "t3"));
-        assert!(token_map_contains(&None, "") == false);
+        assert!(!token_map_contains(&None, ""));
         let (json, removed) = token_map_remove(&m, "t1");
         assert!(removed);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

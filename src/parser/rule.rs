@@ -713,32 +713,27 @@ fn eval_segments<'v>(
             }
             _ => {}
         },
-        JSeg::Slice(s, e, st) => match value {
-            serde_json::Value::Array(arr) => {
-                for v in slice_items(arr, *s, *e, *st) {
-                    eval_segments(v, &segs[1..], out);
-                }
+        JSeg::Slice(s, e, st) => if let serde_json::Value::Array(arr) = value {
+            for v in slice_items(arr, *s, *e, *st) {
+                eval_segments(v, &segs[1..], out);
             }
-            _ => {}
         },
-        JSeg::Multi(items) => match value {
-            serde_json::Value::Array(arr) => {
-                for it in items {
-                    match it {
-                        JItem::I(n) => {
-                            if let Some(v) = norm_index(*n, arr.len()).and_then(|idx| arr.get(idx)) {
-                                eval_segments(v, &segs[1..], out);
-                            }
+        JSeg::Multi(items) => if let serde_json::Value::Array(arr) = value {
+            for it in items {
+                match it {
+                    JItem::I(n) => {
+                        if let Some(v) = norm_index(*n, arr.len()).and_then(|idx| arr.get(idx))
+                        {
+                            eval_segments(v, &segs[1..], out);
                         }
-                        JItem::S(s, e, st) => {
-                            for v in slice_items(arr, *s, *e, *st) {
-                                eval_segments(v, &segs[1..], out);
-                            }
+                    }
+                    JItem::S(s, e, st) => {
+                        for v in slice_items(arr, *s, *e, *st) {
+                            eval_segments(v, &segs[1..], out);
                         }
                     }
                 }
             }
-            _ => {}
         },
         JSeg::Filter(expr) => match value {
             serde_json::Value::Array(arr) => {
@@ -1358,7 +1353,10 @@ mod tests {
         let json = r#"{"a":{"content":"深1","b":{"content":"深2"}},"content":"浅"}"#;
         // $..content 任意深度（DFS 前序：父键先出）
         let r = apply("$..content", json);
-        assert_eq!(r, vec!["浅".to_string(), "深1".to_string(), "深2".to_string()]);
+        assert_eq!(
+            r,
+            vec!["浅".to_string(), "深1".to_string(), "深2".to_string()]
+        );
     }
 
     #[test]
@@ -1366,9 +1364,23 @@ mod tests {
         let json = r#"{"data":["a","b","c","d"]}"#;
         assert_eq!(apply("$.data[0]", json), vec!["a".to_string()]);
         assert_eq!(apply("$.data[-1]", json), vec!["d".to_string()]);
-        assert_eq!(apply("$.data[1:3]", json), vec!["b".to_string(), "c".to_string()]);
-        assert_eq!(apply("$.data[0,2]", json), vec!["a".to_string(), "c".to_string()]);
-        assert_eq!(apply("$.data[*]", json), vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]);
+        assert_eq!(
+            apply("$.data[1:3]", json),
+            vec!["b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            apply("$.data[0,2]", json),
+            vec!["a".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            apply("$.data[*]", json),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ]
+        );
         // 对象通配
         let obj = r#"{"x":1,"y":2}"#;
         assert_eq!(apply("$.*", obj), vec!["1".to_string(), "2".to_string()]);
@@ -1473,7 +1485,8 @@ mod tests {
     #[test]
     fn test_inline_rule_ref_substitution() {
         // {{@@rule}} 规则引用（真实书源：{{@@[name$=update_time]@content##T##🔸}}）
-        let html = r#"<meta name="update_time" content="2024-01-01"><div class="card"><p>正文</p></div>"#;
+        let html =
+            r#"<meta name="update_time" content="2024-01-01"><div class="card"><p>正文</p></div>"#;
         let r = apply("更新时间：{{@@[name$=update_time]@content##-##/}}", html);
         assert_eq!(r, vec!["更新时间：2024/01/01".to_string()]);
         let r2 = apply("{{@@.card@p@text}}", html);
@@ -1501,7 +1514,10 @@ mod tests {
         );
         // 上下文非完整 JSON → 逐行提取 JSON 片段（json_from_html 回退）
         assert_eq!(
-            expand_inline("{{$.data.name}}", "前文\n{\"data\":{\"name\":\"内嵌\"}}\n后文"),
+            expand_inline(
+                "{{$.data.name}}",
+                "前文\n{\"data\":{\"name\":\"内嵌\"}}\n后文"
+            ),
             "内嵌"
         );
         // 未闭合 {{ 原样返回
@@ -1516,7 +1532,7 @@ mod tests {
         let (sep, subs) = split_combined("a||b");
         assert_eq!(sep, Some("||"));
         assert_eq!(subs, vec!["a", "b"]);
-        let (sep, subs) = split_combined("a%%b");
+        let (sep, _subs) = split_combined("a%%b");
         assert_eq!(sep, Some("%%"));
         // 无分隔符
         let (sep, subs) = split_combined("a.b@c");
@@ -1526,7 +1542,7 @@ mod tests {
         let (sep, subs) = split_combined("a[href='x&&y']@b||c");
         assert_eq!(sep, Some("||"));
         assert_eq!(subs, vec!["a[href='x&&y']@b", "c"]);
-        let (sep, subs) = split_combined("[?(@.a == 'x' && @.b)]");
+        let (sep, _subs) = split_combined("[?(@.a == 'x' && @.b)]");
         assert_eq!(sep, None);
         let (sep, subs) = split_combined("{{a&&b}}&&c");
         assert_eq!(sep, Some("&&"));
@@ -1566,7 +1582,10 @@ mod tests {
   <book id="1"><title>三体</title></book>
   <book id="2"><title>流浪地球</title></book>
 </library>"#;
-        assert_eq!(apply("//book/title", xml), vec!["三体".to_string(), "流浪地球".to_string()]);
+        assert_eq!(
+            apply("//book/title", xml),
+            vec!["三体".to_string(), "流浪地球".to_string()]
+        );
         // && 组合
         let r = apply("//book[1]/title&&//book[2]/title", xml);
         assert_eq!(r, vec!["三体".to_string(), "流浪地球".to_string()]);
