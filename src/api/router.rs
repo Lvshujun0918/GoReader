@@ -813,8 +813,12 @@ pub(crate) async fn read_multipart_field_limited(
                 }
             }
             Ok(None) => break,
-            // 流错误（如底层 limited body 超限中断）——用累计长度判定是否超限
-            Err(_) => break,
+            // P2-17：流错误（如底层 limited body 超限中断）——字段不完整，拒绝而非静默截断
+            Err(e) => {
+                return Err(format!(
+                    "上传被中断（请求体超限或连接异常），字段接收不完整: {e}（可用环境变量 READER_UPLOAD_MAX_MB 调整）"
+                ))
+            }
         }
     }
     if out.len() > max_bytes {
