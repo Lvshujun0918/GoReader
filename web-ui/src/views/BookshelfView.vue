@@ -99,6 +99,16 @@ const keyword = ref('')
 watch(keyword, (k) => {
   if (searchMode.value === 'full') triggerContentSearch(k)
 })
+
+/** 主页搜索框 = 全网搜书入口（回车跳搜索页） */
+function goSearchBooks() {
+  const kw = keyword.value.trim()
+  if (!kw) {
+    void router.push('/search')
+    return
+  }
+  void router.push(`/search?key=${encodeURIComponent(kw)}`)
+}
 const failedCovers = ref<Set<string>>(new Set())
 
 /* ================= 多选模式 ================= */
@@ -123,9 +133,7 @@ let wrapObserver: ResizeObserver | undefined
 /** 'name'=书名/作者（本地）；'full'=全书内容搜索（后端契约 GET /reader3/searchBookContent 待实现，
  *  简化实现：本地匹配书名/作者/简介，并标注「全书搜索后端待实现」） */
 const searchMode = ref<'name' | 'full'>('name')
-const searchPlaceholder = computed(() =>
-  searchMode.value === 'full' ? '搜索正文内容（本地书）…' : '搜索书名 / 作者',
-)
+
 
 /* ================= 全书内容搜索（GET /reader3/searchBookContent——逐本地书并发聚合） ================= */
 const contentResults = ref<{ book: Book; hits: ContentSearchHit[] }[]>([])
@@ -1701,8 +1709,9 @@ onMounted(() => {
             v-model="keyword"
             class="search-input"
             type="text"
-            :placeholder="searchPlaceholder"
+            placeholder="搜书（全站书源）…"
             spellcheck="false"
+            @keyup.enter="goSearchBooks"
           />
           <button
             v-if="keyword"

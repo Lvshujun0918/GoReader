@@ -2053,7 +2053,23 @@ async fn get_book_info(
         // 书架无此本地书
         return Json(ReturnData::err("未找到这本书（可能不在书架中）"));
     }
-    let bs_param = param_of(&params, body_json.as_ref(), "bookSource");
+    let mut bs_param = param_of(&params, body_json.as_ref(), "bookSource");
+    // bookSource 缺失时按 URL 匹配启用书源（bookUrlPattern 正则/域名）——详情页直接访问链接可用
+    if bs_param.is_empty() {
+        if let Ok(sources) = state.storage.get_book_sources(&namespace).await {
+            for s in sources {
+                if !s.enabled {
+                    continue;
+                }
+                if let Some(pat) = &s.book_url_pattern {
+                    if !pat.is_empty() && crate::util::regex::Regex::new(pat).map(|r| r.is_match(&url)).unwrap_or(false) {
+                        bs_param = s.book_source_url.clone();
+                        break;
+                    }
+                }
+            }
+        }
+    }
     let Some(source) = resolve_book_source(&state, &namespace, &bs_param).await else {
         return Json(ReturnData::err("书源不存在"));
     };
