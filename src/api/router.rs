@@ -16,7 +16,6 @@ use serde_json::{json, Value};
 
 use crate::model::User;
 use crate::storage::Storage;
-use crate::util::md5::gen_encrypted_password;
 use crate::util::md5_encode;
 
 /// 统一返回结构（兼容 legacy ReturnData：isSuccess/errorMsg/data——camelCase）
@@ -563,8 +562,8 @@ async fn login(
     if !is_login {
         return Json(ReturnData::err("用户名已被占用"));
     }
-    let encrypted = gen_encrypted_password(&password, &user.salt);
-    if encrypted != user.password {
+    // 统一密码校验：argon2id（PHC）优先，legacy 双 MD5 兼容；MD5 通过时自动升级为 argon2id
+    if !crate::util::password::verify_password(&state.storage, &user, &password).await {
         crate::util::login_limit::record_failure(&username, &ip);
         return Json(ReturnData::err("密码错误"));
     }
@@ -642,7 +641,8 @@ async fn register(
     let token = md5_encode(&format!("{username}{now}"));
     let user = User {
         username: username.to_string(),
-        password: gen_encrypted_password(password, &salt),
+        // 新用户密码：argon2id PHC（salt 列保留 legacy 8 位随机盐，兼容旧读取路径）
+        password: crate::util::password::hash_password(password),
         salt,
         token: token.clone(),
         token_map: None,
@@ -4472,14 +4472,14 @@ async fn reset_user_password(
     if username.is_empty() || password.is_empty() {
         return Json(ReturnData::err("参数错误"));
     }
-    // 新 salt（与注册一致：8 位随机字母数字）
+    // 新 salt（与注册一致：8 位随机字母数字；argon2id 哈希自带随机盐，此列仅 legacy 兼容）
     use rand::Rng;
     let salt: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
         .take(8)
         .map(char::from)
         .collect();
-    let encrypted = gen_encrypted_password(&password, &salt);
+    let encrypted = crate::util::password::hash_password(&password);
     match state
         .storage
         .reset_user_password(&username, &salt, &encrypted)
@@ -4943,10 +4943,9 @@ async fn opds_ns(
                     return Ok(opds_user);
                 }
             }
-            // 系统用户账号（users 表；密码为 legacy 双 md5 哈希存储，复用 gen_encrypted_password 校验）
+            // 系统用户账号（users 表；argon2id 或 legacy 双 md5——统一校验，MD5 通过自动升级）
             if let Ok(Some(user)) = state.storage.find_user(username).await {
-                let expect = gen_encrypted_password(password, &user.salt);
-                if expect == user.password {
+                if crate::util::password::verify_password(&state.storage, &user, password).await {
                     return Ok(user.username);
                 }
             }
@@ -8874,6 +8873,117 @@ mod tests {
         cleanup(state, dir).await;
     }
 
+    /// argon2id 密码哈希：新用户注册 → argon2id 存储/登录；legacy MD5 旧用户登录 →
+    /// 自动升级（password 变 $argon2id$）→ 再次登录走 argon2 路径；错误密码拒绝
+    #[tokio::test]
+    async fn test_argon2id_register_login_and_md5_upgrade() {
+        let (state, dir) = test_state("argon2").await;
+        let peer: std::net::SocketAddr = "203.0.113.50:41001".parse().unwrap();
+        let login_body = |u: &str, pw: &str| {
+            Json(LoginBody {
+                username: Some(u.into()),
+                password: Some(pw.into()),
+                is_login: Some(true),
+                code: None,
+            })
+        };
+        let auto_register = |u: &str, pw: &str| {
+            Json(LoginBody {
+                username: Some(u.into()),
+                password: Some(pw.into()),
+                is_login: Some(false),
+                code: None,
+            })
+        };
+
+        // 1) 新用户注册（is_login=false）→ users.password 存 argon2id PHC（不再 MD5）
+        let ret = login(
+            ConnectInfo(peer),
+            AxumState(state.clone()),
+            HeaderMap::new(),
+            auto_register("carol", "pass1234"),
+        )
+        .await;
+        assert!(ret.0.is_success, "注册应成功: {}", ret.0.error_msg);
+        let carol = state.storage.find_user("carol").await.unwrap().unwrap();
+        assert!(
+            carol.password.starts_with("$argon2id$v=19$m=65536,t=3,p=4$"),
+            "新用户密码应为 argon2id PHC: {}",
+            carol.password
+        );
+        assert!(crate::util::password::verify_argon2id("pass1234", &carol.password));
+
+        // 2) 注册用户登录成功（argon2id 校验路径）
+        let ret = login(
+            ConnectInfo(peer),
+            AxumState(state.clone()),
+            HeaderMap::new(),
+            login_body("carol", "pass1234"),
+        )
+        .await;
+        assert!(ret.0.is_success, "argon2id 用户登录应成功: {}", ret.0.error_msg);
+
+        // 3) 错误密码拒绝
+        let ret = login(
+            ConnectInfo(peer),
+            AxumState(state.clone()),
+            HeaderMap::new(),
+            login_body("carol", "wrongpass"),
+        )
+        .await;
+        assert_eq!(ret.0.error_msg, "密码错误");
+
+        // 4) legacy MD5 旧用户：登录成功 → 自动升级为 argon2id（无需重置密码）
+        let salt = "legacysalt".to_string();
+        state
+            .storage
+            .insert_user(&User {
+                username: "dave".into(),
+                password: crate::util::md5::gen_encrypted_password("oldpass1", &salt),
+                salt: salt.clone(),
+                token: "davet".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ret = login(
+            ConnectInfo(peer),
+            AxumState(state.clone()),
+            HeaderMap::new(),
+            login_body("dave", "oldpass1"),
+        )
+        .await;
+        assert!(ret.0.is_success, "MD5 旧用户登录应成功: {}", ret.0.error_msg);
+        let dave = state.storage.find_user("dave").await.unwrap().unwrap();
+        assert!(
+            dave.password.starts_with("$argon2id$"),
+            "MD5 旧用户登录后 password 应自动升级为 argon2id: {}",
+            dave.password
+        );
+
+        // 5) 升级后再次登录成功（argon2id 校验路径）
+        let ret = login(
+            ConnectInfo(peer),
+            AxumState(state.clone()),
+            HeaderMap::new(),
+            login_body("dave", "oldpass1"),
+        )
+        .await;
+        assert!(ret.0.is_success, "升级后再次登录应成功: {}", ret.0.error_msg);
+
+        // 6) 升级后错误密码仍拒绝
+        let ret = login(
+            ConnectInfo(peer),
+            AxumState(state.clone()),
+            HeaderMap::new(),
+            login_body("dave", "wrongpass"),
+        )
+        .await;
+        assert_eq!(ret.0.error_msg, "密码错误");
+
+        cleanup(state, dir).await;
+    }
+
     /// F-34：clearInactiveUsers——secureKey 校验 + 仅删超期用户（调用者受保护）
     #[tokio::test]
     async fn test_clear_inactive_users() {
@@ -10442,10 +10552,14 @@ mod tests {
         assert_ne!(alice.password, "old");
         assert_ne!(alice.salt, "oldsalt", "salt 应重新生成");
         assert!(alice.token.is_empty(), "旧 token 应失效");
-        assert_eq!(
-            crate::util::md5::gen_encrypted_password("新密码abc", &alice.salt),
-            alice.password,
-            "新密码应可通过登录校验"
+        assert!(
+            alice.password.starts_with("$argon2id$"),
+            "重置后密码应为 argon2id PHC: {}",
+            alice.password
+        );
+        assert!(
+            crate::util::password::verify_argon2id("新密码abc", &alice.password),
+            "新密码应可通过 argon2id 校验"
         );
 
         // 重置后旧 token 已失效——重新登录（新 token）以便继续测试管理接口
@@ -11654,19 +11768,19 @@ mod tests {
     }
 
     /// OPDS：Basic 认证——独立 OPDS 账号优先（system_settings），回退系统用户（users 表）；
-    /// 密码存储：独立账号 sha256(salt||pwd)（salt$hash）；系统用户 legacy 双 md5（gen_encrypted_password）
+    /// 密码存储：独立账号 sha256(salt||pwd)（salt$hash）；系统用户 argon2id 或 legacy 双 md5（MD5 通过自动升级）
     #[tokio::test]
     async fn test_opds_basic_auth_accounts() {
         let (state, dir) = test_state("opdsbasic").await;
         let mut state = state;
         state.storage.config.secure = true;
-        // 系统用户（users 表，legacy 双 md5 哈希存储）
+        // 系统用户（users 表，legacy 双 md5 哈希存储——兼容路径，校验通过后自动升级）
         let salt = "s1".to_string();
         state
             .storage
             .insert_user(&User {
                 username: "alice".into(),
-                password: gen_encrypted_password("pw123456", &salt),
+                password: crate::util::md5::gen_encrypted_password("pw123456", &salt),
                 salt: salt.clone(),
                 token: "tok123".into(),
                 ..Default::default()
@@ -11703,11 +11817,19 @@ mod tests {
         assert!(ret.is_err());
         assert_eq!(ret.unwrap_err().status(), StatusCode::UNAUTHORIZED);
 
-        // 系统用户 Basic 通过（密码为哈希存储，复用 gen_encrypted_password 校验）
+        // 系统用户 Basic 通过（密码为哈希存储，统一校验：MD5 通过自动升级 argon2id）
         let ns = opds_ns(&state, &basic("alice", "pw123456"), &HashMap::new())
             .await
             .expect("系统用户 Basic 应通过");
         assert_eq!(ns, "alice");
+        // 升级钩子：legacy MD5 校验通过后 users.password 应变为 argon2id PHC
+        let alice = state.storage.find_user("alice").await.unwrap().unwrap();
+        assert!(
+            alice.password.starts_with("$argon2id$"),
+            "OPDS Basic 校验后旧 MD5 密码应自动升级: {}",
+            alice.password
+        );
+        assert!(crate::util::password::verify_argon2id("pw123456", &alice.password));
 
         // 系统用户密码错误 → 401
         let ret = opds_ns(&state, &basic("alice", "bad"), &HashMap::new()).await;
@@ -14270,9 +14392,13 @@ mod tests {
             "resetPassword 应成功: {json}"
         );
         let alice = state.storage.find_user("alice").await.unwrap().unwrap();
-        assert_eq!(
-            gen_encrypted_password("新密码123", &alice.salt),
-            alice.password,
+        assert!(
+            alice.password.starts_with("$argon2id$"),
+            "重置后密码应为 argon2id PHC: {}",
+            alice.password
+        );
+        assert!(
+            crate::util::password::verify_argon2id("新密码123", &alice.password),
             "新密码应可校验"
         );
         assert!(alice.token.is_empty(), "旧 token 应失效");

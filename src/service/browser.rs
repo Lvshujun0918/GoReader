@@ -105,6 +105,11 @@ pub struct Browser {
     >,
     next_id: u64,
     session_id: Option<String>,
+    /// iframe 执行上下文缓存（executionContextCreated 事件——frameId → contextId，
+    /// Turnstile 等 iframe 内 JS 执行用——obscura/Chrome 通用）
+    frame_ctx: std::sync::Arc<
+        std::sync::Mutex<HashMap<String, i64>>,
+    >,
 }
 
 impl Drop for Browser {
@@ -240,6 +245,9 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
         std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_task = std::sync::Arc::clone(&pending);
+    let frame_ctx: std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let frame_ctx_task = std::sync::Arc::clone(&frame_ctx);
     tokio::spawn(async move {
         let mut stream = stream;
         while let Some(msg) = stream.next().await {
@@ -252,6 +260,21 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
             let Ok(v) = serde_json::from_str::<Value>(&text) else {
                 continue;
             };
+            // 事件：Runtime.executionContextCreated —— 缓存 iframe 执行上下文（frameId→contextId）
+            if v.get("id").is_none() {
+                if v.get("method").and_then(|m| m.as_str()) == Some("Runtime.executionContextCreated") {
+                    if let Some(ctx) = v.get("params").and_then(|p| p.get("context")) {
+                        let frame_id = ctx.get("auxData").and_then(|a| a.get("frameId")).and_then(|f| f.as_str());
+                        let ctx_id = ctx.get("id").and_then(|i| i.as_i64());
+                        if let (Some(fid), Some(cid)) = (frame_id, ctx_id) {
+                            if let Ok(mut map) = frame_ctx_task.lock() {
+                                map.insert(fid.to_string(), cid);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
                 continue;
             };
@@ -275,6 +298,7 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
         pending,
         next_id: 0,
         session_id: None,
+        frame_ctx,
     };
     // 创建并附加页面 target（flatten 后命令需带 sessionId——obscura CDP 支持
     // Target.createTarget/attachToTarget + sessionId 路由，puppeteer 同款协议）
@@ -426,6 +450,81 @@ impl Browser {
         }
         // 形状判别：命令 result 含 "type" 键 → 本身即 RemoteObject（obscura）；
         // 否则取内层 result（Chrome）
+        let remote = if r.get("type").is_some() {
+            &r
+        } else {
+            r.get("result").unwrap_or(&Value::Null)
+        };
+        Ok(remote.get("value").cloned().unwrap_or(Value::Null))
+    }
+
+    /// iframe 内 JS 执行：按 frame src 子串找 frame → 用缓存的 contextId 执行。
+    /// Turnstile 勾选框在 challenges.cloudflare.com iframe 内部——主页面 JS/合成事件
+    /// 无法穿透跨源 iframe，obscura 又不投递 CDP 坐标事件——必须 frame 内执行。
+    pub async fn evaluate_in_frame(&mut self, src_hint: &str, expression: &str) -> Result<Value> {
+        // 1. 找 frame
+        let tree = self
+            .command("Page.getFrameTree", json!({}))
+            .await?;
+        let mut frame_id: Option<String> = None;
+        let mut stack = vec![tree.get("frameTree").cloned().unwrap_or(Value::Null)];
+        while let Some(node) = stack.pop() {
+            if node.is_null() {
+                continue;
+            }
+            let f = node.get("frame").cloned().unwrap_or(Value::Null);
+            let url = f.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let id = f.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            if url.contains(src_hint) {
+                frame_id = Some(id.to_string());
+                break;
+            }
+            if let Some(children) = node.get("childFrames").and_then(|c| c.as_array()) {
+                for c in children.iter().rev() {
+                    stack.push(c.clone());
+                }
+            }
+        }
+        let Some(fid) = frame_id else {
+            return Err(anyhow!("未找到包含 {src_hint} 的 iframe"));
+        };
+        // 2. 用缓存的 contextId 执行
+        let ctx_id = self
+            .frame_ctx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&fid)
+            .cloned();
+        let ctx = match ctx_id {
+            Some(c) => c,
+            None => {
+                // context 事件未到——等 500ms 重试一次
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.frame_ctx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&fid)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("iframe 执行上下文未就绪（{src_hint}）"))?
+            }
+        };
+        let r = self
+            .command(
+                "Runtime.evaluate",
+                json!({
+                    "expression": expression,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                    "contextId": ctx,
+                }),
+            )
+            .await?;
+        if r.get("exceptionDetails").is_some() {
+            return Err(anyhow!(
+                "iframe JS 异常: {}",
+                r.get("exceptionDetails").unwrap_or(&Value::Null)
+            ));
+        }
         let remote = if r.get("type").is_some() {
             &r
         } else {
@@ -1233,6 +1332,21 @@ async fn click_turnstile(browser: &mut Browser) -> Result<bool> {
     let h = r.get("h").and_then(|v| v.as_f64()).unwrap_or(0.0);
     if w < 2.0 || h < 2.0 {
         return Ok(false); // widget iframe 尚未布局——下次迭代重试
+    }
+    // obscura 不投递 CDP 坐标事件——优先 iframe 内 JS 点击勾选框（跨源 iframe 需 frame 上下文）
+    let frame_click = r#"(function(){
+      var el = document.querySelector('input[type="checkbox"]')
+        || document.querySelector('.ctp-checkbox-label')
+        || document.querySelector('[role="checkbox"]');
+      if (el) { el.click(); return true; }
+      var label = document.querySelector('label');
+      if (label) { label.click(); return true; }
+      return false;
+    })()"#;
+    if let Ok(v) = browser.evaluate_in_frame("challenges.cloudflare.com", frame_click).await {
+        if v.as_bool().unwrap_or(false) {
+            return Ok(true);
+        }
     }
     browser
         .command(

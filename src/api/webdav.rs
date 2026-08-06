@@ -10,7 +10,6 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 
 use crate::storage::Storage;
-use crate::util::md5::gen_encrypted_password;
 
 /// WebDAV 处理入口（匹配 /reader3/webdav* 任意方法）
 pub async fn handle(
@@ -85,8 +84,8 @@ pub(crate) async fn authenticate(
     if !user.enable_webdav {
         return None;
     }
-    let expect = gen_encrypted_password(password, &user.salt);
-    if expect != user.password {
+    // 统一密码校验：argon2id（PHC）优先，legacy 双 MD5 兼容；MD5 通过时自动升级为 argon2id
+    if !crate::util::password::verify_password(storage, &user, password).await {
         return None;
     }
     let home = storage

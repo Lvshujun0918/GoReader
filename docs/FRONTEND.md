@@ -1,7 +1,7 @@
 # reader-dev 前端规划（Rust 版）
 
 > 决策：**不复用 legacy 前端构建产物**（安全漏洞过多），全新前端。
-> 状态：已启动（脚手架 + 登录页 + 书架页已完成，见文末「已实现进度」）。
+> 状态：**已成型（v5.0.0）**——全部视图与后端联调完成，见文末「已实现进度」。本文 §1–§6 为技术选型与设计要求（§2 中部分要求尚未落地，见 §7 标注）。
 
 ---
 
@@ -18,6 +18,8 @@
 | 内嵌 | **rust-embed**（后端编译时嵌入 dist） | 单二进制全功能 |
 
 ## 2. 安全要求（硬性）
+
+> 注：以下为设计要求——其中「CSP 头」与「npm audit 门禁」**尚未落地**（见 §7 未落地清单）。
 
 - **依赖零已知漏洞**：npm audit 门禁（CI 中阻断高危）
 - **CSP 头**：后端下发 Content-Security-Policy（禁内联脚本/限制来源）
@@ -66,18 +68,24 @@
 
 ## 7. 已实现进度
 
-> 更新于 2026-01（web-ui/ 脚手架阶段，先本地不提交 git）
+> 更新于 2026-08-06（v5.0.0——全量视图与后端联调完成）
 
 ### ✅ 已完成
 
 | 项 | 说明 |
 |---|---|
-| **脚手架** | `web-ui/`：Vite 7 + Vue 3.5 + TypeScript + Pinia 3 + Vue Router 4 + Element Plus + axios（npm 依赖锁定，`npm audit` 0 漏洞） |
-| **登录页** | `src/views/LoginView.vue`：居中玻璃拟态卡片、渐变 logo、登录/注册切换（isLogin=true/false）、深色主题、光斑动画背景；对接 `POST /reader3/login` |
-| **书架页** | `src/views/BookshelfView.vue`：玻璃拟态顶部导航栏（搜索框/用户名/退出）、书封网格（封面懒加载 v-lazy + 缺失封面渐变占位+书名首字）、骨架屏加载动画、空状态、刷新；对接 `GET /reader3/getBookshelf` |
-| **axios 封装** | `src/api/request.ts`：baseURL `/reader3`、accessToken 自动带 query、业务错误统一 toast、NEED_LOGIN/401 自动跳登录 |
-| **路由** | `/login`、`/`（未登录拦截跳登录，已登录访问 /login 跳书架） |
-| **构建** | `npm run build`（vue-tsc 类型检查 + vite build）通过；dev 代理 `/reader3 → localhost:8080` |
+| **脚手架** | `web-ui/`：Vite + Vue 3.5 + TypeScript + Pinia + Vue Router 4 + Element Plus + axios（依赖锁定） |
+| **视图（15）** | 书架/阅读/搜索/详情/探索/书源/文件/用户/规则/RSS/设置/登录/404 等——主页搜索框=全网搜书入口、换源弹层（书源名过滤+刷新）、元数据编辑、书源 header 编辑、分组拖拽、置顶、封面墙三态 |
+| **阅读器** | 双翻页模式/主题/纸纹/简繁/亮度滑条/键盘翻页/快捷键/目录高亮/划词朗读/进度同步 |
+| **PWA** | SW v2：`/reader3` 与 `/assets/proxy` 网络直连/网络优先（动态路径不缓存，上限 200） |
+| **构建/CI** | `npm run build`（vue-tsc 类型检查 + vite）；GitHub Actions `frontend-ci.yml` 自动执行；node:test 单测（`web-ui/src/**/*.test.ts`） |
+| **联调** | dev 代理 `/reader3 → localhost:8080`；SSE 流式搜索/调试/缓存进度 |
+
+### ⚠️ 未落地（如实标注）
+
+- **CSP 头**（§2 要求）：后端当前**未下发** Content-Security-Policy——待办
+- **npm audit 门禁**（§2 要求）：CI 中**未配置**阻断高危依赖——待办
+- **rust-embed 内嵌 dist**（§1 选型）：未采用——前端产物由 `READER_APP_WEB_ROOT` 指向目录（默认 `web-ui/dist`）
 
 ### 目录结构
 
@@ -85,21 +93,9 @@
 web-ui/
 ├── index.html / vite.config.ts / tsconfig.json / package.json
 └── src/
-    ├── main.ts / App.vue / env.d.ts
-    ├── styles/main.css          # 深色阅读主题（渐变/玻璃拟态/动画）
-    ├── types/index.ts           # ReturnData / UserInfo / Book（与后端 camelCase 契约一致）
-    ├── api/request.ts / auth.ts / bookshelf.ts
-    ├── stores/user.ts           # accessToken/username 持久化（localStorage）
-    ├── router/index.ts          # /login、/ + 登录守卫
-    ├── directives/lazy.ts       # 封面懒加载指令（IntersectionObserver）
-    ├── components/LogoMark.vue  # 渐变书本 logo
-    └── views/LoginView.vue / BookshelfView.vue
+    ├── main.ts（SW 注册）/ App.vue / env.d.ts
+    ├── styles/ / types/（与后端 camelCase 契约一致）
+    ├── api/（30 个模块）/ stores/ / router/（登录守卫）
+    ├── components/（LogoMark / ErrorBoundary）/ utils/（chinese/uiTheme/readerConfig/…）
+    └── views/（15 个视图）
 ```
-
-### 待办（下一迭代）
-
-- [ ] 阅读页 `/reader/{url}`（翻页/目录/进度）
-- [ ] 搜索页（多源并发）
-- [ ] 书源管理 / 设置 / 用户管理
-- [ ] rust-embed 内嵌 dist + CSP 头
-- [ ] 与后端真实联调（本机 `npm run dev` + `READER_SERVER_PORT` 后端）

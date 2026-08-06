@@ -2925,6 +2925,17 @@ impl Storage {
         Ok(r.rows_affected())
     }
 
+    /// 密码哈希升级（legacy MD5 → argon2id PHC）：仅更新 password 列，
+    /// 不动 salt/token——登录成功路径自动迁移时不能使当前会话失效。
+    pub async fn upgrade_user_password_hash(&self, username: &str, phc: &str) -> Result<u64> {
+        let r = sqlx::query("UPDATE users SET password = ?1 WHERE username = ?2")
+            .bind(phc)
+            .bind(username)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     // ---------------- F-35 定时书架更新 ----------------
 
     /// F-35 可更新书架书（can_update=1，全命名空间）

@@ -3,6 +3,7 @@
 pub mod db_backup;
 pub mod login_limit;
 pub mod md5;
+pub mod password;
 pub mod regex;
 pub mod sha256;
 
