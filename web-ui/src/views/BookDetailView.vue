@@ -1391,8 +1391,25 @@ onMounted(() => {
                 <span v-else>正在搜索其他书源…</span>
               </div>
 
-              <!-- 结果列表：当前源置顶 + originName 排序 + 失效标注（GAP 20；SSE 增量到达实时追加） -->
-              <ul v-if="sourceResults.length" class="source-list">
+              <!-- 结果工具条：搜索过滤（书源名二次过滤）+ 刷新 -->
+              <div v-if="!sourceBusy && sourceResults.length" class="source-tools">
+                <input
+                  v-model="sourceKeyword"
+                  class="source-filter"
+                  type="text"
+                  placeholder="搜索过滤书源名…"
+                  spellcheck="false"
+                />
+                <button class="source-refresh" type="button" title="重新搜索" @click="refreshSource">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />
+                  </svg>
+                  刷新
+                </button>
+              </div>
+
+              <!-- 结果列表：当前源置顶 + originName 排序 + 失效标注（GAP 20；SSE 增量到达实时追加）——搜索过滤后展示 -->
+              <ul v-if="sourceFiltered.length" class="source-list">
                 <li v-for="(r, i) in sourceResults" :key="i">
                   <button
                     class="source-row"
