@@ -75,7 +75,12 @@ jobs:
           $bytes = [Convert]::FromBase64String($env:PFX_B64)
           $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
           [IO.File]::WriteAllBytes($pfxPath, $bytes)
-          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfxPath, $env:PFX_PWD)
+          try {
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfxPath, $env:PFX_PWD)
+          } catch {
+            Write-Host "证书加载失败（不打印证书内容）：$($_.Exception.Message)"
+            exit 1
+          }
           $exe = Join-Path (Get-Location) "target\release\reader-dev.exe"
           $sig = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert
           Write-Host "签名状态: $($sig.Status)"
