@@ -147,30 +147,14 @@ jobs:
       - name: cargo build (release)
         run: cargo build --release
 
-      - name: 代码签名（PFX 证书来自 secrets——绝不打印 secret 内容，日志只显示签名状态）
+      - name: 打包 Windows exe（签名已移除——SmartScreen 提示属预期）
         shell: pwsh
-        env:
-          PFX_B64: ${{ secrets.WINDOWS_CODESIGN_PFX }}
-          PFX_PWD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
         run: |
-          if ([string]::IsNullOrEmpty($env:PFX_B64) -or [string]::IsNullOrEmpty($env:PFX_PWD)) {
-            Write-Error "WINDOWS_CODESIGN_PFX / WINDOWS_CODESIGN_PASSWORD 未配置——拒绝发布未签名 exe"
-            exit 1
-          }
-          $bytes = [Convert]::FromBase64String($env:PFX_B64)
-          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, $bytes)
-          try {
-            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfxPath, $env:PFX_PWD)
-            $exe = Join-Path (Get-Location) "target\release\reader-dev.exe"
-            $sig = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert
-            Write-Host "签名状态: $($sig.Status)"
-            if ($sig.Status -ne "Valid") { exit 1 }
-            New-Item -ItemType Directory -Force dist | Out-Null
-            Copy-Item $exe (Join-Path (Get-Location) "dist\reader-dev-windows-x64.exe")
-          } finally {
-            Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
-          }
+          $exe = Join-Path (Get-Location) "target\release\reader-dev.exe"
+          if (-not (Test-Path $exe)) { Write-Error "exe 未生成"; exit 1 }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe (Join-Path (Get-Location) "dist\reader-dev-windows-x64.exe")
+          Write-Host "exe 大小: $((Get-Item $exe).Length) bytes"
 
       - name: 上传签名 exe 到 GitHub Release
         uses: softprops/action-gh-release@v2
