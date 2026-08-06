@@ -108,6 +108,89 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
+/// P0-3 旧库迁移：五类 (url 单列主键) 表 → (url, user_namespace) 复合主键
+///
+/// 背景：book_sources/rss_sources/rss_articles/http_tts_list/source_subs 原以 URL 为主键，
+/// secure 多用户下用户 B 保存同 URL 会覆盖用户 A 的行（INSERT OR REPLACE / ON CONFLICT(url)）。
+/// 重建为复合主键后同 URL 按用户分行；所有读写路径均已按 user_namespace 过滤，读侧不受影响。
+///
+/// 幂等：sqlite_master.sql 已含复合主键定义即跳过（新库 CREATE 直接复合键；二次启动不再重建）。
+/// 重建步骤（事务内）：按 pragma_table_info 实况列序建新表（保留类型/NOT NULL/默认值/列序——
+/// 兼容旧库经 ALTER 追加的列如 book_sources.proxy_url 位于表尾）→ 逐列 INSERT SELECT 复制 →
+/// DROP 旧表 → RENAME。
+async fn migrate_ns_composite_keys(pool: &SqlitePool) -> Result<()> {
+    // (表名, URL 列名)——与上方 CREATE TABLE 的复合主键列序一致
+    const TABLES: &[(&str, &str)] = &[
+        ("book_sources", "book_source_url"),
+        ("rss_sources", "rss_source_url"),
+        ("rss_articles", "url"),
+        ("http_tts_list", "url"),
+        ("source_subs", "url"),
+    ];
+    for &(table, url_col) in TABLES {
+        let sql: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        )
+        .bind(table)
+        .fetch_optional(pool)
+        .await?;
+        let composite = format!("PRIMARY KEY ({url_col}, user_namespace)");
+        // 去引号后匹配（重建表存的是带引号标识符形式）
+        let sql_flat = sql.as_deref().map(|s| s.replace('"', ""));
+        if sql_flat.as_deref().map(|s| s.contains(&composite)).unwrap_or(false) {
+            continue; // 已是复合主键（新库或已重建）
+        }
+        // 实况列元数据（pragma 序）：name/type/notnull/dflt_value
+        let cols: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info(?1)",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await?;
+        if cols.is_empty() {
+            tracing::warn!("{table} 无列信息，跳过复合主键重建");
+            continue;
+        }
+        let defs: Vec<String> = cols
+            .iter()
+            .map(|(name, ty, notnull, dflt)| {
+                let mut d = format!("\"{name}\" {ty}");
+                if *notnull != 0 {
+                    d.push_str(" NOT NULL");
+                }
+                if let Some(v) = dflt {
+                    d.push_str(" DEFAULT ");
+                    d.push_str(v);
+                }
+                d
+            })
+            .collect();
+        let col_list = cols
+            .iter()
+            .map(|(name, ..)| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tmp = format!("{table}_ns_pk");
+        let create = format!(
+            "CREATE TABLE \"{tmp}\" ({}, PRIMARY KEY (\"{url_col}\", \"user_namespace\"))",
+            defs.join(", ")
+        );
+        let copy = format!("INSERT INTO \"{tmp}\" ({col_list}) SELECT {col_list} FROM \"{table}\"");
+        let mut tx = pool.begin().await?;
+        sqlx::query(&create).execute(&mut *tx).await?;
+        sqlx::query(&copy).execute(&mut *tx).await?;
+        sqlx::query(&format!("DROP TABLE \"{table}\"")).execute(&mut *tx).await?;
+        sqlx::query(&format!("ALTER TABLE \"{tmp}\" RENAME TO \"{table}\""))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!(
+            "{table} 重建为复合主键 ({url_col}, user_namespace)——同 URL 按用户隔离"
+        );
+    }
+    Ok(())
+}
+
 /// 初始化：建目录 + 打开/建库 + 建表
 pub async fn init(config: &AppConfig) -> Result<Storage> {
     let storage_dir = config.storage_dir();
@@ -271,7 +354,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS book_sources (
-            book_source_url TEXT PRIMARY KEY,
+            book_source_url TEXT,
             book_source_name TEXT DEFAULT '',
             book_source_group TEXT,
             book_source_type INTEGER DEFAULT 0,
@@ -282,6 +365,7 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             enabled_cookie_jar INTEGER,
             concurrent_rate TEXT,
             header TEXT,
+            proxy_url TEXT,
             login_url TEXT,
             login_ui TEXT,
             login_check_js TEXT,
@@ -311,33 +395,50 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             logger TEXT,
             variable TEXT,
             user_namespace TEXT DEFAULT '',
-            raw_json TEXT
+            raw_json TEXT,
+            -- P0-3 按用户隔离：同 URL 不同用户各自成行（旧库由 migrate_ns_composite_keys 重建）
+            PRIMARY KEY (book_source_url, user_namespace)
         );
         "#,
     )
     .execute(&pool)
     .await?;
+
+    // 兼容旧库：book_sources 缺 proxy_url 列时补列（幂等——已存在则跳过；
+    // 书源级代理（proxyUrl）求解 CF 质询/Turnstile 用）
+    let bs_cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('book_sources')")
+            .fetch_all(&pool)
+            .await?;
+    if !bs_cols.iter().any(|c| c == "proxy_url") {
+        sqlx::query("ALTER TABLE book_sources ADD COLUMN proxy_url TEXT")
+            .execute(&pool)
+            .await?;
+        tracing::info!("book_sources 表补充 proxy_url 列");
+    }
 
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS rss_sources (
-            rss_source_url TEXT PRIMARY KEY,
+            rss_source_url TEXT,
             rss_source_name TEXT DEFAULT '',
             rss_source_group TEXT,
             enabled INTEGER DEFAULT 1,
             user_namespace TEXT DEFAULT '',
-            raw_json TEXT
+            raw_json TEXT,
+            -- P0-3 按用户隔离（同 URL 不同用户各自成行）
+            PRIMARY KEY (rss_source_url, user_namespace)
         );
         "#,
     )
     .execute(&pool)
     .await?;
 
-    // RSS 文章缓存（url 主键；content 为 feed 正文/摘要或抓取网页提取的正文）
+    // RSS 文章缓存（P0-3 复合主键 (url, user_namespace)：每用户独立行/已读标记；content 为 feed 正文/摘要或抓取网页提取的正文）
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS rss_articles (
-            url TEXT PRIMARY KEY,
+            url TEXT,
             source_url TEXT DEFAULT '',
             title TEXT DEFAULT '',
             author TEXT DEFAULT '',
@@ -345,7 +446,8 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
             content TEXT,
             cover TEXT,
             read INTEGER DEFAULT 0,
-            user_namespace TEXT DEFAULT ''
+            user_namespace TEXT DEFAULT '',
+            PRIMARY KEY (url, user_namespace)
         );
         "#,
     )
@@ -445,30 +547,37 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS http_tts_list (
-            url TEXT PRIMARY KEY,
+            url TEXT,
             name TEXT NOT NULL DEFAULT '',
             type INTEGER DEFAULT 0,
-            user_namespace TEXT DEFAULT ''
+            user_namespace TEXT DEFAULT '',
+            -- P0-3 按用户隔离（同 URL 不同用户各自成行）
+            PRIMARY KEY (url, user_namespace)
         );
         "#,
     )
     .execute(&pool)
     .await?;
 
-    // 书源订阅（url 主键；raw_json 为抓取到的书源数组 JSON 原文）
+    // 书源订阅（P0-3 复合主键 (url, user_namespace)：raw_json 为抓取到的书源数组 JSON 原文）
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS source_subs (
-            url TEXT PRIMARY KEY,
+            url TEXT,
             name TEXT NOT NULL DEFAULT '',
             enabled INTEGER DEFAULT 1,
             user_namespace TEXT DEFAULT '',
-            raw_json TEXT
+            raw_json TEXT,
+            PRIMARY KEY (url, user_namespace)
         );
         "#,
     )
     .execute(&pool)
     .await?;
+
+    // P0-3 旧库迁移：五类（url 单列主键）表重建为 (url, user_namespace) 复合主键
+    //（幂等：已复合则跳过；重建在全部 CREATE/补列之后，列序以 pragma 实况为准）
+    migrate_ns_composite_keys(&pool).await?;
 
     // 自定义 TXT 目录规则（对齐 legado TxtTocRule：name/rule/serialNumber/enable）
     sqlx::query(
@@ -1031,7 +1140,7 @@ impl Storage {
         let mut tx = self.pool.begin().await?;
         for a in articles {
             sqlx::query(
-                "INSERT INTO rss_articles            (url, source_url, title, author, time, content, cover, user_namespace, read)            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)            ON CONFLICT(url) DO UPDATE SET                source_url = excluded.source_url,                title = excluded.title,                author = excluded.author,                time = excluded.time,                content = excluded.content,                cover = excluded.cover,                user_namespace = excluded.user_namespace",
+                "INSERT INTO rss_articles            (url, source_url, title, author, time, content, cover, user_namespace, read)            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)            ON CONFLICT(url, user_namespace) DO UPDATE SET                source_url = excluded.source_url,                title = excluded.title,                author = excluded.author,                time = excluded.time,                content = excluded.content,                cover = excluded.cover,                user_namespace = excluded.user_namespace",
             )
             .bind(&a.url)
             .bind(&a.source_url)
@@ -1049,13 +1158,15 @@ impl Storage {
         Ok(())
     }
 
-    /// 标记 RSS 文章已读/未读（url 主键；返回受影响行数）
-    pub async fn set_rss_article_read(&self, url: &str, read: bool) -> Result<u64> {
-        let r = sqlx::query("UPDATE rss_articles SET read = ?2 WHERE url = ?1")
-            .bind(url)
-            .bind(read)
-            .execute(&self.pool)
-            .await?;
+    /// 标记 RSS 文章已读/未读（按 (ns, url) 查改——P0-4 命名空间隔离；返回受影响行数）
+    pub async fn set_rss_article_read(&self, ns: &str, url: &str, read: bool) -> Result<u64> {
+        let r =
+            sqlx::query("UPDATE rss_articles SET read = ?2 WHERE url = ?1 AND user_namespace = ?3")
+                .bind(url)
+                .bind(read)
+                .bind(ns)
+                .execute(&self.pool)
+                .await?;
         Ok(r.rows_affected())
     }
 
@@ -1075,12 +1186,17 @@ impl Storage {
         Ok(rows.into_iter().collect())
     }
 
-    /// 按 URL 查 RSS 文章（getRssArticle 正文/缓存用）
-    pub async fn get_rss_article(&self, url: &str) -> Result<Option<crate::model::RssArticle>> {
+    /// 按 (ns, url) 查 RSS 文章（P0-4 命名空间隔离——getRssArticle 正文/缓存用）
+    pub async fn get_rss_article(
+        &self,
+        ns: &str,
+        url: &str,
+    ) -> Result<Option<crate::model::RssArticle>> {
         let r = sqlx::query_as::<_, crate::model::RssArticle>(
-            "SELECT * FROM rss_articles WHERE url = ?1",
+            "SELECT * FROM rss_articles WHERE url = ?1 AND user_namespace = ?2",
         )
         .bind(url)
+        .bind(ns)
         .fetch_optional(&self.pool)
         .await?;
         Ok(r)
@@ -3791,15 +3907,15 @@ where
         INSERT INTO book_sources
             (book_source_url, book_source_name, book_source_group, book_source_type,
              book_url_pattern, custom_order, enabled, enabled_explore, enabled_cookie_jar,
-             concurrent_rate, header, login_url, login_ui, login_check_js, login_js,
+             concurrent_rate, header, proxy_url, login_url, login_ui, login_check_js, login_js,
              book_source_comment, variable_comment, last_update_time, respond_time,
              weight, explore_url, search_url, rule_explore, rule_search, rule_book_info,
              rule_toc, rule_content, rule_related, search_rule, explore_rule, book_info_rule, toc_rule,
              content_rule, key, tag, logger, variable, user_namespace, raw_json)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)
-        ON CONFLICT(book_source_url) DO UPDATE SET
+                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
+        ON CONFLICT(book_source_url, user_namespace) DO UPDATE SET
             book_source_name = excluded.book_source_name,
             book_source_group = excluded.book_source_group,
             book_source_type = excluded.book_source_type,
@@ -3810,6 +3926,7 @@ where
             enabled_cookie_jar = excluded.enabled_cookie_jar,
             concurrent_rate = excluded.concurrent_rate,
             header = excluded.header,
+            proxy_url = excluded.proxy_url,
             login_url = excluded.login_url,
             login_ui = excluded.login_ui,
             login_check_js = excluded.login_check_js,
@@ -3851,6 +3968,7 @@ where
     .bind(source.enabled_cookie_jar)
     .bind(&source.concurrent_rate)
     .bind(&source.header)
+    .bind(&source.proxy_url)
     .bind(&source.login_url)
     .bind(&source.login_ui)
     .bind(&source.login_check_js)
@@ -4125,6 +4243,325 @@ mod tests {
         assert_eq!(groups_fb, vec!["小说", "玄幻"]);
 
         cleanup(storage, "batch").await;
+    }
+
+    /// P0-3：按用户主键隔离——用户 B 保存同 URL 不覆盖用户 A（五类表逐项验证）
+    #[tokio::test]
+    async fn test_ns_isolation_same_url() {
+        let storage = test_storage("nsiso").await;
+
+        // 书源：A/B 同 URL 各自成行；同用户重复保存仍按 (url, ns) 覆盖更新
+        let mut sa = source("https://a.com/src", "A的书源", None);
+        storage.save_book_source("alice", &sa).await.unwrap();
+        let mut sb = source("https://a.com/src", "B的书源", None);
+        sb.enabled = false;
+        storage.save_book_source("bob", &sb).await.unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM book_sources WHERE book_source_url = ?1",
+        )
+        .bind("https://a.com/src")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 2, "同 URL 书源应按用户分行，而非覆盖");
+        let (name, en, ns): (String, i64, String) = sqlx::query_as(
+            "SELECT book_source_name, enabled, user_namespace FROM book_sources \
+             WHERE book_source_url = ?1 AND user_namespace = ?2",
+        )
+        .bind("https://a.com/src")
+        .bind("alice")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!((name.as_str(), en, ns.as_str()), ("A的书源", 1, "alice"));
+        // 用户 A 再保存（改名）→ 仅覆盖自己那行
+        sa.book_source_name = "A的书源v2".into();
+        storage.save_book_source("alice", &sa).await.unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM book_sources WHERE book_source_url = ?1",
+        )
+        .bind("https://a.com/src")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 2, "同用户覆盖更新不应新增行");
+        let name: String = sqlx::query_scalar(
+            "SELECT book_source_name FROM book_sources WHERE user_namespace = ?1 AND book_source_url = ?2",
+        )
+        .bind("alice")
+        .bind("https://a.com/src")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(name, "A的书源v2");
+        let (name_b, en_b): (String, i64) = sqlx::query_as(
+            "SELECT book_source_name, enabled FROM book_sources WHERE user_namespace = ?1 AND book_source_url = ?2",
+        )
+        .bind("bob")
+        .bind("https://a.com/src")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!((name_b.as_str(), en_b), ("B的书源", 0), "B 的行不受 A 更新影响");
+
+        // RSS 源
+        storage
+            .save_rss_source(
+                "alice",
+                &crate::model::RssSource {
+                    source_url: "https://rss.example/x".into(),
+                    source_name: "A的RSS".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_rss_source(
+                "bob",
+                &crate::model::RssSource {
+                    source_url: "https://rss.example/x".into(),
+                    source_name: "B的RSS".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rss_sources WHERE rss_source_url = ?1",
+        )
+        .bind("https://rss.example/x")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 2);
+        let (name, ns): (String, String) = sqlx::query_as(
+            "SELECT rss_source_name, user_namespace FROM rss_sources WHERE user_namespace = ?1 AND rss_source_url = ?2",
+        )
+        .bind("alice")
+        .bind("https://rss.example/x")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!((name.as_str(), ns.as_str()), ("A的RSS", "alice"));
+
+        // HttpTTS
+        storage
+            .save_http_tts(
+                "alice",
+                &crate::model::HttpTts {
+                    url: "https://tts.example/x".into(),
+                    name: "A的TTS".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_http_tts(
+                "bob",
+                &crate::model::HttpTts {
+                    url: "https://tts.example/x".into(),
+                    name: "B的TTS".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM http_tts_list WHERE url = ?1",
+        )
+        .bind("https://tts.example/x")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 2);
+        let name: String = sqlx::query_scalar(
+            "SELECT name FROM http_tts_list WHERE user_namespace = ?1 AND url = ?2",
+        )
+        .bind("bob")
+        .bind("https://tts.example/x")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(name, "B的TTS");
+
+        // 书源订阅
+        storage
+            .save_source_sub("alice", "https://sub.example/x", "A的订阅", "[]")
+            .await
+            .unwrap();
+        storage
+            .save_source_sub("bob", "https://sub.example/x", "B的订阅", "[]")
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_subs WHERE url = ?1")
+            .bind("https://sub.example/x")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        let name: String = sqlx::query_scalar(
+            "SELECT name FROM source_subs WHERE user_namespace = ?1 AND url = ?2",
+        )
+        .bind("alice")
+        .bind("https://sub.example/x")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(name, "A的订阅");
+
+        // RSS 文章：同 feed 同 URL 文章按用户分行；已读标记互不影响
+        storage
+            .save_rss_articles(
+                "alice",
+                &[crate::model::RssArticle {
+                    url: "https://art.example/1".into(),
+                    title: "A标题".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        storage
+            .save_rss_articles(
+                "bob",
+                &[crate::model::RssArticle {
+                    url: "https://art.example/1".into(),
+                    title: "B标题".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_articles WHERE url = ?1")
+            .bind("https://art.example/1")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "同 URL 文章应按用户分行");
+        let title: String = sqlx::query_scalar(
+            "SELECT title FROM rss_articles WHERE user_namespace = ?1 AND url = ?2",
+        )
+        .bind("alice")
+        .bind("https://art.example/1")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(title, "A标题", "B 的刷新不应覆盖 A 的文章行");
+        // A 标记已读 → B 的行保持未读
+        assert_eq!(
+            storage
+                .set_rss_article_read("alice", "https://art.example/1", true)
+                .await
+                .unwrap(),
+            1
+        );
+        let (read_a, read_b): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT read FROM rss_articles WHERE user_namespace = 'alice' AND url = ?1), \
+                    (SELECT read FROM rss_articles WHERE user_namespace = 'bob' AND url = ?1)",
+        )
+        .bind("https://art.example/1")
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(read_a, 1);
+        assert_eq!(read_b, 0, "A 的已读标记不应影响 B");
+
+        cleanup(storage, "nsiso").await;
+    }
+
+    /// P0-3：旧库（url 单列主键）重建为复合主键——数据保留 + 幂等
+    #[tokio::test]
+    async fn test_ns_composite_key_rebuild() {
+        let dir = std::env::temp_dir().join(format!(
+            "reader-storage-test-{}-olddb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = AppConfig::from_env();
+        config.work_dir = dir.to_string_lossy().into_owned();
+        std::fs::create_dir_all(config.storage_dir()).unwrap();
+        let db = config.storage_dir().join("reader.db");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect(&format!("sqlite://{}?mode=rwc", db.display()))
+            .await
+            .unwrap();
+        // 旧库结构：rss_sources url 单列主键——同 URL 只能存一行
+        //（旧实况：用户 B 保存同 URL 会覆盖 A 的行；这里模拟 A 的行被保留的场景）
+        sqlx::query(
+            "CREATE TABLE rss_sources (rss_source_url TEXT PRIMARY KEY, rss_source_name TEXT DEFAULT '', \
+             rss_source_group TEXT, enabled INTEGER DEFAULT 1, user_namespace TEXT DEFAULT '', raw_json TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO rss_sources (rss_source_url, rss_source_name, enabled, user_namespace) \
+             VALUES ('https://r/x', 'A的RSS', 1, 'alice')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 重建 → 复合主键生效：数据/列保留
+        migrate_ns_composite_keys(&pool).await.unwrap();
+        let (name, en): (String, i64) = sqlx::query_as(
+            "SELECT rss_source_name, enabled FROM rss_sources WHERE user_namespace = 'alice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((name.as_str(), en), ("A的RSS", 1));
+        // 表结构确为复合主键
+        let sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rss_sources'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sql.replace('"', "").contains("PRIMARY KEY (rss_source_url, user_namespace)"),
+            "{sql}"
+        );
+        // 重建后用户 B 保存同 URL → 新行共存（旧库覆盖 bug 已消除）
+        sqlx::query(
+            "INSERT OR REPLACE INTO rss_sources (rss_source_url, rss_source_name, enabled, user_namespace) \
+             VALUES ('https://r/x', 'B的RSS', 0, 'bob')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_sources WHERE rss_source_url = 'https://r/x'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "重建后同 URL 应按用户分行");
+        let (name_b, ns_b): (String, String) = sqlx::query_as(
+            "SELECT rss_source_name, user_namespace FROM rss_sources WHERE rss_source_url = 'https://r/x' AND user_namespace = 'bob'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((name_b.as_str(), ns_b.as_str()), ("B的RSS", "bob"));
+        let (name_a, en_a): (String, i64) = sqlx::query_as(
+            "SELECT rss_source_name, enabled FROM rss_sources WHERE rss_source_url = 'https://r/x' AND user_namespace = 'alice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((name_a.as_str(), en_a), ("A的RSS", 1), "A 的行不受 B 保存影响");
+        // 幂等：再跑一次不报错、不丢数据、不重复
+        migrate_ns_composite_keys(&pool).await.unwrap();
+        let n2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_sources")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n2, 2, "二次迁移应跳过");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 书源使用统计：bump 原子自增 use_count/use_ts；命名空间/URL 隔离；
@@ -4812,7 +5249,7 @@ mod tests {
             .unwrap();
 
         let got = storage
-            .get_rss_article("https://feed.example.com/a")
+            .get_rss_article("default", "https://feed.example.com/a")
             .await
             .unwrap()
             .unwrap();
@@ -4832,7 +5269,7 @@ mod tests {
             .await
             .unwrap();
         let again = storage
-            .get_rss_article("https://feed.example.com/a")
+            .get_rss_article("default", "https://feed.example.com/a")
             .await
             .unwrap()
             .unwrap();
@@ -4840,7 +5277,7 @@ mod tests {
         assert_eq!(again.time, 3000);
         assert_eq!(
             storage
-                .get_rss_article("https://feed.example.com/b")
+                .get_rss_article("default", "https://feed.example.com/b")
                 .await
                 .unwrap()
                 .unwrap()
@@ -4850,7 +5287,7 @@ mod tests {
 
         // 已读标记：标记已读 → 重新入库（feed 刷新）不清除
         storage
-            .set_rss_article_read("https://feed.example.com/a", true)
+            .set_rss_article_read("default", "https://feed.example.com/a", true)
             .await
             .unwrap();
         storage
@@ -4861,7 +5298,7 @@ mod tests {
             .await
             .unwrap();
         let marked = storage
-            .get_rss_article("https://feed.example.com/a")
+            .get_rss_article("default", "https://feed.example.com/a")
             .await
             .unwrap()
             .unwrap();
@@ -4869,12 +5306,12 @@ mod tests {
         assert_eq!(marked.title, "甲v3");
         // 标回未读
         storage
-            .set_rss_article_read("https://feed.example.com/a", false)
+            .set_rss_article_read("default", "https://feed.example.com/a", false)
             .await
             .unwrap();
         assert!(
             !storage
-                .get_rss_article("https://feed.example.com/a")
+                .get_rss_article("default", "https://feed.example.com/a")
                 .await
                 .unwrap()
                 .unwrap()
@@ -4894,9 +5331,33 @@ mod tests {
             .unwrap();
         assert!(other.is_empty(), "其他命名空间看不到该源的已读标记");
 
+        // P0-4 跨命名空间拒绝：get 查不到（按 (ns, url) 查）、set 影响 0 行
+        assert!(
+            storage
+                .get_rss_article("other", "https://feed.example.com/a")
+                .await
+                .unwrap()
+                .is_none(),
+            "其他命名空间不应读到本命名空间文章"
+        );
+        assert_eq!(
+            storage
+                .set_rss_article_read("other", "https://feed.example.com/a", true)
+                .await
+                .unwrap(),
+            0,
+            "其他命名空间标记已读应影响 0 行"
+        );
+        let untouched = storage
+            .get_rss_article("default", "https://feed.example.com/a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!untouched.read, "跨命名空间标记不得改动他人已读状态");
+
         // 不存在的 url
         assert!(storage
-            .get_rss_article("https://feed.example.com/nope")
+            .get_rss_article("default", "https://feed.example.com/nope")
             .await
             .unwrap()
             .is_none());

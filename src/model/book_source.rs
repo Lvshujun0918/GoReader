@@ -39,6 +39,12 @@ pub struct BookSource {
     #[sqlx(rename = "concurrent_rate")]
     pub concurrent_rate: Option<String>,
     pub header: Option<String>,
+    /// 书源级代理（如 socks5://127.0.0.1:1080）——CF 质询/Turnstile 求解时透传
+    /// obscura `serve --proxy`（浏览器流量走代理；书源直连抓取不受影响）。
+    /// 未配置时回退环境变量 READER_OBSCURA_PROXY
+    #[serde(rename = "proxyUrl")]
+    #[sqlx(rename = "proxy_url")]
+    pub proxy_url: Option<String>,
     #[serde(rename = "loginUrl")]
     #[sqlx(rename = "login_url")]
     pub login_url: Option<String>,

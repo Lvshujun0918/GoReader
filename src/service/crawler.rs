@@ -336,17 +336,19 @@ pub async fn session_for(ns: &str, url: &str) -> Option<(String, String)> {
 
 // ==================== 书源抓取（带 cookie + Cloudflare 质询绕过） ====================
 
-/// 书源 GET（自动附加书源 cookie；CF 质询自动转 FlareSolverr）
+/// 书源 GET（自动附加书源 cookie；CF 质询自动转 FlareSolverr；proxy = 书源级代理——
+/// 求解浏览器出口，None = 回退环境变量 READER_OBSCURA_PROXY）
 pub async fn http_get(
     ns: &str,
     url: &str,
     headers: &HashMap<String, String>,
     timeout_secs: u64,
+    proxy: Option<&str>,
 ) -> Result<FetchResponse> {
-    http_fetch(ns, url, headers, timeout_secs, "GET", None, None).await
+    http_fetch(ns, url, headers, timeout_secs, "GET", None, None, proxy).await
 }
 
-/// 书源 POST（自动附加书源 cookie；CF 质询自动转 FlareSolverr）
+/// 书源 POST（自动附加书源 cookie；CF 质询自动转 FlareSolverr；proxy 同 http_get）
 pub async fn http_post(
     ns: &str,
     url: &str,
@@ -354,8 +356,9 @@ pub async fn http_post(
     timeout_secs: u64,
     body: Option<&str>,
     charset: Option<&str>,
+    proxy: Option<&str>,
 ) -> Result<FetchResponse> {
-    http_fetch(ns, url, headers, timeout_secs, "POST", body, charset).await
+    http_fetch(ns, url, headers, timeout_secs, "POST", body, charset, proxy).await
 }
 
 /// 书源抓取统一入口：cookie 注入 → 直连 → CF 质询检测 → FlareSolverr 兜底
@@ -367,6 +370,7 @@ async fn http_fetch(
     method: &str,
     body: Option<&str>,
     charset: Option<&str>,
+    proxy: Option<&str>,
 ) -> Result<FetchResponse> {
     // ① 书源 cookie + 记录的 UA（FlareSolverr 返回的 UA 绑定 cookie——部分站点校验 UA 一致性）
     let (cookie, stored_ua) = session_for(ns, url).await.unwrap_or_default();
@@ -401,6 +405,10 @@ async fn http_fetch(
     //    重试仍质询/失败 → 用求解结果（浏览器 HTML）兜底返回
     if is_cloudflare_challenge(resp.status, &resp.body) {
         tracing::debug!("http_fetch 命中 CF 质询 status={} url={url}", resp.status);
+        // 调试/日志：质询页 Turnstile sitekey（纯 Rust 解析预检——与浏览器内提取镜像）
+        if let Some(sk) = crate::service::browser::extract_turnstile_sitekey(&resp.body) {
+            tracing::debug!("CF 质询页含 Turnstile sitekey={sk}（{url}）");
+        }
         // 求解：返回兜底响应 + 合并后 cookie 串（内存直传重试——不依赖 storage 注册状态/
         // 并发覆盖）+ 浏览器 UA
         let (fallback, merged_cookie, solved_ua) = if let Some(fs) =
@@ -429,8 +437,9 @@ async fn http_fetch(
                 fs.user_agent,
             )
         } else {
-            // 未配置 FLARESOLVERR_URL → 内置浏览器求解（进程内 CDP，不依赖外部容器）
-            solve_cf_builtin(ns, url, &cookie).await?
+            // 未配置 FLARESOLVERR_URL → 内置浏览器求解（进程内 CDP，不依赖外部容器；
+            // 带书源级代理 proxy——obscura spawn --proxy）
+            solve_cf_builtin(ns, url, &cookie, proxy).await?
         };
 
         // ④ 重试原请求（原 method/body/headers + 求解后的 cookie——POST 场景关键：
@@ -673,11 +682,13 @@ static CF_BROWSER_AVAIL_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomi
 /// - 浏览器不可用 → 明确错误（提示安装 Edge/Chrome 或配置 FLARESOLVERR_URL）
 /// - 成功：solution.html 作为响应正文；cookies 与用户 cookie 按 name 合并后存库（按用户）
 ///   + 浏览器 UA 记录（与 cf_clearance 绑定）
+/// proxy：书源级代理（None = 环境变量 READER_OBSCURA_PROXY）——透传 obscura serve --proxy
 /// 返回 (兜底响应, 合并后 cookie 串（含 turnstile_token 伪 cookie——重试直接用）, 浏览器 UA)
 async fn solve_cf_builtin(
     ns: &str,
     url: &str,
     user_cookie: &str,
+    proxy: Option<&str>,
 ) -> Result<(FetchResponse, Option<String>, String)> {
     let cookies = parse_cookie_string(user_cookie);
     let solution = if !cf_browser_available() {
@@ -688,10 +699,18 @@ async fn solve_cf_builtin(
             .await
             .map_err(|e| anyhow!("解 CF 质询失败（{url}）: {e:#}"))?
     } else {
-        let solution =
-            crate::service::browser::solve_cf_challenge(ns, url, &cookies, CF_SOLVE_MAX_WAIT_MS)
-                .await
-                .map_err(|e| anyhow!("内置浏览器解 CF 质询失败（{url}）: {e:#}"))?;
+        let solution = crate::service::browser::solve_cf_challenge(
+            ns,
+            url,
+            &cookies,
+            CF_SOLVE_MAX_WAIT_MS,
+            proxy,
+        )
+        .await
+        .map_err(|e| anyhow!("内置浏览器解 CF 质询失败（{url}）: {e:#}"))?;
+        if let Some(sk) = &solution.turnstile_sitekey {
+            tracing::info!("Turnstile 求解命中 sitekey={sk}（{url}）");
+        }
         solution
     };
     let merged = store_solution_session(
@@ -1080,6 +1099,7 @@ mod tests {
             "default",
             "https://cf.example.com/book/1",
             "sid=abc",
+            None,
         ));
         force_cf_browser_available(None);
         std::env::remove_var("READER_CAMOUFOX_DISABLE");

@@ -406,7 +406,7 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         let art = storage
-            .get_rss_article("https://e.com/1")
+            .get_rss_article("default", "https://e.com/1")
             .await
             .unwrap()
             .unwrap();

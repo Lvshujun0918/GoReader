@@ -330,7 +330,7 @@ fn inline_json_path(expr: &str, text: &str) -> String {
         expr
     };
     let mut results = vec![];
-    match serde_json::from_str::<serde_json::Value>(text) {
+    match parse_json_value(text) {
         Ok(v) => walk_json(&v, path, &mut results),
         Err(_) => results = json_from_html(path, text),
     }
@@ -431,7 +431,7 @@ fn merge_groups(sep: Option<&'static str>, groups: Vec<Vec<String>>) -> Vec<Stri
 fn json_path_single(body: &str, text: &str) -> Vec<String> {
     // 提取 body 内路径：{$.list.xxx} 或 {.list.xxx}
     let inner = body.trim().trim_start_matches('{').trim_end_matches('}');
-    let json: serde_json::Value = match serde_json::from_str(text) {
+    let json: serde_json::Value = match parse_json_value(text) {
         Ok(v) => v,
         Err(_) => {
             // HTML 中可能内嵌 JSON（如 <script>），尝试按行提取
@@ -457,7 +457,7 @@ fn json_from_html(path: &str, html: &str) -> Vec<String> {
     for line in html.lines() {
         let line = line.trim();
         if line.starts_with('{') && line.ends_with('}') {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Ok(v) = parse_json_value(line) {
                 let mut r = vec![];
                 walk_json(&v, path, &mut r);
                 results.extend(r);
@@ -468,6 +468,24 @@ fn json_from_html(path: &str, html: &str) -> Vec<String> {
 }
 
 // ---------- JSONPath 路径引擎 ----------
+
+/// JSONPath 求值递归深度上限（段数 + 值嵌套 + 过滤括号嵌套共用）：
+/// 恶意/病态规则（超深路径、超深嵌套括号、超深数组）超限时按“规则错误”处理
+/// （记日志、返回空结果），绝不递归到栈溢出 abort。
+const JSONPATH_MAX_DEPTH: usize = 64;
+
+/// 深度超限错误（内部传播；顶层 walk_json 转日志 + 空结果）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JsonPathDepthExceeded;
+
+/// serde_json 解析：经 serde_stacker 把 serde 递归移到堆上（解析机制本身不栈溢出）；
+/// serde_json 内置 128 层递归上限保留——超限返回解析错误（上层回退 json_from_html/空结果），
+/// 不会 abort；求值侧另有 JSONPATH_MAX_DEPTH=64 兜底（Value 深度超限的 drop 递归风险也因此排除）。
+fn parse_json_value(text: &str) -> serde_json::Result<serde_json::Value> {
+    let mut inner = serde_json::Deserializer::from_str(text);
+    let de = serde_stacker::Deserializer::new(&mut inner);
+    <serde_json::Value as serde::Deserialize>::deserialize(de)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum JSeg {
@@ -491,7 +509,12 @@ enum JItem {
 fn walk_json(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
     let segs = tokenize_json_path(path);
     let mut found: Vec<&serde_json::Value> = Vec::new();
-    eval_segments(value, &segs, &mut found);
+    if let Err(JsonPathDepthExceeded) = eval_segments(value, &segs, 0, &mut found) {
+        tracing::warn!(
+            "JSONPath 求值深度超限（>{JSONPATH_MAX_DEPTH}），按空结果处理（路径: {path}）"
+        );
+        return;
+    }
     for v in found {
         push_json_value(v, out);
     }
@@ -659,43 +682,47 @@ fn parse_bracket(content: &str) -> JSeg {
 fn eval_segments<'v>(
     value: &'v serde_json::Value,
     segs: &[JSeg],
+    depth: usize,
     out: &mut Vec<&'v serde_json::Value>,
-) {
+) -> Result<(), JsonPathDepthExceeded> {
+    if depth > JSONPATH_MAX_DEPTH {
+        return Err(JsonPathDepthExceeded);
+    }
     if segs.is_empty() {
         out.push(value);
-        return;
+        return Ok(());
     }
     match &segs[0] {
         JSeg::Key(name) | JSeg::QuotedKey(name) => match value {
             serde_json::Value::Object(map) => {
                 if let Some(v) = map.get(name) {
-                    eval_segments(v, &segs[1..], out);
+                    eval_segments(v, &segs[1..], depth + 1, out)?;
                 }
             }
             serde_json::Value::Array(arr) => {
                 // 数组自动展开（对齐 v1 行为）
                 for item in arr {
-                    eval_segments(item, segs, out);
+                    eval_segments(item, segs, depth + 1, out)?;
                 }
             }
             _ => {}
         },
         JSeg::RecKey(name) => {
             let mut found: Vec<&'v serde_json::Value> = Vec::new();
-            collect_rec(value, name, &mut found);
+            collect_rec(value, name, depth + 1, &mut found)?;
             for v in found {
-                eval_segments(v, &segs[1..], out);
+                eval_segments(v, &segs[1..], depth + 1, out)?;
             }
         }
         JSeg::Wildcard => match value {
             serde_json::Value::Array(arr) => {
                 for item in arr {
-                    eval_segments(item, &segs[1..], out);
+                    eval_segments(item, &segs[1..], depth + 1, out)?;
                 }
             }
             serde_json::Value::Object(map) => {
                 for v in map.values() {
-                    eval_segments(v, &segs[1..], out);
+                    eval_segments(v, &segs[1..], depth + 1, out)?;
                 }
             }
             _ => {}
@@ -703,12 +730,12 @@ fn eval_segments<'v>(
         JSeg::Index(n) => match value {
             serde_json::Value::Array(arr) => {
                 if let Some(v) = norm_index(*n, arr.len()).and_then(|idx| arr.get(idx)) {
-                    eval_segments(v, &segs[1..], out);
+                    eval_segments(v, &segs[1..], depth + 1, out)?;
                 }
             }
             serde_json::Value::Object(map) => {
                 if let Some(v) = map.get(&n.to_string()) {
-                    eval_segments(v, &segs[1..], out);
+                    eval_segments(v, &segs[1..], depth + 1, out)?;
                 }
             }
             _ => {}
@@ -716,7 +743,7 @@ fn eval_segments<'v>(
         JSeg::Slice(s, e, st) => {
             if let serde_json::Value::Array(arr) = value {
                 for v in slice_items(arr, *s, *e, *st) {
-                    eval_segments(v, &segs[1..], out);
+                    eval_segments(v, &segs[1..], depth + 1, out)?;
                 }
             }
         }
@@ -727,12 +754,12 @@ fn eval_segments<'v>(
                         JItem::I(n) => {
                             if let Some(v) = norm_index(*n, arr.len()).and_then(|idx| arr.get(idx))
                             {
-                                eval_segments(v, &segs[1..], out);
+                                eval_segments(v, &segs[1..], depth + 1, out)?;
                             }
                         }
                         JItem::S(s, e, st) => {
                             for v in slice_items(arr, *s, *e, *st) {
-                                eval_segments(v, &segs[1..], out);
+                                eval_segments(v, &segs[1..], depth + 1, out)?;
                             }
                         }
                     }
@@ -742,18 +769,19 @@ fn eval_segments<'v>(
         JSeg::Filter(expr) => match value {
             serde_json::Value::Array(arr) => {
                 for item in arr {
-                    if eval_filter(expr, item) {
-                        eval_segments(item, &segs[1..], out);
+                    if eval_filter(expr, item, depth + 1)? {
+                        eval_segments(item, &segs[1..], depth + 1, out)?;
                     }
                 }
             }
             other => {
-                if eval_filter(expr, other) {
-                    eval_segments(other, &segs[1..], out);
+                if eval_filter(expr, other, depth + 1)? {
+                    eval_segments(other, &segs[1..], depth + 1, out)?;
                 }
             }
         },
     }
+    Ok(())
 }
 
 fn norm_index(n: i64, len: usize) -> Option<usize> {
@@ -766,24 +794,33 @@ fn norm_index(n: i64, len: usize) -> Option<usize> {
     }
 }
 
-/// $..name：任意深度收集键 name 的值
-fn collect_rec<'v>(value: &'v serde_json::Value, name: &str, out: &mut Vec<&'v serde_json::Value>) {
+/// $..name：任意深度收集键 name 的值（深度受限，防栈溢出 abort）
+fn collect_rec<'v>(
+    value: &'v serde_json::Value,
+    name: &str,
+    depth: usize,
+    out: &mut Vec<&'v serde_json::Value>,
+) -> Result<(), JsonPathDepthExceeded> {
+    if depth > JSONPATH_MAX_DEPTH {
+        return Err(JsonPathDepthExceeded);
+    }
     match value {
         serde_json::Value::Object(map) => {
             if let Some(v) = map.get(name) {
                 out.push(v);
             }
             for v in map.values() {
-                collect_rec(v, name, out);
+                collect_rec(v, name, depth + 1, out)?;
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr {
-                collect_rec(v, name, out);
+                collect_rec(v, name, depth + 1, out)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Python 风格切片（end 排除；负数回绕；step 可为负反向）
@@ -822,67 +859,92 @@ fn slice_items(
 
 // ---------- [?()] 过滤表达式 ----------
 
-fn eval_filter(expr: &str, item: &serde_json::Value) -> bool {
+fn eval_filter(
+    expr: &str,
+    item: &serde_json::Value,
+    depth: usize,
+) -> Result<bool, JsonPathDepthExceeded> {
+    if depth > JSONPATH_MAX_DEPTH {
+        return Err(JsonPathDepthExceeded);
+    }
     for part in split_top_level(expr, "||") {
-        if eval_and(part, item) {
-            return true;
+        if eval_and(part, item, depth + 1)? {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
-fn eval_and(expr: &str, item: &serde_json::Value) -> bool {
+fn eval_and(
+    expr: &str,
+    item: &serde_json::Value,
+    depth: usize,
+) -> Result<bool, JsonPathDepthExceeded> {
+    if depth > JSONPATH_MAX_DEPTH {
+        return Err(JsonPathDepthExceeded);
+    }
     for part in split_top_level(expr, "&&") {
-        if !eval_primary(part, item) {
-            return false;
+        if !eval_primary(part, item, depth + 1)? {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
-fn eval_primary(expr: &str, item: &serde_json::Value) -> bool {
+fn eval_primary(
+    expr: &str,
+    item: &serde_json::Value,
+    depth: usize,
+) -> Result<bool, JsonPathDepthExceeded> {
+    if depth > JSONPATH_MAX_DEPTH {
+        return Err(JsonPathDepthExceeded);
+    }
     let s = expr.trim();
     if s.is_empty() {
-        return false;
+        return Ok(false);
     }
     if let Some(rest) = s.strip_prefix('(') {
         if let Some(inner) = rest.strip_suffix(')') {
-            return eval_filter(inner, item);
+            return eval_filter(inner, item, depth + 1);
         }
     }
     if let Some(rest) = s.strip_prefix('!') {
-        return !eval_primary(rest, item);
+        return Ok(!eval_primary(rest, item, depth + 1)?);
     }
     for op in ["==", "!=", "<=", ">=", "<", ">"] {
         if let Some(pos) = find_op_top(s, op) {
             let lhs = s[..pos].trim();
             let rhs = s[pos + op.len()..].trim();
-            let lv = eval_filter_path(lhs, item);
+            let lv = eval_filter_path(lhs, item, depth + 1)?;
             let rv = parse_filter_literal(rhs);
-            return compare_filter(lv, rv.as_ref(), op);
+            return Ok(compare_filter(lv, rv.as_ref(), op));
         }
     }
     // 无比较：路径真值（存在且非 null/false/空串）
-    eval_filter_path(s, item)
+    Ok(eval_filter_path(s, item, depth + 1)?
         .map(|v| {
             !v.is_null()
                 && v != &serde_json::Value::Bool(false)
                 && v.as_str().map(|s| !s.is_empty()).unwrap_or(true)
         })
-        .unwrap_or(false)
+        .unwrap_or(false))
 }
 
 /// 过滤内路径求值：@ / @.a.b / @['a']（取首个结果）
-fn eval_filter_path<'v>(path: &str, item: &'v serde_json::Value) -> Option<&'v serde_json::Value> {
+fn eval_filter_path<'v>(
+    path: &str,
+    item: &'v serde_json::Value,
+    depth: usize,
+) -> Result<Option<&'v serde_json::Value>, JsonPathDepthExceeded> {
     let p = path.trim();
     if p == "@" {
-        return Some(item);
+        return Ok(Some(item));
     }
     let p = p.strip_prefix('@').unwrap_or(p);
     let segs = tokenize_json_path(p);
     let mut found: Vec<&'v serde_json::Value> = Vec::new();
-    eval_segments(item, &segs, &mut found);
-    found.into_iter().next()
+    eval_segments(item, &segs, depth, &mut found)?;
+    Ok(found.into_iter().next())
 }
 
 fn parse_filter_literal(s: &str) -> Option<serde_json::Value> {
@@ -1417,6 +1479,51 @@ mod tests {
         assert_eq!(r6, vec!["书3".to_string()]);
         let r7 = apply("$.missing||$.list[0].name", json);
         assert_eq!(r7, vec!["书1".to_string()]);
+    }
+
+    /// P0-2：JSONPath 段数超限（超深路径）→ 返回错误语义（空结果 + 日志），不栈溢出 abort
+    #[test]
+    fn test_jsonpath_depth_limit_segments() {
+        let json = r#"{"a":{"a":{"a":1}}}"#;
+        // 100 段路径（远超 JSONPATH_MAX_DEPTH=64）
+        let path = format!("$.{}", "a.".repeat(100).trim_end_matches('.'));
+        let r = apply(&path, json);
+        assert!(r.is_empty(), "超深路径应返回空结果而非崩溃: {r:?}");
+        // 64 段以内仍正常（不误伤合法规则）
+        let ok_path = format!("$.{}", "a.".repeat(3).trim_end_matches('.'));
+        assert_eq!(apply(&ok_path, json), vec!["1".to_string()]);
+    }
+
+    /// P0-2：过滤表达式括号嵌套超限 → 空结果，不栈溢出 abort
+    #[test]
+    fn test_jsonpath_depth_limit_filter_parens() {
+        let json = r#"{"list":[{"name":"书1"}]}"#;
+        // 200 层括号嵌套的过滤表达式
+        let expr = format!("$.list[?({}@.name{})].name", "(".repeat(200), ")".repeat(200));
+        let r = apply(&expr, json);
+        assert!(r.is_empty(), "超深括号过滤应返回空结果而非崩溃: {r:?}");
+        // 正常括号仍工作
+        let ok = apply("$.list[?((@.name))].name", json);
+        assert_eq!(ok, vec!["书1".to_string()]);
+    }
+
+    /// P0-2：深层嵌套 JSON 解析（serde_json 128 层上限之外的输入）→ 解析错误回退空结果，不 abort；
+    /// 128 层内可解析的深层值 + 递归求值 → 求值深度上限（64）返回空结果，不 abort
+    #[test]
+    fn test_jsonpath_deep_nested_value() {
+        // 500 层嵌套数组（超过 serde_json 内置 128 层递归上限 → 解析报错 → 回退空结果）
+        let deep = format!("{}0{}", "[".repeat(500), "]".repeat(500));
+        let r = apply("$[*]", &deep);
+        assert!(r.is_empty(), "超深解析应优雅失败而非崩溃: {r:?}");
+        let r2 = apply("$..x", &deep);
+        assert!(r2.is_empty());
+        // 100 层（可解析）嵌套数组：$[*].x 沿数组展开下钻 → 求值深度超限 → 空结果，不 abort
+        let deep100 = format!("{}0{}", "[".repeat(100), "]".repeat(100));
+        let r3 = apply("$[*].x", &deep100);
+        assert!(r3.is_empty(), "深层值求值应受深度上限约束而非崩溃: {r3:?}");
+        // 普通深度 JSON 正常
+        let normal = r#"{"a":[{"b":{"c":"深"}}]}"#;
+        assert_eq!(apply("$.a[0].b.c", normal), vec!["深".to_string()]);
     }
 
     #[test]

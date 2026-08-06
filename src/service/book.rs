@@ -60,7 +60,7 @@ pub async fn fetch_url(ns: &str, url: &str, source: &BookSource) -> Result<crawl
         .as_deref()
         .map(crawler::parse_header)
         .unwrap_or_default();
-    crawler::http_get(ns, url, &headers, 15).await
+    crawler::http_get(ns, url, &headers, 15, source.proxy_url.as_deref()).await
 }
 
 /// ruleRelated 结构（GAP 17b：相关推荐——字段与 ruleExplore 一致：bookList + 字段规则）

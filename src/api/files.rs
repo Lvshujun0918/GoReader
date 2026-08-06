@@ -33,10 +33,14 @@ fn str_param(params: &HashMap<String, String>, body: Option<&Value>, key: &str) 
     params.get(key).cloned().unwrap_or_default()
 }
 
-/// 管理密码校验（legacy checkManagerAuth：非 secure 或未配置 secureKey 视为通过）
+/// 管理密码校验（legacy checkManagerAuth，P0-8 收紧）：
+/// 仅当 secure_key 已配置且请求携带正确 secureKey 时才具备管理权限；
+/// 非 secure / secure 模式未配置 secure_key / secureKey 缺失或错误 → 一律非 manager
+/// （修复：secure 模式未配置 secure_key 时原先无条件放行，匿名请求可提权为 manager
+/// 访问 __STORAGE__（storage 根）及写/删 __LOCAL_STORE__）
 fn manager_ok(config: &AppConfig, params: &HashMap<String, String>, body: Option<&Value>) -> bool {
-    if !config.secure || config.secure_key.is_empty() {
-        return true;
+    if config.secure_key.is_empty() {
+        return false;
     }
     str_param(params, body, "secureKey") == config.secure_key
 }
@@ -695,6 +699,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = AppConfig::from_env();
         config.work_dir = dir.to_string_lossy().into_owned();
+        // 既有认证测试不关心过期——默认禁用（GAP 118 过期由 router.rs 专用测试单独覆盖）
+        config.token_ttl_days = 0;
         let storage = crate::storage::init(&config).await.unwrap();
         // 图片代理磁盘缓存：独立临时目录 + 固定 1MB 容量（不受宿主 env READER_IMAGE_CACHE_MB 影响）
         let image_cache = crate::service::image_cache::ImageCache::with_capacity(
@@ -1045,6 +1051,115 @@ mod tests {
         .await;
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "参数错误");
+
+        cleanup(state, dir).await;
+    }
+
+    /// P0-8：manager_ok 收紧——仅 secure_key 已配置且请求携带正确 secureKey 才具备管理权限；
+    /// secure 模式未配置 secure_key（原无条件 true 漏洞）→ 非 manager；
+    /// query 与 body 两路 secureKey 均生效
+    #[test]
+    fn test_manager_ok() {
+        let mut config = AppConfig::from_env();
+        let params = |key: Option<&str>| {
+            let mut m = HashMap::new();
+            if let Some(k) = key {
+                m.insert("secureKey".to_string(), k.to_string());
+            }
+            m
+        };
+
+        // secure 模式 + 未配置 secure_key → 非 manager（P0-8 核心：原实现无条件 true）
+        config.secure = true;
+        config.secure_key = "".into();
+        assert!(!manager_ok(&config, &params(None), None));
+        assert!(!manager_ok(&config, &params(Some("any")), None));
+
+        // secure 模式 + 已配置 secure_key：缺失/错误 → 非 manager；正确 → manager
+        config.secure_key = "sk-123".into();
+        assert!(!manager_ok(&config, &params(None), None));
+        assert!(!manager_ok(&config, &params(Some("wrong")), None));
+        assert!(manager_ok(&config, &params(Some("sk-123")), None));
+        // body JSON 携带正确 secureKey（body 优先于 query）
+        let body = serde_json::json!({ "secureKey": "sk-123" });
+        assert!(manager_ok(&config, &params(Some("wrong")), Some(&body)));
+        let body = serde_json::json!({ "secureKey": "wrong" });
+        assert!(!manager_ok(&config, &params(None), Some(&body)));
+
+        // 非 secure：未配置 key → 非 manager；配置 key 且携带正确 secureKey → manager
+        config.secure = false;
+        config.secure_key = "".into();
+        assert!(!manager_ok(&config, &params(None), None));
+        config.secure_key = "sk-123".into();
+        assert!(manager_ok(&config, &params(Some("sk-123")), None));
+        assert!(!manager_ok(&config, &params(None), None));
+    }
+
+    /// P0-8 全链路：secure 模式未配置 secure_key 时，已登录用户写 __STORAGE__ 也被拒
+    /// （NEED_SECURE_KEY，原实现无条件放行）；配置 secure_key 且携带正确 secureKey 后放行
+    #[tokio::test]
+    async fn test_manager_gate_secure_storage_write() {
+        let (mut state, dir) = test_state("mgrgate").await;
+        state.storage.config.secure = true;
+        state.storage.config.secure_key = "".into(); // 未配置 secure_key（P0-8 场景）
+        state
+            .storage
+            .insert_user(&crate::model::User {
+                username: "alice".into(),
+                token: "tok".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let auth: HashMap<String, String> = [("accessToken".into(), "alice:tok".into())]
+            .into_iter()
+            .collect();
+
+        // 已登录但 secure_key 未配置：写 __STORAGE__ → 需管理密码（原实现：放行到 storage 根）
+        let body = Bytes::from(r#"{"path":"/pwn.txt","content":"x","home":"__STORAGE__"}"#);
+        let ret = save(
+            State(state.clone()),
+            Query(auth.clone()),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        assert!(
+            !ret.0.is_success,
+            "未配置 secure_key 时 __STORAGE__ 写应拒绝"
+        );
+        assert_eq!(ret.0.data, json!("NEED_SECURE_KEY"));
+        assert!(!state.storage.config.storage_dir().join("pwn.txt").exists());
+
+        // 配置 secure_key 后：缺/错 secureKey 仍拒绝；携带正确 secureKey（query）→ 放行
+        state.storage.config.secure_key = "sk-123".into();
+        let body = Bytes::from(r#"{"path":"/pwn.txt","content":"x","home":"__STORAGE__"}"#);
+        let ret = save(
+            State(state.clone()),
+            Query(auth.clone()),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.data, json!("NEED_SECURE_KEY"));
+
+        let mut params = auth;
+        params.insert("secureKey".to_string(), "sk-123".to_string());
+        let body = Bytes::from(r#"{"path":"/pwn.txt","content":"x","home":"__STORAGE__"}"#);
+        let ret = save(
+            State(state.clone()),
+            Query(params),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        assert!(
+            ret.0.is_success,
+            "正确 secureKey 应放行: {}",
+            ret.0.error_msg
+        );
+        assert!(state.storage.config.storage_dir().join("pwn.txt").exists());
 
         cleanup(state, dir).await;
     }

@@ -140,7 +140,7 @@ fn normalize_cdp_url(url: &str) -> String {
     }
 }
 
-/// spawn `obscura serve --port <port> --stealth` → 等待 stdout banner
+/// spawn `obscura serve --port <port> --stealth [--proxy <proxy>]` → 等待 stdout banner
 /// （`CDP server: ws://127.0.0.1:{port}/devtools/browser`——serve 的 --quiet 只关日志，
 /// banner 无条件打印）→ 连接 → 会话初始化。任何失败均杀进程并返回错误
 /// （launch_with 换随机端口重试）。
@@ -148,17 +148,17 @@ fn normalize_cdp_url(url: &str) -> String {
 /// 参数说明：obscura 为纯 headless 引擎（**无 --headless 参数**——headless 是其固有
 /// 形态）；`--stealth` 启用反检测 + BoringSSL TLS 指纹模拟（stealth 构建；lean 构建
 /// 传该参数仅打警告、其余功能正常）；`--allow-private-network` 放开本地/内网导航
-/// （obscura 默认禁 RFC1918——与旧 Chrome 路径行为一致，SSRF 面持平）
-async fn spawn_serve_and_connect(exe: &std::path::Path, port: u16) -> Result<Browser> {
-    let mut cmd = Command::new(exe);
-    cmd.arg("serve")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--stealth")
-        .arg("--allow-private-network")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = cmd
+/// （obscura 默认禁 RFC1918——与旧 Chrome 路径行为一致，SSRF 面持平）；`--proxy`
+/// 透传书源级 proxyUrl / 环境 READER_OBSCURA_PROXY（socks5://host:port 等——
+/// 69shuba 等对数据中心 IP 风控的站点可经住宅/本地代理出口）。
+/// obscura serve 命令构造（纯函数，供测试断言参数）：
+/// `serve --port <port> --stealth --allow-private-network [--proxy <proxy>]`
+async fn spawn_serve_and_connect(
+    exe: &std::path::Path,
+    port: u16,
+    proxy: Option<&str>,
+) -> Result<Browser> {
+    let mut child = obscura_serve_command(exe, port, proxy)
         .spawn()
         .map_err(|e| anyhow!("启动 obscura 失败（{}）: {e}", exe.display()))?;
     // 读 stdout banner（banner 先于监听就绪打印——连接阶段有重试）
@@ -232,6 +232,23 @@ async fn spawn_serve_and_connect(exe: &std::path::Path, port: u16) -> Result<Bro
     };
     browser.child = Some(child);
     Ok(browser)
+}
+
+/// 构造 obscura serve 命令（spawn_serve_and_connect 用；独立函数便于单测断言参数）：
+/// `serve --port <port> --stealth --allow-private-network [--proxy <proxy>]`——
+/// proxy 为空/纯空白时不附加 --proxy 参数
+fn obscura_serve_command(exe: &std::path::Path, port: u16, proxy: Option<&str>) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--stealth")
+        .arg("--allow-private-network");
+    if let Some(p) = proxy.filter(|p| !p.trim().is_empty()) {
+        cmd.arg("--proxy").arg(p.trim());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd
 }
 
 /// 连接建立后的会话初始化（target 创建/附加、域启用、stealth 注入）——spawn 与
@@ -341,6 +358,15 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
             )
             .await;
     }
+    // Turnstile render 参数捕获 hook（sitekey/widgetId 提取 + execute 重试用）：
+    // api.js 加载前注入，拦截 window.turnstile 赋值并包装 render（功能性注入，
+    // 与 stealth 开关无关）
+    let _ = browser
+        .command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": TURNSTILE_HOOK_JS }),
+        )
+        .await;
     Ok(browser)
 }
 
@@ -349,6 +375,20 @@ impl Browser {
     /// 服务（不 spawn、不接管进程）；否则发现 obscura 可执行文件并 spawn
     /// `obscura serve --port <随机> --stealth`。未配置/不可用 → Err（提示手动 Cookie 流程）
     pub async fn launch() -> Result<Browser> {
+        // 代理（环境变量 READER_OBSCURA_PROXY——socks5://127.0.0.1:1080 等；
+        // 书源级 proxyUrl 由 solve_captcha/solve_cf_challenge 的 proxy 参数覆盖）
+        let proxy = std::env::var("READER_OBSCURA_PROXY")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+        Browser::launch_proxy(proxy).await
+    }
+
+    /// 带代理启动（书源级 proxyUrl 路径）：
+    /// `READER_OBSCURA_URL` 已配置 → 连接既有 CDP 服务（代理不适用——外部服务
+    /// 的出口由该服务自身配置）；否则发现 obscura 可执行文件并 spawn
+    /// `obscura serve --port <随机> --stealth [--proxy <proxy>]`。
+    pub async fn launch_proxy(proxy: Option<String>) -> Result<Browser> {
         // ① READER_OBSCURA_URL：连接既有 obscura CDP 服务
         if let Ok(url) = std::env::var("READER_OBSCURA_URL") {
             let url = url.trim();
@@ -362,7 +402,7 @@ impl Browser {
                 "未安装 obscura 浏览器（唯一浏览器后端）——请下载 stealth 构建并设置 READER_OBSCURA_BIN（或配置 READER_OBSCURA_URL 连接既有 CDP 服务）；未配置时无法使用浏览器自动登录，请在书源设置中粘贴 Cookie"
             )
         })?;
-        Browser::launch_with(exe).await
+        Browser::launch_with_proxy(exe, proxy).await
     }
 
     /// 连接既有 obscura CDP 服务（`READER_OBSCURA_URL` 路径；不接管进程生命周期——
@@ -382,6 +422,11 @@ impl Browser {
     /// 用指定 obscura 可执行文件启动（spawn `serve --port <随机> --stealth`；
     /// 端口冲突等启动失败自动换随机端口重试，最多 3 次）
     pub async fn launch_with(exe: PathBuf) -> Result<Browser> {
+        Browser::launch_with_proxy(exe, None).await
+    }
+
+    /// 用指定 obscura 可执行文件 + 代理启动（proxy 非空时 spawn 加 `--proxy <proxy>`）
+    pub async fn launch_with_proxy(exe: PathBuf, proxy: Option<String>) -> Result<Browser> {
         if !exe.exists() {
             return Err(anyhow!(
                 "obscura 可执行文件不存在（{}）——无法使用浏览器自动登录",
@@ -393,7 +438,7 @@ impl Browser {
             // 随机端口（20000-49999）——与已有服务/其他实例冲突时 obscura 退出，
             // 换端口重试（概率极低，防御性处理）
             let port = 20000 + rand::random::<u16>() % 30000;
-            match spawn_serve_and_connect(&exe, port).await {
+            match spawn_serve_and_connect(&exe, port, proxy.as_deref()).await {
                 Ok(b) => return Ok(b),
                 Err(e) => last_err = Some(e),
             }
@@ -716,6 +761,9 @@ pub struct CfSolution {
     pub user_agent: String,
     /// Turnstile 求解得到的 cf-turnstile-response token（非 Turnstile 质询为 None）
     pub turnstile_token: Option<String>,
+    /// Turnstile sitekey（检测时从页面 data-sitekey / iframe src query / api.js 脚本
+    /// URL / window.turnstile.render 调用参数提取——日志/调试用；非 Turnstile 质询为 None）
+    pub turnstile_sitekey: Option<String>,
 }
 
 /// CF 质询状态检测 JS（质询等待循环每 500ms 求值一次）——challenge=true 表示仍在质询页
@@ -863,6 +911,138 @@ pub const TURNSTILE_TOKEN_JS: &str = r#"
 })()
 "#;
 
+/// Turnstile render 参数捕获 hook（每个新文档加载前注入）：在 api.js 加载前用
+/// defineProperty 拦截 `window.turnstile` 赋值并包装 `render`——把每次 render 的
+/// 调用参数（widgetId/容器 + options，含 sitekey）存到 `window.__readerTurnstileCaptured`。
+/// 用途：① sitekey 提取（render 参数来源）；② `turnstile.execute(widgetId)` 重试
+/// （widget 暴露 render/execute 时，execute 需同一 widgetId/容器）。
+/// 页面自身对 window.turnstile 的后续写入不受影响（configurable setter，赋值仍生效）。
+pub const TURNSTILE_HOOK_JS: &str = r#"
+(function(){
+  try {
+    var real = undefined;
+    var captured = [];
+    Object.defineProperty(window, 'turnstile', {
+      configurable: true,
+      get: function() { return real; },
+      set: function(v) {
+        if (v && typeof v.render === 'function' && !v.__readerHooked) {
+          try {
+            v.__readerHooked = true;
+            var orig = v.render;
+            v.render = function() {
+              try { captured.push(Array.prototype.slice.call(arguments)); } catch (e) {}
+              return orig.apply(this, arguments);
+            };
+          } catch (e) {}
+        }
+        real = v;
+      }
+    });
+    window.__readerTurnstileCaptured = captured;
+  } catch (e) {}
+})();
+"#;
+
+/// Turnstile sitekey 提取 JS（检测命中时求值——日志/调试用）：依次尝试
+/// ① .cf-turnstile 容器 data-sitekey 属性；② challenges.cloudflare.com iframe src 的
+/// sitekey query 参数；③ turnstile/api.js 脚本 URL 的 sitekey query 参数（手动加载形式）；
+/// ④ window.turnstile.render 调用参数（TURNSTILE_HOOK_JS 捕获的 options.sitekey）——
+/// 同时返回 widgetId（render 首参，execute 重试用）。未命中返回空串。
+pub const TURNSTILE_SITEKEY_JS: &str = r#"
+(function(){
+  try {
+    var out = { sitekey: '', widgetId: '', how: '' };
+    // ① data-sitekey 属性（页面容器）
+    var el = document.querySelector('.cf-turnstile[data-sitekey]') || document.querySelector('[data-sitekey]');
+    if (el) {
+      var k = el.getAttribute('data-sitekey');
+      if (k) { out.sitekey = k; out.how = 'data-sitekey'; }
+    }
+    // ② iframe src query（widget iframe 带 sitekey 参数）
+    if (!out.sitekey) {
+      var f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+      if (f) {
+        var m = (f.src || '').match(/[?&]sitekey=([^&]+)/);
+        if (m && m[1]) { out.sitekey = decodeURIComponent(m[1]); out.how = 'iframe-src'; }
+      }
+    }
+    // ③ turnstile/api.js 脚本 URL query（手动加载形式）
+    if (!out.sitekey) {
+      var s = document.querySelector('script[src*="turnstile/api.js"], script[src*="challenges.cloudflare.com/turnstile"]');
+      if (s) {
+        var m = (s.src || '').match(/[?&]sitekey=([^&]+)/);
+        if (m && m[1]) { out.sitekey = decodeURIComponent(m[1]); out.how = 'script-src'; }
+      }
+    }
+    // ④ window.turnstile.render 调用参数（hook 捕获）
+    if (!out.sitekey && window.__readerTurnstileCaptured && window.__readerTurnstileCaptured.length) {
+      for (var i = 0; i < window.__readerTurnstileCaptured.length; i++) {
+        var args = window.__readerTurnstileCaptured[i];
+        var opts = args && args[1] ? args[1] : {};
+        if (opts.sitekey) {
+          out.sitekey = String(opts.sitekey);
+          out.widgetId = args[0] != null ? String(args[0]) : '';
+          out.how = 'render-args';
+          break;
+        }
+      }
+    }
+    return out;
+  } catch (e) { return { sitekey: '', widgetId: '', how: 'exception' }; }
+})()
+"#;
+
+/// Turnstile 程序化执行 JS（点击后无 token 的策略升级①）：直接调
+/// `window.turnstile.execute(widgetId | 容器 | 无参)`（v0 API——widget 暴露
+/// render/execute 的 response 回调时可用）。**故意不 await**：obscura 只同步执行
+/// CDP 驱动的 JS（定时器/微任务不可靠），execute 的 Promise 在后台跑，token 由
+/// 既有轮询（TURNSTILE_TOKEN_JS 的 getResponse）兜底收集；catch 吞掉拒绝避免
+/// 未处理 Promise 异常。返回实际使用的执行目标（日志用）。
+pub const TURNSTILE_EXECUTE_JS: &str = r#"
+(function(){
+  try {
+    if (!window.turnstile || typeof window.turnstile.execute !== 'function') return '';
+    var wid = '';
+    if (window.__readerTurnstileCaptured && window.__readerTurnstileCaptured.length) {
+      var a0 = window.__readerTurnstileCaptured[0];
+      if (a0 && a0[0] != null) wid = String(a0[0]);
+    }
+    var container = document.querySelector('.cf-turnstile');
+    var p;
+    if (wid) { p = window.turnstile.execute(wid); }
+    else if (container) { p = window.turnstile.execute(container); }
+    else { p = window.turnstile.execute(); }
+    if (p && typeof p.catch === 'function') { try { p.catch(function(){}); } catch (e) {} }
+    return wid || (container ? 'container' : 'all');
+  } catch (e) { return 'error'; }
+})()
+"#;
+
+/// Turnstile iframe 内勾选框点击 JS（checkbox 变体选择器扩展——策略升级②用，
+/// 首次点击同样复用）：`.ctp-checkbox` → `input[type=checkbox]` → `[role=checkbox]`
+/// → `.ctp-checkbox-label` → `label`（命中 label 时先点其内第一元素再点 label 本身
+/// ——视觉勾选框常是 label 的首个子元素）。真实 Turnstile 勾选在 iframe 内部，
+/// 跨源 iframe 需 frame 上下文执行。
+pub const TURNSTILE_FRAME_CLICK_JS: &str = r#"
+(function(){
+  try {
+    var el = document.querySelector('.ctp-checkbox')
+      || document.querySelector('input[type="checkbox"]')
+      || document.querySelector('[role="checkbox"]')
+      || document.querySelector('.ctp-checkbox-label')
+      || document.querySelector('label');
+    if (!el) return false;
+    if (el.tagName === 'LABEL') {
+      var first = el.firstElementChild;
+      if (first) { try { first.click(); } catch (e) {} }
+    }
+    el.click();
+    return true;
+  } catch (e) { return false; }
+})()
+"#;
+
 /// 不支持的验证码类型检测 JS（reCAPTCHA：g-recaptcha/recaptcha/api.js；
 /// hCaptcha：h-captcha/hcaptcha.com）——命中即返回明确错误（不自动求解）
 pub const UNSUPPORTED_CAPTCHA_DETECT_JS: &str = r#"
@@ -877,18 +1057,29 @@ pub const UNSUPPORTED_CAPTCHA_DETECT_JS: &str = r#"
 
 /// Turnstile token 轮询间隔（任务要求每 800ms）
 const TURNSTILE_POLL_MS: u64 = 800;
-/// Turnstile token 轮询上限（任务要求最多 30s——仅对真 Turnstile widget 生效；
-/// 经典 CF 质询误命中 iframe 特征时不受此限，仍按调用方 max_wait_ms）
-const TURNSTILE_MAX_WAIT_MS: u64 = 30_000;
+/// Turnstile token 轮询上限（任务要求最多 45s——Turnstile 慢网络下 30s 偏紧；
+/// 仅对真 Turnstile widget 生效；经典 CF 质询误命中 iframe 特征时不受此限，
+/// 仍按调用方 max_wait_ms）
+const TURNSTILE_MAX_WAIT_MS: u64 = 45_000;
+/// Turnstile 点击后无 token 的策略升级阈值（按 800ms 轮询次数计）：
+/// - 4 次（约 3.2s）：程序化 `window.turnstile.execute()`（widget 暴露 render/execute 时）
+/// - 8 次（约 6.4s）：iframe 内不同元素点击（checkbox 变体选择器扩展）
+/// - 20 次（约 16s）：完整重点击一轮（容器 + iframe + 坐标）
+const TURNSTILE_ESCALATE_EXECUTE: u32 = 4;
+const TURNSTILE_ESCALATE_CLICK2: u32 = 8;
+const TURNSTILE_ESCALATE_CLICK3: u32 = 20;
 
 /// 会话浏览器闲置回收时限（最后一次使用后 TTL 内无新请求 → 杀进程释放资源）
 const CF_SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
 
 /// 全局 CF 质询求解会话：惰性启动（首次 CF 命中时 launch）、并发互斥（tokio Mutex 排队）、
-/// 超时/异常自动重启（出错即弃用实例，下次调用重新 launch）
+/// 超时/异常自动重启（出错即弃用实例，下次调用重新 launch）。
+/// proxy：会话建立时的浏览器代理（书源级 proxyUrl / READER_OBSCURA_PROXY）——
+/// 后续请求 proxy 变化时弃用会话重启（代理是浏览器进程级参数，无法热切换）
 struct CfSession {
     browser: Browser,
     last_used: std::time::Instant,
+    proxy: Option<String>,
 }
 
 /// 按用户命名空间隔离的浏览器会话池（安全：同一实例多用户共享一个浏览器实例会
@@ -917,12 +1108,16 @@ pub async fn shutdown_cf_session() {
 /// 解 CF 质询（进程内浏览器 CDP；会话级浏览器实例——惰性启动/互斥/异常自动重启）。
 /// CF 专用入口（不含滑块分支——登录页滑块走 solve_captcha 或登录流程）。
 ///
+/// proxy：书源级代理（None = 不指定，回退环境变量 READER_OBSCURA_PROXY）。
+///
 /// 流程：启动/复用会话浏览器（独立 user-data-dir，退出自动清理）→ Network.setCookies
 /// 注入 cookies → Page.navigate → 质询等待循环（每 500ms 求值 document：challenge 特征
 /// （#challenge-form/#cf-chl-*/iframe[src*=challenges.cloudflare]/title=="Just a moment"）
-/// 消失或 URL 变化到目标页；Turnstile 分支：点击容器 + 每 800ms 轮询 token（最多 30s）
-/// → 提取最终 HTML → Storage.getCookies（该站点全部，含 cf_clearance）→ {html, cookies,
-/// userAgent, turnstile_token}。超时/浏览器不可用返回明确错误。
+/// 消失或 URL 变化到目标页；Turnstile 分支：点击容器 + 每 800ms 轮询 token（最多 45s，
+/// 点击后无 token 自动策略升级：window.turnstile.execute → iframe 内不同元素点击 →
+/// 完整重点击；失败整体换新浏览器上下文重试一次）→ 提取最终 HTML → Storage.getCookies
+/// （该站点全部，含 cf_clearance）→ {html, cookies, userAgent, turnstile_token, sitekey}。
+/// 超时/浏览器不可用返回明确错误。
 ///
 /// 服务端静默语义：全程 headless（--headless=new），不弹任何窗口/不等待用户——
 /// 求解失败返回明确错误，由调用方（书源 JS 等）自行兜底。
@@ -931,37 +1126,46 @@ pub async fn solve_cf_challenge(
     url: &str,
     cookies: &[(String, String)],
     max_wait_ms: u64,
+    proxy: Option<&str>,
 ) -> Result<CfSolution> {
-    solve_captcha_inner(ns, url, cookies, max_wait_ms, false).await
+    solve_captcha_inner(ns, url, cookies, max_wait_ms, false, proxy).await
 }
 
 /// 统一验证码求解入口（服务端静默 headless——不弹浏览器给用户）：一个函数覆盖全部验证码
 /// 类型——内部按检测分派：
 /// - CF JS 质询（challenge-platform/#challenge-form/"Just a moment"）→ 等待循环（JS 自解）
 /// - Turnstile（.cf-turnstile/[name=cf-turnstile-response]/challenges.cloudflare.com iframe）
-///   → 点击容器（element.click + iframe 中心坐标）→ 每 800ms 轮询 token（最多 30s）
+///   → 点击容器（element.click + iframe 内 checkbox 变体点击）→ 每 800ms 轮询 token
+///   （最多 45s；无 token 自动策略升级：execute/换元素点击/重点击）
 /// - 登录页滑块（DETECT_CAPTCHA_JS kind=slider）→ 贝塞尔轨迹拖拽（人类轨迹，与登录流程一致）
 /// - reCAPTCHA/hCaptcha → 明确错误（不支持自动求解）
-/// 会话管理/超时语义与 solve_cf_challenge 一致。书源 JS 的 java.startBrowserAwait shim
-/// 应路由到此入口（成功返回 body/cookies，失败返回明确错误）。
+/// 会话管理/超时语义与 solve_cf_challenge 一致。proxy：书源级代理（None = 环境变量
+/// READER_OBSCURA_PROXY）。书源 JS 的 java.startBrowserAwait shim 应路由到此入口
+/// （成功返回 body/cookies，失败返回明确错误）。
 pub async fn solve_captcha(
     ns: &str,
     url: &str,
     cookies: &[(String, String)],
     max_wait_ms: u64,
+    proxy: Option<&str>,
 ) -> Result<CfSolution> {
-    solve_captcha_inner(ns, url, cookies, max_wait_ms, true).await
+    solve_captcha_inner(ns, url, cookies, max_wait_ms, true, proxy).await
 }
 
 /// 统一求解内部实现（include_slider：solve_captcha 启用滑块分派，CF 专用入口不启用）。
 /// 求解链（GAP 175）：内置浏览器 CDP → camoufox（HTTP 后端 scripts/camoufox_solver.py）
 /// → 仍失败才报错（合并错误）；`READER_CAMOUFOX_FIRST=1` 时 camoufox 优先。
+/// proxy：书源级代理（None = 不指定，回退环境变量 READER_OBSCURA_PROXY）。
+/// 失败重试：Turnstile/CF 求解失败会**换全新浏览器上下文重试一次（总 2 次）**——
+/// 风控页对同一浏览器指纹/上下文可能持续拒绝，新实例（新 TLS 指纹会话/新页面）
+/// 有第二机会；仍失败才进 camoufox 兜底。
 async fn solve_captcha_inner(
     ns: &str,
     url: &str,
     cookies: &[(String, String)],
     max_wait_ms: u64,
     include_slider: bool,
+    proxy: Option<&str>,
 ) -> Result<CfSolution> {
     // ① camoufox 优先模式（READER_CAMOUFOX_FIRST=1）：先试 HTTP 后端，失败转 CDP
     let camo_err = if crate::service::camoufox::first_mode() {
@@ -977,48 +1181,72 @@ async fn solve_captcha_inner(
     };
 
     let mut guard = CF_SESSION.lock().await;
-    // 惰性启动 / 复用（每用户命名空间独立浏览器实例——防跨用户 cookie 泄漏）
-    if !guard.contains_key(ns) {
-        let browser = match Browser::launch().await {
-            Ok(b) => b,
-            Err(launch_err) => {
-                let cdp_err = anyhow!("CF 质询需浏览器环境：{launch_err:#}");
-                drop(guard);
-                // 无内置浏览器 → camoufox 兜底（默认启用；仍失败合并错误）
-                return finish_with_fallback(url, cookies, max_wait_ms, &cdp_err, camo_err).await;
+    // ② 求解尝试循环（最多 2 次——失败换新浏览器上下文重试）：
+    //    惰性启动 / 复用（每用户命名空间独立浏览器实例——防跨用户 cookie 泄漏）；
+    //    proxy 变化 → 弃用旧实例（代理是进程级参数，无法热切换）
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        if let Some(s) = guard.get(ns) {
+            if s.proxy.as_deref() != proxy {
+                tracing::info!(
+                    "书源代理变化（{} → {:?}）——弃用既有浏览器会话",
+                    s.proxy.as_deref().unwrap_or("(直连)"),
+                    proxy
+                );
+                guard.remove(ns);
             }
-        };
-        guard.insert(
-            ns.to_string(),
-            CfSession {
-                browser,
-                last_used: std::time::Instant::now(),
-            },
-        );
-    }
-    let result = {
-        let session = guard.get_mut(ns).expect("just initialized");
-        session.last_used = std::time::Instant::now();
-        solve_with(
-            &mut session.browser,
-            url,
-            cookies,
-            max_wait_ms,
-            include_slider,
-        )
-        .await
-    };
-    match result {
-        Ok(sol) => {
-            spawn_cf_session_reaper();
-            Ok(sol)
         }
-        Err(e) => {
-            // 超时/异常 → 弃用该用户实例（Drop 杀进程 + 清 user-data-dir），下次自动重启
-            guard.remove(ns);
-            drop(guard);
-            // ② CDP 失败 → camoufox 兜底（仍失败才报错）
-            finish_with_fallback(url, cookies, max_wait_ms, &e, camo_err).await
+        if !guard.contains_key(ns) {
+            let browser = match Browser::launch_proxy(proxy.map(String::from)).await {
+                Ok(b) => b,
+                Err(launch_err) => {
+                    let cdp_err = anyhow!("CF 质询需浏览器环境：{launch_err:#}");
+                    drop(guard);
+                    // 无内置浏览器 → camoufox 兜底（默认启用；仍失败合并错误）
+                    return finish_with_fallback(url, cookies, max_wait_ms, &cdp_err, camo_err)
+                        .await;
+                }
+            };
+            guard.insert(
+                ns.to_string(),
+                CfSession {
+                    browser,
+                    last_used: std::time::Instant::now(),
+                    proxy: proxy.map(String::from),
+                },
+            );
+        }
+        let result = {
+            let session = guard.get_mut(ns).expect("just initialized");
+            session.last_used = std::time::Instant::now();
+            solve_with(
+                &mut session.browser,
+                url,
+                cookies,
+                max_wait_ms,
+                include_slider,
+            )
+            .await
+        };
+        match result {
+            Ok(sol) => {
+                spawn_cf_session_reaper();
+                return Ok(sol);
+            }
+            Err(e) => {
+                // 超时/异常 → 弃用该用户实例（Drop 杀进程 + 清 user-data-dir）
+                guard.remove(ns);
+                if attempts >= 2 {
+                    drop(guard);
+                    // ③ CDP 两次尝试均失败 → camoufox 兜底（仍失败才报错）
+                    return finish_with_fallback(url, cookies, max_wait_ms, &e, camo_err).await;
+                }
+                tracing::warn!(
+                    "CF/Turnstile 求解失败（第 {attempts} 次）——更换全新浏览器上下文重试: {e:#}"
+                );
+                // 继续循环：重新 launch 全新浏览器实例
+            }
         }
     }
 }
@@ -1079,14 +1307,22 @@ async fn solve_with(
     //    变化到目标页；Turnstile 分支：检测 → 点击容器 → 每 800ms 轮询 token；
     //    滑块分支（solve_captcha 入口）：检测到即拖拽；reCAPTCHA/hCaptcha → 明确错误。
     let deadline = std::time::Instant::now() + Duration::from_millis(max_wait_ms);
-    // Turnstile token 轮询上限（任务要求最多 30s——仅对真 Turnstile widget 生效；
-    // 经典 CF 质询误命中 iframe 特征时不受此限，仍按 max_wait_ms）
+    // Turnstile token 轮询上限（任务要求最多 45s——Turnstile 慢网络下 30s 偏紧；
+    // 仅对真 Turnstile widget 生效；经典 CF 质询误命中 iframe 特征时不受此限，
+    // 仍按 max_wait_ms）
     let turnstile_deadline =
         std::time::Instant::now() + Duration::from_millis(max_wait_ms.min(TURNSTILE_MAX_WAIT_MS));
     let mut turnstile_mode = false;
     let mut turnstile_widget = false; // 页面确有 Turnstile widget（容器/input/标题/turnstile iframe）
     let mut turnstile_clicked = false;
     let mut turnstile_token: Option<String> = None;
+    let mut turnstile_sitekey: Option<String> = None;
+    // 点击后无 token 的策略升级状态（换求解手段，不干等）：
+    // executed=已调 window.turnstile.execute；polls=点击后的轮询次数；
+    // click_round=iframe 内换元素点击轮次（0→1 变体选择器；1→2 完整重点击）
+    let mut turnstile_executed = false;
+    let mut turnstile_polls: u32 = 0;
+    let mut turnstile_click_round: u32 = 0;
     let mut slider_dragged = false;
     let mut saw_classic_challenge = false; // 经典 CF 质询特征曾出现（误判 Turnstile 时据此退出）
     loop {
@@ -1125,7 +1361,7 @@ async fn solve_with(
         // ② Turnstile 检测（每次迭代刷新——widget 可能延迟渲染；script 标签先命中、容器后出现）
         //    注意：turnstile_widget 只看页面级特征（.cf-turnstile 容器 / 隐藏 input / 标题）
         //    ——iframe[src*=challenges.cloudflare.com] 单独命中不算 widget（经典 CF 质询页
-        //    也内嵌该 iframe，误判会触发 30s token 轮询上限并破坏经典质询等待循环）
+        //    也内嵌该 iframe，误判会触发 45s token 轮询上限并破坏经典质询等待循环）
         if !turnstile_mode {
             if let Ok(d) = browser.evaluate(TURNSTILE_DETECT_JS).await {
                 let ts = d
@@ -1140,8 +1376,20 @@ async fn solve_with(
                         .unwrap_or(false)
                         || d.get("hasInput").and_then(|v| v.as_bool()).unwrap_or(false)
                         || d.get("hasTitle").and_then(|v| v.as_bool()).unwrap_or(false);
+                    // sitekey 提取（页面 data-sitekey / iframe src / api.js URL /
+                    // turnstile.render 参数——日志/调试用，存 CfSolution）
+                    if let Ok(sk) = browser.evaluate(TURNSTILE_SITEKEY_JS).await {
+                        let sk = sk
+                            .get("sitekey")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                        if sk.is_some() {
+                            turnstile_sitekey = sk;
+                        }
+                    }
                     tracing::warn!(
-                        "Turnstile 检测命中 {url}: container={} input={} title={} iframeTs={}",
+                        "Turnstile 检测命中 {url}: container={} input={} title={} iframeTs={} sitekey={:?}",
                         d.get("hasContainer")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false),
@@ -1150,6 +1398,7 @@ async fn solve_with(
                         d.get("iframeIsTurnstile")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false),
+                        turnstile_sitekey,
                     );
                 }
             }
@@ -1163,11 +1412,26 @@ async fn solve_with(
                     || d.get("hasTitle").and_then(|v| v.as_bool()).unwrap_or(false)
                 {
                     turnstile_widget = true;
+                    // 容器/input 出现后再补提取一次 sitekey（脚本标签先命中时容器未渲染）
+                    if turnstile_sitekey.is_none() {
+                        if let Ok(sk) = browser.evaluate(TURNSTILE_SITEKEY_JS).await {
+                            let sk = sk
+                                .get("sitekey")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(String::from);
+                            if sk.is_some() {
+                                turnstile_sitekey = sk;
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // ③ Turnstile 流程：点击容器 → 轮询 token（每 800ms）——token 非空即通过
+        // ③ Turnstile 流程：点击容器 → 轮询 token（每 800ms）——token 非空即通过；
+        //    点击后无 token 自动策略升级（① window.turnstile.execute 程序化触发；
+        //    ② iframe 内不同元素点击（checkbox 变体选择器）；③ 完整重点击一轮）
         if turnstile_mode {
             if !turnstile_clicked {
                 if click_turnstile(browser).await? {
@@ -1176,10 +1440,51 @@ async fn solve_with(
                 tokio::time::sleep(Duration::from_millis(TURNSTILE_POLL_MS)).await;
                 continue;
             }
+            turnstile_polls += 1;
             if let Ok(v) = browser.evaluate(TURNSTILE_TOKEN_JS).await {
                 if let Some(s) = v.as_str().filter(|s| !s.is_empty()) {
                     turnstile_token = Some(s.to_string());
                     break;
+                }
+            }
+            // 升级①：点击后约 3.2s 无 token → 直接调 window.turnstile.execute
+            //（widget 暴露 render/execute 的 response 回调时；不 await——obscura 定时器
+            //  不可靠，token 由轮询 getResponse 兜底收集）
+            if turnstile_polls >= TURNSTILE_ESCALATE_EXECUTE && !turnstile_executed {
+                turnstile_executed = true;
+                if let Ok(how) = browser.evaluate(TURNSTILE_EXECUTE_JS).await {
+                    tracing::info!(
+                        "Turnstile 点击后无 token——程序化 execute 触发（target={:?}）",
+                        how.as_str().unwrap_or("")
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(TURNSTILE_POLL_MS)).await;
+                continue;
+            }
+            // 升级②：点击后约 6.4s 仍无 token → iframe 内不同元素点击
+            //（checkbox 变体选择器扩展：.ctp-checkbox/input[type=checkbox]/[role=checkbox]/label 内第一元素）
+            if turnstile_polls >= TURNSTILE_ESCALATE_CLICK2 && turnstile_click_round == 0 {
+                turnstile_click_round = 1;
+                if let Ok(v) = browser
+                    .evaluate_in_frame("challenges.cloudflare.com", TURNSTILE_FRAME_CLICK_JS)
+                    .await
+                {
+                    if v.as_bool().unwrap_or(false) {
+                        tracing::info!(
+                            "Turnstile 无 token——iframe 内 checkbox 变体元素点击（轮 1）"
+                        );
+                        tokio::time::sleep(Duration::from_millis(TURNSTILE_POLL_MS)).await;
+                        continue;
+                    }
+                }
+            }
+            // 升级③：点击后约 16s 仍无 token → 完整重点击一轮（容器 + iframe + 坐标）
+            if turnstile_polls >= TURNSTILE_ESCALATE_CLICK3 && turnstile_click_round == 1 {
+                turnstile_click_round = 2;
+                if click_turnstile(browser).await? {
+                    tracing::info!("Turnstile 无 token——完整重点击一轮（轮 2）");
+                    tokio::time::sleep(Duration::from_millis(TURNSTILE_POLL_MS)).await;
+                    continue;
                 }
             }
             // 退出：URL 变化（表单提交/跳转）；或非 widget 命中（经典质询误判）且质询已清除
@@ -1311,6 +1616,7 @@ async fn solve_with(
         cookies: cookies_out,
         user_agent,
         turnstile_token,
+        turnstile_sitekey,
     })
 }
 
@@ -1334,18 +1640,10 @@ async fn click_turnstile(browser: &mut Browser) -> Result<bool> {
     if w < 2.0 || h < 2.0 {
         return Ok(false); // widget iframe 尚未布局——下次迭代重试
     }
-    // obscura 不投递 CDP 坐标事件——优先 iframe 内 JS 点击勾选框（跨源 iframe 需 frame 上下文）
-    let frame_click = r#"(function(){
-      var el = document.querySelector('input[type="checkbox"]')
-        || document.querySelector('.ctp-checkbox-label')
-        || document.querySelector('[role="checkbox"]');
-      if (el) { el.click(); return true; }
-      var label = document.querySelector('label');
-      if (label) { label.click(); return true; }
-      return false;
-    })()"#;
+    // obscura 不投递 CDP 坐标事件——优先 iframe 内 JS 点击勾选框（跨源 iframe 需 frame
+    // 上下文；checkbox 变体选择器扩展：.ctp-checkbox/input[type=checkbox]/[role=checkbox]/label）
     if let Ok(v) = browser
-        .evaluate_in_frame("challenges.cloudflare.com", frame_click)
+        .evaluate_in_frame("challenges.cloudflare.com", TURNSTILE_FRAME_CLICK_JS)
         .await
     {
         if v.as_bool().unwrap_or(false) {
@@ -1383,6 +1681,73 @@ pub fn unsupported_captcha_kind(body: &str) -> Option<&'static str> {
     }
     if b.contains("h-captcha") || b.contains("hcaptcha.com") || b.contains("/hcaptcha") {
         return Some("hCaptcha");
+    }
+    None
+}
+
+/// 从 HTML 提取 Turnstile sitekey（纯 Rust 解析——预检/日志用，与浏览器内
+/// TURNSTILE_SITEKEY_JS 镜像）：依次尝试 ① data-sitekey 属性；② iframe src 的
+/// sitekey query 参数；③ turnstile/api.js 脚本 URL 的 sitekey query 参数。
+/// 未命中 → None。大小写不敏感（HTML 属性名不区分大小写）。
+pub fn extract_turnstile_sitekey(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    // ① data-sitekey 属性（.cf-turnstile 容器或任意元素）
+    for attr in ["data-sitekey=", "data-sitekey = "] {
+        let mut from = 0usize;
+        while let Some(idx) = lower[from..].find(attr) {
+            let start = from + idx + attr.len();
+            let rest = &html[start..];
+            if let Some(v) = rest
+                .strip_prefix('"')
+                .and_then(|r| r.split('"').next())
+                .or_else(|| rest.strip_prefix('\'').and_then(|r| r.split('\'').next()))
+            {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+            from = start + 1;
+        }
+    }
+    // ② iframe src / ③ 脚本 src 的 sitekey query 参数（URL 编码值原样返回）
+    for (open, close) in [("<iframe", ">"), ("<script", ">")] {
+        let mut from = 0usize;
+        while let Some(idx) = lower[from..].find(open) {
+            let tag_start = from + idx;
+            let Some(tag_end) = lower[tag_start..].find(close) else {
+                break;
+            };
+            let tag = &html[tag_start..tag_start + tag_end];
+            let tag_lower = tag.to_lowercase();
+            let is_turnstile = tag_lower.contains("challenges.cloudflare.com")
+                || tag_lower.contains("turnstile/api.js");
+            if is_turnstile {
+                if let Some(sk) = url_query_param(tag, "sitekey") {
+                    return Some(sk);
+                }
+            }
+            from = tag_start + tag_end + 1;
+        }
+    }
+    None
+}
+
+/// 从 URL/标签文本提取 query 参数值（简单解析——无 URL 解析依赖；未命中 → None）
+fn url_query_param(text: &str, key: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let mut from = 0usize;
+    while let Some(idx) = lower[from..].find(&format!("{key}=")) {
+        let start = from + idx + key.len() + 1;
+        let rest = &text[start..];
+        let v: String = rest
+            .chars()
+            .take_while(|c| *c != '&' && *c != '\"' && *c != '\'' && !c.is_whitespace())
+            .collect();
+        if !v.is_empty() {
+            return Some(v);
+        }
+        from = start + 1;
     }
     None
 }
@@ -1606,13 +1971,18 @@ mod tests {
 
     #[test]
     fn test_turnstile_js_constants_shape() {
-        // 冒烟：Turnstile 检测/点击/token 读取/stealth 注入 JS 均可被 boa 解析执行
+        // 冒烟：Turnstile 检测/点击/token 读取/sitekey 提取/execute 重试/iframe 点击/
+        // render 捕获 hook/stealth 注入 JS 均可被 boa 解析执行
         // （无 DOM 环境——检测返回 false、点击返回 no-element、token 返回空串）
         let vars = std::collections::HashMap::new();
         for (name, js) in [
             ("TURNSTILE_DETECT_JS", TURNSTILE_DETECT_JS),
             ("TURNSTILE_CLICK_JS", TURNSTILE_CLICK_JS),
             ("TURNSTILE_TOKEN_JS", TURNSTILE_TOKEN_JS),
+            ("TURNSTILE_HOOK_JS", TURNSTILE_HOOK_JS),
+            ("TURNSTILE_SITEKEY_JS", TURNSTILE_SITEKEY_JS),
+            ("TURNSTILE_EXECUTE_JS", TURNSTILE_EXECUTE_JS),
+            ("TURNSTILE_FRAME_CLICK_JS", TURNSTILE_FRAME_CLICK_JS),
             (
                 "UNSUPPORTED_CAPTCHA_DETECT_JS",
                 UNSUPPORTED_CAPTCHA_DETECT_JS,
@@ -1622,6 +1992,101 @@ mod tests {
             let r = crate::parser::js::eval_js(js, &vars);
             assert!(r.is_ok(), "{name} 应可被 boa 解析执行");
         }
+    }
+
+    #[test]
+    fn test_extract_turnstile_sitekey() {
+        // ① data-sitekey 属性（.cf-turnstile 容器）
+        assert_eq!(
+            extract_turnstile_sitekey(
+                r#"<div class="cf-turnstile" data-sitekey="0x4AAAAAAA-mockkey"></div>"#
+            )
+            .as_deref(),
+            Some("0x4AAAAAAA-mockkey")
+        );
+        // 属性名大小写不敏感 + 单引号
+        assert_eq!(
+            extract_turnstile_sitekey(r#"<DIV DATA-SITEKEY='0x4BBBBB'>"#).as_deref(),
+            Some("0x4BBBBB")
+        );
+        // ② iframe src query
+        assert_eq!(
+            extract_turnstile_sitekey(
+                r#"<iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/orchestrate/turnstile/v1?x=1&sitekey=0x4CCCCC&y=2">"#
+            )
+            .as_deref(),
+            Some("0x4CCCCC")
+        );
+        // ③ turnstile/api.js 脚本 URL query（手动加载形式）
+        assert_eq!(
+            extract_turnstile_sitekey(
+                r#"<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?sitekey=0x4DDDDD" async defer></script>"#
+            )
+            .as_deref(),
+            Some("0x4DDDDD")
+        );
+        // 非 turnstile iframe 的 sitekey 不命中（只认 challenges.cloudflare.com）
+        assert_eq!(
+            extract_turnstile_sitekey(r#"<iframe src="https://other.com/x?sitekey=0x9999">"#),
+            None
+        );
+        // 未命中 → None
+        assert_eq!(extract_turnstile_sitekey("<html>hello</html>"), None);
+        assert_eq!(extract_turnstile_sitekey(""), None);
+        // 空属性值 → 继续找下一来源
+        assert_eq!(
+            extract_turnstile_sitekey(
+                r#"<div data-sitekey=""></div><iframe src="https://challenges.cloudflare.com/turnstile/v1?sitekey=0x4EEEEE">"#
+            )
+            .as_deref(),
+            Some("0x4EEEEE")
+        );
+    }
+
+    #[test]
+    fn test_obscura_serve_command_proxy_arg() {
+        // 无代理：不带 --proxy
+        let cmd = obscura_serve_command(std::path::Path::new("obscura"), 12345, None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "serve",
+                "--port",
+                "12345",
+                "--stealth",
+                "--allow-private-network",
+            ]
+        );
+        // 有代理：--proxy 紧跟代理地址
+        let cmd = obscura_serve_command(
+            std::path::Path::new("obscura"),
+            12345,
+            Some("socks5://127.0.0.1:1080"),
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "serve",
+                "--port",
+                "12345",
+                "--stealth",
+                "--allow-private-network",
+                "--proxy",
+                "socks5://127.0.0.1:1080",
+            ]
+        );
+        // 空/纯空白代理 → 不附加（等价无代理）
+        let cmd = obscura_serve_command(std::path::Path::new("obscura"), 1, Some("  "));
+        let n = cmd.get_args().count();
+        assert_eq!(n, 5, "空白代理不应附加 --proxy（实际参数数 {n}）");
     }
 
     #[test]

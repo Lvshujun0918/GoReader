@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! JS 规则执行（boa_engine 0.19，对齐 legado AnalyzeByJS / js 规则）
 //!
 //! v2 支持：
@@ -1050,7 +1051,7 @@ async fn solve_page(
     }
     #[cfg(not(test))]
     {
-        let sol = crate::service::browser::solve_captcha(&ns, &url, &cookies, 60_000)
+        let sol = crate::service::browser::solve_captcha(&ns, &url, &cookies, 60_000, None)
             .await
             .map_err(|e| anyhow!("浏览器加载失败（{url}）: {e:#}"))?;
         Ok((sol.html, sol.cookies, sol.user_agent))
@@ -1543,7 +1544,7 @@ fn java_des_encode(
     }
     let mut key_bytes = key.as_bytes().to_vec();
     key_bytes.resize(8, 0);
-    use des::cipher::{Block, BlockCipherEncrypt, KeyInit};
+    use des::cipher::{BlockCipherEncrypt, KeyInit};
     let cipher = des::Des::new_from_slice(&key_bytes[..8])
         .map_err(|e| js_native_error(format!("java.desEncodeToBase64String: {e}")))?;
     // PKCS5/7 padding
@@ -1552,7 +1553,7 @@ fn java_des_encode(
     padded.extend(std::iter::repeat_n(pad as u8, pad));
     let mut out = Vec::with_capacity(padded.len());
     for chunk in padded.chunks(8) {
-        let mut block = Block::<des::Des>::clone_from_slice(chunk);
+        let mut block = des::cipher::Block::<des::Des>::clone_from_slice(chunk);
         cipher.encrypt_block(&mut block);
         out.extend_from_slice(&block);
     }
@@ -1620,19 +1621,15 @@ fn http_response_object(
                     let mut req = ObjectInitializer::new(ctx);
                     let u = url.clone();
                     req.function(
-                        unsafe {
-                            NativeFunction::from_closure(move |_t, _a, _c| {
-                                Ok(JsValue::from(JsString::from(u.clone())))
-                            })
-                        },
+                        NativeFunction::from_closure(move |_t, _a, _c| {
+                            Ok(JsValue::from(JsString::from(u.clone())))
+                        }),
                         JsString::from("url"),
                         0,
                     );
                     let c = code;
                     req.function(
-                        unsafe {
-                            NativeFunction::from_closure(move |_t, _a, _c| Ok(JsValue::from(c)))
-                        },
+                        NativeFunction::from_closure(move |_t, _a, _c| Ok(JsValue::from(c))),
                         JsString::from("code"),
                         0,
                     );

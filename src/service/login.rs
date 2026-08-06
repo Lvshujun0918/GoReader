@@ -376,10 +376,11 @@ pub async fn login_http(
             20,
             body.as_deref(),
             suffix.charset.as_deref(),
+            source.proxy_url.as_deref(),
         )
         .await?
     } else {
-        crawler::http_get(ns, &url, &req_headers, 20).await?
+        crawler::http_get(ns, &url, &req_headers, 20, source.proxy_url.as_deref()).await?
     };
 
     // Set-Cookie 合并存库（按用户）

@@ -1311,7 +1311,16 @@ async fn submit_captcha(
 
 /// GET/POST /reader3/getCacheInfo：缓存统计（toc_cache 行数 / book_chapters 行数 /
 /// 章节近似大小 sum length(content) / 目录缓存大小 / 总大小）
-async fn get_cache_info(State(state): State<AppState>) -> Json<ReturnData> {
+/// P0-9：需登录（resolve_namespace）——secure 模式匿名请求拒绝 NEED_LOGIN
+async fn get_cache_info(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<ReturnData> {
+    // P0-9：缓存统计/清理接口加登录校验（缓存为全局表，不按命名空间隔离，仅要求登录）
+    if let Err(ret) = resolve_namespace(&state, &params, &headers).await {
+        return Json(ret);
+    }
     match state.storage.get_cache_info().await {
         Ok(info) => Json(ReturnData::ok(
             serde_json::to_value(info).unwrap_or(serde_json::Value::Null),
@@ -1324,11 +1333,16 @@ async fn get_cache_info(State(state): State<AppState>) -> Json<ReturnData> {
 }
 
 /// POST /reader3/clearCache：清空缓存（body/query {type: "toc"|"chapters"|"all"}）
+/// P0-9：需登录（resolve_namespace）——secure 模式匿名请求拒绝 NEED_LOGIN
 async fn clear_cache(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
+    if let Err(ret) = resolve_namespace(&state, &params, &headers).await {
+        return Json(ret);
+    }
     let mut cache_type = params.get("type").cloned().unwrap_or_default();
     if let Some(body) = body {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
@@ -1775,7 +1789,6 @@ async fn mark_rss_article_read(
     if let Err(ret) = require_rss_permission(&state, &namespace).await {
         return Json(ret);
     }
-    let _ = namespace;
     let body_json: Option<Value> = body.as_ref().and_then(|b| serde_json::from_slice(b).ok());
     let url = param_of(&params, body_json.as_ref(), "articleUrl");
     if url.is_empty() {
@@ -1785,7 +1798,13 @@ async fn mark_rss_article_read(
         .as_ref()
         .and_then(|b| b.get("read").and_then(|v| v.as_bool()))
         .unwrap_or(true);
-    match state.storage.set_rss_article_read(&url, read).await {
+    // P0-4：按 (ns, url) 查改——跨命名空间/不存在的文章影响 0 行 → 显式拒绝
+    match state
+        .storage
+        .set_rss_article_read(&namespace, &url, read)
+        .await
+    {
+        Ok(0) => Json(ReturnData::err("文章不存在或无权操作")),
         Ok(_) => Json(ReturnData::ok(Value::Null)),
         Err(e) => {
             tracing::error!("markRssArticleRead 失败: {e}");
@@ -1810,14 +1829,13 @@ async fn get_rss_article(
     if let Err(ret) = require_rss_permission(&state, &namespace).await {
         return Json(ret);
     }
-    let _ = namespace;
     let body_json: Option<Value> = body.as_ref().and_then(|b| serde_json::from_slice(b).ok());
     let url = param_of(&params, body_json.as_ref(), "url");
     if url.is_empty() {
         return Json(ReturnData::err("RSS文章链接不能为空"));
     }
-    // 已入库且带 content → 直接返回（content 字段随序列化输出）
-    if let Ok(Some(article)) = state.storage.get_rss_article(&url).await {
+    // P0-4：按 (ns, url) 查——跨命名空间文章视为未入库（走网页抓取兜底）
+    if let Ok(Some(article)) = state.storage.get_rss_article(&namespace, &url).await {
         if article
             .content
             .as_deref()
@@ -2810,18 +2828,20 @@ async fn collect_export_chapters(
         }
         return Ok((book.name, book.author, chapters));
     }
-    // ② 文件型本地书：解析原文件（TXT 用用户规则）
+    // ② 文件型本地书：解析原文件（TXT 用用户规则）。P0-7：必须当前 ns 书架归属
+    //（防跨用户任意文件读取——url 直传不再放行）
     if is_file {
+        let book = shelf.ok_or_else(|| "书籍不存在（请先加入书架）".to_string())?;
         let path = resolve_export_file_path(&state.storage.config.storage_dir(), url)
             .ok_or_else(|| "本地书文件不存在".to_string())?;
         let user_rules = txt_toc_rule_regexes(state, ns).await;
         let imported = crate::service::local_book::parse_loc_book_path(&path, &user_rules)
             .map_err(|e| format!("解析失败: {e}"))?;
-        let name = shelf
-            .as_ref()
-            .map(|b| b.name.clone())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| imported.meta.title.clone());
+        let name = if book.name.is_empty() {
+            imported.meta.title.clone()
+        } else {
+            book.name.clone()
+        };
         let chapters: Vec<(String, String)> = imported
             .chapters
             .iter()
@@ -6236,14 +6256,15 @@ fn import_preview_from_bytes(
 }
 
 /// POST /reader3/readSourceFile：读取书源文件文本（body {path}）
-/// secure 模式限 storage 目录内（resolve_storage_path 防穿越）；非 secure 限工作目录内
+/// P0-5：secure 模式限 {storage_dir}/data/{ns}/ 用户子目录内（防跨用户读取，
+/// resolve_secure_path 组件级防穿越）；非 secure 限工作目录内
 async fn read_source_file(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
-    let _namespace = match resolve_namespace(&state, &params, &headers).await {
+    let namespace = match resolve_namespace(&state, &params, &headers).await {
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
@@ -6252,13 +6273,23 @@ async fn read_source_file(
     if path.is_empty() {
         return Json(ReturnData::err("参数错误"));
     }
-    let file = if state.storage.config.secure {
-        resolve_storage_path(&state.storage.config.storage_dir(), &path)
+    // secure：base = 用户子目录（storage/data/{ns}/）；legacy "storage/" 前缀按相对用户目录处理
+    let base = if state.storage.config.secure {
+        state
+            .storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join(&namespace)
     } else {
-        let base = std::path::PathBuf::from(&state.storage.config.work_dir);
-        crate::api::files::resolve_secure_path(&base, &path)
+        std::path::PathBuf::from(&state.storage.config.work_dir)
     };
-    let Some(file) = file else {
+    let rel = if state.storage.config.secure {
+        path.trim_start_matches("storage/")
+    } else {
+        path.as_str()
+    };
+    let Some(file) = crate::api::files::resolve_secure_path(&base, rel) else {
         return Json(ReturnData::err("路径不存在"));
     };
     if !file.is_file() {
@@ -7274,45 +7305,63 @@ fn is_loc_book_file_chapter(chapter_url: &str) -> bool {
 }
 
 /// legacy 本地书文件定位：book_url 指向的文件可能缺失（legacy 导入时改名 index.epub）
-/// 兜底：父目录 index.epub → 任意 epub/txt
+/// 兜底：父目录 index.epub → 任意 epub/txt。
+/// P0-7：返回前 canonicalize + containment 校验——路径必须在 storage_dir 内
+/// （防 .. 穿越/绝对路径/符号链接逃逸；与 resolve_storage_path 同模式）
 fn resolve_loc_book_file(
     storage_dir: &std::path::Path,
     book_url: &str,
 ) -> Option<std::path::PathBuf> {
     let path = storage_dir.join(book_url.trim_start_matches("storage/"));
+    let mut found: Option<std::path::PathBuf> = None;
     if path.is_file() {
-        return Some(path);
+        found = Some(path.clone());
     }
     // legacy 的 epub 是目录（{书名}.epub/ 内含 index.epub）
-    if path.is_dir() {
+    if found.is_none() && path.is_dir() {
         let idx = path.join("index.epub");
         if idx.is_file() {
-            return Some(idx);
-        }
-        let rd = std::fs::read_dir(&path).ok()?;
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_file() && p.to_string_lossy().to_lowercase().ends_with(".epub") {
-                return Some(p);
+            found = Some(idx);
+        } else {
+            let rd = std::fs::read_dir(&path).ok()?;
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file() && p.to_string_lossy().to_lowercase().ends_with(".epub") {
+                    found = Some(p);
+                    break;
+                }
             }
         }
     }
-    let parent = path.parent()?;
-    let idx = parent.join("index.epub");
-    if idx.is_file() {
-        return Some(idx);
-    }
-    let rd = std::fs::read_dir(parent).ok()?;
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_file() {
-            let lower = p.to_string_lossy().to_lowercase();
-            if lower.ends_with(".epub") || lower.ends_with(".txt") {
-                return Some(p);
+    if found.is_none() {
+        let parent = path.parent()?;
+        let idx = parent.join("index.epub");
+        if idx.is_file() {
+            found = Some(idx);
+        } else {
+            let rd = std::fs::read_dir(parent).ok()?;
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    let lower = p.to_string_lossy().to_lowercase();
+                    if lower.ends_with(".epub") || lower.ends_with(".txt") {
+                        found = Some(p);
+                        break;
+                    }
+                }
             }
         }
     }
-    None
+    let p = found?;
+    let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
+    let root = storage_dir
+        .canonicalize()
+        .unwrap_or_else(|_| storage_dir.to_path_buf());
+    if abs.starts_with(&root) && abs.is_file() {
+        Some(abs)
+    } else {
+        None
+    }
 }
 
 /// legacy 本地书目录：toc_url 是分章正则（或空）——查书架定位 TXT 文件 → 按规则分章
@@ -8295,7 +8344,7 @@ mod tests {
         .await;
         assert_eq!(ret.0.error_msg, "参数错误");
 
-        // secure：storage 内可读、storage 外拒绝（需登录）
+        // secure：用户子目录（storage/data/{ns}/）内可读、目录外拒绝（需登录）
         state.storage.config.secure = true;
         state
             .storage
@@ -8306,12 +8355,22 @@ mod tests {
             })
             .await
             .unwrap();
+        state
+            .storage
+            .insert_user(&User {
+                username: "bob".into(),
+                token: "tokb".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         let auth_params: HashMap<String, String> = [("accessToken".into(), "alice:tok9".into())]
             .into_iter()
             .collect();
         let storage_dir = state.storage.config.storage_dir();
-        std::fs::create_dir_all(&storage_dir).unwrap();
-        std::fs::write(storage_dir.join("bookSource.json"), "[secure]").unwrap();
+        let alice_dir = storage_dir.join("data").join("alice");
+        std::fs::create_dir_all(&alice_dir).unwrap();
+        std::fs::write(alice_dir.join("bookSource.json"), "[secure]").unwrap();
         let body = Bytes::from(r#"{"path":"storage/bookSource.json"}"#);
         let ret = read_source_file(
             AxumState(state.clone()),
@@ -8322,7 +8381,7 @@ mod tests {
         .await;
         assert!(
             ret.0.is_success,
-            "secure storage 内应可读: {}",
+            "secure 用户目录内应可读: {}",
             ret.0.error_msg
         );
         assert_eq!(ret.0.data, json!("[secure]"));
@@ -8330,13 +8389,60 @@ mod tests {
         std::fs::write(dir.join("work-only.txt"), "outside").unwrap();
         let ret = read_source_file(
             AxumState(state.clone()),
-            Query(auth_params),
+            Query(auth_params.clone()),
             HeaderMap::new(),
             Some(body),
         )
         .await;
         assert!(!ret.0.is_success, "工作目录文件在 secure 下不可达");
         assert_eq!(ret.0.error_msg, "路径不存在");
+        // storage 根下的文件（非用户子目录）也不可达
+        std::fs::write(storage_dir.join("root-only.json"), "root").unwrap();
+        let body = Bytes::from(r#"{"path":"storage/root-only.json"}"#);
+        let ret = read_source_file(
+            AxumState(state.clone()),
+            Query(auth_params.clone()),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        assert!(!ret.0.is_success, "storage 根文件在 secure 下不可达");
+        assert_eq!(ret.0.error_msg, "路径不存在");
+        // P0-5 跨用户拒绝：bob 目录内文件，alice 不可读（含 .. 穿越到 bob 目录）
+        let bob_dir = storage_dir.join("data").join("bob");
+        std::fs::create_dir_all(&bob_dir).unwrap();
+        std::fs::write(bob_dir.join("secret.txt"), "bob-secret").unwrap();
+        let body = Bytes::from(r#"{"path":"storage/data/bob/secret.txt"}"#);
+        let ret = read_source_file(
+            AxumState(state.clone()),
+            Query(auth_params.clone()),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        assert!(!ret.0.is_success, "跨用户路径应拒绝");
+        assert_eq!(ret.0.error_msg, "路径不存在");
+        let body = Bytes::from(r#"{"path":"../bob/secret.txt"}"#);
+        let ret = read_source_file(
+            AxumState(state.clone()),
+            Query(auth_params.clone()),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        assert!(!ret.0.is_success, ".. 穿越到其他用户目录应拒绝");
+        // 本人（alice）目录内文件仍可读（相对路径不带 storage/ 前缀）
+        std::fs::write(alice_dir.join("mine.txt"), "mine").unwrap();
+        let body = Bytes::from(r#"{"path":"mine.txt"}"#);
+        let ret = read_source_file(
+            AxumState(state.clone()),
+            Query(auth_params),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        assert!(ret.0.is_success, "用户目录内相对路径应可读: {}", ret.0.error_msg);
+        assert_eq!(ret.0.data, json!("mine"));
         cleanup(state, dir).await;
     }
 
@@ -10707,7 +10813,12 @@ mod tests {
             .unwrap();
 
         // getCacheInfo：统计字段（camelCase）
-        let ret = get_cache_info(AxumState(state.clone())).await;
+        let ret = get_cache_info(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await;
         assert!(ret.0.is_success);
         assert_eq!(ret.0.data["tocCacheCount"], 1);
         assert_eq!(ret.0.data["tocCacheSize"], 2, "SQLite length() 按字符计");
@@ -10717,7 +10828,13 @@ mod tests {
 
         // clearCache：type=toc（body）
         let body = Bytes::from(r#"{"type":"toc"}"#);
-        let ret = clear_cache(AxumState(state.clone()), Query(HashMap::new()), Some(body)).await;
+        let ret = clear_cache(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
         assert!(ret.0.is_success, "{}", ret.0.error_msg);
         assert_eq!(ret.0.data["deletedToc"], 1);
         assert_eq!(ret.0.data["deletedChapters"], 0);
@@ -10728,18 +10845,107 @@ mod tests {
         // clearCache：type=chapters（query）
         let params: HashMap<String, String> =
             [("type".into(), "chapters".into())].into_iter().collect();
-        let ret = clear_cache(AxumState(state.clone()), Query(params), None).await;
+        let ret = clear_cache(
+            AxumState(state.clone()),
+            Query(params),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
         assert!(ret.0.is_success);
         assert_eq!(ret.0.data["deletedChapters"], 2);
 
         // 非法 type → 参数错误
         let body = Bytes::from(r#"{"type":"books"}"#);
-        let ret = clear_cache(AxumState(state.clone()), Query(HashMap::new()), Some(body)).await;
+        let ret = clear_cache(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
         assert!(!ret.0.is_success);
         assert_eq!(ret.0.error_msg, "参数错误");
         // 空 body + 空 query → 默认 all（成功）
-        let ret = clear_cache(AxumState(state.clone()), Query(HashMap::new()), None).await;
+        let ret = clear_cache(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
         assert!(ret.0.is_success);
+
+        cleanup(state, dir).await;
+    }
+
+    /// P0-9：getCacheInfo/clearCache 需登录——secure 模式匿名请求拒绝 NEED_LOGIN（且不清数据），
+    /// 携带有效 accessToken 后可用
+    #[tokio::test]
+    async fn test_cache_api_requires_login() {
+        let (mut state, dir) = test_state("cacheauth").await;
+        state.storage.config.secure = true;
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "tok".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .storage
+            .cache_toc("https://book.com/a", "https://book.com/toc", "[]")
+            .await
+            .unwrap();
+
+        // 匿名（无 accessToken）→ 两个接口均 NEED_LOGIN
+        let ret = get_cache_info(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.data, json!("NEED_LOGIN"));
+        let ret = clear_cache(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.data, json!("NEED_LOGIN"));
+        // 数据未被清除
+        let info = state.storage.get_cache_info().await.unwrap();
+        assert_eq!(info.toc_cache_count, 1);
+        assert_eq!(info.chapter_count, 0);
+
+        // 携带有效 accessToken → 统计可用、清理可执行
+        let params: HashMap<String, String> = [("accessToken".into(), "alice:tok".into())]
+            .into_iter()
+            .collect();
+        let ret = get_cache_info(
+            AxumState(state.clone()),
+            Query(params.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["tocCacheCount"], 1);
+        let ret = clear_cache(
+            AxumState(state.clone()),
+            Query(params),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert_eq!(ret.0.data["deletedToc"], 1);
+        let info = state.storage.get_cache_info().await.unwrap();
+        assert_eq!(info.toc_cache_count, 0);
 
         cleanup(state, dir).await;
     }
@@ -13623,7 +13829,7 @@ mod tests {
         assert!(ret.0.is_success, "{}", ret.0.error_msg);
         let got = state
             .storage
-            .get_rss_article("https://feed.example.com/x")
+            .get_rss_article("default", "https://feed.example.com/x")
             .await
             .unwrap()
             .unwrap();
@@ -13641,7 +13847,7 @@ mod tests {
         assert!(
             !state
                 .storage
-                .get_rss_article("https://feed.example.com/x")
+                .get_rss_article("default", "https://feed.example.com/x")
                 .await
                 .unwrap()
                 .unwrap()
@@ -13667,6 +13873,84 @@ mod tests {
         )
         .await;
         assert!(!ret.0.is_success);
+
+        // P0-4 跨用户拒绝：bob 的文章，alice 标记 → 显式拒绝且不影响 bob 状态
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "tok_alice".into(),
+                enable_rss_source: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .storage
+            .insert_user(&User {
+                username: "bob".into(),
+                token: "tok_bob".into(),
+                enable_rss_source: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_rss_articles(
+                "bob",
+                &[crate::model::RssArticle {
+                    url: "https://feed.example.com/bob-only".into(),
+                    source_url: "https://feed.example.com/rss".into(),
+                    title: "Bob".into(),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        let alice_params: HashMap<String, String> =
+            [("accessToken".into(), "alice:tok_alice".into())]
+                .into_iter()
+                .collect();
+        let body = Bytes::from(r#"{"articleUrl":"https://feed.example.com/bob-only","read":true}"#);
+        let ret = mark_rss_article_read(
+            AxumState(state.clone()),
+            Query(alice_params.clone()),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        assert!(!ret.0.is_success, "跨用户标记应被拒绝");
+        assert_eq!(ret.0.error_msg, "文章不存在或无权操作");
+        let bob_art = state
+            .storage
+            .get_rss_article("bob", "https://feed.example.com/bob-only")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!bob_art.read, "跨用户标记不得改动他人已读状态");
+        // 本人（bob）标记成功
+        let bob_params: HashMap<String, String> = [("accessToken".into(), "bob:tok_bob".into())]
+            .into_iter()
+            .collect();
+        let body = Bytes::from(r#"{"articleUrl":"https://feed.example.com/bob-only","read":true}"#);
+        let ret = mark_rss_article_read(
+            AxumState(state.clone()),
+            Query(bob_params),
+            HeaderMap::new(),
+            Some(body),
+        )
+        .await;
+        assert!(ret.0.is_success, "本人标记应成功: {}", ret.0.error_msg);
+        assert!(
+            state
+                .storage
+                .get_rss_article("bob", "https://feed.example.com/bob-only")
+                .await
+                .unwrap()
+                .unwrap()
+                .read
+        );
 
         cleanup(state, dir).await;
     }
@@ -15555,6 +15839,197 @@ mod tests {
             .unwrap();
         assert!(ch.contains("正文内容。"));
         cleanup(state, dir).await;
+    }
+
+    /// P0-7：exportBook 文件型本地书越权——is_file 分支必须书架归属：
+    /// 未入架文件拒绝（含跨用户文件）；本人书架文件可导出
+    #[tokio::test]
+    async fn test_export_book_file_authz_api() {
+        let (mut state, dir) = test_state("exportauthz").await;
+        let storage_dir = state.storage.config.storage_dir();
+
+        // 本人书架文件书：可导出
+        let book_dir = storage_dir.join("data/default/books");
+        std::fs::create_dir_all(&book_dir).unwrap();
+        let book_url = "storage/data/default/books/我的书.txt";
+        std::fs::write(
+            storage_dir.join("data/default/books/我的书.txt"),
+            "第一章 开始\n正文甲。\n第二章 结束\n正文乙。\n",
+        )
+        .unwrap();
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.into(),
+                    name: "我的书".into(),
+                    author: "作者甲".into(),
+                    origin: "loc_book".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), book_url.into());
+        params.insert("format".into(), "txt".into());
+        let resp = export_book(
+            AxumState(state.clone()),
+            Query(params.clone()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let txt = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(txt.contains("正文甲。"), "书架文件应导出成功: {txt}");
+
+        // 文件存在但未入架 → 拒绝（P0-7：url 直传不再放行）
+        std::fs::write(storage_dir.join("data/default/books/未入架.txt"), "秘密\n").unwrap();
+        let mut p2 = params.clone();
+        p2.insert("url".into(), "storage/data/default/books/未入架.txt".into());
+        let resp = export_book(
+            AxumState(state.clone()),
+            Query(p2),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        let json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap());
+        assert_eq!(json["errorMsg"], "书籍不存在（请先加入书架）");
+
+        // secure + 跨用户：bob 目录内文件，alice 导出 → 拒绝
+        state.storage.config.secure = true;
+        state
+            .storage
+            .insert_user(&User {
+                username: "alice".into(),
+                token: "tka".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .storage
+            .insert_user(&User {
+                username: "bob".into(),
+                token: "tkb".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let bob_dir = storage_dir.join("data/bob");
+        std::fs::create_dir_all(&bob_dir).unwrap();
+        std::fs::write(bob_dir.join("bob-secret.txt"), "bob机密\n").unwrap();
+        // secure 模式：alice 身份 + url 参数
+        let alice_req = |url: &str| -> HashMap<String, String> {
+            [
+                ("accessToken".into(), "alice:tka".into()),
+                ("url".into(), url.into()),
+                ("format".into(), "txt".into()),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let resp = export_book(
+            AxumState(state.clone()),
+            Query(alice_req("storage/data/bob/bob-secret.txt")),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        let json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!json["isSuccess"].as_bool().unwrap(), "跨用户导出应拒绝");
+        assert_eq!(json["errorMsg"], "书籍不存在（请先加入书架）");
+
+        // 穿越路径（.. 越出 storage 指向外部文件）→ 拒绝
+        let outside = storage_dir.parent().unwrap().join("outside-secret.txt");
+        std::fs::write(&outside, "外部机密\n").unwrap();
+        let resp = export_book(
+            AxumState(state.clone()),
+            Query(alice_req("storage/../outside-secret.txt")),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        let json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !json["isSuccess"].as_bool().unwrap(),
+            "穿越路径应拒绝: {}",
+            json["errorMsg"]
+        );
+        assert_eq!(json["errorMsg"], "书籍不存在（请先加入书架）");
+
+        cleanup(state, dir).await;
+    }
+
+    /// P0-7：resolve_loc_book_file canonicalize + containment——正常定位放行、
+    /// .. 越出/绝对路径/符号链接逃逸拒绝
+    #[test]
+    fn test_resolve_loc_book_file_containment() {
+        let base = std::env::temp_dir().join("reader-locbook-resolve");
+        let _ = std::fs::remove_dir_all(&base);
+        let storage_dir = base.join("storage");
+        std::fs::create_dir_all(&storage_dir.join("data/alice")).unwrap();
+        std::fs::write(storage_dir.join("data/alice/ok.txt"), "ok").unwrap();
+        // legacy 目录式 epub（{书}.epub/ 内含 index.epub）
+        std::fs::create_dir_all(&storage_dir.join("data/alice/书.epub")).unwrap();
+        std::fs::write(
+            storage_dir.join("data/alice/书.epub/index.epub"),
+            "legacy",
+        )
+        .unwrap();
+        let escape = base.join("escape.txt");
+        std::fs::write(&escape, "escape").unwrap();
+        let storage_dir = storage_dir.canonicalize().unwrap();
+
+        // 正常：直接文件 + legacy 目录式 index.epub 兜底
+        let p = resolve_loc_book_file(&storage_dir, "storage/data/alice/ok.txt").unwrap();
+        assert_eq!(p, storage_dir.join("data/alice/ok.txt"));
+        let p = resolve_loc_book_file(&storage_dir, "storage/data/alice/书.epub").unwrap();
+        assert_eq!(p, storage_dir.join("data/alice/书.epub/index.epub"));
+
+        // .. 越出 storage → 拒绝
+        assert!(resolve_loc_book_file(&storage_dir, "storage/../escape.txt").is_none());
+        assert!(resolve_loc_book_file(&storage_dir, "storage/a/../../escape.txt").is_none());
+        // 绝对路径（join 替换 base）→ 拒绝
+        assert!(
+            resolve_loc_book_file(&storage_dir, escape.to_string_lossy().as_ref()).is_none(),
+            "绝对路径应拒绝"
+        );
+        // 符号链接逃逸（unix）：storage 内链接指向外部文件 → canonicalize 后拒绝
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&escape, storage_dir.join("data/alice/link.txt")).unwrap();
+            assert!(
+                resolve_loc_book_file(&storage_dir, "storage/data/alice/link.txt").is_none(),
+                "符号链接逃逸应拒绝"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// GAP 140：disableInvalidBookSources——坏源批量禁用、好源保留、返回 count/disabled

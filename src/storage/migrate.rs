@@ -414,14 +414,14 @@ async fn migrate_book_sources(
                 INSERT OR REPLACE INTO book_sources
                     (book_source_url, book_source_name, book_source_group, book_source_type,
                      book_url_pattern, custom_order, enabled, enabled_explore, enabled_cookie_jar,
-                     concurrent_rate, header, login_url, login_ui, login_check_js, login_js,
+                     concurrent_rate, header, proxy_url, login_url, login_ui, login_check_js, login_js,
                      book_source_comment, variable_comment, last_update_time, respond_time,
                      weight, explore_url, search_url, rule_explore, rule_search, rule_book_info,
                      rule_toc, rule_content, rule_related, search_rule, explore_rule, book_info_rule, toc_rule,
                      content_rule, key, tag, logger, variable, user_namespace, raw_json)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                        ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)
+                        ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
                 "#,
             )
             .bind(&src.book_source_url)
@@ -435,6 +435,7 @@ async fn migrate_book_sources(
             .bind(src.enabled_cookie_jar)
             .bind(&src.concurrent_rate)
             .bind(&src.header)
+            .bind(&src.proxy_url)
             .bind(&src.login_url)
             .bind(&src.login_ui)
             .bind(&src.login_check_js)
@@ -598,8 +599,12 @@ fn scan_namespaces_for(data_dir: &Path, file: &str) -> Vec<String> {
     namespaces
 }
 
-/// 各命名空间 bookmark.json（legacy：[{bookUrl,title,chapterIndex,content,time}]）
-/// → bookmarks 表；raw_json 原文保底（legacy content 无对应列，不丢）。
+/// 各命名空间 bookmark.json（legacy：Bookmark 实体 JSON——{time, bookName, bookAuthor,
+/// chapterIndex, chapterPos, chapterName, bookText, content}，无 bookUrl）
+/// → bookmarks 表：book_url ← bookName（legacy 无 URL，书名+作者为最稳定标识；作者为空时仅书名）、
+/// title ← chapterName（同章多书签 → 追加 @time 消歧，避免主键折叠丢数据）、
+/// paragraph_index ← chapterPos、chapter_index ← chapterIndex、created_at ← time；
+/// raw_json 原文保底（bookText/content/bookAuthor 等不丢）。
 /// 幂等：bookmarks 表非空即跳过（表空才迁）。
 async fn migrate_bookmarks(
     pool: &SqlitePool,
@@ -636,6 +641,8 @@ async fn migrate_bookmarks(
         };
         let mut count = 0usize;
         let mut tx = pool.begin().await?;
+        // 主键 (book_url, title) 去重表：同章多书签 → title 追加 @time 消歧
+        let mut used_keys = std::collections::HashSet::new();
         for value in items {
             let get_str = |k: &str| {
                 value
@@ -644,26 +651,47 @@ async fn migrate_bookmarks(
                     .unwrap_or("")
                     .to_string()
             };
-            let book_url = get_str("bookUrl");
-            let title = get_str("title");
-            if book_url.trim().is_empty() || title.trim().is_empty() {
-                tracing::warn!("书签缺 bookUrl/title，跳过");
+            let book_name = get_str("bookName");
+            let book_author = get_str("bookAuthor");
+            let chapter_name = get_str("chapterName");
+            let book_text = get_str("bookText");
+            if book_name.trim().is_empty() {
+                tracing::warn!("书签缺 bookName，跳过");
                 continue;
             }
-            // legacy：content(文本)/time(时间戳)；新格式：paragraphIndex/createdAt——两者兼容
+            // legacy 无 bookUrl：书名（+作者）为稳定标识
+            let book_url = if book_author.trim().is_empty() {
+                book_name.clone()
+            } else {
+                format!("{book_name}::{book_author}")
+            };
+            // title ← chapterName；空则回退 bookText 截断；仍空则占位
+            let base_title = if !chapter_name.trim().is_empty() {
+                chapter_name
+            } else if !book_text.trim().is_empty() {
+                book_text.chars().take(40).collect()
+            } else {
+                "书签".to_string()
+            };
+            let time = value.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
+            let mut title = base_title.clone();
+            let mut suffix = 0u64;
+            while !used_keys.insert((book_url.clone(), title.clone())) {
+                suffix += 1;
+                title = if suffix == 1 {
+                    format!("{base_title}@{time}")
+                } else {
+                    format!("{base_title}@{time}#{suffix}")
+                };
+            }
+            // legacy：chapterPos → paragraph_index、chapterIndex、time（毫秒时间戳）
             let paragraph_index = value
-                .get("paragraphIndex")
+                .get("chapterPos")
                 .and_then(|v| v.as_i64())
-                .or_else(|| value.get("content").and_then(|v| v.as_i64()))
                 .unwrap_or(0);
             let chapter_index = value
                 .get("chapterIndex")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let created_at = value
-                .get("createdAt")
-                .and_then(|v| v.as_i64())
-                .or_else(|| value.get("time").and_then(|v| v.as_i64()))
                 .unwrap_or(0);
             sqlx::query(
                 r#"
@@ -676,7 +704,7 @@ async fn migrate_bookmarks(
             .bind(&title)
             .bind(paragraph_index)
             .bind(chapter_index)
-            .bind(created_at)
+            .bind(time)
             .bind(ns)
             .bind(value.to_string())
             .execute(&mut *tx)
@@ -690,8 +718,10 @@ async fn migrate_bookmarks(
     Ok(total)
 }
 
-/// 各命名空间 replaceRule.json（legacy：[{name,find,replace,enabled,order}]，无 id）
-/// → replace_rules 表；legacy 无 id → 补 uuid（对齐 saveReplaceRule/restore 语义）。
+/// 各命名空间 replaceRule.json（legacy：ReplaceRule 实体 JSON——{id, name, group, pattern,
+/// replacement, scope, scopeTitle, scopeContent, isEnabled, isRegex, timeoutMillisecond, order}）
+/// → replace_rules 表：find ← pattern、replace ← replacement、enable ← isEnabled、
+/// order_num ← order；legacy id 为 Long → 字符串化，缺失补 uuid（对齐 saveReplaceRule/restore 语义）。
 /// 幂等：replace_rules 表非空即跳过（表空才迁）。
 async fn migrate_replace_rules(
     pool: &SqlitePool,
@@ -737,12 +767,13 @@ async fn migrate_replace_rules(
                     .to_string()
             };
             let name = get_str("name");
-            let find = get_str("find");
+            // legacy 真实字段为 pattern（非 find）
+            let find = get_str("pattern");
             if name.trim().is_empty() || find.trim().is_empty() {
-                tracing::warn!("替换规则缺 name/find，跳过");
+                tracing::warn!("替换规则缺 name/pattern，跳过");
                 continue;
             }
-            // legacy 无 id（或有数字 id）→ 统一字符串 id，缺失补 uuid
+            // legacy id 为 Long（数字）→ 统一字符串 id，缺失补 uuid
             let mut id = match value.get("id") {
                 Some(v) => match v.as_str() {
                     Some(s) => s.to_string(),
@@ -753,9 +784,10 @@ async fn migrate_replace_rules(
             if id.trim().is_empty() {
                 id = uuid::Uuid::new_v4().simple().to_string();
             }
-            // enabled/enable、order/orderNum 双兼容（legacy 变体）
+            // legacy 真实字段为 isEnabled（JsonProperty 注解）；enabled/enable 兼容变体
             let enabled = value
-                .get("enabled")
+                .get("isEnabled")
+                .or_else(|| value.get("enabled"))
                 .or_else(|| value.get("enable"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
@@ -774,7 +806,7 @@ async fn migrate_replace_rules(
             .bind(&id)
             .bind(&name)
             .bind(&find)
-            .bind(get_str("replace"))
+            .bind(get_str("replacement"))
             .bind(enabled)
             .bind(order)
             .bind(ns)
@@ -967,8 +999,9 @@ async fn migrate_http_tts(
     Ok(total)
 }
 
-/// 各命名空间 bookGroup.json（legacy：[{id,name,order}]）
-/// → book_groups 表（legacy id 保留，books.group_name 引用不变；id<=0 时自增）。
+/// 各命名空间 bookGroup.json（legacy：BookGroup 实体 JSON——{groupId, groupName, cover, order, show}）
+/// → book_groups 表：id ← groupId、name ← groupName、order_num ← order（legacy id 保留，
+/// books.group_name 引用不变）；cover/show 无对应列 → 不迁移。
 /// 幂等：book_groups 表非空即跳过（表空才迁）。
 async fn migrate_book_groups(
     pool: &SqlitePool,
@@ -1006,16 +1039,17 @@ async fn migrate_book_groups(
         let mut count = 0usize;
         let mut tx = pool.begin().await?;
         for value in items {
+            // legacy 真实字段为 groupName/groupId（非 name/id）
             let name = value
-                .get("name")
+                .get("groupName")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
             if name.trim().is_empty() {
-                tracing::warn!("分组缺 name，跳过");
+                tracing::warn!("分组缺 groupName，跳过");
                 continue;
             }
-            let id = value.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let id = value.get("groupId").and_then(|v| v.as_i64()).unwrap_or(0);
             let order = value.get("order").and_then(|v| v.as_i64()).unwrap_or(0);
             sqlx::query(
                 r#"
@@ -1152,21 +1186,21 @@ mod tests {
         let default = data_dir.join("default");
         std::fs::create_dir_all(&default).unwrap();
         std::fs::create_dir_all(data_dir.join("alice")).unwrap();
-        // 书签：legacy 字段 bookUrl/title/chapterIndex/content/time（任务规格）
+        // 书签：legacy Bookmark 实体 JSON（无 bookUrl；同章两个书签——验证主键消歧）
         std::fs::write(
             default.join("bookmark.json"),
             r#"[
-                {"bookUrl":"https://a.com/book/1","title":"第一章 起点","chapterIndex":1,"content":"这是书签内容","time":1700000000000},
-                {"bookUrl":"https://a.com/book/1","title":"第二章 转折","chapterIndex":2,"content":"第二个书签","time":1700000001000}
+                {"time":1700000000000,"bookName":"三体","bookAuthor":"刘慈欣","chapterIndex":1,"chapterPos":120,"chapterName":"第一章 起点","bookText":"这是书签内容","content":"备注A"},
+                {"time":1700000001000,"bookName":"三体","bookAuthor":"刘慈欣","chapterIndex":1,"chapterPos":300,"chapterName":"第一章 起点","bookText":"第二个书签","content":"备注B"}
             ]"#,
         )
         .unwrap();
-        // 替换规则：legacy 无 id
+        // 替换规则：legacy ReplaceRule 实体 JSON（pattern/replacement/isEnabled；id 为 Long）
         std::fs::write(
             default.join("replaceRule.json"),
             r#"[
-                {"name":"去广告","find":"广告","replace":"","enabled":true,"order":1},
-                {"name":"净化","find":"旧排版","replace":"新排版","enabled":false,"order":2}
+                {"id":1700000000000,"name":"去广告","group":"","pattern":"广告","replacement":"","scope":"content","scopeTitle":false,"scopeContent":true,"isEnabled":true,"isRegex":false,"timeoutMillisecond":3000,"order":1},
+                {"id":1700000001000,"name":"净化","pattern":"旧排版","replacement":"新排版","isEnabled":false,"order":2}
             ]"#,
         )
         .unwrap();
@@ -1179,21 +1213,21 @@ mod tests {
             ]"#,
         )
         .unwrap();
-        // HttpTTS：legacy 含 Long id（模型忽略，url 为主键）
+        // HttpTTS：legacy HttpTTS 实体 JSON（无 type 字段；contentType/header 等保底不迁）
         std::fs::write(
             default.join("httpTTS.json"),
             r#"[
-                {"id":1,"name":"在线TTS","url":"https://tts.example.com/synth","type":0},
-                {"id":2,"name":"本地引擎","url":"local://engine","type":1}
+                {"id":1,"name":"在线TTS","url":"https://tts.example.com/synth","contentType":"audio/mpeg","header":"{}"},
+                {"id":2,"name":"本地引擎","url":"local://engine"}
             ]"#,
         )
         .unwrap();
-        // 分组：legacy id 保留
+        // 分组：legacy BookGroup 实体 JSON（groupId/groupName）
         std::fs::write(
             default.join("bookGroup.json"),
             r#"[
-                {"id":1,"name":"玄幻","order":0},
-                {"id":2,"name":"言情","order":1}
+                {"groupId":1,"groupName":"玄幻","cover":null,"order":0,"show":true},
+                {"groupId":2,"groupName":"言情","cover":null,"order":1,"show":true}
             ]"#,
         )
         .unwrap();
@@ -1256,26 +1290,39 @@ mod tests {
         assert_eq!(count(pool, "book_groups").await, 2);
         assert_eq!(count(pool, "user_config").await, 3); // default 2 + alice 1
 
-        // 书签：legacy content/time → raw_json 保底；paragraph_index 无对应 → 0
+        // 书签：bookName/bookAuthor → book_url（书名::作者）；chapterName → title；
+        // chapterPos → paragraph_index；time → created_at；同章第二枚书签 title 追加 @time 消歧
         let (chapter_index, created_at, paragraph_index): (i64, i64, i64) = sqlx::query_as(
             "SELECT chapter_index, created_at, paragraph_index FROM bookmarks WHERE book_url = ?1 AND title = ?2",
         )
-        .bind("https://a.com/book/1")
+        .bind("三体::刘慈欣")
         .bind("第一章 起点")
         .fetch_one(pool)
         .await
         .unwrap();
         assert_eq!(chapter_index, 1);
         assert_eq!(created_at, 1700000000000);
-        assert_eq!(paragraph_index, 0);
+        assert_eq!(paragraph_index, 120, "chapterPos 应映射 paragraph_index");
         let raw: String = sqlx::query_scalar("SELECT raw_json FROM bookmarks WHERE title = ?1")
             .bind("第一章 起点")
             .fetch_one(pool)
             .await
             .unwrap();
         assert!(
-            raw.contains("这是书签内容"),
-            "legacy content 应保底在 raw_json: {raw}"
+            raw.contains("这是书签内容") && raw.contains("备注A"),
+            "legacy bookText/content 应保底在 raw_json: {raw}"
+        );
+        // 同章第二个书签：title 消歧后缀，bookText/content 均保留
+        let (para2, raw2): (i64, String) =
+            sqlx::query_as("SELECT paragraph_index, raw_json FROM bookmarks WHERE title = ?1")
+                .bind("第一章 起点@1700000001000")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(para2, 300);
+        assert!(
+            raw2.contains("第二个书签") && raw2.contains("备注B"),
+            "第二枚书签原文应保留: {raw2}"
         );
         let ns: String =
             sqlx::query_scalar("SELECT user_namespace FROM bookmarks WHERE title = ?1")
@@ -1285,21 +1332,21 @@ mod tests {
                 .unwrap();
         assert_eq!(ns, "default");
 
-        // 替换规则：legacy 无 id → 补 uuid；enabled/order 映射 enable/order_num
+        // 替换规则：legacy Long id → 字符串化；pattern/isEnabled 映射 find/enable
         let id: String = sqlx::query_scalar("SELECT id FROM replace_rules WHERE name = ?1")
             .bind("去广告")
             .fetch_one(pool)
             .await
             .unwrap();
-        assert!(!id.is_empty(), "legacy 无 id 应补 uuid");
+        assert_eq!(id, "1700000000000", "legacy Long id 应字符串化保留");
         let (find, enable, order_num): (String, i64, i64) =
             sqlx::query_as("SELECT find, enable, order_num FROM replace_rules WHERE name = ?1")
                 .bind("净化")
                 .fetch_one(pool)
                 .await
                 .unwrap();
-        assert_eq!(find, "旧排版");
-        assert_eq!((enable, order_num), (0, 2));
+        assert_eq!(find, "旧排版", "legacy pattern 应映射 find");
+        assert_eq!((enable, order_num), (0, 2), "isEnabled 应映射 enable");
 
         // TXT 目录规则：legacy Long id → 字符串化
         let (id, serial_number, enable): (String, i64, i64) =
@@ -1321,7 +1368,7 @@ mod tests {
         assert_eq!(name, "在线TTS");
         assert_eq!(tts_type, 0);
 
-        // 分组：legacy id 保留
+        // 分组：groupId/groupName 映射 id/name，legacy id 保留
         let (id, order_num): (i64, i64) =
             sqlx::query_as("SELECT id, order_num FROM book_groups WHERE name = ?1")
                 .bind("玄幻")
@@ -1329,6 +1376,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((id, order_num), (1, 0));
+        let (id2, name2): (i64, String) =
+            sqlx::query_as("SELECT id, name FROM book_groups WHERE id = ?1")
+                .bind(2)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(id2, 2);
+        assert_eq!(name2, "言情", "legacy groupName 应映射 name");
 
         // 用户配置：对象 map（default）+ 数组（alice）
         let config: String = sqlx::query_scalar(

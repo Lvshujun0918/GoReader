@@ -52,8 +52,8 @@ pub async fn handle(
         "PUT" => put_file(&file, body).await,
         "MKCOL" => mkcol(&file).await,
         "DELETE" => delete(&file).await,
-        "MOVE" => move_copy(&file, headers, false).await,
-        "COPY" => move_copy(&file, headers, true).await,
+        "MOVE" => move_copy(&file, &home, headers, false).await,
+        "COPY" => move_copy(&file, &home, headers, true).await,
         "LOCK" => lock(headers),
         "UNLOCK" => webdav_status(StatusCode::NO_CONTENT, None),
         _ => webdav_status(StatusCode::METHOD_NOT_ALLOWED, None),
@@ -104,20 +104,15 @@ fn base64_decode(s: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// 路径解析（安全：不越出 webdav 根）
+/// 路径解析（P0-6：组件级归一化防穿越——复用 files::resolve_secure_path：`..` 逐级
+/// 弹出、越出 webdav 根即拒绝；绝对路径按相对处理；符号链接逃逸被 canonicalize 拦截）
 fn resolve_path(home: &Path, path: &str) -> Option<PathBuf> {
     let decoded = percent_decode(path);
     // 去掉 /reader3/webdav 前缀
     let rel = decoded
         .trim_start_matches("/reader3/webdav")
         .trim_start_matches('/');
-    let home_abs = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-    let target = home_abs.join(rel);
-    if target.starts_with(&home_abs) {
-        Some(target)
-    } else {
-        None
-    }
+    crate::api::files::resolve_secure_path(home, rel)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -260,8 +255,8 @@ async fn delete(file: &Path) -> Response {
     }
 }
 
-/// MOVE/COPY（Destination 头）
-async fn move_copy(file: &Path, headers: &HeaderMap, copy: bool) -> Response {
+/// MOVE/COPY（Destination 头）——目标同样经 resolve_secure_path 组件级校验（P0-6）
+async fn move_copy(file: &Path, home: &Path, headers: &HeaderMap, copy: bool) -> Response {
     let Some(dest) = headers.get("destination").and_then(|v| v.to_str().ok()) else {
         return webdav_status(StatusCode::BAD_REQUEST, None);
     };
@@ -272,26 +267,13 @@ async fn move_copy(file: &Path, headers: &HeaderMap, copy: bool) -> Response {
         .nth(1)
         .and_then(|s| s.split_once('/').map(|(_, p)| format!("/{p}")))
         .unwrap_or(dest_path.clone());
-    // 需要 home 才能 resolve——简化：MOVE 在 webdav 根内（调用方传入的 file 已安全）
-    // 这里用 file.parent 推导 home（webdav 根 = file 链上最近的 webdav 目录）
-    let mut home = file.to_path_buf();
-    while let Some(p) = home.parent() {
-        if p.file_name().map(|n| n == "webdav").unwrap_or(false) {
-            home = p.to_path_buf();
-            break;
-        }
-        home = p.to_path_buf();
-    }
     let rel = dest_path
         .trim_start_matches("/reader3/webdav")
         .trim_start_matches('/');
-    let target = home.join(rel);
-    // 安全校验：目标必须在 webdav 根内（防路径穿越任意写入）
-    let home_abs = home.canonicalize().unwrap_or_else(|_| home.clone());
-    let target_abs = target.canonicalize().unwrap_or_else(|_| target.clone());
-    if !target_abs.starts_with(&home_abs) {
+    // 安全校验：目标必须在 webdav 根内（组件级归一化——防 .. 穿越任意写入）
+    let Some(target) = crate::api::files::resolve_secure_path(home, rel) else {
         return webdav_status(StatusCode::FORBIDDEN, None);
-    }
+    };
     if !file.exists() {
         return webdav_status(StatusCode::NOT_FOUND, None);
     }
@@ -339,4 +321,38 @@ fn lock(headers: &HeaderMap) -> Response {
         .header("Content-Type", "application/xml; charset=utf-8")
         .body(Body::from(body))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P0-6：resolve_path 组件级归一化——正常放行、`..` 越出根拒绝（含百分号编码绕过）
+    #[test]
+    fn test_resolve_path_traversal() {
+        let base = std::env::temp_dir().join("reader-webdav-resolve");
+        let home = base.join("data/alice/webdav");
+        std::fs::create_dir_all(&home).unwrap();
+        let home_abs = home.canonicalize().unwrap();
+
+        // 正常：/reader3/webdav 前缀剥离 + 相对解析
+        let p = resolve_path(&home, "/reader3/webdav/a/b.txt").unwrap();
+        assert_eq!(p, home_abs.join("a/b.txt"));
+        let p = resolve_path(&home, "/reader3/webdav").unwrap();
+        assert_eq!(p, home_abs);
+
+        // 根内 .. 弹回放行（组件级归一化）
+        let p = resolve_path(&home, "/reader3/webdav/a/../b.txt").unwrap();
+        assert_eq!(p, home_abs.join("b.txt"));
+
+        // 穿越拒绝：越出 webdav 根一律 None
+        assert!(resolve_path(&home, "/reader3/webdav/../escape.txt").is_none());
+        assert!(resolve_path(&home, "/reader3/webdav/a/../../escape.txt").is_none());
+        assert!(resolve_path(&home, "/reader3/webdav/../../data/bob/secret.txt").is_none());
+        // 百分号编码的 .. 同样拒绝（解码后再归一化）
+        assert!(resolve_path(&home, "/reader3/webdav/..%2F..%2Fescape.txt").is_none());
+        assert!(resolve_path(&home, "/reader3/webdav/a/..%2F..%2Fescape.txt").is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

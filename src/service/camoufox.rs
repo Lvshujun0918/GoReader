@@ -144,6 +144,11 @@ pub async fn solve(
             .and_then(|x| x.as_str())
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty()),
+        turnstile_sitekey: v
+            .get("turnstileSitekey")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
     })
 }
 
