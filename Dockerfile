@@ -32,7 +32,7 @@ RUN pip install --no-cache-dir camoufox==0.5.4 \
     && python -m camoufox fetch
 
 # ---------- 阶段 3：运行镜像 ----------
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # chromium（验证码/CF 质询浏览器流）+ 时区 + CA + python3（camoufox 后端）
 RUN apt-get update \
@@ -68,4 +68,5 @@ COPY --from=web /web/dist /app/web-ui/dist
 
 EXPOSE 8080
 VOLUME ["/data"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["reader-dev"]

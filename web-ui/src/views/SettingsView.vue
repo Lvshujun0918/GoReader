@@ -47,7 +47,7 @@ const router = useRouter()
 const store = useUserStore()
 
 /** 版本号与 package.json 保持一致 */
-const VERSION = '1.0.0'
+const VERSION = '5.0.0'
 
 /** 系统信息（/reader3/getSystemInfo，设置页「关于」区展示） */
 const sysInfo = ref<SystemInfo | null>(null)

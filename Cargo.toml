@@ -1,6 +1,6 @@
 [package]
 name = "reader-dev"
-version = "1.0.0"
+version = "5.0.0"
 edition = "2021"
 description = "阅读3服务器版 Rust 重构（API/数据兼容 legacy 分支，吸收 SQLite/多规则解析/书籍格式扩展）"
 license = "GPL-3.0"
