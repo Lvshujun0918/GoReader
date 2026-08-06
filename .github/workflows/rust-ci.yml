@@ -66,26 +66,12 @@ jobs:
       - name: cargo build (release)
         run: cargo build --release
 
-      - name: 代码签名（自签证书来自 secrets）
+      - name: 校验产物（签名已移除——SmartScreen 提示属预期；构建/链接验证）
         shell: pwsh
-        env:
-          PFX_B64: ${{ secrets.WINDOWS_CODESIGN_PFX }}
-          PFX_PWD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
         run: |
-          $bytes = [Convert]::FromBase64String($env:PFX_B64)
-          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, $bytes)
-          try {
-            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfxPath, $env:PFX_PWD)
-          } catch {
-            Write-Host "证书加载失败（不打印证书内容）：$($_.Exception.Message)"
-            exit 1
-          }
           $exe = Join-Path (Get-Location) "target\release\reader-dev.exe"
-          $sig = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert
-          Write-Host "签名状态: $($sig.Status)"
-          if ($sig.Status -ne "Valid") { exit 1 }
-          Remove-Item $pfxPath
+          if (-not (Test-Path $exe)) { Write-Error "exe 未生成"; exit 1 }
+          Write-Host "exe 大小: $((Get-Item $exe).Length) bytes"
 
       - uses: actions/upload-artifact@v4
         with:
