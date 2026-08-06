@@ -63,6 +63,7 @@ jobs:
       - name: Setup Rust（复用 DE 常驻 rustup——避免 dtolnay 下载网络抖动；musl target 带重试）
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup --version
           for i in 1 2 3 4 5; do
             if rustup target add x86_64-unknown-linux-musl 2>/dev/null; then
