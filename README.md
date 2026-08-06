@@ -297,3 +297,15 @@ Telegram 群：[t.me/readerdev](https://t.me/readerdev)（使用反馈 / 书源�
 ## 📄 License
 
 [GNU General Public License v3.0](LICENSE) (GPL-3.0)
+
+## 💝 赞助
+
+如果你觉得这个项目有帮助，欢迎赞助支持（我是大一学生——每一份支持都在帮助我覆盖服务器/证书/AI 工具成本，并推进 iOS 上线）：
+
+| 网络 | 币种 | 地址 |
+|---|---|---|
+| Arbitrum | USDC | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
+| Ethereum | USDT | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
+| Arbitrum | USDC.e (USD24) | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
+
+> 地址已通过 EIP-55 校验和验证。转账前请再次核对网络与币种。
