@@ -11356,6 +11356,7 @@ mod tests {
     /// deleteSourceSub / 格式错误与上限校验
     #[tokio::test]
     async fn test_source_sub_api() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("subsapi").await;
         let v1 = r#"[{"bookSourceUrl":"https://s1.com","bookSourceName":"源1"},{"bookSourceUrl":"https://s2.com","bookSourceName":"源2"}]"#;
         let v2 = r#"[{"bookSourceUrl":"https://s1.com","bookSourceName":"源1v2"},{"bookSourceUrl":"https://s2.com","bookSourceName":"源2"},{"bookSourceUrl":"https://s3.com","bookSourceName":"源3"}]"#;
@@ -15031,6 +15032,7 @@ mod tests {
     /// searchBookSourceSSE：流式换源（逐书源 event: book → event: end）
     #[tokio::test]
     async fn test_search_book_source_sse_api() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("srcsse").await;
         // 当前源 s1（排除）
         state
