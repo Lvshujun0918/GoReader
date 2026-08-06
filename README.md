@@ -2,9 +2,9 @@
 
 # Reader Dev
 
-**自托管 Web 阅读服务（v5.0.0） —— 书源搜索 · 本地书仓 · OPDS · WebDAV · 多用户**
+**自托管 Web 阅读服务 —— 书源搜索 · 本地书仓 · OPDS · WebDAV · 多用户**
 
-Rust + Vue 3 实现的现代化阅读服务器，API 与数据兼容 legacy 分支（Kotlin），支持多书源规则引擎、9 种本地书格式、OPDS 1.2/2.0 与 PSE、书源登录与反爬（内嵌浏览器 + FlareSolverr 能力）、多用户隔离。
+Rust + Vue 3 实现。书源规则引擎、9 种本地书格式、OPDS 1.2/2.0 + PSE、进程内反检测浏览器（obscura stealth）、多用户隔离。
 
 </div>
 
@@ -13,87 +13,111 @@ Rust + Vue 3 实现的现代化阅读服务器，API 与数据兼容 legacy 分�
 ## ✨ 功能特性
 
 ### 📚 书源与抓取
-- **规则引擎**：legacy/legado 双命名规则（`ruleSearch`/`searchRule`、`ruleToc`/`tocRule` 等）——CSS 链式选择器、JSONPath、XPath、Regex、JS（boa 沙箱，含 `java.*`/`source.*` shim 与 AES 解密）；**正则 lookbehind**（`(?<=…)` 规则主体与 `##` 替换段经 fancy-regex 兼容层）
-- **JS shim（完整 legacy 集）**：`java.ajax` / **`java.startBrowserAwait`**（内置浏览器加载页面并等待完成——走与验证码求解同一浏览器流）/ `setContent` / `getString` / `getElements` / `getWebViewUA` / `encodeURI` 等
-- **书源管理**：增删改（规则字段 JSON 编辑）、启停、分组、失效检测 + **失效源一键禁用**、本地/远程导入、导出、订阅源、**header（JSON）/loginUrl/cookie 编辑**
+- **规则引擎**：CSS 链式（元素级——索引/排除/属性选择器/`||`/`&&`/`%%`/JS 嵌套）、JSONPath、XPath、正则（多段替换）——legacy/legado 双命名
+- **书源管理**：增删改（规则字段 JSON 编辑）、启停、分组、失效检测、本地/远程导入、导出、订阅源
 - **书源调试**：搜索/目录/正文逐规则逐步日志（SSE 流式）
-- **书源登录**：`loginUrl` 登录流 + `loginCheckJs` 校验 + Set-Cookie 按用户合并；图片验证码截图回填；**CDP 浏览器自动登录**（表单/滑块贝塞尔轨迹/cookie 提取——obscura 反检测浏览器，**唯一浏览器后端**，替代 Chrome/Edge、无回退）
-- **反爬（验证码/CF 质询 bypass）**：Cloudflare 质询检测（503/403 + 特征 HTML）→ **进程内 obscura 浏览器求解**（stealth 构建：BoringSSL TLS 指纹模拟/反检测/追踪器拦截 + **质询重试**（原 method/body/headers + 新 cookie）+ cookie 按 name 合并复用——无需外部容器）或可选外部 `FLARESOLVERR_URL`；**Turnstile 验证码**（widget 检测 → 自动点击 → 读取 `cf-turnstile-response`）；**camoufox 强质询兜底**（CDP 失败后自动转 HTTP 后端——Firefox 内核真实指纹，`READER_CAMOUFOX_URL`）；**69shuba 等真实书源实测**（scripts/69shuba.json）
-- **相关推荐**：`ruleRelated` 详情页相关书籍（同 ruleExplore 规则风格）；**探索源扩充**（内置探索源清单，与 bookSource.json 同构——可直接导入）
-- **换源**：并发多源搜索 + 书名过滤去重，一键切换；弹层支持**书源名搜索过滤 + 手动刷新**（SSE 流式逐源结果）
+- **书源登录**：`loginUrl` 登录流 + 图片验证码回填 + 手动 Cookie
+- **换源**：并发多源搜索 + 书名过滤去重 + 结果内书源名二次过滤 + 刷新
+
+### 🛡️ 反检测（进程内——obscura）
+- **obscura 浏览器引擎内嵌**（Rust 实现——`--stealth` 构建：BoringSSL TLS 指纹模拟/反检测/追踪器拦截）——作为唯一浏览器后端（无系统浏览器依赖）
+- **Cloudflare 质询**：检测（503/403 + 特征）→ 浏览器内质询等待循环 → cookie 提取合并（按用户隔离）→ **原请求重试**
+- **Turnstile 验证码**：widget 检测 → **iframe 内 JS 点击**（frame 上下文执行）→ token 轮询
+- **登录滑块**：JS 合成事件拖拽
+- **会话管理**：按用户独立实例、闲置回收、求解前清 cookie 防跨用户泄漏
+- **可选代理**：`READER_OBSCURA_PROXY`（住宅代理等）
 
 ### 📖 阅读体验
-- 阅读器：字体（12 档 + 离线网络字体）、行距/段距/字重/宽度/字距/缩进/对齐、主题（浅色/深色/纸色 + 界面深色独立 + **纸纹**（噪点纹理开关））、**滑动/滚动双翻页模式**、自动阅读、进度服务端同步、书签、划词（复制/搜索 + **划词朗读**）、预加载、TTS（Edge TTS + HttpTTS 音色/倍速 + **音色列表 10 分钟缓存**）、**亮度滑条、键盘翻页、快捷键（书架 g/s/r）、目录当前章高亮、顶部细进度条（点击跳章）、卷标题分隔**
-- **全局简繁转换**（自动检测/简/繁三态）、阅读偏好 12 项云端同步（多端一致）
-- **续读**：详情页按书架进度显示「续读 第 N 章」一键继续；**复制本章**（剪贴板全文）；**正文图片代理**（`/assets/proxy?fmt=webp&q=80`——webp 转码省流量，失败回退原图透传）
-- 整书缓存（后台并发 + SSE 进度 + 取消）、正文缓存、缓存管理、**全书内容搜索**（含文件型本地书）
-- 阅读统计（时长/字数累计）、书架排序/分组折叠/**分组拖拽排序**/网格密度/进度角标/**置顶**/最近阅读
+- 字体（12 档 + 离线网络字体）、行距/段距/字重/宽度/字距/缩进/对齐、主题（亮/暗/暖色/自定义/跟随系统）、翻页模式（滚动/滑动/仿真）、自动阅读、亮度、键盘翻页、Wake Lock 常亮
+- 全局简繁转换（自动检测/简/繁）、12 项阅读偏好云端同步、每本书独立配置
+- 整书缓存（SSE 进度）、正文缓存、全书搜索（本地书 + 已缓存书源书）、阅读统计、章节字数
+- 非文本书籍：音频/视频/漫画（图片逐页）/文件书
 
 ### 📁 本地书（9 格式）
-EPUB · TXT · MOBI · AZW3 · PDF · FB2 · DOCX · CBZ · UMD —— 上传导入（含预览）、目录、正文、重扫、全书搜索、**元数据编辑（书名/作者/标签/简介）**、OPDS 下载统一分派（PDF 8MB 解压上限防炸弹、DOCX 标题样式分章、TXT 编码自动检测、CBZ 漫画图片页、UMD 手写解析）
-
-- **双轨同步仓**：文件与 DB 双向对账——书仓目录（`storage/data/{user}/books/` + 可选 `READER_LOCAL_BOOK_DIR`）由后台文件监听（300ms 去抖批量）自动同步：新文件自动导入、修改自动重扫、删除保留书籍与进度、仅 DB 书自动生成 epub 落仓（幂等，无事件循环）
-- **迁移工具**：legacy `loc_book` 文件书一键迁入 DB（`migrateLocBook`——保留原记录/阅读进度，章节转 DB 直读）
+EPUB · TXT · MOBI · AZW3 · PDF · FB2 · DOCX · CBZ（漫画）· UMD —— 上传导入（含预览）、目录、正文、重扫、全书搜索
+- **双轨同步仓**：文件与 DB 双向同步（文件变更自动导入/重扫；DB 书自动生成 epub 镜像）
 
 ### 📤 导出与备份
-- 书籍导出：TXT（**编码可选 utf-8/gbk/gb2312/gb18030**）/ EPUB / HTML；**书源书导出并发抓章**（并发 4，错误章跳过不中断）；书源导出
-- **备份恢复闭环**（`backupToWebdav` + `restoreFromZip`/`restoreFromWebdav`——9 类目幂等恢复，兼容 legacy 备份布局）
-- **自动备份**：启动时 DB 快照（`reader.db.bak-{ts}`，保留 5 份，`READER_DB_BACKUP=0` 禁用；WAL checkpoint 保证一致）+ 每日定时备份（`READER_AUTO_BACKUP_HOUR` 默认 03:00，保留 7 份）
+- 导出：TXT（编码可选）/ EPUB（内嵌中文字体 + 完整目录导航）/ HTML
+- 备份：WebDAV / zip（含 MongoDB 可选）——**恢复**（zip/WebDAV——9 类目幂等，兼容 legacy 备份）
+- 数据迁移：legacy（Kotlin）JSON → SQLite 全量自动迁移（书/书源/书签/规则/RSS/分组/用户配置——原文件保留可回退）
 
 ### 🌐 OPDS & WebDAV
-- **OPDS 1.2**（Atom 导航/分组/分页/OpenSearch/获取/下载/封面）+ **OPDS 2.0**（JSON catalog：facets/groups/publications）+ **OPDS-PSE**（进度保存/读取）
-- **独立 OPDS 账号**（sha256+salt）或系统账号 Basic / token 三路认证
-- **WebDAV 服务器**（**OPTIONS 预检**（DAV 1,2 + Allow 头，不校验认证——客户端兼容）/PROPFIND/GET/PUT/MKCOL/DELETE/MOVE/COPY/LOCK/UNLOCK——路径穿越防护）——可作为 Calibre/坚果云客户端存储
+- **OPDS 1.2**（导航/分组/分页/搜索/获取/下载/封面）+ **2.0**（JSON catalog）+ **PSE**（进度保存）
+- 独立 OPDS 账号（sha256）或系统账号/token 三路认证
+- **WebDAV 服务器**（全方法 + 路径穿越防护）
 
 ### 👥 多用户与安全
-- 多用户注册/登录：token 随机化（uuid v4）+ **多设备会话**（每用户最多 5 个 token 并存，互不干扰）+ **登录限流**（用户名+**直连 IP** 失败 5 次锁 5 分钟——X-Forwarded-For 可伪造，完全忽略）+ **token 过期**（`READER_TOKEN_TTL_DAYS` 默认 30 天）；用户权限开关（WebDAV/本地书仓/书源/RSS）、用户管理
-- 命名空间隔离（书架/书源 cookie/配置/文件全部按用户）、路径穿越防护（白名单 + 组件级归一化）、SQL 全参数化、OPDS/WebDAV 独立认证、**上传大小上限**（`READER_UPLOAD_MAX_MB` 默认 100MB，超限 413 明确错误）
-- **SSRF 防护**：图片代理 `/assets/proxy` 回源目标**逐跳校验**（含重定向）——DNS 解析后仅允许公网地址，私网/回环/链路本地一律拒绝（非 secure 模式同样生效）
-- **图片缓存跨用户隔离**：磁盘缓存键 = `md5(命名空间|URL)`——用户 A 会话 cookie 的回源结果不会串给用户 B；启动自动清理旧格式（无命名空间）残留键
-- **密码哈希 argon2 升级（实现中）**：新用户/改密直接存 **argon2id PHC**（m=65536,t=3,p=4）；legacy 双 MD5 旧哈希兼容校验，登录通过后自动升级为 argon2id
-- 安全设计详见 [`docs/SECURITY.md`](docs/SECURITY.md)
+- argon2id 密码哈希（PHC——登录自动升级）、token 随机化、登录限流（直连 IP）、多设备 token
+- 命名空间隔离、路径穿越防护、SSRF 防护、图片缓存按用户隔离、SQL 全参数化
+- 服务监控页（内存/CPU/请求/在线/书源成功率）、日志
 
-### 🎨 前端（web-ui）
-Vue 3 + Vite + Element Plus，A 版极简风格（近白底/细字重/强调色/圆角），响应式移动端适配、深色主题、虚拟滚动书架、SSE 流式搜索/调试/缓存进度；**骨架屏（shimmer 扫光）、移动端下拉刷新、搜索加载更多/热词/历史、快捷加入书架、跨书书签汇总、探索书单收藏、记住我（token 存 sessionStorage）、404 页、全局快捷键、元数据编辑、书源 header 编辑、分组拖拽、置顶、纸纹、主页搜索框=全网搜书入口（回车跳搜索页）、PWA（SW v2——/reader3 与 /assets/proxy 网络直连/网络优先，动态路径不缓存，上限 200）**；**前端 CI**（GitHub Actions：web-ui 路径触发 vue-tsc 严格类型检查 + vite 构建）
+### 🎨 前端
+Vue 3 + Vite + Element Plus，极简风格、响应式、深色主题、虚拟滚动、SSE 流式、PWA、i18n（中/英）、命令面板（Ctrl+K）
 
 ---
 
 ## 🚀 快速开始
 
-### 本地运行（Windows/Linux/macOS）
-
+### 直接运行（Linux/Windows/macOS）
 ```bash
-# 1. 构建后端（Rust 1.75+）
+# 后端
 cargo build --release
-
-# 2. 构建前端
+# 前端
 cd web-ui && npm install && npm run build && cd ..
-
-# 3. 运行
-export READER_APP_WORKDIR="$PWD/data"     # 数据目录（可选）
-export READER_APP_SECURE=true             # 开启多用户安全模式（可选）
+# 运行
+export READER_APP_WORKDIR="$PWD/data"
+export READER_APP_SECURE=true
 ./target/release/reader-dev
 ```
+浏览器打开 `http://localhost:8080`。
 
-浏览器打开 `http://localhost:8080`（前端/API/封面/OPDS/WebDAV 同端口）。
+> 反检测浏览器：需下载 [obscura](https://github.com/h4ckf0r0day/obscura) stealth 构建（`-stealth` 资产），放同目录或配置 `READER_OBSCURA_BIN`（Windows/Linux 自动探测）。无 obscura 时质询类功能降级报错（普通抓取不受影响）。
 
-> 非 secure 模式单用户（default）；secure 模式注册/登录后使用。
-
-### Docker（推荐——镜像内置 obscura 反检测浏览器，验证码/CF 质询浏览器流可直接使用）
-
+### Docker（推荐）
 ```bash
-# 构建（多阶段：Rust 编译 + 前端构建 + obscura release 下载 + 运行镜像（debian））
-docker build -t reader-dev .
+docker pull ghcr.io/warpdotsys/reader-dev:latest
+docker run -d --name reader-dev -p 8080:8080 \
+  -v "$PWD/data:/storage" \
+  -e READER_APP_WORKDIR=/storage \
+  -e READER_APP_SECURE=true \
+  ghcr.io/warpdotsys/reader-dev:latest
+```
+镜像内置 obscura（stealth）+ chromium 依赖移除——**反检测能力开箱即用**。
 
-# 运行（数据持久化到 ./data）
-docker run -d --name reader-dev -p 8080:8080   -v "$PWD/data:/data"   -e READER_APP_WORKDIR=/data   -e READER_APP_SECURE=true   reader-dev
+---
+
+## 🔄 从 legacy（Kotlin）Docker 迁移
+
+### 只换镜像（数据零改动）
+```bash
+# 1. 备份（保险）
+docker exec <旧容器> tar czf /tmp/backup.tar.gz /storage
+docker cp <旧容器>:/tmp/backup.tar.gz .
+
+# 2. 停旧容器（数据卷不动）
+docker stop <旧容器>
+
+# 3. 起新容器（同一数据卷——挂载路径保持）
+docker run -d --name reader-dev-rust \
+  -v <同一数据卷>:/storage \
+  -p 8080:8080 \
+  -e READER_APP_WORKDIR=/storage \
+  -e READER_APP_SECURE=true \
+  ghcr.io/warpdotsys/reader-dev:latest
+
+# 4. 启动时自动迁移（JSON → SQLite 全量——日志见「JSON→SQLite 迁移完成」）
+#    原 JSON 文件保留（可回退）
 ```
 
-> 容器内验证码路径：**内置 obscura**（`READER_OBSCURA_BIN=/opt/obscura/obscura`——release stealth 构建，构建期从 GitHub Releases 下载，amd64/arm64 自动选资产）→ 登录表单/滑块自动处理、CF 质询进程内求解 → 失败转 **camoufox 兜底**（内置 python3 + `camoufox_solver.py`，端口 8196）；无需外部 FlareSolverr 容器（如需仍可 `FLARESOLVERR_URL` 指向 sidecar）。
->
-> **镜像入口**：`ENTRYPOINT ["/usr/bin/tini", "--"]` + `CMD ["reader-dev"]`——tini 作 PID 1（信号转发/僵尸回收），1Panel 等面板可直接使用镜像默认入口（或覆盖 CMD 追加启动参数）。
->
-> **运行镜像**：`debian:trixie-slim`（**GLIBC** 运行时——非 musl；内置 CA 证书 + 时区 `TZ=Asia/Shanghai`）。另提供 **musl 静态二进制**发布资产（`reader-dev-linux-x64-musl`——无 glibc 依赖，任意发行版直跑）。
+### 直接跑二进制
+```bash
+# release 资产 reader-dev-linux-x64-musl（静态——任何发行版）
+READER_APP_WORKDIR=/storage READER_APP_SECURE=true ./reader-dev-linux-x64-musl
+```
+
+### 迁移覆盖
+用户 / 书架（含进度）/ 书源 / RSS / 书签 / 替换规则 / TXT 目录规则 / HttpTTS / 分组 / 用户配置——全量，raw_json 保底。
 
 ---
 
@@ -101,211 +125,70 @@ docker run -d --name reader-dev -p 8080:8080   -v "$PWD/data:/data"   -e READER_
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `READER_SERVER_PORT` | `8080` | 服务端口 |
-| `READER_APP_WORKDIR` | 当前目录 | 工作目录（数据在 `{workdir}/storage`） |
-| `READER_APP_WEB_ROOT` | `web-ui/dist` | 前端静态资源根（SPA fallback） |
-| `READER_APP_SECURE` / `READER_APP_SECUREKEY` | 关 | 多用户安全模式（secureKey 保护管理接口） |
-| `READER_APP_MINUSERPASSWORDLENGTH` | `8` | 注册密码最小长度 |
-| `READER_APP_USERLIMIT` | `500000` | 用户数上限 |
-| `READER_APP_INVITECODE` | 空 | 注册邀请码（配置后注册必须） |
-| `READER_LOG_DIR` | 空（仅控制台） | 日志目录（控制台 + 文件，按大小轮转 10MB×7） |
-| `READER_LOG_MAX_SIZE_MB` / `READER_LOG_MAX_FILES` | `10` / `7` | 日志轮转参数 |
-| `READER_OBSCURA_BIN` | 自动发现 | obscura 可执行文件路径（浏览器流唯一后端；默认探测：同目录 → 系统 PATH） |
-| `READER_OBSCURA_URL` | 空 | 连接既有 obscura CDP 服务（ws:// 或 http:// 端点；配置后不再 spawn 进程） |
-| `READER_IMAGE_CACHE_MB` | `512` | 图片代理磁盘缓存容量（MB；`0` = 禁用——`storage/cache/images` LRU） |
-| `READER_CAMOUFOX_URL` | `http://127.0.0.1:8196` | camoufox 强质询兜底服务地址（CDP 求解失败后自动转） |
-| `READER_CAMOUFOX_DISABLE` | 空 | `1` = 禁用 camoufox 兜底 |
-| `READER_CAMOUFOX_FIRST` | 空 | `1` = camoufox 优先于内置浏览器（CDP 前先试） |
-| `READER_CAMOUFOX_UA` | Chrome/131 Win | camoufox 求解用 UA（69shuba 等站点有 UA 门禁） |
-| `FLARESOLVERR_URL` | 空（内嵌求解） | 可选外部 FlareSolverr 服务地址 |
-| `READER_UPLOAD_MAX_MB` | `100` | 上传大小上限（MB，multipart 导入/文件上传/备份恢复；超限返回明确错误） |
-| `READER_TOKEN_TTL_DAYS` | `30` | token 过期天数（基于最近登录时间；过期需重新登录） |
-| `READER_LOCAL_BOOK_DIR` | 空 | 双轨书仓附加目录（文件监听 + 对账；secure 模式下归 default 命名空间） |
-| `READER_DB_BACKUP` | `1` | 启动数据库快照开关（`0` 禁用；保留最近 5 份 `reader.db.bak-*`） |
-| `READER_AUTO_BACKUP_HOUR` | `3` | 每日自动备份小时（0-23；备份到 `webdav/legado/auto-YYYYMMDD.zip`，保留 7 份） |
-
-> **配置生效时机**：所有环境变量在服务启动时读取一次——修改后需**重启进程**生效（无运行时热加载）。
-
----
-
-## 📦 部署说明
-
-### 书源浏览器流依赖（obscura——唯一浏览器后端）
-- **obscura**：Rust headless 浏览器（stealth 构建——BoringSSL TLS 指纹模拟/反检测/追踪器拦截；CDP 兼容）。下载：GitHub Releases 的 `-stealth` 资产（`obscura-x86_64-linux-stealth.tar.gz` / `obscura-aarch64-linux-stealth.tar.gz` / `obscura-x86_64-windows-stealth.zip`）
-- **Windows**：解压后设置 `READER_OBSCURA_BIN` 指向 `obscura.exe`（或放入 PATH）
-- **Linux/容器**：下载解压到任意目录并设置 `READER_OBSCURA_BIN`；Docker 镜像已内置（`/opt/obscura/obscura`）
-- **既有服务**：已运行 `obscura serve --port 9222 --stealth` 时，配置 `READER_OBSCURA_URL=http://127.0.0.1:9222` 直连复用（不再 spawn 进程）
-- 无浏览器时：登录/CF 质询降级为明确报错 + 手动 Cookie 粘贴
-
-### 反爬（Cloudflare）
-- **默认内嵌求解**：检测到 CF 质询自动用本机浏览器执行 JS 质询并提取 `cf_clearance`（无需外部服务）
-- 可选：部署 FlareSolverr（Docker）并通过 `FLARESOLVERR_URL` 指定
-
-### 本地书双轨书仓
-- **默认书仓目录**：`storage/data/{user}/books/`（secure 按用户隔离；非 secure 为 `default`）——放入文件（EPUB/TXT/MOBI/AZW3/PDF/FB2/DOCX）自动导入书架，修改自动重扫，删除保留书籍与进度
-- **附加目录**：`READER_LOCAL_BOOK_DIR`（可选，同样被文件监听 + 对账；secure 多用户模式下统一归 `default` 命名空间）
-- 仅 DB 书（无文件关联）自动生成 epub 落书仓（文件名 `{书名}.epub`，冲突加后缀）
-
-### 上传限制 / token 过期 / 迁移备份
-- **上传限制**：`READER_UPLOAD_MAX_MB`（默认 100MB）——multipart 导入/文件上传/备份恢复统一上限，超限返回 413 明确错误；反向代理 `client_max_body_size` 需匹配（见上）
-- **token 过期**：`READER_TOKEN_TTL_DAYS`（默认 30 天）——基于用户最近登录时间，过期需重新登录（前端自动跳登录页）
-- **迁移备份**：启动时自动快照 `storage/reader.db` → `reader.db.bak-{YYYYMMDDHHMMSS}`（保留最近 5 份，WAL checkpoint 保证一致；`READER_DB_BACKUP=0` 禁用）
-
-### 反向代理（HTTPS）
-服务端为 HTTP；公网部署建议前置 nginx/Caddy 终止 TLS：
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name reader.example.com;
-    client_max_body_size 200m;              # 上传大文件（与 READER_UPLOAD_MAX_MB 匹配）
-    location / { proxy_pass http://127.0.0.1:8080; proxy_buffering off; }  # SSE
-}
-```
-
-### 单实例假设
-服务以**单实例**运行为前提：SQLite 数据文件 + 内存态缓存（目录/正文/语音列表/登录限流）不做跨进程协调；
-请勿对同一数据目录启动多个进程（多副本部署请按实例拆分数据目录）。
-
-### 网络协议现状（HTTP/1.1）
-- **出站（书源抓取/图片回源）**：**HTTP/1.1**（含 HTTPS）——`reqwest` 未启用 `http2` feature，书源直连固定 HTTP/1.1；`http3` feature 虽在 `Cargo.toml` 中启用，但客户端代码未调用 QUIC 接口（未启用 `reqwest_unstable` cfg），**实际不会发起 HTTP/3 连接**。
-- **服务端（对外服务）**：`axum` 监听 TCP，**纯 HTTP——无 TLS、无 QUIC**；HTTP/2 / HTTP/3 暂不提供。公网 HTTPS 由反向代理终止（见上）；如需 H2/H3，同样由代理层提供（nginx/Caddy）。
-
----
-
-## 🔄 从 legacy（Kotlin）Docker 迁移到 Rust 版
-
-### 方式一：只换镜像（数据零改动）
-```bash
-# 1. 备份（保险）
-docker exec <旧容器> tar czf /tmp/backup.tar.gz /storage
-docker cp <旧容器>:/tmp/backup.tar.gz .
-
-# 2. 停旧容器（保留数据卷）
-docker stop <旧容器>
-# 数据卷不动（挂载路径保持不变——默认 /storage）
-
-# 3. 起新容器（同一数据卷）
-docker pull ghcr.io/warpdotsys/reader-dev:latest
-docker run -d --name reader-dev-rust   -v <同一数据卷>:/storage   -p 8080:8080   -e READER_APP_WORKDIR=/storage   -e READER_APP_SECURE=true   ghcr.io/warpdotsys/reader-dev:latest
-
-# 4. 启动时自动迁移（JSON → SQLite——书/书源/书签/替换规则/TXT 规则/HttpTTS/分组/用户配置/RSS 全量，raw_json 保底）
-#    原 JSON 文件保留在 storage/data/（不删除——可回退）
-docker logs -f reader-dev-rust   # 看到「JSON→SQLite 迁移完成」即成功
-```
-
-### 方式二：直接跑 Rust 二进制
-```bash
-# Linux（release 资产下载 reader-dev-linux-x64）
-chmod +x reader-dev-linux-x64
-READER_APP_WORKDIR=/storage READER_APP_SECURE=true ./reader-dev-linux-x64
-# 首次启动同样自动迁移 legacy JSON 数据
-```
-
-### 迁移覆盖
-| 数据 | 说明 |
-|---|---|
-| 用户 / 书架（含进度）/ 书源 / RSS | ✅ 全量 |
-| 书签 / 替换规则 / TXT 目录规则 / HttpTTS / 分组 / 用户配置 | ✅ 全量（本次补全） |
-| 原 JSON 文件 | 保留（可回退） |
-
-### 直接跑 Rust 的能力说明（分层）
-- **本地直跑**：obscura stealth 构建（`READER_OBSCURA_BIN` 指向下载的二进制——Windows/Linux 发布资产；macOS 资产未发布，需自行构建）——覆盖 CF JS 质询/Turnstile 基础/滑块
-- **Docker 镜像**：内置 obscura（stealth）+ python + camoufox（强质询兜底——69shuba 级）
-- **强质询边界**：数据中心 IP 会被 Turnstile 风控（69shuba 实测 400030——环境风控，与 UA/指纹无关）；**住宅代理支持尚未接线**（代码中无代理配置项）——此类场景需在更上游解决（住宅出口/代理层），见 ROADMAP 待办
-
-## 📖 使用指南
-
-- **书源导入**：书源管理 → 本地导入 / 远程导入 / 订阅源；调试器逐规则排查；失效检测后一键禁用
-- **双轨书仓**：直接把书文件放入书仓目录（或 `READER_LOCAL_BOOK_DIR`）自动入架；`migrateLocBook` 迁移 legacy 文件书
-- **OPDS 接入**：外部阅读器（Legado/静读天下）添加 `http://host:port/opds`（可配独立账号，设置页查看并复制）
-- **WebDAV**：`http://host:port/reader3/webdav/`（系统用户 Basic 认证，需开启 WebDAV 权限）
-- **备份/恢复**：设置页 → 备份到 WebDAV / 下载备份；恢复通过 `POST /reader3/restoreFromZip`
-- **全书搜索**：详情页 → 全书搜索（本地书，含文件型）；书架搜索可切「全书」范围
+| `READER_SERVER_PORT` | `8080` | 端口 |
+| `READER_APP_WORKDIR` | 当前目录 | 数据目录（storage/ 下） |
+| `READER_APP_WEB_ROOT` | `web-ui/dist` | 前端静态根 |
+| `READER_APP_SECURE` | 关 | 多用户安全模式 |
+| `READER_APP_MINUSERPASSWORDLENGTH` | `8` | 密码最小长度 |
+| `READER_APP_INVITECODE` | 空 | 注册邀请码 |
+| `READER_OBSCURA_BIN` | 自动探测 | obscura 可执行文件路径 |
+| `READER_OBSCURA_URL` | 空 | 连接既有 obscura CDP 服务 |
+| `READER_OBSCURA_PROXY` | 空 | obscura 代理（如 socks5://127.0.0.1:1080） |
+| `READER_UPLOAD_MAX_MB` | `100` | 上传上限 |
+| `READER_IMAGE_CACHE_MB` | `512` | 图片代理磁盘缓存上限 |
+| `READER_TOKEN_TTL_DAYS` | `30` | token 过期天数 |
+| `READER_DB_BACKUP` | `1` | 启动时 DB 快照备份 |
+| `READER_AUTO_BACKUP_HOUR` | `3` | 每日自动备份小时 |
+| `READER_LOCAL_BOOK_DIR` | 空 | 本地书监听目录 |
+| `READER_LOG_DIR` | 空 | 日志目录（按大小轮转） |
 
 ---
 
 ## 🧑‍💻 开发
 
 ```bash
-cargo test        # 后端测试（480+，含 CF 求解/Turnstile/OPDS/本地格式集成测试）
-cd web-ui && npm run build   # 前端（vue-tsc 类型检查 + vite）
+cargo test          # 480+ 单测与集成（规则引擎/格式解析/obscura/CF 质询/WebDAV）
+cd web-ui && npm run build   # 前端（vue-tsc + vite）
+npm test            # 前端单测（54+）
 ```
 
-### 项目结构
-
+### 结构
 ```
 src/
-├── api/          # axum 路由（/reader3/*、/opds、/opds-save、/assets/proxy）
-├── middleware/   # upload_limit（multipart 上限 413）/ cache_control（静态资源缓存）
-├── model/        # 数据模型（book/book_source/rss/user/...）
-├── parser/       # 规则引擎（css_chain / js(boa 沙箱) / rule / xpath）
-├── service/      # 业务（search/crawler(SSRF 防护+质询)/explore/local_book(9 格式)/
-│                 #   browser(obscura CDP——唯一浏览器后端)/camoufox(强质询兜底)/
-│                 #   image_cache(跨用户隔离图片缓存)/login(书源登录)/export_book/debug/
-│                 #   cache_job/health/tts/local_sync(双轨书仓)/schedule(定时任务)/
-│                 #   imaging(webp 代理)/opds/epub/rss）
-├── storage/      # SQLite（迁移/CRUD/书源 cookie/正文缓存/阅读统计）
-└── util/         # md5/sha256/login_limit(登录限流)/db_backup(启动备份)
-web-ui/src/
-├── views/        # 15 个视图（书架/阅读/搜索/详情/探索/书源/文件/用户/规则/RSS/设置/登录/404/...）
-├── components/   # LogoMark / ErrorBoundary
-├── api/          # 后端接口封装（30 个模块）
-└── utils/        # chinese(简繁)/uiTheme/readerConfig/download/...
-scripts/          # api-scan.py（API 扫描）/ mock-cf-site.py / mock-slider-site.py /
-                  # mock-turnstile-site.py（质询 mock）/ 69shuba.json（真实书源验证）/
-                  # camoufox_solver.py（强质询后端）/ e2e-smoke.py / source-audit.py
-tests/            # 集成测试（cf_solve / turnstile_solve / captcha_matrix /
-                  #   obscura_browser / 69shuba_probe）
-.github/workflows/ # rust-ci.yml / frontend-ci.yml（前端 CI）/ docker-publish-rust.yml
-                  #   （发布：v1.* 标签 + master 祖先 guard + 多架构镜像 + Windows 签名）
-docs/             # SECURITY.md / ARCHITECTURE.md / ROADMAP.md / legado-ref/
+├── api/          # axum 路由
+├── model/        # 数据模型
+├── parser/       # 规则引擎（css_chain/js/rule/xpath/jsonpath）
+├── service/      # 业务（browser(obscura CDP)/crawler/search/explore/local_book/opds/...）
+├── storage/      # SQLite（迁移/CRUD/缓存/统计）
+└── util/         # password(argon2)/regex/md5/...
+web-ui/src/       # Vue3 视图/组件/api/utils
+web-simple/       # Kindle 轻量页
+scripts/          # 审计/测试工具（api-scan/mock 站点等）
+docs/             # SECURITY/ARCHITECTURE/ROADMAP/FRONTEND
 ```
 
 ---
 
-## 🧪 测试
-
-- 后端 **480+** 单测与集成测试（规则引擎/存储迁移/OPDS XML/本地书 9 格式解析/CF 质询端到端/Turnstile/WebDAV 全方法/obscura 浏览器）
-- `scripts/api-scan.py`：API 全接口扫描（正常/空参/错参/边界）；`mock-cf-site.py` / `mock-slider-site.py` / `mock-turnstile-site.py`：验证码质询 mock 站点
-- 前端 `vue-tsc --noEmit` 严格类型检查 + vite 构建（GitHub Actions 前端 CI 自动执行）
-
----
-
-## 💬 交流
-
-Telegram 群：[t.me/readerdev](https://t.me/readerdev)（使用反馈 / 书源交流）
-
 ## 📚 文档
+- `docs/SECURITY.md` —— 安全设计（argon2/SSRF/隔离/限流）
+- `docs/ARCHITECTURE.md` —— 架构（obscura 内嵌/分层）
+- `docs/ROADMAP.md` —— 路线图与待办
+- `docs/legado-ref/ruleHelp.md` —— 规则参考
 
-- [`docs/SECURITY.md`](docs/SECURITY.md) —— 安全设计审查
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) —— 架构设计
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) —— 路线图
-- [`docs/legado-ref/ruleHelp.md`](docs/legado-ref/ruleHelp.md) —— 书源规则参考（legado）
-
----
-
-## 📌 分支说明
-
+## 📌 分支
 | 分支 | 说明 |
 |---|---|
-| `master` | **Rust 重构版（当前）**——本文档 |
-| `legacy` | Kotlin 稳定版（ghcr.io/warpdotsys/reader-dev:latest / v4.x 双平台镜像） |
-
----
-
-## 📄 License
-
-[GNU General Public License v3.0](LICENSE) (GPL-3.0)
+| `master` | **Rust 版（当前）——v5.0.0** |
+| `legacy` | Kotlin 稳定版（ghcr v4.x） |
 
 ## 💝 赞助
-
-如果你觉得这个项目有帮助，欢迎赞助支持（我是大一学生——每一份支持都在帮助我覆盖服务器/证书/AI 工具成本，并推进 iOS 上线）：
-
 | 网络 | 币种 | 地址 |
 |---|---|---|
 | Arbitrum | USDC | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
 | Ethereum | USDT | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
-| Arbitrum | USDC.e (USD24) | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
+| Arbitrum | USDC.e | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
 
-> 地址已通过 EIP-55 校验和验证。转账前请再次核对网络与币种。
+> 地址已通过 EIP-55 校验。转账前请核对网络与币种。
+
+## 📄 License
+[GNU General Public License v3.0](LICENSE) (GPL-3.0)
