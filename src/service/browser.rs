@@ -107,9 +107,7 @@ pub struct Browser {
     session_id: Option<String>,
     /// iframe 执行上下文缓存（executionContextCreated 事件——frameId → contextId，
     /// Turnstile 等 iframe 内 JS 执行用——obscura/Chrome 通用）
-    frame_ctx: std::sync::Arc<
-        std::sync::Mutex<HashMap<String, i64>>,
-    >,
+    frame_ctx: std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>>,
 }
 
 impl Drop for Browser {
@@ -262,9 +260,14 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
             };
             // 事件：Runtime.executionContextCreated —— 缓存 iframe 执行上下文（frameId→contextId）
             if v.get("id").is_none() {
-                if v.get("method").and_then(|m| m.as_str()) == Some("Runtime.executionContextCreated") {
+                if v.get("method").and_then(|m| m.as_str())
+                    == Some("Runtime.executionContextCreated")
+                {
                     if let Some(ctx) = v.get("params").and_then(|p| p.get("context")) {
-                        let frame_id = ctx.get("auxData").and_then(|a| a.get("frameId")).and_then(|f| f.as_str());
+                        let frame_id = ctx
+                            .get("auxData")
+                            .and_then(|a| a.get("frameId"))
+                            .and_then(|f| f.as_str());
                         let ctx_id = ctx.get("id").and_then(|i| i.as_i64());
                         if let (Some(fid), Some(cid)) = (frame_id, ctx_id) {
                             if let Ok(mut map) = frame_ctx_task.lock() {
@@ -463,9 +466,7 @@ impl Browser {
     /// 无法穿透跨源 iframe，obscura 又不投递 CDP 坐标事件——必须 frame 内执行。
     pub async fn evaluate_in_frame(&mut self, src_hint: &str, expression: &str) -> Result<Value> {
         // 1. 找 frame
-        let tree = self
-            .command("Page.getFrameTree", json!({}))
-            .await?;
+        let tree = self.command("Page.getFrameTree", json!({})).await?;
         let mut frame_id: Option<String> = None;
         let mut stack = vec![tree.get("frameTree").cloned().unwrap_or(Value::Null)];
         while let Some(node) = stack.pop() {
@@ -1343,7 +1344,10 @@ async fn click_turnstile(browser: &mut Browser) -> Result<bool> {
       if (label) { label.click(); return true; }
       return false;
     })()"#;
-    if let Ok(v) = browser.evaluate_in_frame("challenges.cloudflare.com", frame_click).await {
+    if let Ok(v) = browser
+        .evaluate_in_frame("challenges.cloudflare.com", frame_click)
+        .await
+    {
         if v.as_bool().unwrap_or(false) {
             return Ok(true);
         }

@@ -21,8 +21,8 @@ pub const ARGON2_P_COST: u32 = 4;
 
 /// 生成 argon2id PHC 哈希（`$argon2id$v=19$m=65536,t=3,p=4$salt$hash`；随机 16 字节盐）
 pub fn hash_password(password: &str) -> String {
-    let params =
-        Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32)).expect("argon2id 参数合法");
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .expect("argon2id 参数合法");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let salt = SaltString::generate(&mut OsRng);
     argon2
@@ -107,7 +107,10 @@ mod tests {
         let phc = hash_password("correct-horse");
         assert!(verify_argon2id("correct-horse", &phc));
         assert!(!verify_argon2id("wrong", &phc));
-        assert!(!verify_argon2id("correct-horse", "$argon2id$v=19$m=8,t=1,p=1$badsalt$badhash"));
+        assert!(!verify_argon2id(
+            "correct-horse",
+            "$argon2id$v=19$m=8,t=1,p=1$badsalt$badhash"
+        ));
         assert!(!verify_argon2id("correct-horse", "not-a-phc"));
     }
 

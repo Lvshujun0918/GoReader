@@ -8907,11 +8907,16 @@ mod tests {
         assert!(ret.0.is_success, "注册应成功: {}", ret.0.error_msg);
         let carol = state.storage.find_user("carol").await.unwrap().unwrap();
         assert!(
-            carol.password.starts_with("$argon2id$v=19$m=65536,t=3,p=4$"),
+            carol
+                .password
+                .starts_with("$argon2id$v=19$m=65536,t=3,p=4$"),
             "新用户密码应为 argon2id PHC: {}",
             carol.password
         );
-        assert!(crate::util::password::verify_argon2id("pass1234", &carol.password));
+        assert!(crate::util::password::verify_argon2id(
+            "pass1234",
+            &carol.password
+        ));
 
         // 2) 注册用户登录成功（argon2id 校验路径）
         let ret = login(
@@ -8921,7 +8926,11 @@ mod tests {
             login_body("carol", "pass1234"),
         )
         .await;
-        assert!(ret.0.is_success, "argon2id 用户登录应成功: {}", ret.0.error_msg);
+        assert!(
+            ret.0.is_success,
+            "argon2id 用户登录应成功: {}",
+            ret.0.error_msg
+        );
 
         // 3) 错误密码拒绝
         let ret = login(
@@ -8953,7 +8962,11 @@ mod tests {
             login_body("dave", "oldpass1"),
         )
         .await;
-        assert!(ret.0.is_success, "MD5 旧用户登录应成功: {}", ret.0.error_msg);
+        assert!(
+            ret.0.is_success,
+            "MD5 旧用户登录应成功: {}",
+            ret.0.error_msg
+        );
         let dave = state.storage.find_user("dave").await.unwrap().unwrap();
         assert!(
             dave.password.starts_with("$argon2id$"),
@@ -8969,7 +8982,11 @@ mod tests {
             login_body("dave", "oldpass1"),
         )
         .await;
-        assert!(ret.0.is_success, "升级后再次登录应成功: {}", ret.0.error_msg);
+        assert!(
+            ret.0.is_success,
+            "升级后再次登录应成功: {}",
+            ret.0.error_msg
+        );
 
         // 6) 升级后错误密码仍拒绝
         let ret = login(
@@ -11829,7 +11846,10 @@ mod tests {
             "OPDS Basic 校验后旧 MD5 密码应自动升级: {}",
             alice.password
         );
-        assert!(crate::util::password::verify_argon2id("pw123456", &alice.password));
+        assert!(crate::util::password::verify_argon2id(
+            "pw123456",
+            &alice.password
+        ));
 
         // 系统用户密码错误 → 401
         let ret = opds_ns(&state, &basic("alice", "bad"), &HashMap::new()).await;

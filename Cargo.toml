@@ -57,6 +57,7 @@ des = "0.9"
 cipher = "0.4"
 hex = "0.4"
 base64 = "0.22"
+argon2 = "0.5"        # 用户密码哈希：argon2id（PHC 格式，默认特性）
 uuid = { version = "1", features = ["v4"] }
 zhconv = "0.4"
 urlencoding = "2"
