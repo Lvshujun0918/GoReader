@@ -489,6 +489,9 @@ async fn browser_login_inner(
     // 注入既有 cookie（保持会话连续性）
     inject_cookies(&mut b, storage, ns, source, url).await?;
 
+    // P1 SSRF：登录 URL 公网校验（DNS 解析后——拒绝私网/回环；浏览器侧也已默认
+    // 禁 RFC1918 导航）
+    crate::service::crawler::validate_public_target(url).await?;
     b.navigate(url).await?;
 
     // ① 验证码处理（滑块自动拖；图片截图；点选降级）
@@ -692,6 +695,8 @@ pub async fn get_captcha(storage: &Storage, ns: &str, source: &BookSource) -> Re
 
     let mut b = browser::Browser::launch().await?;
     inject_cookies(&mut b, storage, ns, source, &url).await?;
+    // P1 SSRF：登录 URL 公网校验后才允许浏览器导航
+    crate::service::crawler::validate_public_target(&url).await?;
     b.navigate(&url).await?;
 
     let det = b.evaluate(browser::DETECT_CAPTCHA_JS).await?;
@@ -817,6 +822,8 @@ async fn submit_captcha_inner(
 
     let mut b = browser::Browser::launch().await?;
     inject_cookies(&mut b, storage, ns, source, &url).await?;
+    // P1 SSRF：登录 URL 公网校验后才允许浏览器导航
+    crate::service::crawler::validate_public_target(&url).await?;
     b.navigate(&url).await?;
 
     // 填验证码输入框

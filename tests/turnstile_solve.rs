@@ -4,6 +4,11 @@
 //!      → token 非空即通过 → cf_clearance cookie 提取 → 用户 cookie 保留/按 name 合并 →
 //!      turnstile_token 随 cookie 串存库（按用户，http_get 全链路）。
 //! 前置：本机安装 Edge/Chrome 且 PATH 有 python；任一缺失 → 跳过（打印原因，不失败）。
+//! P1：应用已不再传 --allow-private-network——mock 类测试需自行以
+//! `obscura serve --allow-private-network` 启动并经 READER_OBSCURA_URL 连接；
+//! 爬虫/求解入口的 SSRF 校验由 common::PrivateNetGuard 放行（仅测试进程）。
+
+mod common;
 
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -55,6 +60,24 @@ fn start_mock(port: u16) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.spawn().expect("启动 mock-turnstile-site.py")
+}
+
+/// 启动 python 脚本（带 stdout 重定向到文件——如 SOCKS5 代理的连接日志）
+fn start_python_script(script: &str, port: u16, stdout_file: Option<&std::path::Path>) -> Child {
+    let launcher = python_cmd().expect("python 已探测");
+    let mut cmd = Command::new(launcher[0]);
+    for a in &launcher[1..] {
+        cmd.arg(a);
+    }
+    cmd.arg(script)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(match stdout_file {
+            Some(p) => std::fs::File::create(p).expect("创建日志文件").into(),
+            None => Stdio::null(),
+        })
+        .stderr(Stdio::null());
+    cmd.spawn().expect("启动 python 脚本")
 }
 
 /// 杀 mock 进程树（cmd /C 包装下 child.kill 只杀 cmd，python 会残留——用 taskkill /T）
@@ -124,6 +147,8 @@ async fn mock_serves_turnstile_challenge_features() {
 /// 检测 → 点击容器 → 轮询 token（≤30s）→ token 非空即通过 → HTML/cookie/token 返回
 #[tokio::test]
 async fn turnstile_challenge_solve_end_to_end() {
+    // P1 SSRF：mock 绑定 127.0.0.1——持测试守卫放行
+    let _ssrf = common::PrivateNetGuard::on();
     if !reader_dev::service::browser::is_browser_available() {
         eprintln!("SKIP: obscura 浏览器不可用——跳过 Turnstile 求解集成测试");
         return;
@@ -146,6 +171,7 @@ async fn turnstile_challenge_solve_end_to_end() {
         &format!("http://127.0.0.1:{port}/"),
         &user_cookies,
         30_000,
+        None,
     )
     .await;
 
@@ -193,12 +219,112 @@ async fn turnstile_challenge_solve_end_to_end() {
     );
     // ⑤ UA 非空
     assert!(!sol.user_agent.is_empty(), "应返回浏览器 UA");
+    // ⑥ sitekey 提取（页面 data-sitekey 属性——CfSolution 调试字段）
+    assert_eq!(
+        sol.turnstile_sitekey.as_deref(),
+        Some("0x4AAAAAAA-mockkey"),
+        "应提取到 mock 站点 data-sitekey"
+    );
+}
+
+/// 代理支持全流程：书源级 proxyUrl（socks5://127.0.0.1:port）→ solve_cf_challenge
+/// proxy 参数 → obscura serve --proxy → 浏览器流量经 SOCKS5 代理 → mock 站点求解成功。
+/// 代理日志断言 CONNECT 命中——证明代理真实生效（非忽略）。
+/// 负例：代理端口无监听时求解必须失败（证明代理为强制出口而非摆设）。
+#[tokio::test]
+async fn turnstile_challenge_solve_via_proxy() {
+    // P1 SSRF：mock 绑定 127.0.0.1——持测试守卫放行
+    let _ssrf = common::PrivateNetGuard::on();
+    if !reader_dev::service::browser::is_browser_available() {
+        eprintln!("SKIP: obscura 浏览器不可用——跳过代理求解集成测试");
+        return;
+    }
+    if python_cmd().is_none() {
+        eprintln!("SKIP: 未找到 python——跳过代理求解集成测试");
+        return;
+    }
+    let port = free_port();
+    let mut child = start_mock(port);
+    if !wait_mock_ready(port).await {
+        kill_mock(&mut child);
+        panic!("mock-turnstile-site.py 未在 10s 内就绪");
+    }
+    // ① 正例：经 SOCKS5 代理求解 mock Turnstile
+    let proxy_port = free_port();
+    let log_path = std::env::temp_dir().join(format!("reader-socks5-{}.log", std::process::id()));
+    let mut proxy =
+        start_python_script("scripts/mock-socks5-proxy.py", proxy_port, Some(&log_path));
+    // 等代理就绪
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let proxy_url = format!("socks5://127.0.0.1:{proxy_port}");
+    let result = reader_dev::service::browser::solve_cf_challenge(
+        "default",
+        &format!("http://127.0.0.1:{port}/"),
+        &[],
+        30_000,
+        Some(&proxy_url),
+    )
+    .await;
+    let sol = match result {
+        Ok(s) => s,
+        Err(e) => {
+            kill_mock(&mut child);
+            kill_mock(&mut proxy);
+            panic!("经代理求解失败: {e:#}");
+        }
+    };
+    assert!(
+        sol.turnstile_token
+            .as_deref()
+            .is_some_and(|t| t.starts_with("mock-turnstile-")),
+        "经代理应取得 mock turnstile token"
+    );
+    assert_eq!(
+        sol.turnstile_sitekey.as_deref(),
+        Some("0x4AAAAAAA-mockkey"),
+        "经代理应提取 sitekey"
+    );
+    // 代理日志：CONNECT 到 mock 站点（真实流量经过代理）
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        log.contains(&format!("CONNECT 127.0.0.1:{port}")),
+        "代理日志应含到 mock 站点的 CONNECT（实际: {log}"
+    );
+    println!(
+        "代理求解通过：流量经 SOCKS5（CONNECT 127.0.0.1:{port}）token={}",
+        sol.turnstile_token.unwrap_or_default()
+    );
+    kill_mock(&mut child);
+    kill_mock(&mut proxy);
+    reader_dev::service::browser::shutdown_cf_session().await;
+    let _ = std::fs::remove_file(&log_path);
+
+    // ② 负例：代理端口无监听 → 求解必须失败（代理为强制出口）
+    let dead_port = free_port();
+    let dead = format!("socks5://127.0.0.1:{dead_port}");
+    let r = reader_dev::service::browser::solve_cf_challenge(
+        "default",
+        &format!("http://127.0.0.1:{port}/"),
+        &[],
+        15_000,
+        Some(&dead),
+    )
+    .await;
+    reader_dev::service::browser::shutdown_cf_session().await;
+    assert!(
+        r.is_err(),
+        "代理不可达时求解应失败（证明 --proxy 为强制出口）——实际 {:?}",
+        r.map(|s| s.html.len())
+    );
+    println!("代理负例通过：不可达代理导致求解失败（符合预期）");
 }
 
 /// 全链路：http_get → CF 特征检测（Turnstile）→ 内置浏览器求解（含 Turnstile 分支）→
 /// 响应正文 + cookies 按 name 合并存库（按用户）→ turnstile_token 随 cookie 串存库
 #[tokio::test]
 async fn http_get_solves_turnstile_and_stores_per_user() {
+    // P1 SSRF：mock 绑定 127.0.0.1——持测试守卫放行（http_get 入口公网校验）
+    let _ssrf = common::PrivateNetGuard::on();
     if !reader_dev::service::browser::is_browser_available() {
         eprintln!("SKIP: obscura 浏览器不可用——跳过 Turnstile 全链路集成测试");
         return;
@@ -238,6 +364,7 @@ async fn http_get_solves_turnstile_and_stores_per_user() {
         &url,
         &std::collections::HashMap::new(),
         30,
+        None,
     )
     .await;
 

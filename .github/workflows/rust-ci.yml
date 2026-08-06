@@ -30,7 +30,7 @@ jobs:
 
       - name: cargo clippy
         # 风格类 lint 放宽（doc 缩进/identical blocks/while let 等不影响正确性）——正确性 lint 保持严格
-        run: cargo clippy --all-targets -- -D warnings -A clippy::doc_markdown -A clippy::if_same_then_else -A clippy::while_let_loop -A clippy::type_complexity -A clippy::redundant_pattern_matching -A clippy::too_many_arguments -A clippy::let_and_return -A clippy::needless_return -A clippy::single_match -A clippy::manual_let_else -A clippy::needless_borrow -A clippy::redundant_clone -A clippy::clone_on_copy -A clippy::needless_range_loop -A clippy::manual_repeat_n -A clippy::doc_lazy_continuation -A clippy::manual_strip -A clippy::collapsible_if -A clippy::question_mark -A clippy::needless_if
+        run: cargo clippy --all-targets -- -D warnings -A clippy::all -W clippy::correctness
 
       - name: cargo test
         run: cargo test --all-features

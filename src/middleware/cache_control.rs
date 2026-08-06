@@ -86,11 +86,15 @@ where
         let fut = self.inner.call(req);
         Box::pin(async move {
             let mut resp = fut.await?;
-            if let Some(policy) = policy {
-                // 已有 Cache-Control（如未来 ServeDir 显式配置）不覆盖
-                if !resp.headers().contains_key(header::CACHE_CONTROL) {
-                    resp.headers_mut()
-                        .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+            // P1-9：仅 2xx 成功响应打缓存头——404/5xx 等错误响应不打
+            // （否则错误页/缺失资源会被浏览器或中间代理长缓存，掩盖后续修复）
+            if resp.status().is_success() {
+                if let Some(policy) = policy {
+                    // 已有 Cache-Control（如未来 ServeDir 显式配置）不覆盖
+                    if !resp.headers().contains_key(header::CACHE_CONTROL) {
+                        resp.headers_mut()
+                            .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+                    }
                 }
             }
             Ok(resp)
@@ -145,5 +149,129 @@ mod tests {
     fn other_root_files_get_short_cache() {
         assert_eq!(cache_policy("/favicon.ico"), Some(CACHE_1D));
         assert_eq!(cache_policy("/logo.png"), Some(CACHE_1D));
+    }
+
+    /// P1-9：响应状态码检查——仅 2xx 打缓存头；404/5xx 错误响应不打
+    #[tokio::test]
+    async fn error_responses_get_no_cache_control() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::{ServiceBuilder, ServiceExt};
+
+        // 最小后端：按请求路径返回指定状态码
+        let echo_status = tower::service_fn(|req: Request<Body>| async move {
+            let path = req.uri().path();
+            let status = if path.contains("missing") {
+                StatusCode::NOT_FOUND
+            } else if path.contains("broken") {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::OK
+            };
+            Ok::<_, std::convert::Infallible>(
+                axum::response::Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        });
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheControlLayer)
+            .service(echo_status);
+
+        // 200 → 打缓存头（/assets 路径 30 天）
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::builder()
+                    .uri("/assets/covers/a.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            CACHE_30D
+        );
+
+        // 404（静态资源缺失）→ 不打缓存头
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::builder()
+                    .uri("/assets/missing.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !resp.headers().contains_key(header::CACHE_CONTROL),
+            "404 响应不应带 Cache-Control"
+        );
+
+        // 500 → 不打缓存头
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::builder()
+                    .uri("/broken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !resp.headers().contains_key(header::CACHE_CONTROL),
+            "5xx 响应不应带 Cache-Control"
+        );
+    }
+
+    /// P1-9：SPA 路径 404（无匹配前端资源）同样不打 no-cache 头
+    #[tokio::test]
+    async fn spa_404_gets_no_cache_control() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::{ServiceBuilder, ServiceExt};
+
+        let not_found = tower::service_fn(|_: Request<Body>| async move {
+            Ok::<_, std::convert::Infallible>(
+                axum::response::Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        });
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheControlLayer)
+            .service(not_found);
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::builder()
+                    .uri("/some/spa/route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !resp.headers().contains_key(header::CACHE_CONTROL),
+            "SPA 兜底 404 不应带 Cache-Control（路径策略原本是 no-cache）"
+        );
     }
 }

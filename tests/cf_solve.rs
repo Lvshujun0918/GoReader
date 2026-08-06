@@ -3,6 +3,11 @@
 //! 覆盖：CF 特征检测 → 质询等待循环 → 求解后 HTML 提取 → cf_clearance cookie 获取 →
 //!      用户 cookie 保留/按 name 合并 → 按用户存库（http_get 全链路）。
 //! 前置：本机安装 Edge/Chrome 且 PATH 有 python；任一缺失 → 跳过（打印原因，不失败）。
+//! P1：应用已不再传 --allow-private-network——mock 类测试需自行以
+//! `obscura serve --allow-private-network` 启动并经 READER_OBSCURA_URL 连接；
+//! 爬虫/求解入口的 SSRF 校验由 common::PrivateNetGuard 放行（仅测试进程）。
+
+mod common;
 
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -136,11 +141,14 @@ async fn cf_challenge_solve_end_to_end() {
 
     // 用户既有 cookie（会话连续性：求解后仍保留并合并）
     let user_cookies = vec![("sid".to_string(), "abc123".to_string())];
+    // P1 SSRF：mock 绑定 127.0.0.1——持测试守卫放行
+    let _ssrf = common::PrivateNetGuard::on();
     let result = reader_dev::service::browser::solve_cf_challenge(
         "default",
         &format!("http://127.0.0.1:{port}/"),
         &user_cookies,
         30_000,
+        None,
     )
     .await;
 
@@ -201,6 +209,8 @@ async fn cf_challenge_solve_end_to_end() {
 #[tokio::test]
 async fn http_get_solves_cf_and_stores_per_user() {
     let _guard = STORAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // P1 SSRF：mock 绑定 127.0.0.1——持测试守卫放行（http_get 入口公网校验）
+    let _ssrf = common::PrivateNetGuard::on();
     if !reader_dev::service::browser::is_browser_available() {
         eprintln!("SKIP: obscura 浏览器不可用——跳过 CF 全链路集成测试");
         return;
@@ -240,6 +250,7 @@ async fn http_get_solves_cf_and_stores_per_user() {
         &url,
         &std::collections::HashMap::new(),
         30,
+        None,
     )
     .await;
 
@@ -283,6 +294,8 @@ async fn http_get_solves_cf_and_stores_per_user() {
 #[tokio::test]
 async fn http_post_retries_after_solve_and_gets_search_results() {
     let _guard = STORAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // P1 SSRF：mock 绑定 127.0.0.1——持测试守卫放行（http_post 入口公网校验）
+    let _ssrf = common::PrivateNetGuard::on();
     if !reader_dev::service::browser::is_browser_available() {
         eprintln!("SKIP: obscura 浏览器不可用——跳过 POST 重试集成测试");
         return;
@@ -317,6 +330,7 @@ async fn http_post_retries_after_solve_and_gets_search_results() {
         &std::collections::HashMap::new(),
         30,
         Some("searchkey=诡秘"),
+        None,
         None,
     )
     .await;

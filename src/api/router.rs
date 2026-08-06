@@ -16,7 +16,6 @@ use serde_json::{json, Value};
 
 use crate::model::User;
 use crate::storage::Storage;
-use crate::util::md5_encode;
 
 /// 统一返回结构（兼容 legacy ReturnData：isSuccess/errorMsg/data——camelCase）
 #[derive(Debug, serde::Serialize)]
@@ -418,6 +417,63 @@ async fn health() -> &'static str {
     "ok!"
 }
 
+/// P1-C6：上游 Content-Type 合法性校验——仅接受 RFC 7230 token 字符集的
+/// `type/subtype[; param=value]`（拒绝控制字符/空白/CRLF 头注入）；非法回退默认 image/*。
+/// 返回值为纯 ASCII token 字符，可安全用作响应头。
+fn sanitize_proxy_content_type(content_type: Option<&str>) -> String {
+    const DEFAULT_CT: &str = "image/png";
+    let is_token = |x: &str| -> bool {
+        !x.is_empty()
+            && x.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+    };
+    let Some(ct) = content_type else {
+        return DEFAULT_CT.to_string();
+    };
+    let ct = ct.trim();
+    // 拒绝头注入/硬控制字符（CR/LF/NUL/DEL）；空白（含参数区 OWS）由结构校验处理
+    if ct.is_empty() || ct.bytes().any(|b| matches!(b, 0x0A | 0x0D | 0x00 | 0x7F)) {
+        return DEFAULT_CT.to_string();
+    }
+    let mut segs = ct.split(';');
+    let media = segs.next().unwrap_or("").trim();
+    let mut parts = media.splitn(2, '/');
+    let (t, s) = (parts.next(), parts.next());
+    if t.map(is_token).unwrap_or(false) && s.map(is_token).unwrap_or(false) {
+        // 参数段：token=token 或 token="quoted-token"
+        let params_ok = segs.all(|p| {
+            let p = p.trim();
+            let mut kv = p.splitn(2, '=');
+            match (kv.next(), kv.next()) {
+                (Some(k), Some(v)) => is_token(k) && is_token(v.trim_matches('"')),
+                _ => false,
+            }
+        });
+        if params_ok {
+            return ct.to_string();
+        }
+    }
+    DEFAULT_CT.to_string()
+}
+
 /// GAP #88/125：GET /assets/proxy?url=&referer=（封面/正文图片防盗链代理）
 /// GAP #88/125：GET /assets/proxy?url=&referer=（封面/正文图片防盗链代理）
 ///
@@ -481,21 +537,34 @@ async fn assets_proxy(
                 None
             };
             match converted {
-                Some(webp) => Response::builder()
+                Some(webp) => match Response::builder()
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
                     .header("Content-Type", "image/webp")
                     .header("Cache-Control", cache_control)
                     .body(Body::from(webp))
-                    .unwrap(),
-                None => Response::builder()
-                    .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header("Cache-Control", cache_control)
-                    .body(Body::from(bytes))
-                    .unwrap(),
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::error!("图片代理响应构造失败: {e}");
+                        Json(ReturnData::err("系统错误")).into_response()
+                    }
+                },
+                None => {
+                    // P1-C6：上游 Content-Type 校验（非法回退默认 image/*）——防头注入/任意类型透传
+                    let content_type = sanitize_proxy_content_type(content_type.as_deref());
+                    match Response::builder()
+                        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+                        .header("Content-Type", content_type)
+                        .header("Cache-Control", cache_control)
+                        .body(Body::from(bytes))
+                    {
+                        Ok(resp) => resp,
+                        Err(e) => {
+                            tracing::error!("图片代理响应构造失败: {e}");
+                            Json(ReturnData::err("系统错误")).into_response()
+                        }
+                    }
+                }
             }
         }
         Err(e) => {
@@ -516,12 +585,13 @@ struct LoginBody {
 }
 
 /// POST /reader3/login：注册或登录，返回 formatUser（camelCase）
-/// GAP 61 登录限流（用户名+直连 IP 失败 5 次锁 5 分钟）+ GAP 59 多设备 token
-/// M3：限流键用直连 socket 对端 IP（axum ConnectInfo）——X-Forwarded-For 可伪造，不再信任
+/// GAP 61 登录限流（用户名+IP 失败 5 次锁 5 分钟）+ GAP 59 多设备 token
+/// M3：限流键默认用直连 socket 对端 IP（axum ConnectInfo，不可伪造）；
+/// P1-2：仅当直连 IP 命中 READER_TRUSTED_PROXIES 白名单时才信任 X-Forwarded-For
 async fn login(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Json<ReturnData> {
     let username = body.username.clone().unwrap_or_default();
@@ -535,8 +605,9 @@ async fn login(
         return Json(ReturnData::err("请输入密码"));
     }
 
-    // GAP 61：登录限流（用户名+直连 IP；锁定中直接拒绝）——M3：XFF 仅可伪造，完全忽略
-    let ip = peer.ip().to_string();
+    // GAP 61：登录限流（用户名+客户端 IP；锁定中直接拒绝）——
+    // P1-2：客户端 IP 默认取直连 IP（XFF 可伪造），仅可信代理白名单内才信 XFF
+    let ip = client_ip(&peer, &headers);
     if let Err(msg) = crate::util::login_limit::check_allowed(&username, &ip) {
         return Json(ReturnData::err(msg));
     }
@@ -638,7 +709,8 @@ async fn register(
         .map(char::from)
         .collect();
     let now = now_millis();
-    let token = md5_encode(&format!("{username}{now}"));
+    // P1-7：注册初始 token 与登录一致——uuid v4 随机（原 md5(username+now) 可预测）
+    let token = uuid::Uuid::new_v4().simple().to_string();
     let user = User {
         username: username.to_string(),
         // 新用户密码：argon2id PHC（salt 列保留 legacy 8 位随机盐，兼容旧读取路径）
@@ -4927,6 +4999,86 @@ fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+// ---------------- 客户端 IP 解析（P1-2：可信代理白名单） ----------------
+
+/// 可信代理网络（IP 或 CIDR，来自 READER_TRUSTED_PROXIES 环境变量：逗号分隔）
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TrustedNet {
+    Ip(std::net::IpAddr),
+    Cidr { net: std::net::IpAddr, prefix: u8 },
+}
+
+impl TrustedNet {
+    fn matches(&self, ip: std::net::IpAddr) -> bool {
+        match *self {
+            TrustedNet::Ip(net) => net == ip,
+            TrustedNet::Cidr { net, prefix } => match (ip, net) {
+                (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+                    let p = prefix.min(32);
+                    p == 0
+                        || (u32::from(a) & (u32::MAX << (32 - p)))
+                            == (u32::from(b) & (u32::MAX << (32 - p)))
+                }
+                (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+                    let p = prefix.min(128);
+                    p == 0
+                        || (u128::from(a) & (u128::MAX << (128 - p)))
+                            == (u128::from(b) & (u128::MAX << (128 - p)))
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
+/// 解析 READER_TRUSTED_PROXIES（逗号分隔 IP/CIDR；非法项忽略）——纯函数可测
+fn parse_trusted_proxies(raw: &str) -> Vec<TrustedNet> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.split_once('/') {
+            Some((ip, prefix)) => {
+                let net = ip.parse::<std::net::IpAddr>().ok()?;
+                let prefix = prefix.parse::<u8>().ok()?;
+                Some(TrustedNet::Cidr { net, prefix })
+            }
+            None => s.parse::<std::net::IpAddr>().ok().map(TrustedNet::Ip),
+        })
+        .collect()
+}
+
+/// 可信代理白名单（首次使用时读 env；未配置 = 空表 = 任何 XFF 都不信）
+static TRUSTED_PROXIES: std::sync::LazyLock<Vec<TrustedNet>> = std::sync::LazyLock::new(|| {
+    parse_trusted_proxies(&std::env::var("READER_TRUSTED_PROXIES").unwrap_or_default())
+});
+
+/// 客户端 IP 解析（P1-2）：默认只用直连 IP（ConnectInfo，不可伪造）；
+/// X-Forwarded-For 仅当直连 IP 命中 READER_TRUSTED_PROXIES 白名单时取最左项
+/// （可信代理链追加的原始客户端地址）。
+fn client_ip(peer: &std::net::SocketAddr, headers: &HeaderMap) -> String {
+    client_ip_with(peer, headers, &TRUSTED_PROXIES)
+}
+
+/// 纯函数版本（测试用）：proxies 显式传入
+fn client_ip_with(
+    peer: &std::net::SocketAddr,
+    headers: &HeaderMap,
+    proxies: &[TrustedNet],
+) -> String {
+    let direct = peer.ip().to_string();
+    if !proxies.iter().any(|p| p.matches(peer.ip())) {
+        return direct;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.parse::<std::net::IpAddr>().is_ok())
+        .unwrap_or(&direct)
+        .to_string()
+}
+
 /// 通用错误 JSON（axum 兜底）
 pub fn internal_error(err: anyhow::Error) -> axum::response::Response {
     (
@@ -4940,10 +5092,12 @@ pub fn internal_error(err: anyhow::Error) -> axum::response::Response {
 /// ① Basic——独立 OPDS 账号优先（system_settings opds_username/opds_password，sha256+salt），
 ///    未配置或校验失败回退系统用户账号（users 表，legacy 双 md5 校验）；
 /// ② accessToken（query/header，username:token，与 /reader3 一致）。
+/// P1-1：Basic 密码校验接入登录限流（用户名+客户端 IP——失败 5 次锁 5 分钟）。
 async fn opds_ns(
     state: &AppState,
     headers: &HeaderMap,
     params: &HashMap<String, String>,
+    client_ip: &str,
 ) -> Result<String, Response> {
     if !state.storage.config.secure {
         return Ok("default".to_string());
@@ -4956,19 +5110,27 @@ async fn opds_ns(
     {
         let decoded = String::from_utf8(opds_base64_decode(creds)).unwrap_or_default();
         if let Some((username, password)) = decoded.split_once(':') {
+            // P1-1：锁定中直接拒绝 Basic 校验（不泄露锁定状态，统一 401）
+            if crate::util::login_limit::check_allowed(username, client_ip).is_err() {
+                return Err(opds_unauthorized());
+            }
             // 独立 OPDS 账号（配置后优先）
             if let Ok(Some((opds_user, stored))) = state.storage.get_opds_account().await {
                 if username == opds_user && crate::util::sha256::verify_password(password, &stored)
                 {
+                    crate::util::login_limit::reset(&opds_user, client_ip);
                     return Ok(opds_user);
                 }
             }
             // 系统用户账号（users 表；argon2id 或 legacy 双 md5——统一校验，MD5 通过自动升级）
             if let Ok(Some(user)) = state.storage.find_user(username).await {
                 if crate::util::password::verify_password(&state.storage, &user, password).await {
+                    crate::util::login_limit::reset(&user.username, client_ip);
                     return Ok(user.username);
                 }
             }
+            // 密码错误 / 账号不存在 → 计入失败次数（与 /reader3/login 一致）
+            crate::util::login_limit::record_failure(username, client_ip);
         }
     }
     // ② accessToken（query/header，username:token，与 /reader3 一致）
@@ -4997,13 +5159,16 @@ fn opds_base64_decode(s: &str) -> Vec<u8> {
 
 /// OPDS 统一分发（/opds/*rest）：OPDS 1.2 目录/搜索/获取/下载/保存 + OPDS 2.0 JSON
 async fn opds_dispatch(
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     State(state): State<AppState>,
     path: Option<axum::extract::Path<String>>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
     let rest = path.as_deref().map(String::as_str).unwrap_or("");
-    let ns = match opds_ns(&state, &headers, &params).await {
+    // P1-2：客户端 IP（直连优先，可信代理白名单内才信 XFF）——OPDS Basic 限流键
+    let ip = client_ip(&peer, &headers);
+    let ns = match opds_ns(&state, &headers, &params, &ip).await {
         Ok(ns) => ns,
         Err(resp) => return resp,
     };
@@ -5211,12 +5376,15 @@ fn opds_404() -> Response {
 
 /// POST /opds/save/{bookId}：OPDS-PSE 保存进度（body/query：progress/position/total/chapterIndex/chapterTitle/timestamp）
 async fn opds_save_post(
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Response {
-    let ns = match opds_ns(&state, &headers, &params).await {
+    // P1-2：客户端 IP（直连优先，可信代理白名单内才信 XFF）——OPDS Basic 限流键
+    let ip = client_ip(&peer, &headers);
+    let ns = match opds_ns(&state, &headers, &params, &ip).await {
         Ok(ns) => ns,
         Err(resp) => return resp,
     };
@@ -5439,6 +5607,29 @@ async fn save_book(
             return Json(ReturnData::err("系统错误"));
         }
     };
+    // P1-C4：书籍数上限（users.book_limit；limit<=0 不限制；已存在覆盖不计名额）
+    if !exists {
+        if let Some(limit) = state
+            .storage
+            .book_limit_for(&namespace)
+            .await
+            .ok()
+            .flatten()
+        {
+            if limit > 0 {
+                let count = match state.storage.count_books_for_user(&namespace).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("统计书籍数失败: {e}");
+                        return Json(ReturnData::err("系统错误"));
+                    }
+                };
+                if count >= limit {
+                    return Json(ReturnData::err("超过书籍数上限"));
+                }
+            }
+        }
+    }
     let result = if exists {
         // 编辑：按 body 出现的字段增量更新
         let patch = body_json.as_object().cloned().unwrap_or_default();
@@ -6516,7 +6707,8 @@ async fn save_replace_rule(
     }
     rule.user_namespace = namespace.clone();
     match state.storage.save_replace_rule(&namespace, &rule).await {
-        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        // P1-C2：返回生效 id（归属冲突时后端已改插新 id——前端据此同步本地列表，避免重复保存）
+        Ok(id) => Json(ReturnData::ok(serde_json::json!({ "id": id }))),
         Err(e) => {
             tracing::error!("saveReplaceRule 失败: {e}");
             Json(ReturnData::err("保存失败"))
@@ -6967,7 +7159,8 @@ async fn save_txt_toc_rule(
     }
     rule.user_namespace = namespace.clone();
     match state.storage.save_txt_toc_rule(&namespace, &rule).await {
-        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        // P1-C2：返回生效 id（归属冲突时后端已改插新 id）
+        Ok(id) => Json(ReturnData::ok(serde_json::json!({ "id": id }))),
         Err(e) => {
             tracing::error!("saveTxtTocRule 失败: {e}");
             Json(ReturnData::err("保存失败"))
@@ -7543,6 +7736,7 @@ async fn get_book_content_local(state: &AppState, chapter_url: &str) -> Option<J
 
 /// fallback：webdav 分流 / API 404 JSON / 前端 SPA（index.html）
 async fn fallback_handler(
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     State(state): State<AppState>,
     method: axum::http::Method,
     uri: axum::http::Uri,
@@ -7553,7 +7747,9 @@ async fn fallback_handler(
     tracing::debug!("fallback: {} {}", method, path);
     // WebDAV
     if path.starts_with("/reader3/webdav") {
-        return crate::api::webdav::handle(&state.storage, method, path, &headers, body).await;
+        // P1-2：客户端 IP（直连优先，可信代理白名单内才信 XFF）——WebDAV Basic 限流键
+        let ip = client_ip(&peer, &headers);
+        return crate::api::webdav::handle(&state.storage, method, path, &headers, body, &ip).await;
     }
     // 其他 /reader3 未匹配 → JSON 404
     if path.starts_with("/reader3") {
@@ -8441,7 +8637,11 @@ mod tests {
             Some(body),
         )
         .await;
-        assert!(ret.0.is_success, "用户目录内相对路径应可读: {}", ret.0.error_msg);
+        assert!(
+            ret.0.is_success,
+            "用户目录内相对路径应可读: {}",
+            ret.0.error_msg
+        );
         assert_eq!(ret.0.data, json!("mine"));
         cleanup(state, dir).await;
     }
@@ -8449,6 +8649,7 @@ mod tests {
     /// getChapterListByRule：书源 ruleToc 单页解析（url 抓取 → 章节数组）
     #[tokio::test]
     async fn test_get_chapter_list_by_rule_api() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("chplist").await;
         let base_url = serve_bodies(vec![r#"{"chapters":[
             {"t":"第一章 开始","h":"/c/1.html"},
@@ -9011,7 +9212,14 @@ mod tests {
         )
         .await;
         assert!(ret.0.is_success, "注册应成功: {}", ret.0.error_msg);
+        // P1-7：注册初始 token 为 uuid v4（32 位十六进制）——与登录一致，不再可预测
         let carol = state.storage.find_user("carol").await.unwrap().unwrap();
+        assert_eq!(carol.token.len(), 32, "uuid v4 simple 应为 32 字符");
+        assert!(
+            carol.token.chars().all(|c| c.is_ascii_hexdigit()),
+            "token 应为十六进制: {}",
+            carol.token
+        );
         assert!(
             carol
                 .password
@@ -11539,6 +11747,7 @@ mod tests {
     /// 抓取成功后写回；local:// 与缺 bookUrl 不参与缓存
     #[tokio::test]
     async fn test_get_book_content_cache_api() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("contentcache").await;
         let base_url = serve_bodies(vec![
             r#"<html><body><div class="content">正文一。</div></body></html>"#.to_string(),
@@ -11943,6 +12152,70 @@ mod tests {
         cleanup(state, dir).await;
     }
 
+    /// P1-2：客户端 IP 解析——默认只用直连 IP（XFF 可伪造，不信任）；
+    /// 仅当直连 IP 命中 READER_TRUSTED_PROXIES 白名单（IP/CIDR）时才取 XFF 最左项
+    #[test]
+    fn test_client_ip_defaults_to_direct() {
+        let peer: std::net::SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        h.insert("x-real-ip", "9.9.9.9".parse().unwrap());
+        // 无白名单：XFF 完全忽略
+        assert_eq!(client_ip_with(&peer, &h, &[]), "203.0.113.9");
+        // 白名单不含直连 IP：仍忽略 XFF
+        let proxies = parse_trusted_proxies("198.51.100.1, 10.0.0.0/8");
+        assert_eq!(client_ip_with(&peer, &h, &proxies), "203.0.113.9");
+    }
+
+    /// P1-2：直连 IP 命中白名单 → 信任 XFF（取最左项）；XFF 缺失/非法回退直连 IP
+    #[test]
+    fn test_client_ip_trusted_proxy_xff() {
+        let proxies = parse_trusted_proxies("10.0.0.0/8, 192.168.1.1");
+        let peer: std::net::SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.7, 10.0.0.5".parse().unwrap());
+        assert_eq!(client_ip_with(&peer, &h, &proxies), "203.0.113.7");
+        // XFF 缺失 → 回退直连 IP
+        assert_eq!(
+            client_ip_with(&peer, &HeaderMap::new(), &proxies),
+            "10.0.0.5"
+        );
+        // XFF 非法 → 回退直连 IP
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        assert_eq!(client_ip_with(&peer, &h2, &proxies), "10.0.0.5");
+        // 精确 IP 白名单
+        let proxies2 = parse_trusted_proxies("192.168.1.1");
+        let peer2: std::net::SocketAddr = "192.168.1.1:9".parse().unwrap();
+        let mut h3 = HeaderMap::new();
+        h3.insert("x-forwarded-for", "198.51.100.2".parse().unwrap());
+        assert_eq!(client_ip_with(&peer2, &h3, &proxies2), "198.51.100.2");
+        // IPv6 CIDR 白名单
+        let proxies3 = parse_trusted_proxies("fd00::/8");
+        let peer3: std::net::SocketAddr = "[fd00::1]:4000".parse().unwrap();
+        let mut h4 = HeaderMap::new();
+        h4.insert("x-forwarded-for", "2001:db8::1".parse().unwrap());
+        assert_eq!(client_ip_with(&peer3, &h4, &proxies3), "2001:db8::1");
+    }
+
+    /// P1-2：READER_TRUSTED_PROXIES 解析——逗号分隔 IP/CIDR，非法项忽略，v4/v6 均支持
+    #[test]
+    fn test_parse_trusted_proxies() {
+        assert!(parse_trusted_proxies("").is_empty());
+        assert!(parse_trusted_proxies("  , , ").is_empty());
+        let p = parse_trusted_proxies("10.0.0.1, 192.168.1.0/24, garbage, 2001:db8::/32");
+        assert_eq!(p.len(), 3, "非法项忽略");
+        assert!(p[0].matches("10.0.0.1".parse().unwrap()));
+        assert!(!p[0].matches("10.0.0.2".parse().unwrap()));
+        assert!(p[1].matches("192.168.1.55".parse().unwrap()));
+        assert!(!p[1].matches("192.168.2.55".parse().unwrap()));
+        assert!(p[2].matches("2001:db8::42".parse().unwrap()));
+        assert!(!p[2].matches("2001:db9::42".parse().unwrap()));
+        // /0 匹配全部
+        let any = parse_trusted_proxies("0.0.0.0/0");
+        assert!(any[0].matches("8.8.8.8".parse().unwrap()));
+    }
+
     /// OPDS：accessToken 查询参数认证（secure 模式），与 /reader3 一致
     #[tokio::test]
     async fn test_opds_access_token_query_auth() {
@@ -11964,7 +12237,7 @@ mod tests {
         let params: HashMap<String, String> = [("accessToken".into(), "alice:tok123".into())]
             .into_iter()
             .collect();
-        let ns = opds_ns(&state, &HeaderMap::new(), &params)
+        let ns = opds_ns(&state, &HeaderMap::new(), &params, "198.51.100.60")
             .await
             .expect("应认证通过");
         assert_eq!(ns, "alice");
@@ -11973,18 +12246,18 @@ mod tests {
         let params: HashMap<String, String> = [("accessToken".into(), "alice:bad".into())]
             .into_iter()
             .collect();
-        let ret = opds_ns(&state, &HeaderMap::new(), &params).await;
+        let ret = opds_ns(&state, &HeaderMap::new(), &params, "198.51.100.60").await;
         assert!(ret.is_err());
         assert_eq!(ret.unwrap_err().status(), StatusCode::UNAUTHORIZED);
 
         // 缺 accessToken → 401（secure）
-        let ret = opds_ns(&state, &HeaderMap::new(), &HashMap::new()).await;
+        let ret = opds_ns(&state, &HeaderMap::new(), &HashMap::new(), "198.51.100.60").await;
         assert!(ret.is_err());
 
         // 非 secure → 恒 default（accessToken 不参与）
         let mut state2 = state.clone();
         state2.storage.config.secure = false;
-        let ret = opds_ns(&state2, &HeaderMap::new(), &HashMap::new()).await;
+        let ret = opds_ns(&state2, &HeaderMap::new(), &HashMap::new(), "198.51.100.60").await;
         assert_eq!(ret.unwrap(), "default");
 
         cleanup(state, dir).await;
@@ -12030,20 +12303,36 @@ mod tests {
         };
 
         // 独立 OPDS 账号通过
-        let ns = opds_ns(&state, &basic("reader", "opds-pass"), &HashMap::new())
-            .await
-            .expect("独立 OPDS 账号应通过");
+        let ns = opds_ns(
+            &state,
+            &basic("reader", "opds-pass"),
+            &HashMap::new(),
+            "198.51.100.61",
+        )
+        .await
+        .expect("独立 OPDS 账号应通过");
         assert_eq!(ns, "reader");
 
         // 独立账号密码错误 → 401（不回退系统账号的同名用户）
-        let ret = opds_ns(&state, &basic("reader", "wrong"), &HashMap::new()).await;
+        let ret = opds_ns(
+            &state,
+            &basic("reader", "wrong"),
+            &HashMap::new(),
+            "198.51.100.61",
+        )
+        .await;
         assert!(ret.is_err());
         assert_eq!(ret.unwrap_err().status(), StatusCode::UNAUTHORIZED);
 
         // 系统用户 Basic 通过（密码为哈希存储，统一校验：MD5 通过自动升级 argon2id）
-        let ns = opds_ns(&state, &basic("alice", "pw123456"), &HashMap::new())
-            .await
-            .expect("系统用户 Basic 应通过");
+        let ns = opds_ns(
+            &state,
+            &basic("alice", "pw123456"),
+            &HashMap::new(),
+            "198.51.100.61",
+        )
+        .await
+        .expect("系统用户 Basic 应通过");
         assert_eq!(ns, "alice");
         // 升级钩子：legacy MD5 校验通过后 users.password 应变为 argon2id PHC
         let alice = state.storage.find_user("alice").await.unwrap().unwrap();
@@ -12058,14 +12347,25 @@ mod tests {
         ));
 
         // 系统用户密码错误 → 401
-        let ret = opds_ns(&state, &basic("alice", "bad"), &HashMap::new()).await;
+        let ret = opds_ns(
+            &state,
+            &basic("alice", "bad"),
+            &HashMap::new(),
+            "198.51.100.61",
+        )
+        .await;
         assert!(ret.is_err());
 
         // 禁用独立账号后：系统账号仍可用
         state.storage.clear_opds_account().await.unwrap();
-        let ns = opds_ns(&state, &basic("alice", "pw123456"), &HashMap::new())
-            .await
-            .expect("禁用独立账号后系统用户应通过");
+        let ns = opds_ns(
+            &state,
+            &basic("alice", "pw123456"),
+            &HashMap::new(),
+            "198.51.100.61",
+        )
+        .await
+        .expect("禁用独立账号后系统用户应通过");
         assert_eq!(ns, "alice");
 
         cleanup(state, dir).await;
@@ -12092,6 +12392,7 @@ mod tests {
             .unwrap();
         let dispatch = |rest: &str, params: HashMap<String, String>| {
             opds_dispatch(
+                ConnectInfo("198.51.100.62:8080".parse().unwrap()),
                 AxumState(state.clone()),
                 Some(axum::extract::Path(rest.to_string())),
                 Query(params),
@@ -12716,6 +13017,7 @@ mod tests {
     /// exportBook：书源书（目录 → 逐章正文，复用规则引擎）
     #[tokio::test]
     async fn test_export_book_web_api() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("exportweb").await;
         let base_url = serve_bodies(vec![
             r#"<ul class="chapters"><li><a href="/ch1.html">第一章</a></li><li><a href="/ch2.html">第二章</a></li></ul>"#.to_string(),
@@ -12784,6 +13086,7 @@ mod tests {
     /// bookSourceDebugSSE：search 动作逐步骤事件（规则解析/URL 构造/请求/规则应用）→ result
     #[tokio::test]
     async fn test_book_source_debug_sse_search() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("dbgsearch").await;
         let base_url = serve_bodies(vec![
             r#"{"data":[{"name":"调试书","author":"甲","url":"/book/1"}]}"#.to_string(),
@@ -12911,6 +13214,7 @@ mod tests {
     /// bookSourceDebugSSE：toc / content 动作
     #[tokio::test]
     async fn test_book_source_debug_sse_toc_content() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("dbgtoc").await;
         let base_url = serve_bodies(vec![
             r#"<ul class="chapters"><li><a href="/ch.html">第一章</a></li></ul>"#.to_string(),
@@ -13177,6 +13481,7 @@ mod tests {
     /// 注意：mock 按请求路径返回（并发抓章时请求到达序不定——路径寻址保证确定性）
     #[tokio::test]
     async fn test_cache_book_web_api() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("cacheweb").await;
         let base_url = serve_bodies_by_path(vec![
             // toc_url 未持久化（upsert_book 列缺失，预存问题）→ 任务回退抓 book_url 当目录页
@@ -14291,6 +14596,7 @@ mod tests {
     /// getInvalidBookSources：HEAD 200 判定可用；连接拒绝判定失效
     #[tokio::test]
     async fn test_get_invalid_book_sources_api() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("invalidsrc").await;
         let good_url = serve_head_get().await;
         state
@@ -15257,6 +15563,7 @@ mod tests {
     /// GAP #51：exploreBook 分页——page 服务端替换 {{page}}；返回 {books, hasMore}
     #[tokio::test]
     async fn test_explore_book_pagination_response() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("explorepg").await;
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let cap = captured.clone();
@@ -15395,6 +15702,7 @@ mod tests {
     /// GAP 51 边界：exploreBook page 参数——POST body 传 page / 缺省 1 / 0 与负数原样透传
     #[tokio::test]
     async fn test_explore_book_page_param_boundaries() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("explorepgb").await;
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let cap = captured.clone();
@@ -15895,13 +16203,7 @@ mod tests {
         std::fs::write(storage_dir.join("data/default/books/未入架.txt"), "秘密\n").unwrap();
         let mut p2 = params.clone();
         p2.insert("url".into(), "storage/data/default/books/未入架.txt".into());
-        let resp = export_book(
-            AxumState(state.clone()),
-            Query(p2),
-            HeaderMap::new(),
-            None,
-        )
-        .await;
+        let resp = export_book(AxumState(state.clone()), Query(p2), HeaderMap::new(), None).await;
         let json: Value = serde_json::from_slice(
             &axum::body::to_bytes(resp.into_body(), 1024 * 1024)
                 .await
@@ -15997,11 +16299,7 @@ mod tests {
         std::fs::write(storage_dir.join("data/alice/ok.txt"), "ok").unwrap();
         // legacy 目录式 epub（{书}.epub/ 内含 index.epub）
         std::fs::create_dir_all(&storage_dir.join("data/alice/书.epub")).unwrap();
-        std::fs::write(
-            storage_dir.join("data/alice/书.epub/index.epub"),
-            "legacy",
-        )
-        .unwrap();
+        std::fs::write(storage_dir.join("data/alice/书.epub/index.epub"), "legacy").unwrap();
         let escape = base.join("escape.txt");
         std::fs::write(&escape, "escape").unwrap();
         let storage_dir = storage_dir.canonicalize().unwrap();
@@ -16035,6 +16333,7 @@ mod tests {
     /// GAP 140：disableInvalidBookSources——坏源批量禁用、好源保留、返回 count/disabled
     #[tokio::test]
     async fn test_disable_invalid_book_sources_api() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("disinv").await;
         let good_url = serve_head_get().await;
         state
@@ -16340,6 +16639,7 @@ mod tests {
     /// 文件 → {downloadUrl}；文本书 → {content}（正文缓存路径不受影响）
     #[tokio::test]
     async fn test_get_book_content_non_text_dispatch() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let (state, dir) = test_state("nontext").await;
         let base = mini_server(
             r#"<html><div class="p">测试正文。<audio src="/a/1.mp3"></audio><img src="/i/1.jpg"><img src="/i/2.jpg"></div></html>"#,
@@ -16635,6 +16935,169 @@ mod tests {
             .unwrap();
         assert!(content.contains("前言"), "正文应含可读文本");
 
+        cleanup(state, dir).await;
+    }
+
+    // ---------------- P1-C4：saveBook 书籍数上限 ----------------
+
+    /// saveBook 新增入架超 users.book_limit → 拒绝；已存在覆盖不计名额；limit<=0 不限制
+    #[tokio::test]
+    async fn test_save_book_limit() {
+        let (state, dir) = test_state("booklimit").await;
+        state
+            .storage
+            .insert_user(&User {
+                username: "default".into(),
+                book_limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let save = |url: &str| {
+            let state = state.clone();
+            let body = Bytes::from(
+                serde_json::json!({
+                    "bookUrl": url,
+                    "name": url,
+                })
+                .to_string(),
+            );
+            async move {
+                save_book(
+                    AxumState(state),
+                    Query(HashMap::new()),
+                    HeaderMap::new(),
+                    Some(body),
+                )
+                .await
+            }
+        };
+        // 前 2 本成功
+        for i in 1..=2 {
+            let ret = save(&format!("https://b{i}.com")).await;
+            assert!(ret.0.is_success, "第 {i} 本应成功: {}", ret.0.error_msg);
+        }
+        // 第 3 本超限拒绝
+        let ret = save("https://b3.com").await;
+        assert!(!ret.0.is_success);
+        assert_eq!(ret.0.error_msg, "超过书籍数上限");
+        assert!(state
+            .storage
+            .find_book("default", "https://b3.com")
+            .await
+            .unwrap()
+            .is_none());
+        // 已存在书覆盖（编辑）不计名额
+        let ret = save("https://b1.com").await;
+        assert!(ret.0.is_success, "编辑已有书应成功: {}", ret.0.error_msg);
+        // 无用户行（非 secure 模式）→ 不限制
+        let (state2, dir2) = test_state("booklimit2").await;
+        for i in 1..=3 {
+            let body = Bytes::from(
+                serde_json::json!({
+                    "bookUrl": format!("https://n{i}.com"),
+                    "name": format!("n{i}"),
+                })
+                .to_string(),
+            );
+            let ret = save_book(
+                AxumState(state2.clone()),
+                Query(HashMap::new()),
+                HeaderMap::new(),
+                Some(body),
+            )
+            .await;
+            assert!(ret.0.is_success, "无用户行不限制: {}", ret.0.error_msg);
+        }
+        cleanup(state2, dir2).await;
+        cleanup(state, dir).await;
+    }
+
+    // ---------------- P1-C6：/assets/proxy 上游 Content-Type 安全 ----------------
+
+    /// sanitize_proxy_content_type：合法 token 透传；非法/注入/缺失回退默认 image/png
+    #[test]
+    fn test_sanitize_proxy_content_type() {
+        // 合法：无参 / 带参数 / 带引号参数
+        assert_eq!(sanitize_proxy_content_type(Some("image/png")), "image/png");
+        assert_eq!(
+            sanitize_proxy_content_type(Some("text/html; charset=utf-8")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            sanitize_proxy_content_type(Some("application/json; charset=\"utf-8\"")),
+            "application/json; charset=\"utf-8\""
+        );
+        // 缺失 → 默认
+        assert_eq!(sanitize_proxy_content_type(None), "image/png");
+        assert_eq!(sanitize_proxy_content_type(Some("")), "image/png");
+        // 非法：控制字符/CRLF 注入/空白/非 token 字符/坏参数
+        assert_eq!(
+            sanitize_proxy_content_type(Some("text/html\r\nX-Evil: 1")),
+            "image/png",
+            "CRLF 注入应回退默认"
+        );
+        assert_eq!(
+            sanitize_proxy_content_type(Some("text /html")),
+            "image/png",
+            "空白应回退默认"
+        );
+        assert_eq!(
+            sanitize_proxy_content_type(Some("text")),
+            "image/png",
+            "缺子类型应回退默认"
+        );
+        assert_eq!(
+            sanitize_proxy_content_type(Some("image/png; charset=\"utf 8\"")),
+            "image/png",
+            "引号参数含空白应回退默认"
+        );
+        assert_eq!(
+            sanitize_proxy_content_type(Some("image/png; badparam")),
+            "image/png",
+            "坏参数应回退默认"
+        );
+    }
+
+    /// /assets/proxy 端到端：上游返回非法 Content-Type（含空白）→ 响应回退默认 image/png；
+    /// 合法 image/png 照常透传（既有 test_assets_proxy_endpoint 已覆盖）
+    #[tokio::test]
+    async fn test_assets_proxy_invalid_content_type_falls_back() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1
+        let (state, dir) = test_state("proxy-ct").await;
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 9, 9, 9];
+        let body = png.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text /html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut resp = head.into_bytes();
+            resp.extend_from_slice(&body);
+            let _ = sock.write_all(&resp).await;
+        });
+        let img_url = format!("http://{addr}/evil/1");
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("url".into(), img_url);
+        let resp = assets_proxy(AxumState(state.clone()), Query(params), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png"),
+            "非法上游 Content-Type 应回退默认 image/png"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        assert_eq!(bytes.to_vec(), png, "图片字节仍应透传");
         cleanup(state, dir).await;
     }
 }

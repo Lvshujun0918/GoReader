@@ -1499,7 +1499,11 @@ mod tests {
     fn test_jsonpath_depth_limit_filter_parens() {
         let json = r#"{"list":[{"name":"书1"}]}"#;
         // 200 层括号嵌套的过滤表达式
-        let expr = format!("$.list[?({}@.name{})].name", "(".repeat(200), ")".repeat(200));
+        let expr = format!(
+            "$.list[?({}@.name{})].name",
+            "(".repeat(200),
+            ")".repeat(200)
+        );
         let r = apply(&expr, json);
         assert!(r.is_empty(), "超深括号过滤应返回空结果而非崩溃: {r:?}");
         // 正常括号仍工作

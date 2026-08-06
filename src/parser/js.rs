@@ -56,6 +56,26 @@ pub const JS_WEBVIEW_UA: &str =
 static SOURCE_VARS: LazyLock<Mutex<HashMap<String, HashMap<String, String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// P1-3：source.put 存储上限（防书源脚本无界写入）——单书源最多 1000 条 / 总 1MB（UTF-8 字节），
+/// 超限拒绝写入（no-op + warn，不抛错——legado 语义 source.put 无返回值，静默丢弃超限值）
+pub const SOURCE_VARS_MAX_ENTRIES: usize = 1000;
+pub const SOURCE_VARS_MAX_BYTES: usize = 1024 * 1024;
+
+/// source.put 核心（纯函数可测）：写入成功返回 true；超限（条数/字节）拒绝返回 false
+fn source_put_limited(vars: &mut HashMap<String, String>, key: &str, value: &str) -> bool {
+    let adding_new = !vars.contains_key(key);
+    if adding_new && vars.len() >= SOURCE_VARS_MAX_ENTRIES {
+        return false;
+    }
+    // 字节上限：当前总量 + 新写入（更新已有 key 同样受字节上限约束——防止反复更新撑破 1MB）
+    let total: usize = vars.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total + key.len() + value.len() > SOURCE_VARS_MAX_BYTES {
+        return false;
+    }
+    vars.insert(key.to_string(), value.to_string());
+    true
+}
+
 /// 书源 JS 桥接：持有书源信息与可被 JS 读写的状态（请求头 / java 临时变量）。
 ///
 /// - 每次搜索/详情流程创建一次（`JsBridge::new(source_key, source_name)`），
@@ -329,14 +349,19 @@ pub fn eval_js_json(code: &str, vars: &HashMap<String, String>) -> Result<JsonVa
 }
 
 /// 带书源桥接的 JSON 版本（同 eval_js_json，注入 java.*/source.*）
+/// P1-C5：与 eval_js_json_with_bridge_limited 对齐——install_globals（默认变量/cookie/jsoup/
+/// 缓存等 shim）+ auto_set_content（隐式 setContent：result 注入的 JS 规则可直接用
+/// java.getString/getElements）
 pub fn eval_js_json_with_bridge(
     code: &str,
     vars: &HashMap<String, String>,
     bridge: &JsBridge,
 ) -> Result<JsonValue> {
     let mut context = context_with_limit(JS_LOOP_ITERATION_LIMIT);
+    install_globals(&mut context, bridge)?;
     inject_vars(&mut context, vars)?;
     install_bridge(&mut context, bridge)?;
+    auto_set_content(vars, bridge);
     let result = context
         .eval(Source::from_bytes(code.as_bytes()))
         .map_err(map_js_error)?;
@@ -2255,16 +2280,19 @@ fn source_get_name(
 }
 
 /// source.put(key, value)：书源级变量（全局存储，按书源 key 隔离，
-/// 跨搜索/详情调用可见）
+/// 跨搜索/详情调用可见）。P1-3：条数/字节上限，超限拒绝写入（见 source_put_limited）。
 fn source_put(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let key = js_value_to_string(args.get_or_undefined(0), context);
     let value = js_value_to_string(args.get_or_undefined(1), context);
-    SOURCE_VARS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(inner.source_key.clone())
-        .or_default()
-        .insert(key, value);
+    let mut map = SOURCE_VARS.lock().unwrap_or_else(|e| e.into_inner());
+    let vars = map.entry(inner.source_key.clone()).or_default();
+    if !source_put_limited(vars, &key, &value) {
+        tracing::warn!(
+            "source.put 超限拒绝（书源 {}，key={key:?}，value_len={}）——单书源上限 {SOURCE_VARS_MAX_ENTRIES} 条 / {SOURCE_VARS_MAX_BYTES} 字节",
+            inner.source_key,
+            value.len()
+        );
+    }
     Ok(JsValue::undefined())
 }
 
@@ -2700,6 +2728,33 @@ mod tests {
         assert_eq!(json.as_array().unwrap()[0]["n"], 1);
     }
 
+    /// P1-C5：eval_js_json_with_bridge 与 eval_js_with_bridge_limited 对齐——
+    /// install_globals（默认变量/unescape/cache 等 shim）+ 隐式 setContent（result 变量
+    /// 自动成为 java 解析文档——搜索/探索 JS 规则无需手动 java.setContent）
+    #[test]
+    fn eval_js_json_with_bridge_globals_and_implicit_set_content() {
+        let bridge = JsBridge::new("https://src.test", "源");
+        // 隐式 setContent：vars.result 注入文档后 java.getString 直接可用
+        let v = vars(&[("result", "<p>你好，世界</p>")]);
+        let json = eval_js_json_with_bridge("java.getString('p@text')", &v, &bridge).unwrap();
+        assert_eq!(json, serde_json::json!("你好，世界"), "应隐式 setContent");
+        // install_globals 的全局 shim（cache/unescape 等）可用
+        let json =
+            eval_js_json_with_bridge("cache.set('k', 42); cache.get('k')", &v, &bridge).unwrap();
+        assert_eq!(json, serde_json::json!(42), "cache shim 应可用");
+        let json = eval_js_json_with_bridge("unescape('a%20b')", &v, &bridge).unwrap();
+        assert_eq!(json, serde_json::json!("a b"), "unescape shim 应可用");
+        // 无 result 变量时与受限路径一致（显式 setContent 仍可用）
+        let v2 = vars(&[]);
+        let json = eval_js_json_with_bridge(
+            "java.setContent('<p>显式</p>'); java.getString('p@text')",
+            &v2,
+            &bridge,
+        )
+        .unwrap();
+        assert_eq!(json, serde_json::json!("显式"));
+    }
+
     /// GAP #94：死循环 JS 触发循环迭代上限 → 报“JS 执行超限”（而非卡死）
     #[test]
     fn eval_js_infinite_loop_hits_limit() {
@@ -2999,6 +3054,9 @@ mod tests {
 
     #[test]
     fn bridge_java_ajax_get_returns_body() {
+        // P1 SSRF：java.ajax 走 crawler::fetch（入口公网校验）——mock 绑定 127.0.0.1，
+        // 持放行守卫（仅测试代码可设置）
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let rt = tokio::runtime::Runtime::new().unwrap();
         let url = rt.block_on(serve_echo(b"hello-ajax".to_vec(), captured.clone()));
@@ -3012,6 +3070,8 @@ mod tests {
 
     #[test]
     fn bridge_java_ajax_post_suffix_gbk() {
+        // P1 SSRF：mock 绑定 127.0.0.1，持放行守卫
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
         // POST + `,{...}` 后缀（method/body/charset）：GBK 字节响应正确解码
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3042,5 +3102,50 @@ mod tests {
             err.to_string().contains("java.ajax 失败"),
             "应报 ajax 失败: {err}"
         );
+    }
+
+    /// P1-3：source.put 条数上限——第 1001 条拒绝，已有 key 更新不受条数限制
+    #[test]
+    fn test_source_put_entry_limit() {
+        let mut vars = HashMap::new();
+        for i in 0..SOURCE_VARS_MAX_ENTRIES {
+            assert!(
+                source_put_limited(&mut vars, &format!("k{i}"), "v"),
+                "前 {SOURCE_VARS_MAX_ENTRIES} 条应写入"
+            );
+        }
+        assert_eq!(vars.len(), SOURCE_VARS_MAX_ENTRIES);
+        // 新 key 超限拒绝
+        assert!(!source_put_limited(&mut vars, "overflow", "v"));
+        assert_eq!(vars.len(), SOURCE_VARS_MAX_ENTRIES, "拒绝后不增长");
+        // 已有 key 更新仍允许（不计新条数）
+        assert!(source_put_limited(&mut vars, "k0", "new-value"));
+        assert_eq!(vars.get("k0").unwrap(), "new-value");
+    }
+
+    /// P1-3：source.put 字节上限——单值超 1MB 拒绝；累加超限拒绝（含更新已有 key）
+    #[test]
+    fn test_source_put_byte_limit() {
+        let mut vars = HashMap::new();
+        // 600KB 值写入成功
+        let big = "x".repeat(600 * 1024);
+        assert!(source_put_limited(&mut vars, "a", &big));
+        // 再写 600KB → 总量超 1MB → 拒绝
+        assert!(!source_put_limited(&mut vars, "b", &big));
+        assert!(!vars.contains_key("b"));
+        // 更新已有 key 撑破上限同样拒绝（值保持原样）
+        assert!(!source_put_limited(&mut vars, "a", &"y".repeat(700 * 1024)));
+        assert_eq!(vars.get("a").unwrap().len(), big.len());
+        // 小值写入正常
+        assert!(source_put_limited(&mut vars, "c", "small"));
+    }
+
+    /// P1-3：source.put 空 key/空值正常（legado 语义兼容）
+    #[test]
+    fn test_source_put_empty_ok() {
+        let mut vars = HashMap::new();
+        assert!(source_put_limited(&mut vars, "", ""));
+        assert!(source_put_limited(&mut vars, "k", ""));
+        assert_eq!(vars.get("k").unwrap(), "");
     }
 }

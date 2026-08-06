@@ -1408,9 +1408,9 @@ onMounted(() => {
                 </button>
               </div>
 
-              <!-- 结果列表：当前源置顶 + originName 排序 + 失效标注（GAP 20；SSE 增量到达实时追加）——搜索过滤后展示 -->
+              <!-- 结果列表：当前源置顶 + originName 排序 + 失效标注（GAP 20；SSE 增量到达实时追加）——搜索过滤后展示（P1-6：v-for 用 sourceFiltered，修复过滤失效 bug） -->
               <ul v-if="sourceFiltered.length" class="source-list">
-                <li v-for="(r, i) in sourceResults" :key="i">
+                <li v-for="(r, i) in sourceFiltered" :key="i">
                   <button
                     class="source-row"
                     :class="{ invalid: invalidSourceUrls.has(r.origin) }"

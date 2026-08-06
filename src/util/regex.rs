@@ -10,7 +10,56 @@
 //! RegexBuilder::multi_line/case_insensitive），便于逐点替换。
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::{LazyLock, Mutex};
+
+/// P1-5：编译结果缓存（防同一模式反复编译——替换规则/TXT 目录规则/书源规则高频路径）。
+/// 上限 500 条：满则整体清空（简单兜底；编译本身受 regex 引擎内部大小限制）。
+const REGEX_CACHE_MAX: usize = 500;
+
+/// 缓存键：(pattern, multi_line, case_insensitive)
+type RegexCacheKey = (String, bool, bool);
+
+static REGEX_CACHE: LazyLock<Mutex<HashMap<RegexCacheKey, Regex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 测试用：缓存命中计数（按模式键计数——各测试用唯一模式，无并行竞争）
+#[cfg(test)]
+static CACHE_HIT_COUNT: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cache_get(key: &RegexCacheKey) -> Option<Regex> {
+    let hit = REGEX_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .cloned();
+    #[cfg(test)]
+    if hit.is_some() {
+        let mut counts = CACHE_HIT_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        *counts.entry(key.0.clone()).or_insert(0) += 1;
+    }
+    hit
+}
+
+/// 测试用：某模式的缓存命中次数
+#[cfg(test)]
+fn cache_hits(pattern: &str) -> usize {
+    *CACHE_HIT_COUNT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(pattern)
+        .unwrap_or(&0)
+}
+
+fn cache_put(key: RegexCacheKey, re: &Regex) {
+    let mut cache = REGEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= REGEX_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(key, re.clone());
+}
 
 /// 编译后的正则（std 或 fancy 引擎之一）
 #[derive(Debug, Clone)]
@@ -25,21 +74,17 @@ enum Inner {
 }
 
 impl Regex {
-    /// 编译：regex 优先；失败回退 fancy-regex（lookbehind 等）；均失败 → Err
+    /// 编译：regex 优先；失败回退 fancy-regex（lookbehind 等）；均失败 → Err。
+    /// P1-5：编译结果缓存（上限 500 条）——命中直接返回克隆（regex::Regex 克隆为
+    /// 内部 Arc 引用计数，O(1)），避免重复编译同一模式。
     pub fn new(pattern: &str) -> Result<Self, String> {
-        match regex::Regex::new(pattern) {
-            Ok(re) => Ok(Regex {
-                inner: Inner::Std(re),
-            }),
-            Err(std_err) => match fancy_regex::Regex::new(pattern) {
-                Ok(re) => Ok(Regex {
-                    inner: Inner::Fancy(re),
-                }),
-                Err(fancy_err) => Err(format!(
-                    "正则编译失败: {pattern:?}（regex: {std_err}；fancy-regex: {fancy_err}）"
-                )),
-            },
+        let key = (pattern.to_string(), false, false);
+        if let Some(cached) = cache_get(&key) {
+            return Ok(cached);
         }
+        let compiled = compile(pattern)?;
+        cache_put(key, &compiled);
+        Ok(compiled)
     }
 
     /// 是否匹配（fancy 引擎求值出错视为不匹配）
@@ -187,26 +232,60 @@ impl<'a> RegexBuilder<'a> {
     }
 
     pub fn build(&self) -> Result<Regex, String> {
-        let mut sb = regex::RegexBuilder::new(self.pattern);
-        sb.multi_line(self.multi_line)
-            .case_insensitive(self.case_insensitive);
-        match sb.build() {
+        let key = (
+            self.pattern.to_string(),
+            self.multi_line,
+            self.case_insensitive,
+        );
+        if let Some(cached) = cache_get(&key) {
+            return Ok(cached);
+        }
+        let compiled = build_uncached(self.pattern, self.multi_line, self.case_insensitive)?;
+        cache_put(key, &compiled);
+        Ok(compiled)
+    }
+}
+
+/// 实际编译（无缓存路径）——regex 优先，fancy-regex 回退
+fn compile(pattern: &str) -> Result<Regex, String> {
+    match regex::Regex::new(pattern) {
+        Ok(re) => Ok(Regex {
+            inner: Inner::Std(re),
+        }),
+        Err(std_err) => match fancy_regex::Regex::new(pattern) {
             Ok(re) => Ok(Regex {
-                inner: Inner::Std(re),
+                inner: Inner::Fancy(re),
             }),
-            Err(std_err) => {
-                let mut fb = fancy_regex::RegexBuilder::new(self.pattern);
-                fb.multi_line(self.multi_line)
-                    .case_insensitive(self.case_insensitive);
-                match fb.build() {
-                    Ok(re) => Ok(Regex {
-                        inner: Inner::Fancy(re),
-                    }),
-                    Err(fancy_err) => Err(format!(
-                        "正则编译失败: {:?}（regex: {}；fancy-regex: {}）",
-                        self.pattern, std_err, fancy_err
-                    )),
-                }
+            Err(fancy_err) => Err(format!(
+                "正则编译失败: {pattern:?}（regex: {std_err}；fancy-regex: {fancy_err}）"
+            )),
+        },
+    }
+}
+
+/// RegexBuilder 实际编译（无缓存路径）
+fn build_uncached(
+    pattern: &str,
+    multi_line: bool,
+    case_insensitive: bool,
+) -> Result<Regex, String> {
+    let mut sb = regex::RegexBuilder::new(pattern);
+    sb.multi_line(multi_line).case_insensitive(case_insensitive);
+    match sb.build() {
+        Ok(re) => Ok(Regex {
+            inner: Inner::Std(re),
+        }),
+        Err(std_err) => {
+            let mut fb = fancy_regex::RegexBuilder::new(pattern);
+            fb.multi_line(multi_line).case_insensitive(case_insensitive);
+            match fb.build() {
+                Ok(re) => Ok(Regex {
+                    inner: Inner::Fancy(re),
+                }),
+                Err(fancy_err) => Err(format!(
+                    "正则编译失败: {:?}（regex: {}；fancy-regex: {}）",
+                    pattern, std_err, fancy_err
+                )),
             }
         }
     }
@@ -289,5 +368,73 @@ mod tests {
             .collect();
         // UTF-8 字节偏移（两=3B 本=3B 书=3B）
         assert_eq!(caps, vec![(6, 9)]);
+    }
+
+    /// P1-5：编译缓存命中——同一模式二次编译走缓存（命中计数 +1，唯一模式无竞争）
+    #[test]
+    fn test_compile_cache_hit() {
+        let re1 = Regex::new(r"p1-5-hit-唯一模式").unwrap();
+        assert_eq!(cache_hits(r"p1-5-hit-唯一模式"), 0, "首次编译不应命中缓存");
+        let re2 = Regex::new(r"p1-5-hit-唯一模式").unwrap();
+        assert_eq!(
+            cache_hits(r"p1-5-hit-唯一模式"),
+            1,
+            "第二次应命中缓存（不重复编译）"
+        );
+        // 缓存克隆功能等价
+        assert!(re1.is_match("前缀 p1-5-hit-唯一模式 后缀"));
+        assert!(re2.is_match("p1-5-hit-唯一模式"));
+        assert!(!re1.is_match("第一章"));
+    }
+
+    /// P1-5：builder 缓存键含 flags——同 flags 命中缓存，不同 flags 单独编译
+    #[test]
+    fn test_compile_cache_builder_flags() {
+        let r1 = RegexBuilder::new(r"^p1-5-builder-\d+")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        let r2 = RegexBuilder::new(r"^p1-5-builder-\d+")
+            .multi_line(true)
+            .build()
+            .unwrap();
+        assert_eq!(cache_hits(r"^p1-5-builder-\d+"), 1, "同 flags 第二次应命中");
+        // 不同 flags → 新键，不命中
+        let r3 = RegexBuilder::new(r"^p1-5-builder-\d+").build().unwrap();
+        assert_eq!(
+            cache_hits(r"^p1-5-builder-\d+"),
+            1,
+            "不同 flags 不应命中（计数不变）"
+        );
+        assert!(r1.is_match("\np1-5-builder-7"));
+        assert!(r2.is_match("\np1-5-builder-7"), "同 flags 克隆功能等价");
+        assert!(
+            !r3.is_match("\np1-5-builder-7"),
+            "非 multiline 不匹配行首于换行后"
+        );
+    }
+
+    /// P1-5：缓存上限 500——超限清空后仍可正常编译使用（不 panic、不泄漏）
+    #[test]
+    fn test_compile_cache_cap() {
+        // 先填满缓存（> 500 条唯一模式）
+        for i in 0..(REGEX_CACHE_MAX + 50) {
+            let re = Regex::new(&format!(r"pat-{i:04}-\d+")).unwrap();
+            assert!(re.is_match(&format!("pat-{i:04}-123")));
+        }
+        // 清空后重新编译仍正常
+        let re = Regex::new(r"pat-0000-\d+").unwrap();
+        assert!(re.is_match("pat-0000-42"));
+        // 缓存内条数不超过上限（+32 容差：并行测试可能同时插入少量条目，
+        // cache_put 满则清空的策略保证稳态不超上限）
+        let len = REGEX_CACHE.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert!(len <= REGEX_CACHE_MAX + 32);
+    }
+
+    /// P1-5：编译失败不缓存（错误路径不受缓存影响）
+    #[test]
+    fn test_compile_cache_invalid_not_cached() {
+        assert!(Regex::new(r"(?<=unclosed").is_err());
+        assert!(Regex::new(r"(?<=unclosed").is_err());
     }
 }

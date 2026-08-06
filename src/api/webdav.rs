@@ -12,12 +12,16 @@ use axum::response::Response;
 use crate::storage::Storage;
 
 /// WebDAV 处理入口（匹配 /reader3/webdav* 任意方法）
+///
+/// `client_ip`：客户端 IP（router 层解析——直连优先，可信代理白名单内才信 XFF），
+/// 用于 P1-1 登录限流键（用户名+IP）。
 pub async fn handle(
     storage: &Storage,
     method: Method,
     path: &str,
     headers: &HeaderMap,
     body: axum::body::Bytes,
+    client_ip: &str,
 ) -> Response {
     // 1. OPTIONS 预检（不校验认证——CORS/客户端预检，legacy 修复点）
     if method == Method::OPTIONS {
@@ -33,8 +37,8 @@ pub async fn handle(
             .unwrap();
     }
 
-    // 2. Basic 认证
-    let Some((_username, _ns, home)) = authenticate(storage, headers).await else {
+    // 2. Basic 认证（P1-1：密码校验接入登录限流）
+    let Some((_username, _ns, home)) = authenticate(storage, headers, client_ip).await else {
         return webdav_status(
             StatusCode::UNAUTHORIZED,
             Some(("WWW-Authenticate", "Basic realm=\"reader\"")),
@@ -61,9 +65,12 @@ pub async fn handle(
 }
 
 /// Basic 认证 → (username, user_namespace, user_home)
+/// P1-1：接入登录限流（用户名+IP，与 /reader3/login 同表）——
+/// 锁定中拒绝；密码错误/账号不存在计入失败；成功清零。
 pub(crate) async fn authenticate(
     storage: &Storage,
     headers: &HeaderMap,
+    client_ip: &str,
 ) -> Option<(String, String, PathBuf)> {
     if !storage.config.secure {
         let home = storage
@@ -80,14 +87,25 @@ pub(crate) async fn authenticate(
         .strip_prefix("Basic ")?;
     let decoded = String::from_utf8(base64_decode(auth)).ok()?;
     let (username, password) = decoded.split_once(':')?;
-    let user = storage.find_user(username).await.ok().flatten()?;
+    // P1-1：锁定中直接拒绝（不泄露锁定状态，统一 401）
+    if crate::util::login_limit::check_allowed(username, client_ip).is_err() {
+        return None;
+    }
+    let Some(user) = storage.find_user(username).await.ok().flatten() else {
+        // 账号不存在 → 计入失败（与 /reader3/login 一致）
+        crate::util::login_limit::record_failure(username, client_ip);
+        return None;
+    };
     if !user.enable_webdav {
+        // 未开启 WebDAV 权限：账号有效但被拒——不累计密码失败，避免误锁
         return None;
     }
     // 统一密码校验：argon2id（PHC）优先，legacy 双 MD5 兼容；MD5 通过时自动升级为 argon2id
     if !crate::util::password::verify_password(storage, &user, password).await {
+        crate::util::login_limit::record_failure(username, client_ip);
         return None;
     }
+    crate::util::login_limit::reset(username, client_ip);
     let home = storage
         .config
         .storage_dir()
@@ -354,5 +372,78 @@ mod tests {
         assert!(resolve_path(&home, "/reader3/webdav/a/..%2F..%2Fescape.txt").is_none());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P1-1：WebDAV Basic 密码校验接入登录限流——
+    /// 失败 5 次锁定（同 IP 即使密码正确也拒绝）、成功清零、异 IP 独立计数
+    #[tokio::test]
+    async fn test_authenticate_login_rate_limit() {
+        let dir =
+            std::env::temp_dir().join(format!("reader-webdav-ratelimit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = crate::AppConfig::from_env();
+        config.work_dir = dir.to_string_lossy().into_owned();
+        config.secure = true;
+        let storage = crate::storage::init(&config).await.unwrap();
+
+        // 系统用户（argon2id 密码）
+        storage
+            .insert_user(&crate::model::User {
+                username: "davetest".into(),
+                password: crate::util::password::hash_password("pw123456"),
+                enable_webdav: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let basic = |u: &str, p: &str| {
+            use base64::Engine;
+            let mut h = axum::http::HeaderMap::new();
+            let cred = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Basic {cred}").parse().unwrap(),
+            );
+            h
+        };
+        let ip = "203.0.113.77";
+
+        // 正确密码通过（并清零计数）
+        assert!(authenticate(&storage, &basic("davetest", "pw123456"), ip)
+            .await
+            .is_some());
+        // 连续 5 次错误密码 → 锁定
+        for _ in 0..5 {
+            assert!(authenticate(&storage, &basic("davetest", "wrong"), ip)
+                .await
+                .is_none());
+        }
+        // 锁定中：正确密码也被拒（统一 401）
+        assert!(
+            authenticate(&storage, &basic("davetest", "pw123456"), ip)
+                .await
+                .is_none(),
+            "锁定中正确密码也应拒绝"
+        );
+        // 异 IP 不受影响（独立计数）
+        assert!(
+            authenticate(&storage, &basic("davetest", "pw123456"), "203.0.113.78")
+                .await
+                .is_some(),
+            "异 IP 应正常通过"
+        );
+        // 账号不存在也计入失败（与 login 一致）——不存在的用户不锁定已存在用户
+        assert!(authenticate(&storage, &basic("ghost", "x"), ip)
+            .await
+            .is_none());
+        assert!(
+            authenticate(&storage, &basic("davetest", "pw123456"), "203.0.113.79")
+                .await
+                .is_some(),
+            "ghost 失败不应影响 davetest 其他 IP"
+        );
+
+        storage.pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

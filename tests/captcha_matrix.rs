@@ -15,6 +15,11 @@
 //! READER_REAL_SITE_TESTS=1 才运行（用户指示：验证一律走内置环境 mock/单测；
 //! 已完成的真实站点实测结果见提交报告）。真实站点失败（网络/站点变动/headless 被拒）
 //! → 降级 skipped 并打印原因，不阻塞其他测试。
+//! P1：应用已不再传 --allow-private-network——mock 类测试需自行以
+//! `obscura serve --allow-private-network` 启动并经 READER_OBSCURA_URL 连接；
+//! 爬虫/求解入口的 SSRF 校验由 common::PrivateNetGuard 放行（仅测试进程）。
+
+mod common;
 
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -158,6 +163,8 @@ fn unsupported_captcha_detection() {
 /// 链路（api.js 执行/iframe/回调/token 写入）
 #[tokio::test]
 async fn turnstile_real_widget_local_page() {
+    // P1 SSRF：本地页绑定 127.0.0.1——持测试守卫放行
+    let _ssrf = common::PrivateNetGuard::on();
     if !real_site_tests_enabled() {
         eprintln!(
             "SKIP: READER_REAL_SITE_TESTS 未启用——真实 widget 测试默认跳过（实测结果见报告）"
@@ -201,7 +208,8 @@ async fn turnstile_real_widget_local_page() {
     let url = format!("http://{addr}/");
 
     let start = Instant::now();
-    let result = reader_dev::service::browser::solve_captcha("default", &url, &[], 45_000).await;
+    let result =
+        reader_dev::service::browser::solve_captcha("default", &url, &[], 45_000, None).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     match result {
         Ok(sol) => match sol.turnstile_token {
@@ -249,7 +257,7 @@ async fn turnstile_real_site_demo() {
 
     // ① 带 stealth 注入（默认）
     let start = Instant::now();
-    let r1 = reader_dev::service::browser::solve_captcha("default", url, &[], 60_000).await;
+    let r1 = reader_dev::service::browser::solve_captcha("default", url, &[], 60_000, None).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     let (_ok1, tok1) = match &r1 {
         Ok(sol) => match &sol.turnstile_token {
@@ -281,7 +289,7 @@ async fn turnstile_real_site_demo() {
     // ② 关 stealth 重测（过率对比——仅报告，不阻塞）
     std::env::set_var("READER_CDP_NO_STEALTH", "1");
     let start2 = Instant::now();
-    let r2 = reader_dev::service::browser::solve_captcha("default", url, &[], 60_000).await;
+    let r2 = reader_dev::service::browser::solve_captcha("default", url, &[], 60_000, None).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     std::env::remove_var("READER_CDP_NO_STEALTH");
     match r2 {
@@ -318,7 +326,8 @@ async fn real_cf_js_challenge(url: &str, name: &str, max_wait_ms: u64) {
     }
     let start = Instant::now();
     let result =
-        reader_dev::service::browser::solve_cf_challenge("default", url, &[], max_wait_ms).await;
+        reader_dev::service::browser::solve_cf_challenge("default", url, &[], max_wait_ms, None)
+            .await;
     reader_dev::service::browser::shutdown_cf_session().await;
     match result {
         Ok(sol) => {
@@ -402,6 +411,7 @@ async fn cf_403_strong_challenge_69shuba_search() {
         "https://www.69shuba.com/",
         &[],
         45_000,
+        None,
     )
     .await
     {
@@ -447,6 +457,7 @@ async fn cf_403_strong_challenge_69shuba_search() {
             "https://www.69shuba.com/modules/article/search.php",
             &[],
             45_000,
+            None,
         )
         .await
         {
@@ -509,6 +520,8 @@ async fn cf_403_strong_challenge_69shuba_search() {
 /// kind=slider）→ 贝塞尔拖拽（人类轨迹，与登录流程同一套 mouse_drag）→ settle → cookie）
 #[tokio::test]
 async fn slider_mock_solve_via_solve_captcha() {
+    // P1 SSRF：mock 绑定 127.0.0.1——持测试守卫放行
+    let _ssrf = common::PrivateNetGuard::on();
     if !browser_available() {
         eprintln!("SKIP: obscura 浏览器不可用——跳过滑块 mock 测试");
         return;
@@ -525,7 +538,8 @@ async fn slider_mock_solve_via_solve_captcha() {
     }
     let url = format!("http://127.0.0.1:{port}/");
 
-    let result = reader_dev::service::browser::solve_captcha("default", &url, &[], 30_000).await;
+    let result =
+        reader_dev::service::browser::solve_captcha("default", &url, &[], 30_000, None).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     kill_mock(&mut child);
 

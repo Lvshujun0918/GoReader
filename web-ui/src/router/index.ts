@@ -69,7 +69,10 @@ const router = createRouter({
       path: '/server-stats',
       name: 'server-stats',
       component: () => import('@/views/ServerStatsView.vue'),
-      meta: { title: '服务监控', titleKey: 'route.serverStats' },
+      // P0-8 标注：服务监控为管理信息接口。登录守卫已有（下方 beforeEach）；
+      // 非 secure 或非管理员场景由后端拒绝即可（管理接口走 checkManagerAuth：
+      // 非 secure → 不支持；secure 缺/错 secureKey → NEED_SECURE_KEY），无需额外前端守卫
+      meta: { title: '服务监控', titleKey: 'route.serverStats', requiresLogin: true, requiresManager: true },
     },
     {
       path: '/files',
@@ -87,7 +90,10 @@ const router = createRouter({
       path: '/users',
       name: 'users',
       component: () => import('@/views/UserManageView.vue'),
-      meta: { title: '用户管理', titleKey: 'route.users' },
+      // P0-8 标注：用户管理为管理接口（getUsers 走 checkManagerAuth）。登录守卫已有；
+      // 非 secure 或非管理员时后端拒绝已够——secure 缺/错 secureKey 返回 NEED_SECURE_KEY，
+      // 由 UserManageView 引导输入（api/users.ts managerParams），无需额外前端路由守卫
+      meta: { title: '用户管理', titleKey: 'route.users', requiresLogin: true, requiresManager: true },
     },
     // GAP 128：路由兜底——未匹配路径进简单 404 页（返回书架）
     {

@@ -18,9 +18,10 @@ export function getTxtTocRules(): Promise<ReturnData<TxtTocRule[]>> {
   return get<TxtTocRule[]>('/getTxtTocRules')
 }
 
-/** POST /reader3/saveTxtTocRule：保存（id 相同覆盖，缺 id 后端自动补） */
-export function saveTxtTocRule(rule: TxtTocRule): Promise<ReturnData<null>> {
-  return post<null>('/saveTxtTocRule', rule)
+/** POST /reader3/saveTxtTocRule：保存（id 相同覆盖，缺 id 后端自动补；
+ *  P1-C2：响应 data.id = 后端生效 id——归属冲突时后端改插新 id） */
+export function saveTxtTocRule(rule: TxtTocRule): Promise<ReturnData<{ id?: string } | null>> {
+  return post<{ id?: string } | null>('/saveTxtTocRule', rule)
 }
 
 /** POST /reader3/deleteTxtTocRule：按 id 删除 */

@@ -11,6 +11,7 @@ import {
   saveRssSource,
 } from '@/api/rss'
 import { t } from '@/utils/i18n'
+import { sanitizeHtml } from '@/utils/sanitize'
 import type { RssArticle, RssSource } from '@/types'
 
 const router = useRouter()
@@ -186,16 +187,8 @@ function backToList() {
   })
 }
 
-/** 轻量清洗：RSS 正文按 HTML 渲染，去掉脚本/样式/嵌入标签与事件属性 */
-function sanitizeHtml(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<(iframe|object|embed|form)[\s\S]*?<\/(?:iframe|object|embed|form)>/gi, '')
-    .replace(/<(iframe|object|embed|form)\b[^>]*\/?>/gi, '')
-    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    .replace(/\s(?:href|src)\s*=\s*["']?\s*javascript:[^"'\s>]*/gi, '')
-}
+/* P1-4：净化器已抽到 @/utils/sanitize（sanitizeHtml）——实体解码后校验，
+   移除 javascript:/data:/vbscript: 协议 href/src/xlink:href（含编码变体），无外部依赖 */
 
 /* ================= GAP 45：刷新全部（逐源重新抓取 feed；后端无批量接口时逐源循环） ================= */
 

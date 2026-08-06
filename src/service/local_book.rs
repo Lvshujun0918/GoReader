@@ -339,6 +339,127 @@ fn chapters_from_plain_text(text: &str) -> Vec<Chapter> {
 
 // ---------- MOBI / AZW3 ----------
 
+/// P1-C3：MOBI/AZW3 解压前长度校验（Huffman 炸弹防护）——PalmDoc 头声称的未压缩正文长度
+/// （text_length / record_count×record_size）与 CDIC 词典短语数超上限即拒绝，避免进入外部
+/// mobi crate 的无限分配/解压路径。文件结构不完整/不可解析时静默放行（交由 mobi crate
+/// 报其友好错误）。
+fn validate_mobi_lengths(bytes: &[u8]) -> Result<()> {
+    // PalmDB header：78B；记录数 u16 BE @76；记录表 8B/条 @78
+    if bytes.len() < 78 {
+        return Ok(());
+    }
+    let num_records = u16::from_be_bytes([bytes[76], bytes[77]]) as usize;
+    if num_records == 0 {
+        return Ok(());
+    }
+    let rec_list_end = 78usize
+        .checked_add(num_records.saturating_mul(8))
+        .unwrap_or(usize::MAX);
+    if rec_list_end > bytes.len() {
+        return Ok(()); // 记录表越界：交给 mobi crate 报错
+    }
+    let rec0_off = u32::from_be_bytes([bytes[78], bytes[79], bytes[80], bytes[81]]) as usize;
+    // 记录 0 = PalmDocHeader（16B）：compression u16、unused u16、text_length u32 @+4、
+    // record_count u16 @+8、record_size u16 @+10
+    if rec0_off + 16 > bytes.len() {
+        return Ok(());
+    }
+    let compression = u16::from_be_bytes([bytes[rec0_off], bytes[rec0_off + 1]]);
+    let text_length = u32::from_be_bytes([
+        bytes[rec0_off + 4],
+        bytes[rec0_off + 5],
+        bytes[rec0_off + 6],
+        bytes[rec0_off + 7],
+    ]) as u64;
+    let record_count = u16::from_be_bytes([bytes[rec0_off + 8], bytes[rec0_off + 9]]) as u64;
+    let record_size = u16::from_be_bytes([bytes[rec0_off + 10], bytes[rec0_off + 11]]) as u64;
+    if text_length > MAX_MOBI_TEXT_BYTES {
+        anyhow::bail!(
+            "MOBI 声称正文 {text_length} 字节超出上限（{}MB），已拒绝",
+            MAX_MOBI_TEXT_BYTES / 1024 / 1024
+        );
+    }
+    if record_count.saturating_mul(record_size) > MAX_MOBI_TEXT_BYTES {
+        anyhow::bail!(
+            "MOBI 记录容量 {record_count}×{record_size} 超出上限（{}MB），已拒绝",
+            MAX_MOBI_TEXT_BYTES / 1024 / 1024
+        );
+    }
+    if compression != 2 {
+        return Ok(()); // 非 Huffman：无需 CDIC 词典校验
+    }
+    // MOBI header @ rec0+16："MOBI" + header_length；first_huff_record @+96（0x60）、
+    // huff_record_count @+100（0x64）
+    if rec0_off + 16 + 116 > bytes.len() {
+        return Ok(());
+    }
+    if &bytes[rec0_off + 16..rec0_off + 20] != b"MOBI" {
+        return Ok(());
+    }
+    let first_huff = u32::from_be_bytes([
+        bytes[rec0_off + 16 + 96],
+        bytes[rec0_off + 16 + 97],
+        bytes[rec0_off + 16 + 98],
+        bytes[rec0_off + 16 + 99],
+    ]) as usize;
+    let huff_count = u32::from_be_bytes([
+        bytes[rec0_off + 16 + 100],
+        bytes[rec0_off + 16 + 101],
+        bytes[rec0_off + 16 + 102],
+        bytes[rec0_off + 16 + 103],
+    ]) as usize;
+    // CDIC 记录：first_huff 之后各条（第一条是 HUFF 字典，其后为 CDIC）；
+    // 与 mobi crate 相同口径累计短语数（n = min(1<<bits, num_phrases - 已累计)）
+    let mut dict_len: u64 = 0;
+    for i in 1..huff_count {
+        let rec_idx = first_huff + i;
+        if rec_idx >= num_records {
+            break;
+        }
+        let entry = 78 + rec_idx * 8;
+        if entry + 4 > bytes.len() {
+            break;
+        }
+        let off = u32::from_be_bytes([
+            bytes[entry],
+            bytes[entry + 1],
+            bytes[entry + 2],
+            bytes[entry + 3],
+        ]) as usize;
+        if off + 16 > bytes.len() {
+            break;
+        }
+        if &bytes[off..off + 4] != b"CDIC" {
+            continue;
+        }
+        let num_phrases = u32::from_be_bytes([
+            bytes[off + 8],
+            bytes[off + 9],
+            bytes[off + 10],
+            bytes[off + 11],
+        ]) as u64;
+        let bits = u32::from_be_bytes([
+            bytes[off + 12],
+            bytes[off + 13],
+            bytes[off + 14],
+            bytes[off + 15],
+        ]) as u64;
+        let n = if bits >= 64 {
+            num_phrases
+        } else {
+            (1u64 << bits).min(num_phrases)
+        };
+        dict_len = dict_len.saturating_add(n);
+        if dict_len > MAX_MOBI_CDIC_PHRASES {
+            anyhow::bail!(
+                "MOBI Huffman 词典短语数超上限（{} 条），已拒绝",
+                MAX_MOBI_CDIC_PHRASES
+            );
+        }
+    }
+    Ok(())
+}
+
 /// MOBI（mobi7）解析：PalmDB header → 记录表 → 解压（Palmdoc/Huff/无压缩）→ rawml HTML → 纯文本分章
 pub fn parse_mobi(bytes: &[u8]) -> Result<ImportedBook> {
     parse_mobi_impl(bytes, "mobi")
@@ -350,6 +471,8 @@ pub fn parse_azw3(bytes: &[u8]) -> Result<ImportedBook> {
 }
 
 fn parse_mobi_impl(bytes: &[u8], format: &str) -> Result<ImportedBook> {
+    // P1-C3：解压前长度校验（Huffman 炸弹防护）
+    validate_mobi_lengths(bytes)?;
     let book = mobi::Mobi::new(bytes.to_vec())
         .context("MOBI/AZW3 解析失败（不是有效的 PalmDB/MOBI 文件，或 KF8 加密暂不支持）")?;
     let raw = book.content_as_string_lossy();
@@ -1013,6 +1136,11 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// （`![页名](data:image/jpeg;base64,...)`）。前端 ReaderView 的 singleImageUrl
 /// 识别该形式并直接渲染 <img>，data URI 无需额外图片服务路由，导入/导出/重扫自包含。
 pub fn parse_cbz(bytes: &[u8]) -> Result<ImportedBook> {
+    parse_cbz_impl(bytes, MAX_CBZ_TOTAL_BYTES)
+}
+
+/// 带累计输出上限的 CBZ 解析（P1-C3；测试用小上限验证超限路径）
+fn parse_cbz_impl(bytes: &[u8], total_max: u64) -> Result<ImportedBook> {
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("CBZ 不是有效的 zip")?;
     let mut pages: Vec<(String, usize)> = Vec::new();
@@ -1041,8 +1169,17 @@ pub fn parse_cbz(bytes: &[u8]) -> Result<ImportedBook> {
     pages.sort_by(|x, y| natural_cmp(&x.0, &y.0));
     use base64::Engine;
     let mut chapters = Vec::with_capacity(pages.len());
+    // P1-C3：全部条目累计输出上限（解压炸弹防护——条目多/单条目大均受限）
+    let mut total = 0u64;
     for (name, _idx) in pages {
         let bytes = read_zip(&mut zip, &name).context("读取 CBZ 图片失败")?;
+        total = total.saturating_add(bytes.len() as u64);
+        if total > total_max {
+            anyhow::bail!(
+                "CBZ 图片累计超出大小上限（{}MB），已拒绝",
+                total_max / 1024 / 1024
+            );
+        }
         let file_name = std::path::Path::new(&name)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1082,6 +1219,11 @@ pub fn parse_cbz(bytes: &[u8]) -> Result<ImportedBook> {
 ///
 /// 正文为 UTF-16LE；按章节偏移切片后解码，U+2029 段落分隔符替换为 \n（umdlib getContentString）。
 pub fn parse_umd(bytes: &[u8]) -> Result<ImportedBook> {
+    parse_umd_impl(bytes, MAX_UMD_TEXT_BYTES)
+}
+
+/// 带正文输出上限的 UMD 解析（P1-C3；测试用小上限验证解压炸弹超限路径）
+fn parse_umd_impl(bytes: &[u8], max_text: u64) -> Result<ImportedBook> {
     let mut cur = UmdCursor::new(bytes);
     let magic = cur.read_u32le().context("UMD 文件过短")?;
     if magic != 0xDE9A9B89 {
@@ -1225,13 +1367,26 @@ pub fn parse_umd(bytes: &[u8]) -> Result<ImportedBook> {
                 }
                 132 => {
                     if additional_check != check {
-                        // 正文块：zlib 解压后按序拼接
+                        // 正文块：zlib 解压后按序拼接（P1-C3：输出上限——解压炸弹防护）
                         let compressed = cur.bytes(block_len as usize).context("UMD 正文块损坏")?;
                         let mut out = Vec::new();
                         flate2::read::ZlibDecoder::new(&compressed[..])
+                            .take(max_text + 1)
                             .read_to_end(&mut out)
                             .context("UMD 正文解压失败")?;
+                        if out.len() as u64 > max_text {
+                            anyhow::bail!(
+                                "UMD 正文解压超出大小上限（{}MB），已拒绝",
+                                max_text / 1024 / 1024
+                            );
+                        }
                         contents.extend_from_slice(&out);
+                        if contents.len() as u64 > max_text {
+                            anyhow::bail!(
+                                "UMD 正文累计超出大小上限（{}MB），已拒绝",
+                                max_text / 1024 / 1024
+                            );
+                        }
                     } else {
                         // 标题块
                         for _ in 0..num_chapters {
@@ -1437,13 +1592,43 @@ pub fn parse_loc_book_path(path: &std::path::Path, user_rules: &[String]) -> Res
 
 // ---------- 工具 ----------
 
+/// P1-C3：zip 单条目解压输出上限（EPUB/DOCX/CBZ 解压炸弹防护——超限拒绝）
+const MAX_ZIP_ENTRY_BYTES: u64 = 500 * 1024 * 1024;
+
+/// P1-C3：CBZ 全部条目累计输出上限（与单条目同值）
+const MAX_CBZ_TOTAL_BYTES: u64 = 500 * 1024 * 1024;
+
+/// P1-C3：MOBI 声称未压缩正文长度上限（解压前校验——Huffman 炸弹防护）
+const MAX_MOBI_TEXT_BYTES: u64 = 500 * 1024 * 1024;
+
+/// P1-C3：MOBI Huffman 词典短语数上限（CDIC num_phrases 分配前校验；正常词典数百~数千条）
+const MAX_MOBI_CDIC_PHRASES: u64 = 1 << 20;
+
+/// P1-C3：UMD 正文 zlib 解压输出上限
+const MAX_UMD_TEXT_BYTES: u64 = 500 * 1024 * 1024;
+
 fn read_zip<R: std::io::Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     path: &str,
 ) -> Result<Vec<u8>> {
+    read_zip_limited(zip, path, MAX_ZIP_ENTRY_BYTES)
+}
+
+/// 带输出上限的 zip 条目读取（P1-C3；测试用小上限验证超限路径）
+fn read_zip_limited<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    path: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
     let mut f = zip.by_name(path)?;
     let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut f, &mut buf)?;
+    std::io::Read::take(&mut f, max_bytes + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        anyhow::bail!(
+            "条目 [{path}] 解压后超出大小上限（{}MB），已拒绝",
+            max_bytes / 1024 / 1024
+        );
+    }
     Ok(buf)
 }
 
@@ -2607,5 +2792,160 @@ mod tests {
         // 未知扩展名仍拒绝
         let err = parse_file_bytes(b"x", "rar", &[]).unwrap_err();
         assert!(format!("{err:#}").contains("不支持的格式"));
+    }
+
+    // ---------------- P1-C3：解压炸弹防护 ----------------
+
+    /// zip 单条目输出上限：超限拒绝（测试用小上限验证超限路径）
+    #[test]
+    fn zip_entry_oversize_rejected() {
+        let big = vec![0u8; 300 * 1024]; // 300KB 条目
+        let bytes = build_cbz(&[("big.bin", &big)]);
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let err = read_zip_limited(&mut zip, "big.bin", 100_000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("超出大小上限"), "超限应拒绝: {err}");
+        // 未超限（同条目用更大上限）→ 正常读取
+        let ok = read_zip_limited(&mut zip, "big.bin", 400_000).unwrap();
+        assert_eq!(ok.len(), 300 * 1024);
+    }
+
+    /// CBZ 累计输出上限：多条目合计超限拒绝；未超限正常
+    #[test]
+    fn cbz_total_oversize_rejected() {
+        let page = vec![0x89u8; 60 * 1024]; // 60KB/页
+        let bytes = build_cbz(&[("p1.jpg", &page), ("p2.jpg", &page), ("p3.jpg", &page)]);
+        let err = parse_cbz_impl(&bytes, 100_000).unwrap_err().to_string();
+        assert!(err.contains("累计超出"), "CBZ 累计超限应拒绝: {err}");
+        // 默认上限（500MB）下正常解析
+        let book = parse_cbz(&bytes).unwrap();
+        assert_eq!(book.chapters.len(), 3);
+    }
+
+    /// UMD 正文 zlib 解压炸弹：小压缩块解出超限正文 → 拒绝；未超限正常
+    #[test]
+    fn umd_zlib_bomb_rejected() {
+        let big = "字".repeat(200_000); // UTF-16LE ≈ 400KB
+        let bytes = build_umd("炸弹书", "作者", &[("第一章", &big)], false);
+        let err = parse_umd_impl(&bytes, 50_000).unwrap_err().to_string();
+        assert!(err.contains("超出大小上限"), "UMD 解压炸弹应拒绝: {err}");
+        // 默认上限（500MB）下正常解析
+        let book = parse_umd(&bytes).unwrap();
+        assert_eq!(book.chapters.len(), 1);
+        assert!(book.chapters[0].content.len() > 100_000);
+    }
+
+    /// 构造最小 PalmDB（记录 0 = PalmDocHeader + MOBI 头；可选 HUFF/CDIC 记录）
+    /// 供 validate_mobi_lengths 测试——text_length/记录容量/CDIC 短语数炸弹各变体
+    fn build_pdb_for_validation(
+        compression: u16,
+        text_length: u32,
+        record_count: u16,
+        record_size: u16,
+        cdic: Option<(u32, u32)>, // (num_phrases, bits)
+    ) -> Vec<u8> {
+        let rec0_len = 16 + 232; // PalmDocHeader(16) + MOBI 头（"MOBI"+len+224 payload）
+        let n_records = if cdic.is_some() { 3 } else { 1 };
+        let rec_list = 78 + n_records * 8;
+        let rec1_off = rec_list + rec0_len;
+        let rec2_off = rec1_off + 16; // HUFF 记录 16B
+        let mut pdb = Vec::new();
+        pdb.extend_from_slice(b"TestBook\0");
+        pdb.resize(32, 0);
+        pdb.extend_from_slice(&[0u8; 44]);
+        pdb.extend_from_slice(&(n_records as u16).to_be_bytes());
+        assert_eq!(pdb.len(), 78, "PalmDB 头应 78B");
+        let mut put_rec = |off: usize| {
+            pdb.extend_from_slice(&(off as u32).to_be_bytes());
+            pdb.extend_from_slice(&[0u8; 4]);
+        };
+        put_rec(rec_list);
+        if cdic.is_some() {
+            put_rec(rec1_off);
+            put_rec(rec2_off);
+        }
+        // 记录 0：PalmDocHeader（16B）
+        pdb.extend_from_slice(&compression.to_be_bytes());
+        pdb.extend_from_slice(&[0u8; 2]);
+        pdb.extend_from_slice(&text_length.to_be_bytes());
+        pdb.extend_from_slice(&record_count.to_be_bytes());
+        pdb.extend_from_slice(&record_size.to_be_bytes());
+        pdb.extend_from_slice(&[0u8; 4]);
+        // MOBI 头（16 + 224）
+        pdb.extend_from_slice(b"MOBI");
+        pdb.extend_from_slice(&232u32.to_be_bytes());
+        let mut payload = vec![0u8; 224];
+        if cdic.is_some() {
+            // 与 mobi crate 一致：remaining-header[88..92] = first_huff_record（abs MOBI+96）
+            payload[88..92].copy_from_slice(&1u32.to_be_bytes()); // first_huff_record = 1
+            payload[92..96].copy_from_slice(&2u32.to_be_bytes()); // huff_record_count = 2
+        }
+        pdb.extend_from_slice(&payload);
+        if let Some((num_phrases, bits)) = cdic {
+            // 记录 1：HUFF（16B）
+            pdb.extend_from_slice(b"HUFF");
+            pdb.extend_from_slice(&0x18u32.to_be_bytes());
+            pdb.extend_from_slice(&16u32.to_be_bytes());
+            pdb.extend_from_slice(&16u32.to_be_bytes());
+            // 记录 2：CDIC（16B 头）——num_phrases @+8、bits @+12
+            pdb.extend_from_slice(b"CDIC");
+            pdb.extend_from_slice(&0x10u32.to_be_bytes());
+            pdb.extend_from_slice(&num_phrases.to_be_bytes());
+            pdb.extend_from_slice(&bits.to_be_bytes());
+        }
+        pdb
+    }
+
+    /// MOBI 解压前长度校验：良性文件放行；text_length / 记录容量 / CDIC 短语数炸弹拒绝
+    #[test]
+    fn mobi_length_validation_rejects_bombs() {
+        // 良性（PalmDoc 未压缩）→ 放行
+        assert!(validate_mobi_lengths(&build_pdb_for_validation(1, 1_000, 10, 100, None)).is_ok());
+        // text_length 炸弹（声称 600MB > 500MB 上限）→ 拒绝
+        let err = validate_mobi_lengths(&build_pdb_for_validation(
+            2,
+            600 * 1024 * 1024,
+            10,
+            100,
+            None,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("声称正文") && err.contains("超出上限"),
+            "{err}"
+        );
+        // 记录容量炸弹（65535×65535 ≈ 4.3GB）→ 拒绝
+        let err = validate_mobi_lengths(&build_pdb_for_validation(2, 1_000, 65535, 65535, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("记录容量"), "{err}");
+        // CDIC 短语数炸弹（num_phrases=0xFFFFFFFF、bits=31 → 2^31 条）→ 拒绝
+        let err = validate_mobi_lengths(&build_pdb_for_validation(
+            2,
+            1_000,
+            10,
+            100,
+            Some((0xFFFF_FFFF, 31)),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("词典短语数"), "{err}");
+        // CDIC 合法量级（1 万条）→ 放行
+        assert!(validate_mobi_lengths(&build_pdb_for_validation(
+            2,
+            1_000,
+            10,
+            100,
+            Some((10_000, 14))
+        ))
+        .is_ok());
+        // 截断/损坏文件：静默放行（交给 mobi crate 报友好错误，不 panic）
+        assert!(validate_mobi_lengths(&[0u8; 10]).is_ok());
+        assert!(
+            validate_mobi_lengths(&build_pdb_for_validation(1, 1_000, 10, 100, None)[..100])
+                .is_ok()
+        );
     }
 }

@@ -354,6 +354,9 @@ mod tests {
     /// GAP #101：订阅抓取核心校验（非书源数组 → 拒绝）
     #[tokio::test]
     async fn test_refresh_source_sub_core_rejects_bad_data() {
+        // P1 SSRF：订阅抓取走 crawler::fetch（入口公网校验）——mock 绑定 127.0.0.1，
+        // 持放行守卫（仅测试代码可设置）
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
         let (storage, dir) = test_storage("subbad").await;
         let base = mock_server(vec![("/bad", "<html>不是json</html>")]).await;
         let err = refresh_source_sub_core(&storage, "default", &format!("{base}/bad"), "订阅")
@@ -371,6 +374,8 @@ mod tests {
     /// GAP #101：RSS 源定时刷新——抓取文章入库
     #[tokio::test]
     async fn test_run_rss_refresh() {
+        // P1 SSRF：RSS 抓取走 crawler::fetch——mock 绑定 127.0.0.1，持放行守卫
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
         let (storage, dir) = test_storage("rssrefresh").await;
         let base = mock_server(vec![("/feed.xml", SAMPLE_RSS)]).await;
         storage

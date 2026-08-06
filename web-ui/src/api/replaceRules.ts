@@ -58,11 +58,12 @@ export async function getReplaceRules(): Promise<ReturnData<ReplaceRule[]>> {
   }
 }
 
-/** POST /reader3/saveReplaceRule（后端优先；失败降级 localStorage） */
-export async function saveReplaceRule(rule: ReplaceRule): Promise<ReturnData<null>> {
+/** POST /reader3/saveReplaceRule（后端优先；失败降级 localStorage）
+ *  P1-C2：响应 data.id = 后端生效 id（归属冲突时后端改插新 id——前端据此同步本地列表） */
+export async function saveReplaceRule(rule: ReplaceRule): Promise<ReturnData<{ id?: string } | null>> {
   if (!backendDown) {
     try {
-      const res = await post<null>('/saveReplaceRule', rule)
+      const res = await post<{ id?: string } | null>('/saveReplaceRule', rule)
       // 镜像更新本地缓存
       const list = loadReplaceRules()
       const i = list.findIndex((r) => r.id === rule.id)

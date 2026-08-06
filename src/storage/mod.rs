@@ -128,25 +128,27 @@ async fn migrate_ns_composite_keys(pool: &SqlitePool) -> Result<()> {
         ("source_subs", "url"),
     ];
     for &(table, url_col) in TABLES {
-        let sql: Option<String> = sqlx::query_scalar(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        )
-        .bind(table)
-        .fetch_optional(pool)
-        .await?;
+        let sql: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(table)
+                .fetch_optional(pool)
+                .await?;
         let composite = format!("PRIMARY KEY ({url_col}, user_namespace)");
         // 去引号后匹配（重建表存的是带引号标识符形式）
         let sql_flat = sql.as_deref().map(|s| s.replace('"', ""));
-        if sql_flat.as_deref().map(|s| s.contains(&composite)).unwrap_or(false) {
+        if sql_flat
+            .as_deref()
+            .map(|s| s.contains(&composite))
+            .unwrap_or(false)
+        {
             continue; // 已是复合主键（新库或已重建）
         }
         // 实况列元数据（pragma 序）：name/type/notnull/dflt_value
-        let cols: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
-            "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info(?1)",
-        )
-        .bind(table)
-        .fetch_all(pool)
-        .await?;
+        let cols: Vec<(String, String, i64, Option<String>)> =
+            sqlx::query_as("SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info(?1)")
+                .bind(table)
+                .fetch_all(pool)
+                .await?;
         if cols.is_empty() {
             tracing::warn!("{table} 无列信息，跳过复合主键重建");
             continue;
@@ -179,14 +181,14 @@ async fn migrate_ns_composite_keys(pool: &SqlitePool) -> Result<()> {
         let mut tx = pool.begin().await?;
         sqlx::query(&create).execute(&mut *tx).await?;
         sqlx::query(&copy).execute(&mut *tx).await?;
-        sqlx::query(&format!("DROP TABLE \"{table}\"")).execute(&mut *tx).await?;
+        sqlx::query(&format!("DROP TABLE \"{table}\""))
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(&format!("ALTER TABLE \"{tmp}\" RENAME TO \"{table}\""))
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        tracing::info!(
-            "{table} 重建为复合主键 ({url_col}, user_namespace)——同 URL 按用户隔离"
-        );
+        tracing::info!("{table} 重建为复合主键 ({url_col}, user_namespace)——同 URL 按用户隔离");
     }
     Ok(())
 }
@@ -1471,13 +1473,19 @@ impl Storage {
     }
 
     /// 删除本地书（含章节）
-    pub async fn delete_local_book(&self, book_url: &str) -> Result<()> {
+    /// 安全：book_chapters 无命名空间列——按书架归属（books.user_namespace）过滤后再删，
+    /// 防止跨用户删他人本地书缓存（P1-C1）
+    pub async fn delete_local_book(&self, ns: &str, book_url: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
-            .bind(book_url)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM books WHERE book_url = ?1")
+        sqlx::query(
+            "DELETE FROM book_chapters WHERE book_url = ?1              AND book_url IN (SELECT book_url FROM books WHERE user_namespace = ?2)",
+        )
+        .bind(book_url)
+        .bind(ns)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM books WHERE user_namespace = ?1 AND book_url = ?2")
+            .bind(ns)
             .bind(book_url)
             .execute(&mut *tx)
             .await?;
@@ -1497,10 +1505,21 @@ impl Storage {
         .await?
         .flatten();
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
-            .bind(book_url)
-            .execute(&mut *tx)
-            .await?;
+        // P1-C1：book_chapters/toc_cache 无命名空间列——按书架归属过滤后删（跨用户删除防护）
+        sqlx::query(
+            "DELETE FROM book_chapters WHERE book_url = ?1              AND book_url IN (SELECT book_url FROM books WHERE user_namespace = ?2)",
+        )
+        .bind(book_url)
+        .bind(ns)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM toc_cache WHERE book_url = ?1              AND book_url IN (SELECT book_url FROM books WHERE user_namespace = ?2)",
+        )
+        .bind(book_url)
+        .bind(ns)
+        .execute(&mut *tx)
+        .await?;
         let r = sqlx::query("DELETE FROM books WHERE user_namespace = ?1 AND book_url = ?2")
             .bind(ns)
             .bind(book_url)
@@ -1831,6 +1850,7 @@ impl Storage {
     }
 
     /// 保存分组：id > 0 按 id 覆盖，否则自增新建；返回带 id 的分组
+    /// P1-C2：id > 0 时校验归属——该 id 已被其他命名空间占用则拒绝（防跨用户覆写）
     pub async fn save_book_group(
         &self,
         ns: &str,
@@ -1839,6 +1859,16 @@ impl Storage {
         let mut g = group.clone();
         g.user_namespace = ns.to_string();
         if g.id > 0 {
+            let owner: Option<String> =
+                sqlx::query_scalar("SELECT user_namespace FROM book_groups WHERE id = ?1")
+                    .bind(g.id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if let Some(owner) = owner {
+                if owner != ns {
+                    anyhow::bail!("分组不存在或无权操作");
+                }
+            }
             sqlx::query(
                 "INSERT OR REPLACE INTO book_groups (id, name, order_num, user_namespace)              VALUES (?1, ?2, ?3, ?4)",
             )
@@ -1952,10 +1982,21 @@ impl Storage {
         let mut tx = self.pool.begin().await?;
         let mut deleted = 0u64;
         for url in book_urls {
-            sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
-                .bind(url)
-                .execute(&mut *tx)
-                .await?;
+            // P1-C1：章节/目录缓存删除按书架归属过滤（跨用户删除防护）
+            sqlx::query(
+                "DELETE FROM book_chapters WHERE book_url = ?1              AND book_url IN (SELECT book_url FROM books WHERE user_namespace = ?2)",
+            )
+            .bind(url)
+            .bind(ns)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM toc_cache WHERE book_url = ?1              AND book_url IN (SELECT book_url FROM books WHERE user_namespace = ?2)",
+            )
+            .bind(url)
+            .bind(ns)
+            .execute(&mut *tx)
+            .await?;
             let r = sqlx::query("DELETE FROM books WHERE user_namespace = ?1 AND book_url = ?2")
                 .bind(ns)
                 .bind(url)
@@ -2245,23 +2286,47 @@ impl Storage {
     }
 
     /// 保存单条替换规则（INSERT OR REPLACE，按 id 主键覆盖）
+    /// P1-C2：id 已被其他命名空间占用时改插新 id（不覆写他人规则；default 共享规则编辑同理
+    /// 转为自己副本）；返回生效 id（可能已改插）
     pub async fn save_replace_rule(
         &self,
         ns: &str,
         rule: &crate::model::ReplaceRule,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let mut r = rule.clone();
+        self.ensure_rule_id_owned("replace_rules", ns, &mut r.id)
+            .await?;
         sqlx::query(
             "INSERT OR REPLACE INTO replace_rules (id, name, find, replace, enable, order_num, user_namespace)              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
-        .bind(&rule.id)
-        .bind(&rule.name)
-        .bind(&rule.find)
-        .bind(&rule.replace)
-        .bind(rule.enabled)
-        .bind(rule.order)
+        .bind(&r.id)
+        .bind(&r.name)
+        .bind(&r.find)
+        .bind(&r.replace)
+        .bind(r.enabled)
+        .bind(r.order)
         .bind(ns)
         .execute(&self.pool)
         .await?;
+        Ok(r.id)
+    }
+
+    /// P1-C2：规则 id 归属校验——id 非空且已被其他命名空间占用 → 改插新 uuid（插入新而非覆写）
+    /// table 仅为固定字面量（"replace_rules" / "txt_toc_rules"），无注入面
+    async fn ensure_rule_id_owned(&self, table: &str, ns: &str, id: &mut String) -> Result<()> {
+        if id.trim().is_empty() {
+            return Ok(());
+        }
+        let sql = format!("SELECT user_namespace FROM {table} WHERE id = ?1");
+        let owner: Option<String> = sqlx::query_scalar(&sql)
+            .bind(&*id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(owner) = owner {
+            if owner != ns {
+                *id = format!("rule-{}", uuid::Uuid::new_v4());
+            }
+        }
         Ok(())
     }
 
@@ -2273,15 +2338,18 @@ impl Storage {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for rule in rules {
+            let mut r = rule.clone();
+            self.ensure_rule_id_owned("replace_rules", ns, &mut r.id)
+                .await?;
             sqlx::query(
                 "INSERT OR REPLACE INTO replace_rules (id, name, find, replace, enable, order_num, user_namespace)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
-            .bind(&rule.id)
-            .bind(&rule.name)
-            .bind(&rule.find)
-            .bind(&rule.replace)
-            .bind(rule.enabled)
-            .bind(rule.order)
+            .bind(&r.id)
+            .bind(&r.name)
+            .bind(&r.find)
+            .bind(&r.replace)
+            .bind(r.enabled)
+            .bind(r.order)
             .bind(ns)
             .execute(&mut *tx)
             .await?;
@@ -2409,19 +2477,30 @@ impl Storage {
     }
 
     /// 保存单条 TXT 目录规则（INSERT OR REPLACE，按 id 主键覆盖）
-    pub async fn save_txt_toc_rule(&self, ns: &str, rule: &crate::model::TxtTocRule) -> Result<()> {
+    /// P1-C2：id 已被其他命名空间占用时改插新 id（不覆写他人规则）
+    /// 保存单条 TXT 目录规则（INSERT OR REPLACE，按 id 主键覆盖）
+    /// P1-C2：id 已被其他命名空间占用时改插新 id（不覆写他人规则）；返回生效 id（可能已改插）
+    pub async fn save_txt_toc_rule(
+        &self,
+        ns: &str,
+        rule: &crate::model::TxtTocRule,
+    ) -> Result<String> {
+        let mut r = rule.clone();
+        // P1-C2：id 已被其他命名空间占用时改插新 id（不覆写他人规则）
+        self.ensure_rule_id_owned("txt_toc_rules", ns, &mut r.id)
+            .await?;
         sqlx::query(
             "INSERT OR REPLACE INTO txt_toc_rules (id, name, rule, enable, serial_number, user_namespace)              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
-        .bind(&rule.id)
-        .bind(&rule.name)
-        .bind(&rule.rule)
-        .bind(rule.enable)
-        .bind(rule.serial_number)
+        .bind(&r.id)
+        .bind(&r.name)
+        .bind(&r.rule)
+        .bind(r.enable)
+        .bind(r.serial_number)
         .bind(ns)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(r.id)
     }
 
     /// 删除 TXT 目录规则（按 id，仅限本命名空间）；返回受影响行数
@@ -2657,16 +2736,32 @@ impl Storage {
     }
 
     /// 替换本地书全部章节（重扫用：事务内先删后插——旧章残留清理，新章序从 0 开始）
+    /// P1-C1：书必须属于当前命名空间（否则拒绝）——防止跨用户覆写他人章节缓存
     pub async fn replace_chapters(
         &self,
+        ns: &str,
         book_url: &str,
         chapters: &[(String, String)],
     ) -> Result<()> {
+        let owned: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM books WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
+        if !owned {
+            anyhow::bail!("书籍不存在或无权操作");
+        }
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM book_chapters WHERE book_url = ?1")
-            .bind(book_url)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "DELETE FROM book_chapters WHERE book_url = ?1              AND book_url IN (SELECT book_url FROM books WHERE user_namespace = ?2)",
+        )
+        .bind(book_url)
+        .bind(ns)
+        .execute(&mut *tx)
+        .await?;
         for (i, (title, content)) in chapters.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO book_chapters (book_url, chapter_index, title, content) VALUES (?1, ?2, ?3, ?4)",
@@ -2855,6 +2950,24 @@ impl Storage {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(count)
+    }
+
+    /// P1-C4：某命名空间书架书籍数（saveBook 上限校验用）
+    pub async fn count_books_for_user(&self, ns: &str) -> Result<i64> {
+        let count = sqlx::query_scalar("SELECT COUNT(*) FROM books WHERE user_namespace = ?1")
+            .bind(ns)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// 用户书籍上限（users.book_limit；用户不存在返回 None——非 secure 模式不限制）
+    pub async fn book_limit_for(&self, ns: &str) -> Result<Option<i64>> {
+        let limit = sqlx::query_scalar("SELECT book_limit FROM users WHERE username = ?1")
+            .bind(ns)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(limit)
     }
 
     /// 用户书源上限（users.book_source_limit；用户不存在返回 None——非 secure 模式不限制）
@@ -4256,13 +4369,12 @@ mod tests {
         let mut sb = source("https://a.com/src", "B的书源", None);
         sb.enabled = false;
         storage.save_book_source("bob", &sb).await.unwrap();
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM book_sources WHERE book_source_url = ?1",
-        )
-        .bind("https://a.com/src")
-        .fetch_one(&storage.pool)
-        .await
-        .unwrap();
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM book_sources WHERE book_source_url = ?1")
+                .bind("https://a.com/src")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
         assert_eq!(n, 2, "同 URL 书源应按用户分行，而非覆盖");
         let (name, en, ns): (String, i64, String) = sqlx::query_as(
             "SELECT book_source_name, enabled, user_namespace FROM book_sources \
@@ -4277,13 +4389,12 @@ mod tests {
         // 用户 A 再保存（改名）→ 仅覆盖自己那行
         sa.book_source_name = "A的书源v2".into();
         storage.save_book_source("alice", &sa).await.unwrap();
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM book_sources WHERE book_source_url = ?1",
-        )
-        .bind("https://a.com/src")
-        .fetch_one(&storage.pool)
-        .await
-        .unwrap();
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM book_sources WHERE book_source_url = ?1")
+                .bind("https://a.com/src")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
         assert_eq!(n, 2, "同用户覆盖更新不应新增行");
         let name: String = sqlx::query_scalar(
             "SELECT book_source_name FROM book_sources WHERE user_namespace = ?1 AND book_source_url = ?2",
@@ -4302,7 +4413,11 @@ mod tests {
         .fetch_one(&storage.pool)
         .await
         .unwrap();
-        assert_eq!((name_b.as_str(), en_b), ("B的书源", 0), "B 的行不受 A 更新影响");
+        assert_eq!(
+            (name_b.as_str(), en_b),
+            ("B的书源", 0),
+            "B 的行不受 A 更新影响"
+        );
 
         // RSS 源
         storage
@@ -4327,13 +4442,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM rss_sources WHERE rss_source_url = ?1",
-        )
-        .bind("https://rss.example/x")
-        .fetch_one(&storage.pool)
-        .await
-        .unwrap();
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM rss_sources WHERE rss_source_url = ?1")
+                .bind("https://rss.example/x")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
         assert_eq!(n, 2);
         let (name, ns): (String, String) = sqlx::query_as(
             "SELECT rss_source_name, user_namespace FROM rss_sources WHERE user_namespace = ?1 AND rss_source_url = ?2",
@@ -4368,13 +4482,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM http_tts_list WHERE url = ?1",
-        )
-        .bind("https://tts.example/x")
-        .fetch_one(&storage.pool)
-        .await
-        .unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_tts_list WHERE url = ?1")
+            .bind("https://tts.example/x")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
         assert_eq!(n, 2);
         let name: String = sqlx::query_scalar(
             "SELECT name FROM http_tts_list WHERE user_namespace = ?1 AND url = ?2",
@@ -4474,10 +4586,8 @@ mod tests {
     /// P0-3：旧库（url 单列主键）重建为复合主键——数据保留 + 幂等
     #[tokio::test]
     async fn test_ns_composite_key_rebuild() {
-        let dir = std::env::temp_dir().join(format!(
-            "reader-storage-test-{}-olddb",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reader-storage-test-{}-olddb", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = AppConfig::from_env();
         config.work_dir = dir.to_string_lossy().into_owned();
@@ -4522,7 +4632,8 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            sql.replace('"', "").contains("PRIMARY KEY (rss_source_url, user_namespace)"),
+            sql.replace('"', "")
+                .contains("PRIMARY KEY (rss_source_url, user_namespace)"),
             "{sql}"
         );
         // 重建后用户 B 保存同 URL → 新行共存（旧库覆盖 bug 已消除）
@@ -4533,10 +4644,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_sources WHERE rss_source_url = 'https://r/x'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rss_sources WHERE rss_source_url = 'https://r/x'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(n, 2, "重建后同 URL 应按用户分行");
         let (name_b, ns_b): (String, String) = sqlx::query_as(
             "SELECT rss_source_name, user_namespace FROM rss_sources WHERE rss_source_url = 'https://r/x' AND user_namespace = 'bob'",
@@ -4551,7 +4664,11 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((name_a.as_str(), en_a), ("A的RSS", 1), "A 的行不受 B 保存影响");
+        assert_eq!(
+            (name_a.as_str(), en_a),
+            ("A的RSS", 1),
+            "A 的行不受 B 保存影响"
+        );
         // 幂等：再跑一次不报错、不丢数据、不重复
         migrate_ns_composite_keys(&pool).await.unwrap();
         let n2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rss_sources")
@@ -7826,5 +7943,473 @@ mod tests {
             .unwrap();
 
         cleanup(storage, "coverclean").await;
+    }
+
+    // ---------------- P1-C1：跨用户缓存删除防护 ----------------
+
+    /// 跨用户 delete_book：书属 default，alice 删不掉章节/目录缓存/书架行；
+    /// default 自己删则全部清除（含 toc_cache）
+    #[tokio::test]
+    async fn test_delete_book_cache_ns_scoped() {
+        let storage = test_storage("delns").await;
+        let url = "https://book.com/x";
+        storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: url.into(),
+                    name: "书X".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_chapters(url, &[("第一章".into(), "正文一".into())])
+            .await
+            .unwrap();
+        storage.cache_toc(url, url, "[{ \"t\": 1 }]").await.unwrap();
+        assert_eq!(storage.count_chapters(url).await.unwrap(), 1);
+        assert_eq!(
+            storage
+                .get_toc_cache(url, 86_400_000)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("[{ \"t\": 1 }]")
+        );
+
+        // 他人命名空间删除：书架行/章节/目录缓存均不受影响
+        let r = storage.delete_book("alice", url).await.unwrap();
+        assert_eq!(r, 0, "跨用户不应删除书架行");
+        assert!(storage.find_book("default", url).await.unwrap().is_some());
+        assert_eq!(
+            storage.count_chapters(url).await.unwrap(),
+            1,
+            "章节缓存应保留"
+        );
+        assert!(
+            storage
+                .get_toc_cache(url, 86_400_000)
+                .await
+                .unwrap()
+                .is_some(),
+            "目录缓存应保留"
+        );
+
+        // 本人删除：书架行 + 章节 + 目录缓存全部清除
+        let r = storage.delete_book("default", url).await.unwrap();
+        assert_eq!(r, 1);
+        assert!(storage.find_book("default", url).await.unwrap().is_none());
+        assert_eq!(storage.count_chapters(url).await.unwrap(), 0);
+        assert!(storage
+            .get_toc_cache(url, 86_400_000)
+            .await
+            .unwrap()
+            .is_none());
+        cleanup(storage, "delns").await;
+    }
+
+    /// 跨用户 delete_books 批量：仅删本命名空间书籍及其缓存
+    #[tokio::test]
+    async fn test_delete_books_cache_ns_scoped() {
+        let storage = test_storage("delnsb").await;
+        let url = "https://book.com/y";
+        storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: url.into(),
+                    name: "书Y".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_chapters(url, &[("第一章".into(), "正文".into())])
+            .await
+            .unwrap();
+        storage.cache_toc(url, url, "[]").await.unwrap();
+
+        // alice 批量删（含他人书 URL）→ 0 行，缓存保留
+        let r = storage
+            .delete_books("alice", &[url.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(r, 0);
+        assert_eq!(storage.count_chapters(url).await.unwrap(), 1);
+        assert!(storage
+            .get_toc_cache(url, 86_400_000)
+            .await
+            .unwrap()
+            .is_some());
+
+        // default 本人批量删 → 全清
+        let r = storage
+            .delete_books("default", &[url.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(r, 1);
+        assert_eq!(storage.count_chapters(url).await.unwrap(), 0);
+        assert!(storage
+            .get_toc_cache(url, 86_400_000)
+            .await
+            .unwrap()
+            .is_none());
+        cleanup(storage, "delnsb").await;
+    }
+
+    /// 跨用户 delete_local_book：他人删不动，本人删（含章节）成功
+    #[tokio::test]
+    async fn test_delete_local_book_ns_scoped() {
+        let storage = test_storage("delloc").await;
+        let url = "local:///books/测试.mobi";
+        storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: url.into(),
+                    name: "本地书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_chapters(url, &[("第一章".into(), "正文".into())])
+            .await
+            .unwrap();
+
+        storage.delete_local_book("alice", url).await.unwrap();
+        assert!(
+            storage.find_book("default", url).await.unwrap().is_some(),
+            "跨用户不应删除本地书"
+        );
+        assert_eq!(storage.count_chapters(url).await.unwrap(), 1);
+
+        storage.delete_local_book("default", url).await.unwrap();
+        assert!(storage.find_book("default", url).await.unwrap().is_none());
+        assert_eq!(storage.count_chapters(url).await.unwrap(), 0);
+        cleanup(storage, "delloc").await;
+    }
+
+    /// 跨用户 replace_chapters：非本人书拒绝（不删不插）；本人书正常替换
+    #[tokio::test]
+    async fn test_replace_chapters_ns_scoped() {
+        let storage = test_storage("repns").await;
+        let url = "local:///books/替换.mobi";
+        storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: url.into(),
+                    name: "本地书".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_chapters(url, &[("旧章".into(), "旧正文".into())])
+            .await
+            .unwrap();
+
+        // alice 替换 → 拒绝，旧章保留
+        let err = storage
+            .replace_chapters("alice", url, &[("新章".into(), "新正文".into())])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("无权"), "应拒绝跨用户替换: {err}");
+        let list = storage.list_chapters(url).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].1, "旧章");
+
+        // default 本人替换 → 成功
+        storage
+            .replace_chapters("default", url, &[("新章".into(), "新正文".into())])
+            .await
+            .unwrap();
+        let list = storage.list_chapters(url).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].1, "新章");
+        assert_eq!(
+            storage
+                .get_chapter_content(url, 0)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("新正文")
+        );
+        cleanup(storage, "repns").await;
+    }
+
+    // ---------------- P1-C2：book_groups / replace_rules / txt_toc_rules 归属校验 ----------------
+
+    /// 跨用户 save_book_group（同 id）：拒绝，他人分组不被覆写；本人覆盖正常
+    #[tokio::test]
+    async fn test_save_book_group_cross_ns_rejected() {
+        let storage = test_storage("grpns").await;
+        let g = storage
+            .save_book_group(
+                "alice",
+                &crate::model::BookGroup {
+                    name: "alice的分组".into(),
+                    order: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // default 用同 id 保存 → 拒绝
+        let err = storage
+            .save_book_group(
+                "default",
+                &crate::model::BookGroup {
+                    id: g.id,
+                    name: "劫持".into(),
+                    order: 9,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("无权"), "跨用户分组保存应拒绝: {err}");
+        let list = storage.list_book_groups("alice").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "alice的分组", "他人分组不应被覆写");
+        // alice 本人覆盖 → 成功
+        storage
+            .save_book_group(
+                "alice",
+                &crate::model::BookGroup {
+                    id: g.id,
+                    name: "改名".into(),
+                    order: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let list = storage.list_book_groups("alice").await.unwrap();
+        assert_eq!(list[0].name, "改名");
+        // default 新建（id=0）不受影响
+        let g2 = storage
+            .save_book_group(
+                "default",
+                &crate::model::BookGroup {
+                    name: "default的分组".into(),
+                    order: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(g2.id > 0 && g2.id != g.id);
+        cleanup(storage, "grpns").await;
+    }
+
+    /// 跨用户 save_replace_rule：他人 id → 改插新 id（不覆写他人规则）
+    #[tokio::test]
+    async fn test_save_replace_rule_cross_ns_new_id() {
+        let storage = test_storage("rulens").await;
+        storage
+            .save_replace_rule(
+                "alice",
+                &crate::model::ReplaceRule {
+                    id: "rule-shared".into(),
+                    name: "alice规则".into(),
+                    find: "广告".into(),
+                    replace: "".into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // default 用同 id 保存 → 成功但换新 id，alice 规则原样
+        storage
+            .save_replace_rule(
+                "default",
+                &crate::model::ReplaceRule {
+                    id: "rule-shared".into(),
+                    name: "default规则".into(),
+                    find: "弹窗".into(),
+                    replace: "".into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let alice_rules = storage.get_replace_rules("alice").await.unwrap();
+        assert_eq!(alice_rules.len(), 1);
+        assert_eq!(alice_rules[0].id, "rule-shared", "他人规则不应被覆写");
+        assert_eq!(alice_rules[0].name, "alice规则");
+        let default_rules = storage.get_replace_rules("default").await.unwrap();
+        assert_eq!(default_rules.len(), 1);
+        assert_ne!(default_rules[0].id, "rule-shared", "应改插新 id");
+        assert_eq!(default_rules[0].name, "default规则");
+        // 本人同 id 覆盖 → 保持原 id
+        storage
+            .save_replace_rule(
+                "alice",
+                &crate::model::ReplaceRule {
+                    id: "rule-shared".into(),
+                    name: "alice规则v2".into(),
+                    find: "广告".into(),
+                    replace: "".into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let alice_rules = storage.get_replace_rules("alice").await.unwrap();
+        assert_eq!(alice_rules.len(), 1);
+        assert_eq!(alice_rules[0].id, "rule-shared");
+        assert_eq!(alice_rules[0].name, "alice规则v2");
+        cleanup(storage, "rulens").await;
+    }
+
+    /// 跨用户 save_replace_rules 批量：同样改插新 id
+    #[tokio::test]
+    async fn test_save_replace_rules_batch_cross_ns_new_id() {
+        let storage = test_storage("rulesns").await;
+        storage
+            .save_replace_rules(
+                "alice",
+                &[
+                    crate::model::ReplaceRule {
+                        id: "r1".into(),
+                        name: "A1".into(),
+                        find: "f1".into(),
+                        ..Default::default()
+                    },
+                    crate::model::ReplaceRule {
+                        id: "r2".into(),
+                        name: "A2".into(),
+                        find: "f2".into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        storage
+            .save_replace_rules(
+                "default",
+                &[
+                    crate::model::ReplaceRule {
+                        id: "r1".into(),
+                        name: "D1".into(),
+                        find: "f1".into(),
+                        ..Default::default()
+                    },
+                    crate::model::ReplaceRule {
+                        id: "r3".into(),
+                        name: "D3".into(),
+                        find: "f3".into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let alice = storage.get_replace_rules("alice").await.unwrap();
+        assert_eq!(alice.len(), 2);
+        assert!(alice.iter().all(|r| r.id == "r1" || r.id == "r2"));
+        let default = storage.get_replace_rules("default").await.unwrap();
+        assert_eq!(default.len(), 2);
+        assert!(default.iter().any(|r| r.id == "r3"), "r3 新 id 保留");
+        assert!(
+            default.iter().all(|r| r.id != "r1"),
+            "r1 应改插新 id（不覆写 alice）"
+        );
+        cleanup(storage, "rulesns").await;
+    }
+
+    /// 跨用户 save_txt_toc_rule：他人 id → 改插新 id
+    #[tokio::test]
+    async fn test_save_txt_toc_rule_cross_ns_new_id() {
+        let storage = test_storage("tocns").await;
+        storage
+            .save_txt_toc_rule(
+                "alice",
+                &crate::model::TxtTocRule {
+                    id: "toc-1".into(),
+                    name: "alice目录规则".into(),
+                    rule: "^第.*章$".into(),
+                    enable: true,
+                    serial_number: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_txt_toc_rule(
+                "default",
+                &crate::model::TxtTocRule {
+                    id: "toc-1".into(),
+                    name: "default目录规则".into(),
+                    rule: "^第.*节$".into(),
+                    enable: true,
+                    serial_number: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let alice = storage.get_txt_toc_rules("alice").await.unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].id, "toc-1");
+        assert_eq!(alice[0].name, "alice目录规则");
+        let default = storage.get_txt_toc_rules("default").await.unwrap();
+        assert_eq!(default.len(), 1);
+        assert_ne!(default[0].id, "toc-1", "应改插新 id");
+        assert_eq!(default[0].name, "default目录规则");
+        cleanup(storage, "tocns").await;
+    }
+
+    // ---------------- P1-C4：book_limit 辅助 ----------------
+
+    #[tokio::test]
+    async fn test_book_limit_for_and_count() {
+        let storage = test_storage("bklimit").await;
+        // 无用户行 → None（非 secure 模式不限制）
+        assert_eq!(storage.book_limit_for("default").await.unwrap(), None);
+        assert_eq!(storage.count_books_for_user("default").await.unwrap(), 0);
+        // 建用户 + 书
+        storage
+            .insert_user(&crate::model::User {
+                username: "alice".into(),
+                book_limit: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(storage.book_limit_for("alice").await.unwrap(), Some(3));
+        for i in 0..2 {
+            storage
+                .upsert_book(
+                    "alice",
+                    &crate::model::Book {
+                        book_url: format!("https://b{i}.com"),
+                        name: format!("书{i}"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(storage.count_books_for_user("alice").await.unwrap(), 2);
+        assert_eq!(storage.count_books_for_user("default").await.unwrap(), 0);
+        cleanup(storage, "bklimit").await;
     }
 }

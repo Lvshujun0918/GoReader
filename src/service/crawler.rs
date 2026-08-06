@@ -15,6 +15,7 @@ use std::time::Duration;
 pub const CF_SOLVE_MAX_WAIT_MS: u64 = 30_000;
 
 /// 抓取响应
+#[derive(Debug)]
 pub struct FetchResponse {
     pub body: String,
     pub url: String,
@@ -34,6 +35,11 @@ pub fn decode_bytes(bytes: &[u8], charset: Option<&str>) -> String {
 }
 
 /// 抓取（GET/POST，支持 header JSON；charset 指定时转码）
+///
+/// P1 SSRF 全覆盖：**入口 URL 与每个重定向跳转目标均做公网校验**（DNS 解析后——
+/// 拒绝私网/回环/链路本地（含 169.254 云元数据）/未指定地址，错误返回）。
+/// http_get/http_post（书源抓取）、java.ajax 等 JS shim、rss/schedule 订阅抓取
+/// 全部经本函数出网——统一生效。
 pub async fn fetch(
     url: &str,
     headers: &HashMap<String, String>,
@@ -42,9 +48,19 @@ pub async fn fetch(
     body: Option<&str>,
     charset: Option<&str>,
 ) -> Result<FetchResponse> {
+    // 入口目标校验（DNS 解析后——拒绝私网/回环/169.254 等）
+    validate_public_target(url).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .user_agent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
+        // 重定向逐跳校验（Policy::custom 闭包内同步校验跳转目标——防 302 跳回内网；
+        // 保留自动跟进语义，合法公网跳转不受影响；非法目标 attempt.error 直接失败）
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            match validate_redirect_target(attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(e) => attempt.error(e),
+            }
+        }))
         .build()?;
 
     let method = if method.eq_ignore_ascii_case("POST") {
@@ -227,6 +243,47 @@ pub fn is_private_target_ip(ip: std::net::IpAddr) -> bool {
                     .is_some_and(|v4| is_private_target_ip(std::net::IpAddr::V4(v4)))
         }
     }
+}
+
+/// 重定向跳转目标校验（同步版——reqwest redirect `Policy::custom` 闭包内调用；
+/// 语义与 [`validate_public_target`] 一致：字面 IP 直接判定、域名解析后逐个 IP 校验、
+/// 私网/回环/链路本地/未指定/广播一律拒绝、解析失败拒绝；测试钩子
+/// `SSRF_ALLOW_PRIVATE` 放行态同样生效）。
+pub fn validate_redirect_target(url: &str) -> Result<()> {
+    if SSRF_ALLOW_PRIVATE.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(url).map_err(|e| anyhow!("重定向目标 URL 非法: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("重定向目标缺少主机名"))?;
+    // 字面 IP 快速路径（不经 DNS）
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_private_target_ip(ip) {
+            anyhow::bail!("重定向目标为内网/回环地址（{ip}），已拦截");
+        }
+        return Ok(());
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        anyhow::bail!("重定向目标 localhost 为回环地址，已拦截");
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+        .map_err(|e| anyhow!("重定向目标域名解析失败（{host}）: {e}"))?;
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if is_private_target_ip(addr.ip()) {
+            anyhow::bail!(
+                "重定向目标域名 {host} 解析到内网/回环地址（{}），已拦截",
+                addr.ip()
+            );
+        }
+    }
+    if !resolved_any {
+        anyhow::bail!("重定向目标域名 {host} 无可用地址");
+    }
+    Ok(())
 }
 
 /// 校验回源目标为公网地址（SSRF 防护，M1）：
@@ -1325,5 +1382,138 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(ct.as_deref(), Some("image/png"));
         assert_eq!(bytes, vec![0x89, b'P', b'N', b'G', 7, 7, 7]);
+    }
+
+    /// P1 SSRF 全覆盖：fetch 入口拒绝私网目标（http_get/http_post 书源抓取、
+    /// java.ajax 等 JS shim、rss/schedule 订阅抓取均经 fetch——统一生效）
+    #[tokio::test]
+    async fn test_fetch_rejects_private_url() {
+        let _g = ssrf_allow_private_guard(false);
+        let headers = HashMap::new();
+        // fetch 直调：回环 / 私网 / 链路本地（169.254 云元数据）
+        for url in [
+            "http://127.0.0.1:1/x",
+            "http://10.0.0.1/x",
+            "http://192.168.1.1/x",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]:1/x",
+        ] {
+            let err = fetch(url, &headers, 3, "GET", None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("已拦截"),
+                "fetch 应拦截私网目标（{url}）: {err}"
+            );
+        }
+        // http_get / http_post 同链路生效
+        let err = http_get("default", "http://127.0.0.1:1/x", &headers, 3, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("已拦截"), "http_get 应拦截: {err}");
+        let err = http_post(
+            "default",
+            "http://127.0.0.1:1/x",
+            &headers,
+            3,
+            Some("a=1"),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("已拦截"),
+            "http_post 应拦截: {err}"
+        );
+    }
+
+    /// P1 SSRF：重定向跳转目标同步校验（Policy::custom 闭包）——私网/回环/非法 URL
+    /// 拒绝；公网字面 IP 与公网域名放行（离线环境跳过域名断言）
+    #[test]
+    fn test_validate_redirect_target() {
+        let _g = ssrf_allow_private_guard(false);
+        for (url, label) in [
+            ("http://127.0.0.1/x", "回环"),
+            ("http://10.0.0.1/x", "私网 10/8"),
+            ("http://172.16.0.1/x", "私网 172.16/12"),
+            ("http://169.254.169.254/latest/meta-data", "链路本地"),
+            ("http://[::1]/x", "IPv6 回环"),
+            ("http://[fc00::1]/x", "IPv6 ULA"),
+            ("http://localhost/x", "localhost 字面量"),
+            ("not a url", "非法 URL"),
+        ] {
+            let err = validate_redirect_target(url).unwrap_err();
+            assert!(
+                err.to_string().contains("已拦截") || err.to_string().contains("非法"),
+                "{label}（{url}）应被拦截: {err}"
+            );
+        }
+        validate_redirect_target("https://8.8.8.8/x").expect("公网字面 IP 应放行");
+        validate_redirect_target("https://1.1.1.1/x").expect("公网字面 IP 应放行");
+        // 公网域名：DNS 解析后应为公网地址（离线环境跳过）
+        if std::net::ToSocketAddrs::to_socket_addrs(&("example.com", 443)).is_ok() {
+            validate_redirect_target("https://example.com/x").expect("公网域名解析后应放行");
+        }
+    }
+
+    /// P1 SSRF：fetch 重定向正常跟进（Policy::custom 不破坏合法跳转）——
+    /// 302 → 公网目标可拉取（mock 绑定 127.0.0.1，持放行守卫）
+    #[tokio::test]
+    async fn test_fetch_follows_redirect() {
+        let _g = ssrf_allow_private_guard(true); // mock 服务器绑定 127.0.0.1
+                                                 // 目标服务器：返回 200 文本
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = target.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = "redirected-ok";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut resp = head.into_bytes();
+            resp.extend_from_slice(body.as_bytes());
+            let _ = sock.write_all(&resp).await;
+        });
+        // 入口服务器：302 → 目标
+        let entry = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entry_addr = entry.local_addr().unwrap();
+        let loc = format!("http://{target_addr}/final");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = entry.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+        });
+        let headers = HashMap::new();
+        let resp = fetch(
+            &format!("http://{entry_addr}/start"),
+            &headers,
+            5,
+            "GET",
+            None,
+            None,
+        )
+        .await
+        .expect("302 应自动跟进");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, "redirected-ok");
+        assert!(
+            resp.url.ends_with("/final"),
+            "最终 URL 应为跳转后地址: {}",
+            resp.url
+        );
     }
 }

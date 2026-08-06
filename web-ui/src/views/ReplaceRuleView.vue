@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import { deleteReplaceRule, getReplaceRules, saveReplaceRule } from '@/api/replaceRules'
 import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
 import { useUserStore } from '@/stores/user'
+import { checkTestRegex } from '@/utils/regexGuard'
 import type { ReplaceRule, TxtTocRule } from '@/types'
 
 const router = useRouter()
@@ -82,7 +83,12 @@ async function confirmSave() {
   }
   try {
     // 当前为 localStorage 占位；后端就绪后走 POST /reader3/saveReplaceRule（见 api/replaceRules.ts）
-    await saveReplaceRule(rule)
+    const res = await saveReplaceRule(rule)
+    // P1-C2：后端生效 id 与本地不一致（归属冲突改插新 id）→ 同步本地条目 id，避免重复保存
+    if (res.data && typeof res.data === 'object' && res.data.id && res.data.id !== rule.id) {
+      rule.id = res.data.id
+      editingId.value = res.data.id
+    }
     if (editing) {
       const i = rules.value.findIndex((r) => r.id === editing)
       if (i >= 0) rules.value[i] = rule
@@ -104,7 +110,11 @@ async function toggleRule(r: ReplaceRule) {
   const prev = r.enabled
   r.enabled = !prev // 乐观更新
   try {
-    await saveReplaceRule({ ...r, enabled: !prev })
+    const res = await saveReplaceRule({ ...r, enabled: !prev })
+    // P1-C2：后端生效 id 同步（归属冲突改插新 id 时避免后续保存重复建规则）
+    if (res.data && typeof res.data === 'object' && res.data.id && res.data.id !== r.id) {
+      r.id = res.data.id
+    }
   } catch {
     r.enabled = prev // 失败回滚
   } finally {
@@ -173,7 +183,8 @@ function closeTest() {
   document.body.style.overflow = ''
 }
 
-/** 本地应用单条规则：默认与阅读页渲染同引擎（字面 replaceAll）；可切正则模式（简化版规则引擎） */
+/** 本地应用单条规则：默认与阅读页渲染同引擎（字面 replaceAll）；可切正则模式（简化版规则引擎）
+ * P1-5：测试正则加长度限制（200 字符）——浏览器主线程同步匹配无法超时中断，超长恶意模式直接拒绝 */
 function runTest() {
   const r = testingRule.value
   if (!r || testRunBusy.value) return
@@ -186,6 +197,11 @@ function runTest() {
     let after: string
     let count = 0
     if (regexMode.value) {
+      const guard = checkTestRegex(find)
+      if (guard) {
+        testResult.value = { after: input, count: 0, error: guard }
+        return
+      }
       const re = new RegExp(find, 'g')
       after = input.replace(re, replace)
       count = (input.match(re) ?? []).length
@@ -283,6 +299,12 @@ async function confirmTxtSave() {
     ElMessage.warning('「规则」不能为空')
     return
   }
+  // P1-5：保存前同样做长度校验（与测试弹窗一致，避免保存后无法测试）
+  const guard = checkTestRegex(rule)
+  if (guard) {
+    ElMessage.warning(guard)
+    return
+  }
   try {
     new RegExp(rule, 'gm')
   } catch {
@@ -328,6 +350,12 @@ function runTxtTest() {
   const r = txtTestingRule.value
   if (!r) return
   txtTestResult.value = null
+  // P1-5：测试正则长度限制（同替换规则测试）
+  const guard = checkTestRegex(r.rule)
+  if (guard) {
+    txtTestResult.value = { titles: [], error: guard }
+    return
+  }
   try {
     const re = new RegExp(r.rule, 'gm')
     const titles: string[] = []

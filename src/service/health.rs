@@ -19,6 +19,10 @@ pub async fn check_source(_ns: &str, source: &BookSource) -> (bool, String) {
     if base.is_empty() {
         return (false, "书源地址为空".to_string());
     }
+    // P1 SSRF：书源地址公网校验（DNS 解析后——拒绝私网/回环/169.254 等）
+    if let Err(e) = crate::service::crawler::validate_public_target(base).await {
+        return (false, format!("地址校验失败: {e}"));
+    }
     let headers = source
         .header
         .as_deref()
@@ -138,5 +142,25 @@ mod tests {
         };
         let (ok, reason) = check_source("default", &src).await;
         assert!(!ok, "不可达应判定不可用: {reason}");
+    }
+
+    /// P1 SSRF：书源健康检测地址拒绝私网/回环（DNS 解析后校验，错误返回）
+    #[tokio::test]
+    async fn test_check_source_rejects_private_url() {
+        let _g = crate::service::crawler::ssrf_allow_private_guard(false);
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://10.0.0.1",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let src = BookSource {
+                book_source_url: url.into(),
+                book_source_name: "私网源".into(),
+                ..Default::default()
+            };
+            let (ok, reason) = check_source("default", &src).await;
+            assert!(!ok, "私网地址应判定不可用");
+            assert!(reason.contains("已拦截"), "应报内网拦截（{url}）: {reason}");
+        }
     }
 }

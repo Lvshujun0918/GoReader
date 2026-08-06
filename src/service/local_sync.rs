@@ -464,7 +464,7 @@ async fn reparse_and_update(
         .iter()
         .map(|c| (c.title.clone(), c.content.clone()))
         .collect();
-    storage.replace_chapters(&book.book_url, &pairs).await?;
+    storage.replace_chapters(ns, &book.book_url, &pairs).await?;
     // 元数据 patch（仅文件可表达的字段；用户编辑字段 custom_intro/custom_tag 不动）
     let mut patch = serde_json::Map::new();
     patch.insert(

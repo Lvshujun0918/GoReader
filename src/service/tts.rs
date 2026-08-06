@@ -553,6 +553,8 @@ pub async fn http_tts_synthesize(
     if text.trim().is_empty() {
         return Err(anyhow!("合成文本不能为空"));
     }
+    // P1 SSRF：HttpTTS 引擎地址同样做公网校验（DNS 解析后——拒绝私网/回环/169.254 等）
+    crate::service::crawler::validate_public_target(url).await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
@@ -598,6 +600,39 @@ pub async fn http_tts_synthesize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P1 SSRF：HttpTTS 引擎地址拒绝私网/回环/链路本地（DNS 解析后校验，错误返回）
+    #[tokio::test]
+    async fn test_http_tts_synthesize_rejects_private_url() {
+        let _g = crate::service::crawler::ssrf_allow_private_guard(false);
+        for url in [
+            "http://127.0.0.1:1/tts",
+            "http://192.168.1.1/tts",
+            "http://169.254.169.254/tts",
+            "http://[::1]:1/tts",
+        ] {
+            let err = http_tts_synthesize(url, "你好", None, None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("已拦截"),
+                "HttpTTS 应拦截私网地址（{url}）: {err}"
+            );
+        }
+    }
+
+    /// P1 SSRF：HttpTTS 合成文本为空仍先报文本错误（校验顺序不破坏既有语义）
+    #[tokio::test]
+    async fn test_http_tts_synthesize_empty_text_first() {
+        let _g = crate::service::crawler::ssrf_allow_private_guard(false);
+        let err = http_tts_synthesize("http://127.0.0.1:1/tts", "  ", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("合成文本不能为空"),
+            "空文本应先报错: {err}"
+        );
+    }
 
     /// 语音列表：非空、含 zh-CN 晓晓 + en-US Aria、字段齐全
     #[test]

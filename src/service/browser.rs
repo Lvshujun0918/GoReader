@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, LazyLock};
+use std::sync::{mpsc, Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -108,10 +108,19 @@ pub struct Browser {
     /// iframe 执行上下文缓存（executionContextCreated 事件——frameId → contextId，
     /// Turnstile 等 iframe 内 JS 执行用——obscura/Chrome 通用）
     frame_ctx: std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    /// WS 关闭信号（P1）：Drop 时发送 → reader 任务退出循环 → stream（接收半）drop
+    /// → WebSocket 关闭——不残留悬挂的 reader 任务/连接（连接泄漏防护）
+    close_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Drop for Browser {
     fn drop(&mut self) {
+        // P1：先发关闭信号（同步 send，不阻塞）——reader 任务收到后立即退出，
+        // 接收半随之 drop，WS 对端观察到连接关闭；在途命令的 oneshot 随之断开
+        // （发送端 drop → 接收端 RecvError，调用方立即得到"连接已关闭"错误）
+        if let Some(tx) = self.close_tx.take() {
+            let _ = tx.send(());
+        }
         // obscura serve 单进程（--workers 1 默认）——kill 句柄即清理；无临时目录需回收
         if let Some(child) = &mut self.child {
             let _ = child.kill();
@@ -147,12 +156,12 @@ fn normalize_cdp_url(url: &str) -> String {
 ///
 /// 参数说明：obscura 为纯 headless 引擎（**无 --headless 参数**——headless 是其固有
 /// 形态）；`--stealth` 启用反检测 + BoringSSL TLS 指纹模拟（stealth 构建；lean 构建
-/// 传该参数仅打警告、其余功能正常）；`--allow-private-network` 放开本地/内网导航
-/// （obscura 默认禁 RFC1918——与旧 Chrome 路径行为一致，SSRF 面持平）；`--proxy`
-/// 透传书源级 proxyUrl / 环境 READER_OBSCURA_PROXY（socks5://host:port 等——
+/// 传该参数仅打警告、其余功能正常）；**不传 `--allow-private-network`**（P1：obscura
+/// 默认禁 RFC1918 内网导航——SSRF 面收窄；书源/登录 URL 在交给浏览器前另行公网校验）；
+/// `--proxy` 透传书源级 proxyUrl / 环境 READER_OBSCURA_PROXY（socks5://host:port 等——
 /// 69shuba 等对数据中心 IP 风控的站点可经住宅/本地代理出口）。
 /// obscura serve 命令构造（纯函数，供测试断言参数）：
-/// `serve --port <port> --stealth --allow-private-network [--proxy <proxy>]`
+/// `serve --port <port> --stealth [--proxy <proxy>]`
 async fn spawn_serve_and_connect(
     exe: &std::path::Path,
     port: u16,
@@ -235,15 +244,15 @@ async fn spawn_serve_and_connect(
 }
 
 /// 构造 obscura serve 命令（spawn_serve_and_connect 用；独立函数便于单测断言参数）：
-/// `serve --port <port> --stealth --allow-private-network [--proxy <proxy>]`——
+/// `serve --port <port> --stealth [--proxy <proxy>]`——
+/// P1：不传 `--allow-private-network`（obscura 默认禁 RFC1918 内网导航）；
 /// proxy 为空/纯空白时不附加 --proxy 参数
 fn obscura_serve_command(exe: &std::path::Path, port: u16, proxy: Option<&str>) -> Command {
     let mut cmd = Command::new(exe);
     cmd.arg("serve")
         .arg("--port")
         .arg(port.to_string())
-        .arg("--stealth")
-        .arg("--allow-private-network");
+        .arg("--stealth");
     if let Some(p) = proxy.filter(|p| !p.trim().is_empty()) {
         cmd.arg("--proxy").arg(p.trim());
     }
@@ -263,54 +272,10 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
     let frame_ctx: std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>> =
         std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
     let frame_ctx_task = std::sync::Arc::clone(&frame_ctx);
-    tokio::spawn(async move {
-        let mut stream = stream;
-        while let Some(msg) = stream.next().await {
-            let Ok(msg) = msg else { break };
-            let text = match msg {
-                Message::Text(t) => t.to_string(),
-                Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-                _ => continue,
-            };
-            let Ok(v) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            // 事件：Runtime.executionContextCreated —— 缓存 iframe 执行上下文（frameId→contextId）
-            if v.get("id").is_none() {
-                if v.get("method").and_then(|m| m.as_str())
-                    == Some("Runtime.executionContextCreated")
-                {
-                    if let Some(ctx) = v.get("params").and_then(|p| p.get("context")) {
-                        let frame_id = ctx
-                            .get("auxData")
-                            .and_then(|a| a.get("frameId"))
-                            .and_then(|f| f.as_str());
-                        let ctx_id = ctx.get("id").and_then(|i| i.as_i64());
-                        if let (Some(fid), Some(cid)) = (frame_id, ctx_id) {
-                            if let Ok(mut map) = frame_ctx_task.lock() {
-                                map.insert(fid.to_string(), cid);
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
-                continue;
-            };
-            if let Some(tx) = pending_task
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id)
-            {
-                let result = match v.get("error") {
-                    Some(err) => Err(err.to_string()),
-                    None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
-                };
-                let _ = tx.send(result);
-            }
-        }
-    });
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    // reader 任务：按 id 路由响应到对应 oneshot（events 忽略）；
+    // P1：close_rx 收到关闭信号（Browser Drop）→ 退出循环（连接泄漏防护）
+    spawn_reader_task(stream, pending_task, frame_ctx_task, close_rx);
 
     let mut browser = Browser {
         child: None,
@@ -319,6 +284,7 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
         next_id: 0,
         session_id: None,
         frame_ctx,
+        close_tx: Some(close_tx),
     };
     // 创建并附加页面 target（flatten 后命令需带 sessionId——obscura CDP 支持
     // Target.createTarget/attachToTarget + sessionId 路由，puppeteer 同款协议）
@@ -368,6 +334,81 @@ async fn init_session(ws: WsStream) -> Result<Browser> {
         )
         .await;
     Ok(browser)
+}
+
+/// CDP reader 任务：按 id 路由响应到对应 oneshot（events 忽略——
+/// Runtime.executionContextCreated 缓存 iframe 上下文）。
+/// P1 WS 连接泄漏防护：`close_rx` 收到关闭信号（Browser Drop）→ 立即退出循环，
+/// stream（接收半）随之 drop → WebSocket 关闭；退出前清空 pending（在途命令的
+/// oneshot 发送端 drop → 调用方立即收到"连接已关闭"错误）。
+fn spawn_reader_task(
+    stream: futures::stream::SplitStream<WsStream>,
+    pending_task: std::sync::Arc<
+        std::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
+    >,
+    frame_ctx_task: std::sync::Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    mut close_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut stream = stream;
+        loop {
+            tokio::select! {
+                msg = stream.next() => {
+                    let Some(msg) = msg else { break };
+                    let Ok(msg) = msg else { break };
+                    let text = match msg {
+                        Message::Text(t) => t.to_string(),
+                        Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                        _ => continue,
+                    };
+                    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    // 事件：Runtime.executionContextCreated —— 缓存 iframe 执行上下文（frameId→contextId）
+                    if v.get("id").is_none() {
+                        if v.get("method").and_then(|m| m.as_str())
+                            == Some("Runtime.executionContextCreated")
+                        {
+                            if let Some(ctx) = v.get("params").and_then(|p| p.get("context")) {
+                                let frame_id = ctx
+                                    .get("auxData")
+                                    .and_then(|a| a.get("frameId"))
+                                    .and_then(|f| f.as_str());
+                                let ctx_id = ctx.get("id").and_then(|i| i.as_i64());
+                                if let (Some(fid), Some(cid)) = (frame_id, ctx_id) {
+                                    if let Ok(mut map) = frame_ctx_task.lock() {
+                                        map.insert(fid.to_string(), cid);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
+                        continue;
+                    };
+                    if let Some(tx) = pending_task
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id)
+                    {
+                        let result = match v.get("error") {
+                            Some(err) => Err(err.to_string()),
+                            None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+                        };
+                        let _ = tx.send(result);
+                    }
+                }
+                // P1：Browser Drop 关闭信号——立即退出（不再持有 WS 接收半）
+                _ = &mut close_rx => break,
+            }
+        }
+        // 在途命令立即失败（oneshot 发送端 drop）
+        pending_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    });
 }
 
 impl Browser {
@@ -1072,7 +1113,7 @@ const TURNSTILE_ESCALATE_CLICK3: u32 = 20;
 /// 会话浏览器闲置回收时限（最后一次使用后 TTL 内无新请求 → 杀进程释放资源）
 const CF_SESSION_IDLE_TTL: Duration = Duration::from_secs(300);
 
-/// 全局 CF 质询求解会话：惰性启动（首次 CF 命中时 launch）、并发互斥（tokio Mutex 排队）、
+/// 全局 CF 质询求解会话：惰性启动（首次 CF 命中时 launch）、并发互斥（每用户会话锁排队）、
 /// 超时/异常自动重启（出错即弃用实例，下次调用重新 launch）。
 /// proxy：会话建立时的浏览器代理（书源级 proxyUrl / READER_OBSCURA_PROXY）——
 /// 后续请求 proxy 变化时弃用会话重启（代理是浏览器进程级参数，无法热切换）
@@ -1082,27 +1123,100 @@ struct CfSession {
     proxy: Option<String>,
 }
 
+/// 会话条目：`inner` 为**会话级互斥锁**（P1 全局锁优化——不同用户命名空间的求解
+/// 并行执行互不阻塞，同一 ns 串行）。条目经 Arc 共享：从 map 移除后，在途求解仍
+/// 持有 Arc 正常完成（下次求解重建条目）。
+struct CfSessionEntry {
+    /// None = 尚未启动/已弃用（下次求解重新 launch）
+    inner: tokio::sync::Mutex<Option<CfSession>>,
+}
+
+impl CfSessionEntry {
+    fn new() -> Self {
+        CfSessionEntry {
+            inner: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
 /// 按用户命名空间隔离的浏览器会话池（安全：同一实例多用户共享一个浏览器实例会
 /// 泄漏登录态 cookie——A 用户的 cf_clearance/登录 cookie 残留在浏览器，B 用户的
 /// 质询求解会带着 A 的 cookie 请求。每 ns 独立实例（独立 user-data-dir），
 /// 求解前还清空浏览器 cookie 再注入本用户 cookie（双保险）。
-static CF_SESSION: LazyLock<tokio::sync::Mutex<std::collections::HashMap<String, CfSession>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+/// **P1 锁粒度优化**：全局 Mutex → RwLock<条目表> + 每条目会话锁（tokio Mutex）——
+/// 挑战求解期间只持有本 ns 的会话锁，不同 ns 的求解并行；锁内无全局等待。
+static CF_SESSION: LazyLock<
+    tokio::sync::RwLock<std::collections::HashMap<String, Arc<CfSessionEntry>>>,
+> = LazyLock::new(|| tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// 取（无则创建）用户命名空间的会话条目。读锁快路径；未命中才写锁插入。
+async fn cf_session_entry(ns: &str) -> Arc<CfSessionEntry> {
+    if let Some(entry) = CF_SESSION.read().await.get(ns).cloned() {
+        return entry;
+    }
+    let mut map = CF_SESSION.write().await;
+    map.entry(ns.to_string())
+        .or_insert_with(|| Arc::new(CfSessionEntry::new()))
+        .clone()
+}
 
 /// 闲置回收：每次求解成功后挂一个定时任务——TTL 内无新使用则弃用会话（Drop 杀进程+清目录）。
-/// 并发触发多个无害（幂等：last_used 刷新后条件不满足即跳过）
+/// 并发触发多个无害（幂等：last_used 刷新后条件不满足即跳过）。
+/// 正在求解中的条目（会话锁被占用）`try_lock` 失败 → 跳过不回收。
 fn spawn_cf_session_reaper() {
     tokio::spawn(async {
         tokio::time::sleep(CF_SESSION_IDLE_TTL).await;
-        let mut guard = CF_SESSION.lock().await;
-        guard.retain(|_ns, s| s.last_used.elapsed() < CF_SESSION_IDLE_TTL); // Drop 过期 → 杀进程+清目录
+        reap_idle_cf_sessions().await;
     });
+}
+
+/// 回收闲置超时（[`CF_SESSION_IDLE_TTL`] 内无使用）的会话条目。独立函数便于单测。
+/// 锁序安全：try_lock 不等待——先读锁扫描（try_lock 每条目），再写锁二次确认删除，
+/// 持会话锁期间绝不获取 map 写锁（无死锁环）。
+async fn reap_idle_cf_sessions() {
+    let mut stale: Vec<String> = Vec::new();
+    {
+        let map = CF_SESSION.read().await;
+        for (ns, entry) in map.iter() {
+            if let Ok(guard) = entry.inner.try_lock() {
+                let idle = guard
+                    .as_ref()
+                    .map(|s| s.last_used.elapsed() >= CF_SESSION_IDLE_TTL)
+                    .unwrap_or(true);
+                if idle {
+                    stale.push(ns.clone());
+                }
+            }
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+    // 二次确认（写锁下 try_lock——避免误回收刚被复用的条目）
+    let mut map = CF_SESSION.write().await;
+    for ns in stale {
+        let mut remove_it = false;
+        if let Some(entry) = map.get(&ns) {
+            if let Ok(guard) = entry.inner.try_lock() {
+                let idle = guard
+                    .as_ref()
+                    .map(|s| s.last_used.elapsed() >= CF_SESSION_IDLE_TTL)
+                    .unwrap_or(true);
+                if idle {
+                    remove_it = true;
+                }
+            }
+        }
+        if remove_it {
+            map.remove(&ns); // Drop 条目 → 杀进程+清目录
+        }
+    }
 }
 
 /// 显式关闭 CF 求解会话（集成测试/优雅停机用；幂等）
 pub async fn shutdown_cf_session() {
-    let mut guard = CF_SESSION.lock().await;
-    guard.clear();
+    let mut map = CF_SESSION.write().await;
+    map.clear();
 }
 
 /// 解 CF 质询（进程内浏览器 CDP；会话级浏览器实例——惰性启动/互斥/异常自动重启）。
@@ -1167,7 +1281,12 @@ async fn solve_captcha_inner(
     include_slider: bool,
     proxy: Option<&str>,
 ) -> Result<CfSolution> {
-    // ① camoufox 优先模式（READER_CAMOUFOX_FIRST=1）：先试 HTTP 后端，失败转 CDP
+    // ① 目标公网校验（P1 SSRF：书源/登录 URL 校验后才允许浏览器导航——DNS 解析后
+    //    拒绝私网/回环/链路本地；obscura 侧已默认禁 RFC1918（去 --allow-private-
+    //    network），此处为进程内双保险——camoufox/FlareSolverr 路径同样生效）
+    crate::service::crawler::validate_public_target(url).await?;
+
+    // ② camoufox 优先模式（READER_CAMOUFOX_FIRST=1）：先试 HTTP 后端，失败转 CDP
     let camo_err = if crate::service::camoufox::first_mode() {
         match crate::service::camoufox::solve(url, cookies, max_wait_ms).await {
             Ok(sol) => return Ok(sol),
@@ -1180,24 +1299,33 @@ async fn solve_captcha_inner(
         None
     };
 
-    let mut guard = CF_SESSION.lock().await;
-    // ② 求解尝试循环（最多 2 次——失败换新浏览器上下文重试）：
+    // ③ 会话条目（每用户命名空间独立条目 + 会话级锁——P1 全局锁优化：不同 ns 的
+    //    求解并行、互不阻塞；同一 ns 串行）。条目本身先取（map 锁只用于取/建条目，
+    //    不跨求解持有）
+    let entry = cf_session_entry(ns).await;
+    let mut guard = entry.inner.lock().await;
+    // ④ 求解尝试循环（最多 2 次——失败换新浏览器上下文重试）：
     //    惰性启动 / 复用（每用户命名空间独立浏览器实例——防跨用户 cookie 泄漏）；
     //    proxy 变化 → 弃用旧实例（代理是进程级参数，无法热切换）
     let mut attempts = 0u32;
     loop {
         attempts += 1;
-        if let Some(s) = guard.get(ns) {
-            if s.proxy.as_deref() != proxy {
-                tracing::info!(
-                    "书源代理变化（{} → {:?}）——弃用既有浏览器会话",
-                    s.proxy.as_deref().unwrap_or("(直连)"),
-                    proxy
-                );
-                guard.remove(ns);
-            }
+        let proxy_changed = guard
+            .as_ref()
+            .map(|s| s.proxy.as_deref() != proxy)
+            .unwrap_or(false);
+        if proxy_changed {
+            tracing::info!(
+                "书源代理变化（{} → {:?}）——弃用既有浏览器会话",
+                guard
+                    .as_ref()
+                    .and_then(|s| s.proxy.as_deref())
+                    .unwrap_or("(直连)"),
+                proxy
+            );
+            *guard = None; // Drop 旧实例（杀进程）
         }
-        if !guard.contains_key(ns) {
+        if guard.is_none() {
             let browser = match Browser::launch_proxy(proxy.map(String::from)).await {
                 Ok(b) => b,
                 Err(launch_err) => {
@@ -1208,38 +1336,34 @@ async fn solve_captcha_inner(
                         .await;
                 }
             };
-            guard.insert(
-                ns.to_string(),
-                CfSession {
-                    browser,
-                    last_used: std::time::Instant::now(),
-                    proxy: proxy.map(String::from),
-                },
-            );
+            *guard = Some(CfSession {
+                browser,
+                last_used: std::time::Instant::now(),
+                proxy: proxy.map(String::from),
+            });
         }
-        let result = {
-            let session = guard.get_mut(ns).expect("just initialized");
-            session.last_used = std::time::Instant::now();
-            solve_with(
-                &mut session.browser,
-                url,
-                cookies,
-                max_wait_ms,
-                include_slider,
-            )
-            .await
-        };
+        let session = guard.as_mut().expect("just launched");
+        session.last_used = std::time::Instant::now();
+        let result = solve_with(
+            &mut session.browser,
+            url,
+            cookies,
+            max_wait_ms,
+            include_slider,
+        )
+        .await;
         match result {
             Ok(sol) => {
                 spawn_cf_session_reaper();
                 return Ok(sol);
             }
             Err(e) => {
-                // 超时/异常 → 弃用该用户实例（Drop 杀进程 + 清 user-data-dir）
-                guard.remove(ns);
+                // 超时/异常 → 弃用该用户实例（Drop 杀进程 + 清 user-data-dir）；
+                // 条目保留（None 状态），下次求解重新 launch
+                *guard = None;
                 if attempts >= 2 {
                     drop(guard);
-                    // ③ CDP 两次尝试均失败 → camoufox 兜底（仍失败才报错）
+                    // ⑤ CDP 两次尝试均失败 → camoufox 兜底（仍失败才报错）
                     return finish_with_fallback(url, cookies, max_wait_ms, &e, camo_err).await;
                 }
                 tracing::warn!(
@@ -1270,9 +1394,11 @@ async fn finish_with_fallback(
 
 /// 在会话浏览器当前页面执行 JS（求解完成后继续操作页面——如提交表单/页内 fetch，
 /// 69shuba 搜索场景：同源自动携带 cf_clearance）。无会话（未求解过）→ 错误。
+/// P1：只持本 ns 的会话锁（不阻塞其他 ns）。
 pub async fn evaluate_in_session(ns: &str, expression: &str) -> Result<Value> {
-    let mut guard = CF_SESSION.lock().await;
-    let Some(session) = guard.get_mut(ns) else {
+    let entry = cf_session_entry(ns).await;
+    let mut guard = entry.inner.lock().await;
+    let Some(session) = guard.as_mut() else {
         return Err(anyhow!(
             "无浏览器会话——请先调用 solve_cf_challenge/solve_captcha"
         ));
@@ -2045,21 +2171,16 @@ mod tests {
 
     #[test]
     fn test_obscura_serve_command_proxy_arg() {
-        // 无代理：不带 --proxy
+        // 无代理：不带 --proxy；P1：不传 --allow-private-network（obscura 默认禁 RFC1918）
         let cmd = obscura_serve_command(std::path::Path::new("obscura"), 12345, None);
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            args,
-            vec![
-                "serve",
-                "--port",
-                "12345",
-                "--stealth",
-                "--allow-private-network",
-            ]
+        assert_eq!(args, vec!["serve", "--port", "12345", "--stealth"]);
+        assert!(
+            !args.iter().any(|a| a.contains("allow-private-network")),
+            "不应传 --allow-private-network（P1 内网导航收紧）: {args:?}"
         );
         // 有代理：--proxy 紧跟代理地址
         let cmd = obscura_serve_command(
@@ -2078,7 +2199,6 @@ mod tests {
                 "--port",
                 "12345",
                 "--stealth",
-                "--allow-private-network",
                 "--proxy",
                 "socks5://127.0.0.1:1080",
             ]
@@ -2086,7 +2206,7 @@ mod tests {
         // 空/纯空白代理 → 不附加（等价无代理）
         let cmd = obscura_serve_command(std::path::Path::new("obscura"), 1, Some("  "));
         let n = cmd.get_args().count();
-        assert_eq!(n, 5, "空白代理不应附加 --proxy（实际参数数 {n}）");
+        assert_eq!(n, 4, "空白代理不应附加 --proxy（实际参数数 {n}）");
     }
 
     #[test]
@@ -2138,6 +2258,181 @@ mod tests {
         assert!(!cookie_domain_matches("com", "a.com")); // 裸后缀不匹配
         assert!(!cookie_domain_matches(".com", "a.com"));
         assert!(!cookie_domain_matches("a.com.evil.com", "a.com"));
+    }
+
+    // ---- P1：CF 会话锁粒度（每用户会话锁）+ WS 连接泄漏 + 内网导航校验 ----
+
+    /// 微型假 CDP 服务端：接受一个 WS 连接；对任意命令回 `{"id":..,"result":..}`；
+    /// createTarget/attachToTarget 返回必要字段；客户端断开后 notify（供断言用）
+    async fn serve_fake_cdp(closed: std::sync::Arc<tokio::sync::Notify>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sink, mut recv) = ws.split();
+            loop {
+                tokio::select! {
+                    msg = recv.next() => {
+                        match msg {
+                            Some(Ok(Message::Text(t))) => {
+                                let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
+                                let id = v.get("id").cloned().unwrap_or(Value::Null);
+                                let method = v
+                                    .get("method")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("");
+                                let mut result = json!({});
+                                if method == "Target.createTarget" {
+                                    result = json!({ "targetId": "t1" });
+                                } else if method == "Target.attachToTarget" {
+                                    result = json!({ "sessionId": "s1" });
+                                }
+                                let _ = sink
+                                    .send(Message::Text(
+                                        json!({ "id": id, "result": result }).to_string(),
+                                    ))
+                                    .await;
+                            }
+                            // Close/Err/None：客户端已断开
+                            _ => break,
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(20)) => break,
+                }
+            }
+            closed.notify_waiters();
+        });
+        format!("ws://{addr}/devtools/browser")
+    }
+
+    /// P1 WS 连接泄漏：Browser Drop → 关闭信号 → reader 任务退出 → WS 关闭
+    /// （服务端在超时内观察到连接断开）——不残留悬挂 reader 任务/连接
+    #[tokio::test]
+    async fn test_browser_drop_closes_ws() {
+        std::env::set_var("READER_CDP_NO_STEALTH", "1");
+        let closed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let url = serve_fake_cdp(closed.clone()).await;
+        let browser = Browser::connect(&url).await.expect("假 CDP 连接应成功");
+        drop(browser);
+        tokio::time::timeout(Duration::from_secs(5), closed.notified())
+            .await
+            .expect("Drop 后服务端应在 5s 内观察到连接关闭");
+        std::env::remove_var("READER_CDP_NO_STEALTH");
+    }
+
+    /// P1 CF 全局锁优化：锁粒度降到会话级——同一 ns 串行（第二个求解等待），
+    /// 不同 ns 并行（互不阻塞）；条目复用/清空语义
+    #[tokio::test]
+    async fn test_cf_session_per_ns_lock_isolation() {
+        shutdown_cf_session().await; // 清场（幂等）
+                                     // 同 ns 复用同一条目；不同 ns 独立条目
+        let a1 = cf_session_entry("ns-a").await;
+        let a2 = cf_session_entry("ns-a").await;
+        let b = cf_session_entry("ns-b").await;
+        assert!(Arc::ptr_eq(&a1, &a2), "同 ns 应复用同一条目");
+        assert!(!Arc::ptr_eq(&a1, &b), "不同 ns 应独立条目");
+        // shutdown → 清空 → 重新取是新条目
+        shutdown_cf_session().await;
+        let a3 = cf_session_entry("ns-a").await;
+        assert!(!Arc::ptr_eq(&a1, &a3), "清空后应重建条目");
+        // 同 ns 串行：持锁期间第二个获取者阻塞
+        let held = a3.inner.lock().await;
+        let waiter = tokio::spawn(async move {
+            let binding = cf_session_entry("ns-a").await;
+            let _g = binding.inner.lock().await;
+            true
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !waiter.is_finished(),
+            "同 ns 第二个求解应等待会话锁（串行）"
+        );
+        drop(held);
+        assert!(tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("释放后等待者应完成")
+            .unwrap());
+        // 不同 ns 互不阻塞：ns-a 持锁期间 ns-b 立即可取（短超时——若阻塞会超时）
+        let held_a = a3.inner.lock().await;
+        let got_b = tokio::time::timeout(Duration::from_millis(300), b.inner.lock()).await;
+        assert!(got_b.is_ok(), "不同 ns 不应互相阻塞");
+        drop(held_a);
+        shutdown_cf_session().await; // 清场
+    }
+
+    /// P1 CF 会话回收：闲置（无会话/超时）条目被回收；新鲜条目保留；
+    /// 正在求解（会话锁被占用）的条目跳过
+    #[tokio::test]
+    async fn test_reap_idle_cf_sessions() {
+        shutdown_cf_session().await; // 清场
+        let stale_entry = Arc::new(CfSessionEntry::new()); // 无会话（None）→ 闲置
+        let fresh_entry = Arc::new(CfSessionEntry::new());
+        // fresh：真实（假 CDP）浏览器会话，last_used = 现在
+        let closed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let url = serve_fake_cdp(closed).await;
+        let browser = Browser::connect(&url).await.expect("假 CDP 连接应成功");
+        *fresh_entry.inner.lock().await = Some(CfSession {
+            browser,
+            last_used: std::time::Instant::now(),
+            proxy: None,
+        });
+        {
+            let mut map = CF_SESSION.write().await;
+            map.insert("stale-ns".to_string(), stale_entry.clone());
+            map.insert("fresh-ns".to_string(), fresh_entry.clone());
+        }
+        reap_idle_cf_sessions().await;
+        {
+            let map = CF_SESSION.read().await;
+            assert!(!map.contains_key("stale-ns"), "闲置（无会话）条目应被回收");
+            assert!(map.contains_key("fresh-ns"), "新鲜条目应保留");
+        }
+        // 正在求解（锁被占用）的闲置条目跳过
+        let busy_entry = Arc::new(CfSessionEntry::new());
+        let busy_guard = busy_entry.inner.lock().await;
+        {
+            let mut map = CF_SESSION.write().await;
+            map.insert("busy-ns".to_string(), busy_entry.clone());
+        }
+        reap_idle_cf_sessions().await;
+        {
+            let map = CF_SESSION.read().await;
+            assert!(map.contains_key("busy-ns"), "求解中的条目不应被回收");
+        }
+        drop(busy_guard);
+        shutdown_cf_session().await; // 清场（杀假浏览器进程句柄——child=None 仅关 WS）
+    }
+
+    /// P1 SSRF：solve_captcha_inner 入口拒绝私网/回环目标（书源 URL 校验后才允许
+    /// 浏览器导航）——camoufox 优先路径同样被拦截（校验在最前）
+    #[tokio::test]
+    async fn test_solve_rejects_private_url() {
+        let _g = crate::service::crawler::ssrf_allow_private_guard(false);
+        // 禁用 camoufox 兜底，确保不发起任何外部调用即被拦截
+        std::env::set_var("READER_CAMOUFOX_DISABLE", "1");
+        let err = solve_cf_challenge("default", "http://127.0.0.1:1/", &[], 5_000, None)
+            .await
+            .unwrap_err();
+        std::env::remove_var("READER_CAMOUFOX_DISABLE");
+        assert!(
+            err.to_string().contains("已拦截"),
+            "求解入口应拦截私网目标: {err}"
+        );
+        // 公网 URL 不在此处拦截（继续走求解链——浏览器不可用报浏览器错误）
+        std::env::set_var("READER_CAMOUFOX_DISABLE", "1");
+        let err2 = solve_cf_challenge("default", "https://cf.example.com/x", &[], 5_000, None)
+            .await
+            .unwrap_err();
+        std::env::remove_var("READER_CAMOUFOX_DISABLE");
+        assert!(
+            !err2.to_string().contains("已拦截"),
+            "公网 URL 不应被 SSRF 拦截: {err2}"
+        );
     }
 }
 

@@ -839,6 +839,7 @@ mod tests {
     /// 音频书：ruleContent.content 提取音频 URL → analyze_media_url 返回音频流直链
     #[tokio::test]
     async fn test_analyze_media_url_audio() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let base =
             serve(r#"<html><div class="player"><audio src="/stream/1.mp3"></audio></div></html>"#)
                 .await;
@@ -877,6 +878,7 @@ mod tests {
     /// 漫画书：CSS 规则命中多个图片节点 → images 列表（绝对化 + 去重）
     #[tokio::test]
     async fn test_analyze_comic_images_css() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let base = serve(
             r#"<html><div class="imgs"><img src="/p/1.jpg"><img src="/p/2.jpg"><img src="/p/1.jpg"></div></html>"#,
         )
@@ -896,6 +898,7 @@ mod tests {
     /// 漫画书：@js: 规则返回 JSON 字符串数组 → images 列表
     #[tokio::test]
     async fn test_analyze_comic_images_js_array() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
         let base = serve(r#"{"data":["/a/1.webp","/a/2.webp"]}"#).await;
         let mut src = test_source();
         src.rule_content = Some(serde_json::json!({
@@ -914,7 +917,8 @@ mod tests {
     /// 漫画书：无规则且章节 URL 即图片直链 → 单图列表；有规则但提取不到 → 空列表
     #[tokio::test]
     async fn test_analyze_comic_images_direct() {
-        // 有规则但页面无匹配 → 空列表
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1（P1 SSRF 校验放行，仅测试）
+                                                                             // 有规则但页面无匹配 → 空列表
         let base = serve(r#"<html><div class="imgs"></div></html>"#).await;
         let mut src = test_source();
         src.rule_content = Some(serde_json::json!({ "content": "div.imgs img@src" }));

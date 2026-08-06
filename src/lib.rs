@@ -67,16 +67,9 @@ impl AppConfig {
                 .unwrap_or_else(|_| "web-ui/dist".to_string()),
             default_user_enable_webdav: env_flag("READER_APP_DEFAULTUSERENABLEWEBDAV"),
             default_user_enable_local_store: env_flag("READER_APP_DEFAULTUSERENABLELOCALSTORE"),
-            default_user_enable_book_source: if env_flag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE") {
-                true
-            } else {
-                true
-            },
-            default_user_enable_rss_source: if env_flag("READER_APP_DEFAULTUSERENABLERSSSOURCE") {
-                true
-            } else {
-                true
-            },
+            // P1-8：env_flag 正确读取（修复前 if/else 两支恒 true——默认开书源/RSS 的 env 失效）
+            default_user_enable_book_source: env_flag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE"),
+            default_user_enable_rss_source: env_flag("READER_APP_DEFAULTUSERENABLERSSSOURCE"),
             default_user_book_source_limit: env_i64("READER_APP_DEFAULTUSERBOOKSOURCELIMIT", 100),
             default_user_book_limit: env_i64("READER_APP_DEFAULTUSERBOOKLIMIT", 200),
             upload_max_mb: env_i64("READER_UPLOAD_MAX_MB", 100),
@@ -138,8 +131,13 @@ impl AppConfig {
 
 fn env_flag(key: &str) -> bool {
     std::env::var(key)
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+        .map(|v| flag_from_str(&v))
         .unwrap_or(false)
+}
+
+/// 环境变量布尔值解析（纯函数可测）：true/1/yes/on（大小写不敏感）→ true，其余 → false
+fn flag_from_str(v: &str) -> bool {
+    matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
 }
 
 fn env_i64(key: &str, default: i64) -> i64 {
@@ -147,4 +145,51 @@ fn env_i64(key: &str, default: i64) -> i64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-8：env_flag 布尔解析——true/1/yes/on（大小写不敏感）→ true，其余/缺失 → false
+    #[test]
+    fn test_flag_from_str() {
+        for v in ["true", "TRUE", "True", "1", "yes", "on", "On"] {
+            assert!(flag_from_str(v), "{v} 应为 true");
+        }
+        for v in ["false", "0", "no", "off", "", "2", "tru", "true "] {
+            assert!(!flag_from_str(v), "{v:?} 应为 false");
+        }
+    }
+
+    /// P1-8：默认用户权限 env 正确读取（修复前 if/else 两支恒 true——
+    /// READER_APP_DEFAULTUSERENABLEBOOKSOURCE/RSSSOURCE 设 false 或缺失应关闭）
+    #[test]
+    fn test_default_user_env_flags() {
+        // 缺失（默认）→ false
+        std::env::remove_var("READER_APP_DEFAULTUSERENABLEBOOKSOURCE");
+        std::env::remove_var("READER_APP_DEFAULTUSERENABLERSSSOURCE");
+        assert!(!env_flag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE"));
+        assert!(!env_flag("READER_APP_DEFAULTUSERENABLERSSSOURCE"));
+        // 显式 false → false
+        std::env::set_var("READER_APP_DEFAULTUSERENABLEBOOKSOURCE", "false");
+        assert!(!env_flag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE"));
+        // 显式 true → true
+        std::env::set_var("READER_APP_DEFAULTUSERENABLEBOOKSOURCE", "true");
+        assert!(env_flag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE"));
+        // 清理
+        std::env::remove_var("READER_APP_DEFAULTUSERENABLEBOOKSOURCE");
+    }
+
+    /// P1-8：AppConfig::from_env 将 env 落到默认用户权限字段（与 WEBDAV/LOCALSTORE 一致）
+    #[test]
+    fn test_from_env_default_user_flags() {
+        std::env::set_var("READER_APP_DEFAULTUSERENABLEBOOKSOURCE", "true");
+        std::env::set_var("READER_APP_DEFAULTUSERENABLERSSSOURCE", "false");
+        let cfg = AppConfig::from_env();
+        assert!(cfg.default_user_enable_book_source);
+        assert!(!cfg.default_user_enable_rss_source);
+        std::env::remove_var("READER_APP_DEFAULTUSERENABLEBOOKSOURCE");
+        std::env::remove_var("READER_APP_DEFAULTUSERENABLERSSSOURCE");
+    }
 }
