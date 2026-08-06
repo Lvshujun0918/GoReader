@@ -8,8 +8,10 @@ DETECT_CAPTCHA_JS 的滑块选择器与 solve_captcha 的贝塞尔拖拽路径�
 - 按钮 class="drag-slider"（命中 '.drag-slider' 选择器——DETECT_CAPTCHA_JS 返回其 rect）
 - 轨道 class="slider-track"（祖先加宽匹配 /slider/ 正则——返回 trackX/trackW）
 - 内嵌 JS：mousedown 起拖 → mousemove 跟随 → mouseup 时位移 ≥ 轨道 40% 即通过
-  （mock 阈值放宽——验证拖拽机制而非风控评分；真实滑块需更精准）→ 写
-  cf_clearance=mock-slider-<ts> cookie 并原地切换内容页
+  （mock 阈值放宽——验证拖拽机制而非风控评分；真实滑块需更精准）→ 同步
+  form.submit() → /pass（服务端 Set-Cookie 头写 cf_clearance=mock-slider-<ts> +
+  302 → /content 内容页——不用 JS fetch/定时器/document.cookie：obscura 不触发
+  页面异步执行且 JS cookie 写入不落 jar）
 - GET /status → {"ok": true}（测试探活）
 
 用法：python scripts/mock-slider-site.py [--port 8195] [--host 127.0.0.1]
@@ -47,7 +49,10 @@ SLIDER_HTML = """<!DOCTYPE html>
   var track = document.getElementById('slider-track');
   var btn = document.getElementById('slider-btn');
   var dragging = false, startX = 0, startBtn = 0;
-  btn.addEventListener('mousedown', function(e){
+  // 监听器挂在 document（委托式）——后端无关：obscura 的 CDP 坐标事件不投递
+  // 页面事件，拖拽走 JS 合成事件（dispatchEvent 直达 document 监听器）；
+  // Chrome 下真实鼠标事件同样命中
+  document.addEventListener('mousedown', function(e){
     dragging = true; startX = e.clientX; startBtn = btn.offsetLeft;
   });
   document.addEventListener('mousemove', function(e){
@@ -62,11 +67,15 @@ SLIDER_HTML = """<!DOCTYPE html>
     var max = track.clientWidth - btn.clientWidth;
     if (btn.offsetLeft >= max * 0.4) {
       var ts = Date.now();
-      document.cookie = 'cf_clearance=mock-slider-' + ts + '; path=/; SameSite=Lax';
-      document.getElementById('cookie-echo').textContent = document.cookie;
-      document.getElementById('challenge-wrap').style.display = 'none';
-      document.getElementById('content-area').style.display = 'block';
-      document.title = '真实内容';
+      // 后端无关：同步 form 提交 → /pass（服务端 Set-Cookie 写
+      // cf_clearance=mock-slider-<ts> + 302 → /content 内容页）。
+      // 不用 fetch/定时器——obscura 不触发页面异步执行；
+      // 不用 JS document.cookie——obscura 的写入不落 jar
+      var f = document.createElement('form');
+      f.method = 'GET';
+      f.action = '/pass?ts=' + ts;
+      document.body.appendChild(f);
+      f.submit();
     } else {
       btn.style.left = '0px';
       document.getElementById('tip').textContent = '距离不足，请重试';
@@ -85,18 +94,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):  # 静默日志
         pass
 
-    def _send(self, status, body, ctype="text/html; charset=utf-8"):
+    def _send(self, status, body, ctype="text/html; charset=utf-8", extra_headers=None):
         data = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
+        for k, v in (extra_headers or []):
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
         if self.path == "/status":
             self._send(200, '{"ok": true}', "application/json")
+        elif self.path.startswith("/pass"):
+            # 拖拽成功后 form 提交——Set-Cookie 头写 cf_clearance + 302 → /content
+            import urllib.parse as _up
+            ts = _up.parse_qs(_up.urlparse(self.path).query).get("ts", ["0"])[0]
+            self._send(
+                302, "", "text/plain",
+                [
+                    ("Set-Cookie", f"cf_clearance=mock-slider-{ts}; Path=/; SameSite=Lax"),
+                    ("Location", "/content"),
+                ],
+            )
+        elif self.path == "/content":
+            # 内容页（服务端渲染——SLIDER_OK + cookie 回显）
+            cookies = self.headers.get("Cookie", "")
+            ok = "SLIDER_OK" if "cf_clearance=mock-slider-" in cookies else "SLIDER_MISSING"
+            body = f"""<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>真实内容</title></head>
+<body>
+<h1 id="content-marker">真实内容页</h1>
+<p>收到 cookie: {cookies}</p>
+<p id="success-echo">{ok}</p>
+</body>
+</html>"""
+            self._send(200, body)
         else:
             self._send(200, SLIDER_HTML)
 

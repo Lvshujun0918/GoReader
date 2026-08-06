@@ -1,7 +1,7 @@
 # ============================================================
 # reader-dev (Rust) 多阶段构建
-#   - 运行镜像内置 chromium：书源登录/滑块验证码/CF 质询浏览器流
-#     （browser.rs CDP 自动发现 READER_CHROME_PATH=/usr/bin/chromium）
+#   - 运行镜像内置 obscura（唯一浏览器后端）：书源登录/滑块验证码/CF 质询浏览器流
+#     （browser.rs spawn `obscura serve --stealth`——READER_OBSCURA_BIN=/opt/obscura/obscura）
 #   - GAP 175：运行镜像内置 python3 + camoufox（验证码求解 HTTP 后端
 #     scripts/camoufox_solver.py——CDP 失败后的强质询兜底，端口 8196）
 #   - 构建：docker build -t reader-dev .
@@ -31,13 +31,34 @@ FROM python:3.12-slim AS camo
 RUN pip install --no-cache-dir camoufox==0.5.4 \
     && python -m camoufox fetch
 
-# ---------- 阶段 3：运行镜像 ----------
+# ---------- 阶段 3：obscura 浏览器（release stealth 构建——BoringSSL TLS 指纹模拟/反检测/追踪器拦截） ----------
+FROM debian:trixie-slim AS obscura
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# 仓库无安装脚本——直接下载官方 release 资产（-stealth 后缀为 stealth 构建，
+# 含 BoringSSL/wreq 传输层）。TARGETARCH 由 buildx --platform 自动注入（amd64/arm64）；
+# 普通 docker build 未注入时默认 x86_64。资产内含 obscura + obscura-worker（同目录）
+RUN set -eux; \
+    case "${TARGETARCH:-}" in \
+      ""|amd64|x86_64) ASSET="obscura-x86_64-linux-stealth.tar.gz" ;; \
+      arm64|aarch64) ASSET="obscura-aarch64-linux-stealth.tar.gz" ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fL --retry 3 -o /tmp/obscura.tar.gz \
+      "https://github.com/h4ckf0r0day/obscura/releases/latest/download/${ASSET}"; \
+    mkdir -p /opt/obscura; \
+    tar xzf /tmp/obscura.tar.gz -C /opt/obscura; \
+    rm /tmp/obscura.tar.gz; \
+    test -x /opt/obscura/obscura; \
+    ls -la /opt/obscura
+
+# ---------- 阶段 4：运行镜像 ----------
 FROM debian:trixie-slim
 
-# chromium（验证码/CF 质询浏览器流）+ 时区 + CA + python3（camoufox 后端）
+# 时区 + CA + python3（camoufox 后端）——obscura 为静态依赖少的 Rust 二进制（无需 chromium）
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        chromium \
         ca-certificates \
         tzdata \
         fonts-noto-cjk \
@@ -58,9 +79,12 @@ COPY --from=camo /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.
 COPY --from=camo /root/.cache/camoufox /root/.cache/camoufox
 COPY scripts/camoufox_solver.py /usr/local/bin/camoufox_solver.py
 
+# obscura 浏览器（唯一后端——stealth 构建：BoringSSL TLS 指纹模拟/反检测/追踪器拦截）
+COPY --from=obscura /opt/obscura /opt/obscura
+
 ENV TZ=Asia/Shanghai
 ENV READER_APP_WEB_ROOT=/app/web-ui/dist
-ENV READER_CHROME_PATH=/usr/bin/chromium
+ENV READER_OBSCURA_BIN=/opt/obscura/obscura
 ENV READER_CAMOUFOX_URL=http://127.0.0.1:8196
 
 COPY --from=builder /app/target/release/reader-dev /usr/local/bin/reader-dev

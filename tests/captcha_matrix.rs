@@ -128,7 +128,9 @@ fn unsupported_captcha_detection() {
         Some("reCAPTCHA")
     );
     assert_eq!(
-        unsupported_captcha_kind("<script src=\"https://www.google.com/recaptcha/api.js\"></script>"),
+        unsupported_captcha_kind(
+            "<script src=\"https://www.google.com/recaptcha/api.js\"></script>"
+        ),
         Some("reCAPTCHA")
     );
     // hCaptcha：h-captcha 容器 / hcaptcha.com iframe
@@ -141,7 +143,10 @@ fn unsupported_captcha_detection() {
         Some("hCaptcha")
     );
     // 未命中（Turnstile/普通页）→ None
-    assert_eq!(unsupported_captcha_kind("<div class=\"cf-turnstile\"></div>"), None);
+    assert_eq!(
+        unsupported_captcha_kind("<div class=\"cf-turnstile\"></div>"),
+        None
+    );
     assert_eq!(unsupported_captcha_kind("<html>normal</html>"), None);
 }
 
@@ -154,11 +159,13 @@ fn unsupported_captcha_detection() {
 #[tokio::test]
 async fn turnstile_real_widget_local_page() {
     if !real_site_tests_enabled() {
-        eprintln!("SKIP: READER_REAL_SITE_TESTS 未启用——真实 widget 测试默认跳过（实测结果见报告）");
+        eprintln!(
+            "SKIP: READER_REAL_SITE_TESTS 未启用——真实 widget 测试默认跳过（实测结果见报告）"
+        );
         return;
     }
     if !browser_available() {
-        eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过真实 widget 测试");
+        eprintln!("SKIP: obscura 浏览器不可用——跳过真实 widget 测试");
         return;
     }
     if !reachable("https://challenges.cloudflare.com/turnstile/v0/api.js").await {
@@ -177,7 +184,9 @@ async fn turnstile_real_widget_local_page() {
     tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             let mut buf = [0u8; 8192];
             let _ = sock.read(&mut buf).await;
             let head = format!(
@@ -202,7 +211,11 @@ async fn turnstile_real_widget_local_page() {
                     &t[..t.len().min(32)],
                     start.elapsed()
                 );
-                assert_eq!(&t[..t.len().min(19)], &"XXXX.DUMMY.TOKEN.XXXX"[..19], "always-passes sitekey 应返回官方测试 token");
+                assert_eq!(
+                    &t[..t.len().min(19)],
+                    &"XXXX.DUMMY.TOKEN.XXXX"[..19],
+                    "always-passes sitekey 应返回官方测试 token"
+                );
             }
             _ => {
                 eprintln!("SKIP: 真实 widget 求解返回但未取到 token——如实记录");
@@ -219,11 +232,13 @@ async fn turnstile_real_widget_local_page() {
 #[tokio::test]
 async fn turnstile_real_site_demo() {
     if !real_site_tests_enabled() {
-        eprintln!("SKIP: READER_REAL_SITE_TESTS 未启用——Turnstile demo 测试默认跳过（实测结果见报告）");
+        eprintln!(
+            "SKIP: READER_REAL_SITE_TESTS 未启用——Turnstile demo 测试默认跳过（实测结果见报告）"
+        );
         return;
     }
     if !browser_available() {
-        eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过 Turnstile 真实站点测试");
+        eprintln!("SKIP: obscura 浏览器不可用——跳过 Turnstile 真实站点测试");
         return;
     }
     let url = "https://turnstile-demo.pages.dev/";
@@ -236,7 +251,7 @@ async fn turnstile_real_site_demo() {
     let start = Instant::now();
     let r1 = reader_dev::service::browser::solve_captcha("default", url, &[], 60_000).await;
     reader_dev::service::browser::shutdown_cf_session().await;
-    let (ok1, tok1) = match &r1 {
+    let (_ok1, tok1) = match &r1 {
         Ok(sol) => match &sol.turnstile_token {
             Some(t) if !t.is_empty() => {
                 eprintln!(
@@ -280,9 +295,9 @@ async fn turnstile_real_site_demo() {
             }
             _ => eprintln!("[stealth=off] Turnstile demo 通过但未取到 token"),
         },
-        Err(e) => eprintln!(
-            "[stealth=off] Turnstile demo 失败: {e:#}——对比结论：stealth 注入提升过率"
-        ),
+        Err(e) => {
+            eprintln!("[stealth=off] Turnstile demo 失败: {e:#}——对比结论：stealth 注入提升过率")
+        }
     }
 }
 
@@ -294,7 +309,7 @@ async fn real_cf_js_challenge(url: &str, name: &str, max_wait_ms: u64) {
         return;
     }
     if !browser_available() {
-        eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过 {name} 质询测试");
+        eprintln!("SKIP: obscura 浏览器不可用——跳过 {name} 质询测试");
         return;
     }
     if !reachable(url).await {
@@ -302,7 +317,8 @@ async fn real_cf_js_challenge(url: &str, name: &str, max_wait_ms: u64) {
         return;
     }
     let start = Instant::now();
-    let result = reader_dev::service::browser::solve_cf_challenge("default", url, &[], max_wait_ms).await;
+    let result =
+        reader_dev::service::browser::solve_cf_challenge("default", url, &[], max_wait_ms).await;
     reader_dev::service::browser::shutdown_cf_session().await;
     match result {
         Ok(sol) => {
@@ -344,7 +360,12 @@ async fn cf_js_challenge_wuxiaworld() {
 
 #[tokio::test]
 async fn cf_js_challenge_lightnovelworld() {
-    real_cf_js_challenge("https://www.lightnovelworld.com", "lightnovelworld.com", 60_000).await;
+    real_cf_js_challenge(
+        "https://www.lightnovelworld.com",
+        "lightnovelworld.com",
+        60_000,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -360,11 +381,13 @@ async fn cf_js_challenge_allnovelfull() {
 #[tokio::test]
 async fn cf_403_strong_challenge_69shuba_search() {
     if !real_site_tests_enabled() {
-        eprintln!("SKIP: READER_REAL_SITE_TESTS 未启用——69shuba 强质询测试默认跳过（实测结果见报告）");
+        eprintln!(
+            "SKIP: READER_REAL_SITE_TESTS 未启用——69shuba 强质询测试默认跳过（实测结果见报告）"
+        );
         return;
     }
     if !browser_available() {
-        eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过 69shuba 强质询测试");
+        eprintln!("SKIP: obscura 浏览器不可用——跳过 69shuba 强质询测试");
         return;
     }
     if !reachable("https://www.69shuba.com/").await {
@@ -414,7 +437,10 @@ async fn cf_403_strong_challenge_69shuba_search() {
     if lower.contains("just a moment") || lower.contains("challenge-platform") {
         // ③ 搜索请求自身也触发质询——浏览器直接导航 search.php（GET 400 但质询仍会下发）
         //    清除后再 fetch 一次
-        eprintln!("69shuba 搜索首次 fetch 命中质询（{}B）——导航 search.php 清除后重试", text.len());
+        eprintln!(
+            "69shuba 搜索首次 fetch 命中质询（{}B）——导航 search.php 清除后重试",
+            text.len()
+        );
         let start2 = Instant::now();
         match reader_dev::service::browser::solve_cf_challenge(
             "default",
@@ -457,7 +483,10 @@ async fn cf_403_strong_challenge_69shuba_search() {
         return;
     }
     if text.contains("诡秘") {
-        eprintln!("PASS: 69shuba 搜索返回结果（含'诡秘'） 响应={}B", text.len());
+        eprintln!(
+            "PASS: 69shuba 搜索返回结果（含'诡秘'） 响应={}B",
+            text.len()
+        );
         return;
     }
     if lower.contains("charset=\"gbk\"") || lower.contains("charset=gbk") {
@@ -481,7 +510,7 @@ async fn cf_403_strong_challenge_69shuba_search() {
 #[tokio::test]
 async fn slider_mock_solve_via_solve_captcha() {
     if !browser_available() {
-        eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过滑块 mock 测试");
+        eprintln!("SKIP: obscura 浏览器不可用——跳过滑块 mock 测试");
         return;
     }
     if python_cmd().is_none() {
@@ -501,10 +530,15 @@ async fn slider_mock_solve_via_solve_captcha() {
     kill_mock(&mut child);
 
     let sol = result.expect("solve_captcha 应拖拽滑块成功（mock 拖动过半即通过）");
-    assert!(sol.html.contains("SLIDER_OK"), "应切换为成功内容页（SLIDER_OK）");
+    assert!(
+        sol.html.contains("SLIDER_OK"),
+        "应切换为成功内容页（SLIDER_OK）"
+    );
     assert!(sol.html.contains("真实内容"), "应显示真实内容页");
     assert!(
-        sol.cookies.iter().any(|(n, v)| n == "cf_clearance" && v.starts_with("mock-slider-")),
+        sol.cookies
+            .iter()
+            .any(|(n, v)| n == "cf_clearance" && v.starts_with("mock-slider-")),
         "应取得滑块通过的 cf_clearance cookie"
     );
     eprintln!(

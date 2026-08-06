@@ -172,22 +172,24 @@ book_groups(id, group_name, order_num, user_namespace)
         │     POST /v1 request.get/post（带书源 cookie 数组，  │
         │     保持会话连续性；60s 超时）                        │
         │                                                      │
-        │  B. 进程内专精浏览器（默认——零外部依赖）              │
-        │     ① 浏览器发现：READER_CHROME_PATH → Windows 自动  │
-        │        检测 Edge/Chrome → 不可用则明确报错（提示安装  │
-        │        或配置 FLARESOLVERR_URL）                      │
-        │     ② stealth 注入：puppeteer-extra-plugin-stealth   │
-        │        清单翻译——webdriver 清除 / plugins/vendor /   │
-        │        chrome 对象修复（每次新文档加载前执行）        │
-        │     ③ UA 覆盖：去 HeadlessChrome 标记（headless 默认 │
-        │        UA 会被 CF 风控直接命中）                      │
-        │     ④ 质询分型：                                    │
-        │        - 经典 CF 质询 → 执行 JS 质询 → 等待           │
+        │  B. 进程内 obscura 浏览器（默认——零外部依赖）        │
+        │     ① 浏览器发现：READER_OBSCURA_URL（既有 CDP 服务）│
+        │        → READER_OBSCURA_BIN → 同目录 → PATH；不可用则│
+        │        明确报错（提示下载 stealth 构建或配置         │
+        │        FLARESOLVERR_URL）                            │
+        │     ② spawn obscura serve --port 随机 --stealth      │
+        │        stealth 构建：BoringSSL TLS 指纹模拟 / 反检测 │
+        │        / 追踪器拦截 + STEALTH_JS 注入（webdriver 清除│
+        │        / plugins / chrome 对象修复——每文档加载前执行 │
+        │     ③ UA：obscura 内置 Chrome 系指纹（旋转 UA 池，与 │
+        │        cf_clearance 绑定）                           │
+        │     ④ 质询分型：                                     │
+        │        - 经典 CF 质询 → 执行 JS 质询 → 等待          │
         │          cf_clearance cookie 写入                    │
-        │        - Turnstile 质询 → iframe(challenges.cloudflare│
-        │          .com) / .cf-turnstile 检测 → 点击 widget →   │
-        │          读取 cf-turnstile-response token             │
-        │     ⑤ 超时/失败 → 明确错误（不静默吞掉）              │
+        │        - Turnstile 质询 → challenges.cloudflare      │
+        │          iframe/.cf-turnstile 检测 → 点击 widget →   │
+        │          读取 cf-turnstile-response token            │
+        │     ⑤ 超时/失败 → 明确错误（不静默吞掉）             │
         └───────────────────────┬──────────────────────────────┘
                                 │
                ④ cookie 按 name 合并（求解结果 ∪ 用户原 cookie）

@@ -120,7 +120,7 @@ async fn mock_serves_cloudflare_challenge_features() {
 #[tokio::test]
 async fn cf_challenge_solve_end_to_end() {
     if !reader_dev::service::browser::is_browser_available() {
-        eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过 CF 求解集成测试");
+        eprintln!("SKIP: obscura 浏览器不可用——跳过 CF 求解集成测试");
         return;
     }
     if python_cmd().is_none() {
@@ -166,7 +166,11 @@ async fn cf_challenge_solve_end_to_end() {
         .iter()
         .find(|(n, _)| n == "cf_clearance")
         .expect("应取得 cf_clearance");
-    assert!(cf.1.starts_with("mock-"), "cf_clearance 值应为 mock-*（实际: {}）", cf.1);
+    assert!(
+        cf.1.starts_with("mock-"),
+        "cf_clearance 值应为 mock-*（实际: {}）",
+        cf.1
+    );
     // ③ 用户 cookie 保留
     assert!(
         sol.cookies.iter().any(|(n, v)| n == "sid" && v == "abc123"),
@@ -198,7 +202,7 @@ async fn cf_challenge_solve_end_to_end() {
 async fn http_get_solves_cf_and_stores_per_user() {
     let _guard = STORAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !reader_dev::service::browser::is_browser_available() {
-        eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过 CF 全链路集成测试");
+        eprintln!("SKIP: obscura 浏览器不可用——跳过 CF 全链路集成测试");
         return;
     }
     if python_cmd().is_none() {
@@ -212,7 +216,9 @@ async fn http_get_solves_cf_and_stores_per_user() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut config = reader_dev::AppConfig::from_env();
     config.work_dir = dir.to_string_lossy().into_owned();
-    let storage = reader_dev::storage::init(&config).await.expect("storage init");
+    let storage = reader_dev::storage::init(&config)
+        .await
+        .expect("storage init");
     reader_dev::service::crawler::register_cookie_storage(storage.clone());
 
     let port = free_port();
@@ -224,15 +230,29 @@ async fn http_get_solves_cf_and_stores_per_user() {
     let url = format!("http://127.0.0.1:{port}/");
 
     // 预置用户 cookie（模拟已有登录态）——求解后应与 cf_clearance 按 name 合并存库
-    storage.set_cookie("default", &url, "sid=abc123").await.expect("预置 cookie");
+    storage
+        .set_cookie("default", &url, "sid=abc123")
+        .await
+        .expect("预置 cookie");
 
-    let result =
-        reader_dev::service::crawler::http_get("default", &url, &std::collections::HashMap::new(), 30).await;
+    let result = reader_dev::service::crawler::http_get(
+        "default",
+        &url,
+        &std::collections::HashMap::new(),
+        30,
+    )
+    .await;
 
     // 先取回数据再收尾（避免断言失败时浏览器/mock 残留）
     let resp = result.expect("http_get 应经内置浏览器解 CF 质询成功");
-    let stored = storage.get_cookie_by_base("default", &url).await.expect("读库");
-    let session = storage.get_source_session("default", &url).await.expect("读会话");
+    let stored = storage
+        .get_cookie_by_base("default", &url)
+        .await
+        .expect("读库");
+    let session = storage
+        .get_source_session("default", &url)
+        .await
+        .expect("读会话");
     reader_dev::service::browser::shutdown_cf_session().await;
     kill_mock(&mut child);
     reader_dev::service::crawler::clear_cookie_storage();
@@ -249,7 +269,10 @@ async fn http_get_solves_cf_and_stores_per_user() {
         stored.contains("cf_clearance=mock-"),
         "库中应含 cf_clearance（实际: {stored}）"
     );
-    assert!(stored.contains("sid=abc123"), "库中应保留用户 sid（实际: {stored}）");
+    assert!(
+        stored.contains("sid=abc123"),
+        "库中应保留用户 sid（实际: {stored}）"
+    );
     // UA 记录（与 cf_clearance 绑定）
     let (_, ua) = session.expect("应有会话行");
     assert!(!ua.is_empty(), "应记录浏览器 UA");
@@ -261,7 +284,7 @@ async fn http_get_solves_cf_and_stores_per_user() {
 async fn http_post_retries_after_solve_and_gets_search_results() {
     let _guard = STORAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !reader_dev::service::browser::is_browser_available() {
-        eprintln!("SKIP: 本机未检测到 Edge/Chrome——跳过 POST 重试集成测试");
+        eprintln!("SKIP: obscura 浏览器不可用——跳过 POST 重试集成测试");
         return;
     }
     if python_cmd().is_none() {
@@ -275,7 +298,9 @@ async fn http_post_retries_after_solve_and_gets_search_results() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut config = reader_dev::AppConfig::from_env();
     config.work_dir = dir.to_string_lossy().into_owned();
-    let storage = reader_dev::storage::init(&config).await.expect("storage init");
+    let storage = reader_dev::storage::init(&config)
+        .await
+        .expect("storage init");
     reader_dev::service::crawler::register_cookie_storage(storage.clone());
 
     let port = free_port();
@@ -298,7 +323,10 @@ async fn http_post_retries_after_solve_and_gets_search_results() {
 
     // 先取回数据再收尾（避免断言失败时浏览器/mock 残留）
     let resp = result.expect("http_post 应经质询求解 + 重试成功");
-    let stored = storage.get_cookie_by_base("default", &url).await.expect("读库");
+    let stored = storage
+        .get_cookie_by_base("default", &url)
+        .await
+        .expect("读库");
     reader_dev::service::browser::shutdown_cf_session().await;
     kill_mock(&mut child);
     reader_dev::service::crawler::clear_cookie_storage();
@@ -308,9 +336,20 @@ async fn http_post_retries_after_solve_and_gets_search_results() {
     // ① 重试 POST 拿到真实搜索结果（SEARCH_OK + 关键词回显——证明是重试结果而非
     //    浏览器 GET 首页兜底）
     assert_eq!(resp.status, 200, "重试 POST 应返回 200");
-    assert!(resp.body.contains("SEARCH_OK"), "应返回搜索结果页（实际: {}）", &resp.body[..resp.body.len().min(200)]);
-    assert!(resp.body.contains("诡秘"), "应回显搜索关键词（实际: {}）", &resp.body[..resp.body.len().min(200)]);
+    assert!(
+        resp.body.contains("SEARCH_OK"),
+        "应返回搜索结果页（实际: {}）",
+        &resp.body[..resp.body.len().min(200)]
+    );
+    assert!(
+        resp.body.contains("诡秘"),
+        "应回显搜索关键词（实际: {}）",
+        &resp.body[..resp.body.len().min(200)]
+    );
     // ② 库中已合并 cf_clearance（重试凭它通过）
     let stored = stored.expect("应按用户存下 cookie");
-    assert!(stored.contains("cf_clearance=mock-"), "库中应含 cf_clearance（实际: {stored}）");
+    assert!(
+        stored.contains("cf_clearance=mock-"),
+        "库中应含 cf_clearance（实际: {stored}）"
+    );
 }

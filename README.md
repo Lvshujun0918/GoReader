@@ -17,8 +17,8 @@ Rust + Vue 3 实现的现代化阅读服务器，API 与数据兼容 legacy 分�
 - **JS shim（完整 legacy 集）**：`java.ajax` / **`java.startBrowserAwait`**（内置浏览器加载页面并等待完成——走与验证码求解同一浏览器流）/ `setContent` / `getString` / `getElements` / `getWebViewUA` / `encodeURI` 等
 - **书源管理**：增删改（规则字段 JSON 编辑）、启停、分组、失效检测 + **失效源一键禁用**、本地/远程导入、导出、订阅源、**header（JSON）/loginUrl/cookie 编辑**
 - **书源调试**：搜索/目录/正文逐规则逐步日志（SSE 流式）
-- **书源登录**：`loginUrl` 登录流 + `loginCheckJs` 校验 + Set-Cookie 按用户合并；图片验证码截图回填；**CDP 浏览器自动登录**（表单/滑块贝塞尔轨迹/cookie 提取——本机 Chrome/Edge 自动发现）
-- **反爬（验证码/CF 质询 bypass）**：Cloudflare 质询检测（503/403 + 特征 HTML）→ **进程内专精浏览器求解**（stealth 反检测注入 + UA 覆盖 + **质询重试**（原 method/body/headers + 新 cookie）+ cookie 按 name 合并复用——无需外部容器）或可选外部 `FLARESOLVERR_URL`；**Turnstile 验证码**（widget 检测 → 自动点击 → 读取 `cf-turnstile-response`）；**69shuba 等真实书源实测**（scripts/69shuba.json）
+- **书源登录**：`loginUrl` 登录流 + `loginCheckJs` 校验 + Set-Cookie 按用户合并；图片验证码截图回填；**CDP 浏览器自动登录**（表单/滑块贝塞尔轨迹/cookie 提取——obscura 反检测浏览器后端）
+- **反爬（验证码/CF 质询 bypass）**：Cloudflare 质询检测（503/403 + 特征 HTML）→ **进程内 obscura 浏览器求解**（stealth 构建：BoringSSL TLS 指纹模拟/反检测/追踪器拦截 + **质询重试**（原 method/body/headers + 新 cookie）+ cookie 按 name 合并复用——无需外部容器）或可选外部 `FLARESOLVERR_URL`；**Turnstile 验证码**（widget 检测 → 自动点击 → 读取 `cf-turnstile-response`）；**69shuba 等真实书源实测**（scripts/69shuba.json）
 - **相关推荐**：`ruleRelated` 详情页相关书籍（同 ruleExplore 规则风格）；**探索源扩充**（内置探索源清单，与 bookSource.json 同构——可直接导入）
 - **换源**：并发多源搜索 + 书名过滤去重，一键切换
 
@@ -76,17 +76,17 @@ export READER_APP_SECURE=true             # 开启多用户安全模式（可选
 
 > 非 secure 模式单用户（default）；secure 模式注册/登录后使用。
 
-### Docker（推荐——镜像内置 chromium，验证码/CF 质询浏览器流可直接使用）
+### Docker（推荐——镜像内置 obscura 反检测浏览器，验证码/CF 质询浏览器流可直接使用）
 
 ```bash
-# 构建（多阶段：Rust 编译 + 前端构建 + 运行镜像（debian + chromium））
+# 构建（多阶段：Rust 编译 + 前端构建 + obscura release 下载 + 运行镜像（debian））
 docker build -t reader-dev .
 
 # 运行（数据持久化到 ./data）
 docker run -d --name reader-dev -p 8080:8080   -v "$PWD/data:/data"   -e READER_APP_WORKDIR=/data   -e READER_APP_SECURE=true   reader-dev
 ```
 
-> 容器内验证码路径：**内置 chromium**（`READER_CHROME_PATH=/usr/bin/chromium`）→ 登录表单/滑块自动处理、CF 质询进程内求解；无需外部 FlareSolverr 容器（如需仍可 `FLARESOLVERR_URL` 指向 sidecar）。
+> 容器内验证码路径：**内置 obscura**（`READER_OBSCURA_BIN=/opt/obscura/obscura`——release stealth 构建，构建期从 GitHub Releases 下载，amd64/arm64 自动选资产）→ 登录表单/滑块自动处理、CF 质询进程内求解；无需外部 FlareSolverr 容器（如需仍可 `FLARESOLVERR_URL` 指向 sidecar）。
 
 ---
 
@@ -103,7 +103,8 @@ docker run -d --name reader-dev -p 8080:8080   -v "$PWD/data:/data"   -e READER_
 | `READER_APP_INVITECODE` | 空 | 注册邀请码（配置后注册必须） |
 | `READER_LOG_DIR` | 空（仅控制台） | 日志目录（控制台 + 文件，按大小轮转 10MB×7） |
 | `READER_LOG_MAX_SIZE_MB` / `READER_LOG_MAX_FILES` | `10` / `7` | 日志轮转参数 |
-| `READER_CHROME_PATH` | 自动发现 | Chrome/Edge 路径（书源登录浏览器流） |
+| `READER_OBSCURA_BIN` | 自动发现 | obscura 可执行文件路径（浏览器流唯一后端；默认探测：同目录 → 系统 PATH） |
+| `READER_OBSCURA_URL` | 空 | 连接既有 obscura CDP 服务（ws:// 或 http:// 端点；配置后不再 spawn 进程） |
 | `FLARESOLVERR_URL` | 空（内嵌求解） | 可选外部 FlareSolverr 服务地址 |
 | `READER_UPLOAD_MAX_MB` | `100` | 上传大小上限（MB，multipart 导入/文件上传/备份恢复；超限返回明确错误） |
 | `READER_TOKEN_TTL_DAYS` | `30` | token 过期天数（基于最近登录时间；过期需重新登录） |
@@ -117,9 +118,11 @@ docker run -d --name reader-dev -p 8080:8080   -v "$PWD/data:/data"   -e READER_
 
 ## 📦 部署说明
 
-### 书源浏览器流依赖
-- **Windows**：自动发现系统 Edge/Chrome，无需安装
-- **Linux/容器**：`apt install chromium`（或 `chromium-browser`/`google-chrome`），或用 `READER_CHROME_PATH` 显式指定
+### 书源浏览器流依赖（obscura——唯一浏览器后端）
+- **obscura**：Rust headless 浏览器（stealth 构建——BoringSSL TLS 指纹模拟/反检测/追踪器拦截；CDP 兼容）。下载：GitHub Releases 的 `-stealth` 资产（`obscura-x86_64-linux-stealth.tar.gz` / `obscura-aarch64-linux-stealth.tar.gz` / `obscura-x86_64-windows-stealth.zip`）
+- **Windows**：解压后设置 `READER_OBSCURA_BIN` 指向 `obscura.exe`（或放入 PATH）
+- **Linux/容器**：下载解压到任意目录并设置 `READER_OBSCURA_BIN`；Docker 镜像已内置（`/opt/obscura/obscura`）
+- **既有服务**：已运行 `obscura serve --port 9222 --stealth` 时，配置 `READER_OBSCURA_URL=http://127.0.0.1:9222` 直连复用（不再 spawn 进程）
 - 无浏览器时：登录/CF 质询降级为明确报错 + 手动 Cookie 粘贴
 
 ### 反爬（Cloudflare）
@@ -195,8 +198,8 @@ READER_APP_WORKDIR=/storage READER_APP_SECURE=true ./reader-dev-linux-x64
 | 原 JSON 文件 | 保留（可回退） |
 
 ### 直接跑 Rust 的能力说明（分层）
-- **本地直跑**：CDP + stealth 反检测（系统 Edge/Chrome——Windows 几乎必有）——覆盖 CF JS 质询/Turnstile 基础/滑块
-- **Docker 镜像**：内置 chromium + python + camoufox（强质询兜底——69shuba 级）
+- **本地直跑**：obscura stealth 构建（`READER_OBSCURA_BIN` 指向下载的二进制——Windows/Linux/macOS release 资产）——覆盖 CF JS 质询/Turnstile 基础/滑块
+- **Docker 镜像**：内置 obscura（stealth）+ python + camoufox（强质询兜底——69shuba 级）
 - **强质询边界**：数据中心 IP 会被 Turnstile 风控（400030）——需住宅代理（camoufox 支持 per-context proxy，配置 `READER_PROXY_URL` 或书源代理字段）
 
 ## 📖 使用指南

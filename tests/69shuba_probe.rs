@@ -1,4 +1,4 @@
-//! 69shuba 质询对比探针（GAP 175）：内置浏览器 CDP（headless Chrome/Edge）vs
+//! 69shuba 质询对比探针（GAP 175）：内置浏览器 CDP（obscura stealth 后端）vs
 //! camoufox 求解后端——对比「质询页是否出现 input（cf-turnstile-response）」。
 //!
 //! 运行（真实网络 + 本机浏览器；默认 cargo test 不执行）：
@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-/// 探针 1：内置浏览器 CDP（headless Chrome/Edge + STEALTH_JS 手搓反检测）解 69shuba——
+/// 探针 1：内置浏览器 CDP（obscura stealth 构建）解 69shuba——
 /// 记录质询页是否出现 input（[name=cf-turnstile-response]）/ Turnstile widget /
 /// challenge 特征是否消失
 #[test]
@@ -28,10 +28,21 @@ fn probe_cdp_on_69shuba() {
             println!("=== CDP（当前实现）69shuba 求解结果 ===");
             println!("html_len={}", h.len());
             println!("title 含 Just a moment: {}", h.contains("Just a moment"));
-            println!("含 challenge-form/cf-chl: {}", h.contains("challenge-form") || h.contains("cf-chl-") || h.contains("challenge-platform"));
-            println!("含 [name=cf-turnstile-response] input: {}", h.contains("cf-turnstile-response"));
+            println!(
+                "含 challenge-form/cf-chl: {}",
+                h.contains("challenge-form")
+                    || h.contains("cf-chl-")
+                    || h.contains("challenge-platform")
+            );
+            println!(
+                "含 [name=cf-turnstile-response] input: {}",
+                h.contains("cf-turnstile-response")
+            );
             println!("含 .cf-turnstile 容器: {}", h.contains("cf-turnstile"));
-            println!("含 challenges.cloudflare.com iframe: {}", h.contains("challenges.cloudflare.com"));
+            println!(
+                "含 challenges.cloudflare.com iframe: {}",
+                h.contains("challenges.cloudflare.com")
+            );
             println!("cookies: {:?}", sol.cookies);
             println!("ua: {}", sol.user_agent);
         }
@@ -55,10 +66,21 @@ fn probe_camoufox_on_69shuba() {
             println!("=== camoufox（新后端）69shuba 求解结果 ===");
             println!("html_len={}", h.len());
             println!("title 含 Just a moment: {}", h.contains("Just a moment"));
-            println!("含 challenge-form/cf-chl: {}", h.contains("challenge-form") || h.contains("cf-chl-") || h.contains("challenge-platform"));
-            println!("含 [name=cf-turnstile-response] input: {}", h.contains("cf-turnstile-response"));
+            println!(
+                "含 challenge-form/cf-chl: {}",
+                h.contains("challenge-form")
+                    || h.contains("cf-chl-")
+                    || h.contains("challenge-platform")
+            );
+            println!(
+                "含 [name=cf-turnstile-response] input: {}",
+                h.contains("cf-turnstile-response")
+            );
             println!("含 .cf-turnstile 容器: {}", h.contains("cf-turnstile"));
-            println!("含 challenges.cloudflare.com iframe: {}", h.contains("challenges.cloudflare.com"));
+            println!(
+                "含 challenges.cloudflare.com iframe: {}",
+                h.contains("challenges.cloudflare.com")
+            );
             println!("cookies: {:?}", sol.cookies);
             println!("ua: {}", sol.user_agent);
             println!("turnstile_token: {:?}", sol.turnstile_token);
