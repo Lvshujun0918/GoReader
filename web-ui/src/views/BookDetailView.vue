@@ -490,6 +490,22 @@ const sourceOpen = ref(false)
 const sourceBusy = ref(false)
 const sourceSwitching = ref(false)
 const sourceResults = ref<SearchBook[]>([])
+const sourceKeyword = ref('')
+const sourceFiltered = computed(() => {
+  const kw = sourceKeyword.value.trim().toLowerCase()
+  if (!kw) return sourceResults.value
+  return sourceResults.value.filter(
+    (r) =>
+      (r.originName || '').toLowerCase().includes(kw) ||
+      (r.origin || '').toLowerCase().includes(kw),
+  )
+})
+function refreshSource() {
+  if (sourceBusy.value) return
+  sourceSSEHandle?.abort()
+  sourceResults.value = []
+  void runSourceSearch()
+}
 const sourceMsg = ref('')
 const sourceMsgError = ref(false)
 const currentOrigin = ref('')
@@ -1393,6 +1409,11 @@ onMounted(() => {
                   </button>
                 </li>
               </ul>
+
+              <!-- 过滤后无匹配提示 -->
+              <p v-else-if="!sourceBusy && sourceResults.length > 0 && sourceFiltered.length === 0" class="source-empty">
+                未找到匹配「{{ sourceKeyword }}」的书源
+              </p>
 
               <!-- 空 / 失败提示（搜索结束后仍无结果时） -->
               <template v-else-if="!sourceBusy">
@@ -2358,6 +2379,56 @@ onMounted(() => {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.source-tools {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.source-filter {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 13px;
+  font-weight: 300;
+  border: 1px solid var(--border, #ececec);
+  border-radius: 8px;
+  background: var(--card, #fff);
+  color: var(--text-1, #333);
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+.source-filter:focus {
+  border-color: var(--accent, #4f46e5);
+}
+.source-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2, #666);
+  background: none;
+  border: 1px solid var(--border, #ececec);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.source-refresh:hover {
+  border-color: var(--accent, #4f46e5);
+  color: var(--accent, #4f46e5);
+}
+.source-refresh svg {
+  width: 13px;
+  height: 13px;
+}
+.source-empty {
+  padding: 14px 4px;
+  font-size: 13px;
+  font-weight: 300;
+  color: var(--text-2, #888);
 }
 
 /* ================= 换源弹层 ================= */

@@ -1025,7 +1025,7 @@ fn register_js_solve_hook(hook: Option<Arc<SolveHook>>) {
 /// 接入 `browser::solve_captcha`（统一验证码求解入口：CF JS 质询 / Turnstile / 滑块
 /// 自动处理；进程内 CDP，会话级浏览器实例惰性启动/复用/异常自动重启）。
 async fn solve_page(
-    _ns: String,
+    ns: String,
     url: String,
     cookies: Vec<(String, String)>,
     _title: String,
