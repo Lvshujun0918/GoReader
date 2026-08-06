@@ -1,12 +1,14 @@
 //! 图片代理磁盘缓存（/assets/proxy 回源加速）
 //!
-//! - 磁盘缓存：`storage/cache/images/{md5(url)前16}.{ext}`——命中直接读盘，避免每次回源；
+//! - 磁盘缓存：`storage/cache/images/{md5("{ns}|{url}")}.{ext}`（M2：键含命名空间——
+//!   跨用户隔离，用户 A 的会话 cookie 回源结果不会串给用户 B）——命中直接读盘，避免每次回源；
 //!   命中方（router）下发长 Cache-Control（public, max-age=31536000, immutable）
 //! - 容量上限：env `READER_IMAGE_CACHE_MB`（默认 512MB，0 = 禁用磁盘缓存），
 //!   超限按 LRU（最近最少使用，进程内单调时钟序）清理
-//! - 并发去重：同 URL 同时请求共享一次回源（内存 in-flight map + 每 key 信号量）
-//! - 安全：缓存键 = md5(url) 前 16 位十六进制（不落原始 URL）；扩展名白名单——
-//!   仅白名单 Content-Type 落盘（文件名扩展名从白名单映射），非白名单原样透传
+//! - 并发去重：同 (ns,url) 同时请求共享一次回源（内存 in-flight map + 每 key 信号量）
+//! - 安全：缓存键 = md5(ns|url) 完整 32 位十六进制（不落原始 URL；含命名空间防串用户）；
+//!   扩展名白名单——仅白名单 Content-Type 落盘（文件名扩展名从白名单映射），非白名单原样透传；
+//!   旧格式 16 位键（md5(url) 前 16，无命名空间）启动时识别并删除（跨用户串图残留）
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,10 +57,10 @@ fn content_type_for_ext(ext: &str) -> &'static str {
     }
 }
 
-/// 缓存键：md5(url) 前 16 位十六进制（URL 哈希——不落原始 URL）
-fn cache_key(url: &str) -> String {
-    let hex = md5_encode(url);
-    hex[..16].to_string()
+/// 缓存键：md5("{ns}|{url}") 完整 32 位十六进制（M2：命名空间并入键——跨用户隔离；
+/// 完整 32 位避免 64 位截断碰撞；不落原始 URL）
+fn cache_key(ns: &str, url: &str) -> String {
+    md5_encode(&format!("{ns}|{url}"))
 }
 
 /// 索引条目
@@ -146,10 +148,11 @@ impl ImageCache {
             .total_bytes
     }
 
-    /// 取图片：磁盘命中直接返回；未命中回源（同 URL 并发去重）并写入缓存。
+    /// 取图片：磁盘命中直接返回；未命中回源（同 (ns,url) 并发去重）并写入缓存。
     ///
     /// 返回 (字节, Content-Type, 上游状态码, 是否磁盘命中)；仅 HTTP 200 且白名单
     /// 图片类型会落盘；缓存 I/O 失败不影响响应（回源结果照常返回）。
+    /// 缓存键 = md5("{ns}|{url}")（M2 跨用户隔离）。
     pub async fn get_or_fetch(
         &self,
         ns: &str,
@@ -158,7 +161,7 @@ impl ImageCache {
         timeout_secs: u64,
         max_bytes: u64,
     ) -> anyhow::Result<FetchOutcome> {
-        let key = cache_key(url);
+        let key = cache_key(ns, url);
         if self.max_bytes > 0 {
             if let Some((bytes, ct)) = self.read_disk(&key) {
                 return Ok((bytes, Some(ct.to_string()), 200, true));
@@ -277,8 +280,10 @@ impl ImageCache {
         }
     }
 
-    /// 启动种子化：扫描目录，将存量缓存文件纳入索引（key 形如 16 位 hex + 扩展名白名单），
+    /// 启动种子化：扫描目录，将存量缓存文件纳入索引（key 形如 32 位 hex + 扩展名白名单），
     /// 并立即按容量 LRU 清理（重启后磁盘可能已超限）。
+    /// M2：旧格式 16 位 hex 键（md5(url) 前 16，无命名空间）无法归属用户——删除清理，
+    /// 避免跨用户串图残留继续占用容量。
     fn seed_from_disk(&self) {
         if self.max_bytes == 0 {
             return;
@@ -292,7 +297,13 @@ impl ImageCache {
             let Some((key, ext)) = name.rsplit_once('.') else {
                 continue;
             };
-            if key.len() != 16 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                // 旧格式键（md5(url) 前 16 位、无命名空间）：跨用户串图残留，删除
+                tracing::info!("图片缓存：清理旧格式跨用户键 {name}");
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+            if key.len() != 32 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
                 continue; // 非缓存命名（如 .tmp 临时文件）
             }
             // 扩展名必须在白名单（content_type_for_ext → ext_for_content_type 往返一致）
@@ -394,10 +405,11 @@ mod tests {
         (ImageCache::with_capacity(dir.clone(), max_bytes), dir)
     }
 
-    /// 首次拉取：回源 1 次并写盘 storage/cache/images/{md5前16}.png；二次请求磁盘命中、
+    /// 首次拉取：回源 1 次并写盘 storage/cache/images/{md5(ns|url)}.png；二次请求磁盘命中、
     /// 不再回源（Content-Type 由扩展名还原）。
     #[tokio::test]
     async fn test_first_fetch_writes_cache_and_second_hits() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1
         let (cache, dir) = temp_cache("first", 1024 * 1024).await;
         let (addr, count) = mock_server(0).await;
         let url = format!("http://{addr}/cover.png");
@@ -412,9 +424,9 @@ mod tests {
         assert_eq!(ct.as_deref(), Some("image/png"));
         assert_eq!(bytes, expected);
 
-        // 缓存文件落盘：{md5(url)前16}.png
-        let key = cache_key(&url);
-        assert_eq!(key.len(), 16);
+        // 缓存文件落盘：{md5("default|url")}.png（32 位完整哈希）
+        let key = cache_key("default", &url);
+        assert_eq!(key.len(), 32);
         let path = cache.dir().join(format!("{key}.png"));
         assert!(path.exists(), "首次拉取应写缓存文件: {path:?}");
         assert_eq!(
@@ -448,12 +460,13 @@ mod tests {
     /// 重新拉取 small（miss 回源）→ 40K；再拉取 medium → 60K → 清最久未用的 big → 30K。
     #[tokio::test]
     async fn test_capacity_lru_eviction() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
         let (cache, dir) = temp_cache("lru", 45_000).await;
         let (addr, count) = mock_server(0).await;
         let small = format!("http://{addr}/small.png");
         let medium = format!("http://{addr}/medium.png");
         let big = format!("http://{addr}/big.png");
-        let file_of = |u: &str| cache.dir().join(format!("{}.png", cache_key(u)));
+        let file_of = |u: &str| cache.dir().join(format!("{}.png", cache_key("default", u)));
 
         for url in [&small, &medium, &big] {
             let (_, _, status, _) = cache
@@ -497,6 +510,7 @@ mod tests {
     /// 并发去重：同 URL 同时请求（慢上游）仅回源一次，5 个请求全部拿到相同字节
     #[tokio::test]
     async fn test_concurrent_same_url_single_fetch() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
         let (cache, dir) = temp_cache("dedup", 1024 * 1024).await;
         let (addr, count) = mock_server(300).await; // 慢上游：确保请求重叠
         let url = format!("http://{addr}/cover.png");
@@ -531,6 +545,7 @@ mod tests {
     /// 安全：非白名单 Content-Type 与 非 200 响应不落盘（原样透传，后续仍回源）
     #[tokio::test]
     async fn test_non_whitelist_and_error_not_cached() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
         let (cache, dir) = temp_cache("whitelist", 1024 * 1024).await;
         let (addr, count) = mock_server(0).await;
 
@@ -547,7 +562,7 @@ mod tests {
         assert!(
             !cache
                 .dir()
-                .join(format!("{}.txt", cache_key(&url)))
+                .join(format!("{}.txt", cache_key("default", &url)))
                 .exists(),
             "白名单外类型不应落盘"
         );
@@ -568,24 +583,162 @@ mod tests {
         assert!(
             !cache
                 .dir()
-                .join(format!("{}.png", cache_key(&url)))
+                .join(format!("{}.png", cache_key("default", &url)))
                 .exists(),
             "非 200 不应落盘"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 安全：缓存键 = md5(url) 前 16 位十六进制——原始 URL 不出现在文件名
+    /// M2 跨用户隔离：同 URL 不同命名空间 → 不同缓存键、互不命中（A 的会话 cookie 回源
+    /// 字节不会串给 B）；且用户 B 请求不被 A 的缓存命中（必须回源）。
+    #[tokio::test]
+    async fn test_cache_isolated_by_namespace() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        let (cache, dir) = temp_cache("ns-isolation", 1024 * 1024).await;
+        // mock 服务器：按 Referer 返回不同字节（模拟按用户个性化/防盗链内容）
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cnt = count.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let cnt = cnt.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                    // 按 Referer 区分用户内容：A 的 referer → 字节 A，B 的 → 字节 B
+                    let body: Vec<u8> = if req.contains("referer: https://user-a/") {
+                        vec![0xAA; 500]
+                    } else if req.contains("referer: https://user-b/") {
+                        vec![0xBB; 600]
+                    } else {
+                        vec![0xCC; 700]
+                    };
+                    cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let mut resp = head.into_bytes();
+                    resp.extend_from_slice(&body);
+                    let _ = sock.write_all(&resp).await;
+                });
+            }
+        });
+        let url = format!("http://{addr}/personal.png");
+
+        // 用户 A 拉取：回源 + 写盘（键 = md5("alice|url")）
+        let (bytes_a, _, _, from_cache_a) = cache
+            .get_or_fetch(
+                "alice",
+                &url,
+                Some("https://user-a/book/1"),
+                10,
+                5 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+        assert!(!from_cache_a);
+        assert_eq!(bytes_a, vec![0xAA; 500], "A 应拿到 A 的个性化字节");
+
+        // 用户 B 请求同一 URL：不得命中 A 的缓存（回源拿 B 的字节）
+        let (bytes_b, _, _, from_cache_b) = cache
+            .get_or_fetch(
+                "bob",
+                &url,
+                Some("https://user-b/book/1"),
+                10,
+                5 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+        assert!(!from_cache_b, "B 不应命中 A 的缓存（跨用户隔离）");
+        assert_eq!(bytes_b, vec![0xBB; 600], "B 应拿到 B 的个性化字节");
+
+        // 两个键都落盘且不同
+        let key_a = cache_key("alice", &url);
+        let key_b = cache_key("bob", &url);
+        assert_ne!(key_a, key_b, "不同命名空间键必须不同");
+        assert!(cache.dir().join(format!("{key_a}.png")).exists());
+        assert!(cache.dir().join(format!("{key_b}.png")).exists());
+
+        // 各自二次请求：命中各自的缓存，不再回源
+        let (bytes_a2, _, _, from_cache_a2) = cache
+            .get_or_fetch(
+                "alice",
+                &url,
+                Some("https://user-a/book/1"),
+                10,
+                5 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+        assert!(from_cache_a2);
+        assert_eq!(bytes_a2, vec![0xAA; 500]);
+        let (bytes_b2, _, _, from_cache_b2) = cache
+            .get_or_fetch(
+                "bob",
+                &url,
+                Some("https://user-b/book/1"),
+                10,
+                5 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+        assert!(from_cache_b2);
+        assert_eq!(bytes_b2, vec![0xBB; 600]);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "两个用户各回源一次，互不串用"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M2 旧格式键清理：16 位 hex 键（md5(url) 前 16，无命名空间）在种子化时删除；
+    /// 32 位新键正常纳入索引
     #[test]
-    fn test_cache_key_is_md5_prefix() {
-        let key = cache_key("https://example.com/cover.png");
-        assert_eq!(key.len(), 16);
+    fn test_seed_removes_legacy_16hex_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "reader-image-cache-test-legacy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 旧格式键文件 + 新格式键文件
+        let legacy = format!("{}.png", &md5_encode("http://old.example/x.png")[..16]);
+        let modern = format!("{}.png", md5_encode("alice|http://new.example/x.png"));
+        std::fs::write(dir.join(&legacy), b"legacy").unwrap();
+        std::fs::write(dir.join(&modern), b"modern").unwrap();
+
+        let cache = ImageCache::with_capacity(dir.clone(), 1024 * 1024);
+        assert!(
+            !dir.join(&legacy).exists(),
+            "旧格式 16 位键文件应被清理: {legacy}"
+        );
+        assert!(dir.join(&modern).exists(), "新格式键文件应保留");
+        assert_eq!(cache.total_bytes(), 6, "仅新键计入索引");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 安全：缓存键 = md5("{ns}|{url}") 完整 32 位十六进制——原始 URL 不出现在文件名；
+    /// 同 ns+url 稳定；不同 ns 或不同 url 均不同（M2 跨用户隔离）
+    #[test]
+    fn test_cache_key_is_md5_of_ns_and_url() {
+        let key = cache_key("default", "https://example.com/cover.png");
+        assert_eq!(key.len(), 32);
         assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
-        // 同 URL 稳定；不同 URL 不同
-        assert_eq!(key, cache_key("https://example.com/cover.png"));
-        assert_ne!(key, cache_key("https://example.com/cover2.png"));
-        // 确为 md5 前 16 位
-        let full = md5_encode("https://example.com/cover.png");
-        assert_eq!(key, &full[..16]);
+        // 同 ns+url 稳定；不同 url 不同；不同 ns 不同（跨用户隔离）
+        assert_eq!(key, cache_key("default", "https://example.com/cover.png"));
+        assert_ne!(key, cache_key("default", "https://example.com/cover2.png"));
+        assert_ne!(key, cache_key("alice", "https://example.com/cover.png"));
+        // 确为 md5(ns|url) 完整 32 位
+        assert_eq!(key, md5_encode("default|https://example.com/cover.png"));
     }
 }

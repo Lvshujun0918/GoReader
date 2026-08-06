@@ -587,7 +587,7 @@ fn reload_fetch(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
             .await
             .map(|r| r.body)
     };
-    match block_on_task(fut, Duration::from_secs(60), "Reload") {
+    match block_on_task(fut, BRIDGE_WAIT_TIMEOUT, "Reload") {
         Ok(body) => Ok(JsValue::from(JsString::from(body))),
         Err(e) => Err(js_native_error(format!("Reload 失败（{url}）: {e}"))),
     }
@@ -647,7 +647,7 @@ fn wbi_keys() -> Option<(String, String)> {
     };
     let fetched = block_on_task(
         async move { Ok::<_, anyhow::Error>(fut.await) },
-        Duration::from_secs(20),
+        BRIDGE_WAIT_TIMEOUT,
         "getWbiEnc-nav",
     )
     .ok()
@@ -929,15 +929,20 @@ fn js_native_error(msg: impl Into<String>) -> JsError {
     JsNativeError::error().with_message(msg.into()).into()
 }
 
+/// JS 桥接同步等待上限（M6：60s → 10s）——书源规则并发执行时，单次桥接调用对
+/// axum worker 线程的阻塞占用最多 10s；超时后调用方立即返回错误、不再等待工作线程
+/// （工作线程继续运行至其内部 fetch 超时后自行退出，不占用 worker）。
+const BRIDGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// 同步等待异步任务结果（boa 引擎为同步调用环境；`java.ajax`/`java.startBrowserAwait`
 /// 需要等待网络/浏览器结果）。
 ///
 /// 阻塞说明：书源 JS 通常在 tokio 工作线程（axum handler）中执行，本函数用专用
 /// worker 线程 + 独立 current_thread tokio runtime 执行异步任务，当前线程经
-/// std mpsc `recv_timeout` 阻塞等待（最多 `timeout`）。不在 ambient runtime 上直接
-/// spawn——避免 current_thread runtime（如 `#[tokio::test]`）下「阻塞唯一 worker →
-/// 任务永不被轮询」的死锁；阻塞仅限当前执行 JS 的线程，多线程 runtime 的其他
-/// worker 不受影响。
+/// std mpsc `recv_timeout` 阻塞等待（最多 `timeout`，调用方统一传 [`BRIDGE_WAIT_TIMEOUT`]）。
+/// 不在 ambient runtime 上直接 spawn——避免 current_thread runtime（如 `#[tokio::test]`）下
+/// 「阻塞唯一 worker → 任务永不被轮询」的死锁；阻塞仅限当前执行 JS 的线程，多线程 runtime 的
+/// 其他 worker 不受影响。超时路径：调用方立即返回错误，不再等待工作线程回收（M6）。
 fn block_on_task<T: Send + 'static>(
     fut: impl Future<Output = Result<T>> + Send + 'static,
     timeout: Duration,
@@ -1083,7 +1088,7 @@ fn java_start_browser_await(
         solve_page(ns, fut_url, cookies, title).await
     };
     let (html, cookies, _user_agent) =
-        match block_on_task(fut, Duration::from_secs(60), "java.startBrowserAwait") {
+        match block_on_task(fut, BRIDGE_WAIT_TIMEOUT, "java.startBrowserAwait") {
             Ok(v) => v,
             Err(e) => {
                 return Err(js_native_error(format!(
@@ -1252,7 +1257,7 @@ fn java_ajax(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> 
         .await?;
         Ok::<_, anyhow::Error>(resp.body)
     };
-    let body = match block_on_task(fut, Duration::from_secs(60), "java.ajax") {
+    let body = match block_on_task(fut, BRIDGE_WAIT_TIMEOUT, "java.ajax") {
         Ok(b) => b,
         Err(e) => return Err(js_native_error(format!("java.ajax 失败（{url}）: {e}"))),
     };
@@ -1585,7 +1590,7 @@ fn java_http_fetch(
         }
         crate::service::crawler::fetch(&fut_url, &headers, 15, &fut_method, None, None).await
     };
-    let resp = match block_on_task(fut, Duration::from_secs(60), "java-http") {
+    let resp = match block_on_task(fut, BRIDGE_WAIT_TIMEOUT, "java-http") {
         Ok(r) => r,
         Err(e) => return Err(js_native_error(format!("java {method} 失败（{url}）: {e}"))),
     };
@@ -2401,6 +2406,37 @@ fn aes_base64_decode_to_string(data: &str, key: &str, iv: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M6：block_on_task 超时后立即返回错误（不再无限等待）——永不完成的任务在短超时内返回
+    #[test]
+    fn test_block_on_task_timeout_returns_promptly() {
+        let start = std::time::Instant::now();
+        let fut = async {
+            let _ = std::future::pending::<Result<(), anyhow::Error>>().await;
+            Ok(())
+        };
+        let err =
+            block_on_task(fut, std::time::Duration::from_millis(200), "test-pending").unwrap_err();
+        assert!(err.to_string().contains("超时"), "应为超时错误: {err}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "超时后应立即返回（不再等待工作线程）"
+        );
+    }
+
+    /// M6：正常完成的任务仍能取回结果（超时上限下调不影响正常路径）
+    #[test]
+    fn test_block_on_task_returns_result() {
+        let fut = async { Ok::<_, anyhow::Error>(42u32) };
+        let r = block_on_task(fut, std::time::Duration::from_secs(2), "test-ok").unwrap();
+        assert_eq!(r, 42);
+    }
+
+    /// M6：桥接等待上限为 10s（worker 阻塞窗口封顶）
+    #[test]
+    fn test_bridge_wait_timeout_is_10s() {
+        assert_eq!(BRIDGE_WAIT_TIMEOUT, std::time::Duration::from_secs(10));
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

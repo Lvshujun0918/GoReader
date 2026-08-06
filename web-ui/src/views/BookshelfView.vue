@@ -20,6 +20,7 @@ import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export
 import { probeSecureMode } from '@/api/users'
 import { downloadBlob } from '@/utils/download'
 import { canRescanBook } from '@/utils/localBook'
+import { parseShelfView, shelfViewMetrics, type ShelfViewMode } from '@/utils/shelfView'
 import { useUserStore } from '@/stores/user'
 import type { Book, BookGroup, Bookmark, ContentSearchHit, ImportPreview } from '@/types'
 
@@ -56,15 +57,15 @@ const cardMinW = computed(() =>
   narrowMq.matches ? DENSITY_NARROW_W[density.value] : DENSITY_MIN_W[density.value],
 )
 
-/* ================= 视图切换（GAP 103：网格 / 列表——列表=小缩略图行，localStorage: reader_shelf_view） ================= */
+/* ================= 视图切换（GAP 103：网格 / 列表 / 墙——localStorage: reader_shelf_view；
+    wall 由 utils/shelfView.ts parseShelfView 统一解析，M4：接入三态切换） ================= */
 
 const VIEW_KEY = 'reader_shelf_view'
-const viewMode = ref<'grid' | 'list'>('grid')
+const viewMode = ref<ShelfViewMode>('grid')
 {
-  const raw = localStorage.getItem(VIEW_KEY)
-  if (raw === 'grid' || raw === 'list') viewMode.value = raw
+  viewMode.value = parseShelfView(localStorage.getItem(VIEW_KEY))
 }
-function setViewMode(v: 'grid' | 'list') {
+function setViewMode(v: ShelfViewMode) {
   viewMode.value = v
   try {
     localStorage.setItem(VIEW_KEY, v)
@@ -72,6 +73,24 @@ function setViewMode(v: 'grid' | 'list') {
     /* ignore */
   }
 }
+/** 三态循环：网格 → 列表 → 墙 → 网格 */
+const VIEW_CYCLE: ShelfViewMode[] = ['grid', 'list', 'wall']
+const viewToggleTitle = computed(() => {
+  const next = VIEW_CYCLE[(VIEW_CYCLE.indexOf(viewMode.value) + 1) % VIEW_CYCLE.length]
+  if (next === 'wall') return '切换到墙视图（大封面网格）'
+  if (next === 'list') return '切换到列表视图（小缩略图行）'
+  return '切换到网格视图'
+})
+function cycleViewMode() {
+  const i = VIEW_CYCLE.indexOf(viewMode.value)
+  setViewMode(VIEW_CYCLE[(i + 1) % VIEW_CYCLE.length])
+}
+/** 墙视图卡片最小宽（shelfViewMetrics('wall')——固定大卡片，不受密度影响） */
+const wallCardMinW = computed(() => shelfViewMetrics('wall', narrowMq.matches).cardMinW)
+/** CSS 变量 --card-w 实际取值（wall 模式用墙尺寸；grid/list 用密度尺寸） */
+const gridCardMinW = computed(() =>
+  viewMode.value === 'wall' ? wallCardMinW.value : cardMinW.value,
+)
 
 /** 书卡进度角标（GAP 14）：durChapterIndex / totalChapterNum；无数据（缺字段/总章数 0）时返回 null 隐藏 */
 function bookProgress(book: Book): number | null {
@@ -1057,15 +1076,17 @@ function updateViewport() {
   endRow.value = Math.max(r0 + 1, Math.min(total, r1 + 1))
 }
 
-/** 计算列数并测量行高（卡片宽高比固定，任取一张测量） */
+/** 计算列数并测量行高（卡片宽高比固定，任取一张测量）；
+ *  M4：尺寸统一取自 shelfViewMetrics——墙模式（wall）大卡片 + 宽间距，行高按墙元信息区 */
 function measureGrid() {
   const wrap = gridWrapRef.value
   if (!wrap) return
   const w = wrap.clientWidth
   if (w <= 0) return
-  const minW = viewMode.value === 'list' ? 1 : cardMinW.value
-  const colGap = narrowMq.matches ? 16 : 28
-  rowGap.value = narrowMq.matches ? 24 : 32
+  const m = shelfViewMetrics(viewMode.value, narrowMq.matches, density.value)
+  const minW = m.cardMinW
+  const colGap = m.colGap
+  rowGap.value = m.rowGap
   cols.value = Math.max(1, Math.floor((w + colGap) / (minW + colGap)))
   const card = wrap.querySelector('.book-card')
   if (card) {
@@ -1075,7 +1096,7 @@ function measureGrid() {
     rowH.value = 76
   } else {
     const cw = (w - (cols.value - 1) * colGap) / cols.value
-    rowH.value = Math.round((cw * 4) / 3 + 78)
+    rowH.value = Math.round((cw * 4) / 3 + m.metaH)
   }
   updateViewport()
 }
@@ -1844,37 +1865,45 @@ onMounted(() => {
         <span v-if="addedSortNote" class="sort-note" :title="addedSortTip">{{ addedSortNote }}</span>
       </div>
 
-      <!-- 显示设置：网格密度（GAP 11，localStorage: reader_card_density）+ 网格/列表切换（GAP 103，localStorage: reader_shelf_view） -->
+      <!-- 显示设置：网格密度（GAP 11，localStorage: reader_card_density）+ 网格/列表/墙切换（GAP 103 + M4，localStorage: reader_shelf_view） -->
       <div class="view-bar">
-        <span class="sort-label">密度</span>
-        <button
-          v-for="opt in DENSITY_OPTIONS"
-          :key="opt.value"
-          class="sort-capsule"
-          :class="{ active: density === opt.value }"
-          type="button"
-          :title="`卡片：${opt.label}（${cardMinW}px 起）`"
-          @click="setDensity(opt.value)"
-        >
-          {{ opt.label }}
-        </button>
+        <template v-if="viewMode !== 'wall'">
+          <span class="sort-label">密度</span>
+          <button
+            v-for="opt in DENSITY_OPTIONS"
+            :key="opt.value"
+            class="sort-capsule"
+            :class="{ active: density === opt.value }"
+            type="button"
+            :title="`卡片：${opt.label}（${cardMinW}px 起）`"
+            @click="setDensity(opt.value)"
+          >
+            {{ opt.label }}
+          </button>
+        </template>
         <span class="view-sep"></span>
         <button
           class="view-toggle"
           type="button"
-          :title="viewMode === 'grid' ? '切换到列表视图（小缩略图行）' : '切换到网格视图'"
-          @click="setViewMode(viewMode === 'grid' ? 'list' : 'grid')"
+          :title="viewToggleTitle"
+          @click="cycleViewMode"
         >
-          <svg v-if="viewMode === 'grid'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+          <svg v-if="viewMode === 'wall'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+            <rect x="4" y="4" width="6.5" height="6.5" rx="1.2" />
+            <rect x="13.5" y="4" width="6.5" height="6.5" rx="1.2" />
+            <rect x="4" y="13.5" width="6.5" height="6.5" rx="1.2" />
+            <rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.2" />
+          </svg>
+          <svg v-else-if="viewMode === 'list'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+            <rect x="4" y="4" width="16" height="5" rx="1.5" />
+            <rect x="4" y="9.5" width="16" height="5" rx="1.5" />
+            <rect x="4" y="15" width="16" height="5" rx="1.5" />
+          </svg>
+          <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
             <rect x="4" y="4" width="7" height="7" rx="1.5" />
             <rect x="13" y="4" width="7" height="7" rx="1.5" />
             <rect x="4" y="13" width="7" height="7" rx="1.5" />
             <rect x="13" y="13" width="7" height="7" rx="1.5" />
-          </svg>
-          <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
-            <rect x="4" y="4" width="16" height="5" rx="1.5" />
-            <rect x="4" y="9.5" width="16" height="5" rx="1.5" />
-            <rect x="4" y="15" width="16" height="5" rx="1.5" />
           </svg>
         </button>
       </div>
@@ -1947,8 +1976,8 @@ onMounted(() => {
         <div class="virtual-pad" :style="{ height: padTop + 'px' }"></div>
         <div
           class="book-grid"
-          :class="{ list: viewMode === 'list' }"
-          :style="{ '--card-w': cardMinW + 'px' }"
+          :class="{ list: viewMode === 'list', wall: viewMode === 'wall' }"
+          :style="{ '--card-w': gridCardMinW + 'px' }"
         >
           <template v-for="row in visibleRows" :key="rowKey(row)">
             <!-- 分组标题行（排序=分组；点击折叠/展开该组，折叠后该组书隐藏） -->
@@ -3009,6 +3038,12 @@ onMounted(() => {
   padding: 1px 5px;
   left: 4px;
   bottom: 4px;
+}
+
+/* GAP 103 扩展（M4）：墙视图（大封面网格——固定大卡片，间距更宽；
+   列数/行高由 shelfViewMetrics('wall') 计算，--card-w 由 gridCardMinW 内联） */
+.book-grid.wall {
+  gap: 48px 40px;
 }
 
 .book-card {

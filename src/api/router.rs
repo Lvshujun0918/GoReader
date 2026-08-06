@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -517,10 +517,12 @@ struct LoginBody {
 }
 
 /// POST /reader3/login：注册或登录，返回 formatUser（camelCase）
-/// GAP 61 登录限流（用户名+IP 失败 5 次锁 5 分钟）+ GAP 59 多设备 token
+/// GAP 61 登录限流（用户名+直连 IP 失败 5 次锁 5 分钟）+ GAP 59 多设备 token
+/// M3：限流键用直连 socket 对端 IP（axum ConnectInfo）——X-Forwarded-For 可伪造，不再信任
 async fn login(
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Json<ReturnData> {
     let username = body.username.clone().unwrap_or_default();
@@ -534,8 +536,8 @@ async fn login(
         return Json(ReturnData::err("请输入密码"));
     }
 
-    // GAP 61：登录限流（用户名+IP；锁定中直接拒绝）
-    let ip = client_ip(&headers);
+    // GAP 61：登录限流（用户名+直连 IP；锁定中直接拒绝）——M3：XFF 仅可伪造，完全忽略
+    let ip = peer.ip().to_string();
     if let Err(msg) = crate::util::login_limit::check_allowed(&username, &ip) {
         return Json(ReturnData::err(msg));
     }
@@ -566,9 +568,7 @@ async fn login(
         crate::util::login_limit::record_failure(&username, &ip);
         return Json(ReturnData::err("密码错误"));
     }
-    crate::util::login_limit::reset(&username, &ip);
-
-    // GAP 59：生成新 token 并追加到 token_map（多设备会话，上限 5；uuid v4 随机防预测）
+    crate::util::login_limit::reset(&username, &ip); // GAP 59：生成新 token 并追加到 token_map（多设备会话，上限 5；uuid v4 随机防预测）
     let now = now_millis();
     let token = uuid::Uuid::new_v4().simple().to_string();
     if let Err(e) = state.storage.add_user_token(&username, &token, now).await {
@@ -579,23 +579,6 @@ async fn login(
     user.last_login_at = now;
     tracing::info!("用户登录: {username}");
     Json(ReturnData::ok(format_user(&user)))
-}
-
-/// 客户端 IP（x-forwarded-for 优先取首个，其次 x-real-ip；无代理头时为空串——
-/// 此时限流退化为按用户名计数）
-fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
 }
 
 /// 自动注册（校验顺序与错误消息兼容 legacy）
@@ -8764,7 +8747,8 @@ mod tests {
             .await
             .is_ok());
 
-        // GAP 61：登录限流（用户名+IP 失败 5 次 → 锁定，返回“尝试过多请稍后”）
+        // GAP 61：登录限流（用户名+直连 IP 失败 5 次 → 锁定，返回“尝试过多请稍后”）；
+        // M3：限流键 = 直连 socket IP（ConnectInfo）——X-Forwarded-For 伪造不再生效
         let login_body = |u: &str, pw: &str| {
             Json(LoginBody {
                 username: Some(u.into()),
@@ -8773,12 +8757,12 @@ mod tests {
                 code: None,
             })
         };
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        let peer_a: std::net::SocketAddr = "203.0.113.9:40001".parse().unwrap();
         for _ in 0..5 {
             let ret = login(
+                ConnectInfo(peer_a),
                 AxumState(state.clone()),
-                h.clone(),
+                HeaderMap::new(),
                 login_body("alice", "wrong"),
             )
             .await;
@@ -8786,16 +8770,37 @@ mod tests {
         }
         // 第 6 次（已锁定）→ 尝试过多请稍后（即使密码正确也不放行）
         let ret = login(
+            ConnectInfo(peer_a),
             AxumState(state.clone()),
-            h.clone(),
+            HeaderMap::new(),
             login_body("alice", "whatever"),
         )
         .await;
         assert_eq!(ret.0.error_msg, "尝试过多请稍后");
-        // 同用户名不同 IP 不受影响
-        let mut h2 = HeaderMap::new();
-        h2.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
-        let ret = login(AxumState(state.clone()), h2, login_body("alice", "wrong")).await;
+        // M3：XFF 伪造无法绕过——同一直连 IP 换 X-Forwarded-For 头仍被锁定
+        let mut h_spoof = HeaderMap::new();
+        h_spoof.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        h_spoof.insert("x-real-ip", "9.9.9.9".parse().unwrap());
+        let ret = login(
+            ConnectInfo(peer_a),
+            AxumState(state.clone()),
+            h_spoof,
+            login_body("alice", "wrong"),
+        )
+        .await;
+        assert_eq!(
+            ret.0.error_msg, "尝试过多请稍后",
+            "XFF/x-real-ip 伪造应无法绕过锁定（直连 IP 桶）"
+        );
+        // 同用户名不同直连 IP 不受影响（各自独立计数）
+        let peer_b: std::net::SocketAddr = "203.0.113.10:40002".parse().unwrap();
+        let ret = login(
+            ConnectInfo(peer_b),
+            AxumState(state.clone()),
+            HeaderMap::new(),
+            login_body("alice", "wrong"),
+        )
+        .await;
         assert_eq!(ret.0.error_msg, "密码错误");
 
         // 正确密码登录成功 → 计数清零（新用户名+IP，避免与上文锁定状态耦合）
@@ -8811,12 +8816,12 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut hb = HeaderMap::new();
-        hb.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        let peer_bob: std::net::SocketAddr = "198.51.100.7:40003".parse().unwrap();
         for _ in 0..4 {
             let ret = login(
+                ConnectInfo(peer_bob),
                 AxumState(state.clone()),
-                hb.clone(),
+                HeaderMap::new(),
                 login_body("bob", "bad"),
             )
             .await;
@@ -8824,26 +8829,28 @@ mod tests {
         }
         // 第 5 次失败 → 锁定（错误消息仍为密码错误，但后续被拒）
         let ret = login(
+            ConnectInfo(peer_bob),
             AxumState(state.clone()),
-            hb.clone(),
+            HeaderMap::new(),
             login_body("bob", "bad"),
         )
         .await;
         assert_eq!(ret.0.error_msg, "密码错误");
         let ret = login(
+            ConnectInfo(peer_bob),
             AxumState(state.clone()),
-            hb.clone(),
+            HeaderMap::new(),
             login_body("bob", "pass1234"),
         )
         .await;
         assert_eq!(ret.0.error_msg, "尝试过多请稍后");
         // 锁定自动恢复（5 分钟过期）已由 util::login_limit 单测覆盖——此处验证正确密码
         // 在未锁定状态下可登录成功并重置计数
-        let mut hc = HeaderMap::new();
-        hc.insert("x-forwarded-for", "198.51.100.8".parse().unwrap());
+        let peer_c: std::net::SocketAddr = "198.51.100.8:40004".parse().unwrap();
         let ret = login(
+            ConnectInfo(peer_c),
             AxumState(state.clone()),
-            hc.clone(),
+            HeaderMap::new(),
             login_body("bob", "pass1234"),
         )
         .await;
@@ -8851,8 +8858,9 @@ mod tests {
         // 登录成功后计数清零：再失败 4 次仍不锁（需满 5 次）
         for _ in 0..4 {
             let ret = login(
+                ConnectInfo(peer_c),
                 AxumState(state.clone()),
-                hc.clone(),
+                HeaderMap::new(),
                 login_body("bob", "bad"),
             )
             .await;
@@ -15047,6 +15055,7 @@ mod tests {
     /// GAP #88/125：/assets/proxy 图片代理端点
     #[tokio::test]
     async fn test_assets_proxy_endpoint() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1
         let (state, dir) = test_state("proxy").await;
         // mock 图片服务器（记录请求头）
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -15112,10 +15121,44 @@ mod tests {
         cleanup(state, dir).await;
     }
 
+    /// M1：/assets/proxy 拒绝私网/回环目标（SSRF）——非 secure 模式（test_state 默认
+    /// 非 secure）同样拦截；回环 mock 服务器收不到任何请求
+    #[tokio::test]
+    async fn test_assets_proxy_rejects_private_url() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(false); // 持锁：确保拦截态
+        let (state, dir) = test_state("proxy-ssrf").await;
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert(
+            "url".into(),
+            "http://127.0.0.1:8085/reader3/getSystemInfo".into(),
+        );
+        let resp = assets_proxy(AxumState(state.clone()), Query(params), HeaderMap::new()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "错误信息以 200 + JSON 返回（legacy 契约）"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let msg = String::from_utf8_lossy(&bytes);
+        assert!(msg.contains("图片加载失败"), "应返回加载失败: {msg}");
+        assert!(msg.contains("已拦截"), "应提示私网拦截: {msg}");
+        // 私网字面量（云元数据 169.254.169.254）
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert(
+            "url".into(),
+            "http://169.254.169.254/latest/meta-data/".into(),
+        );
+        let resp = assets_proxy(AxumState(state.clone()), Query(params), HeaderMap::new()).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("已拦截"));
+        cleanup(state, dir).await;
+    }
+
     /// GAP：/assets/proxy 磁盘缓存——首次回源写盘（短缓存），二次磁盘命中
-    /// （长 Cache-Control，不再回源）；缓存文件落在 storage/cache/images/{md5前16}.png
+    /// （长 Cache-Control，不再回源）；缓存文件落在 storage/cache/images/{md5(ns|url)}.png
     #[tokio::test]
     async fn test_assets_proxy_disk_cache() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1
         let (state, dir) = test_state("proxy-cache").await;
         // mock 图片服务器（每请求计数）
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -15168,13 +15211,14 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         assert_eq!(bytes.to_vec(), png, "图片字节透传");
 
-        // 缓存文件落盘：storage/cache/images/{md5前16}.png
-        let key = crate::util::md5::md5_encode(&img_url);
+        // 缓存文件落盘：storage/cache/images/{md5("default|url")}.png（M2：键含命名空间）
+        let key = crate::util::md5::md5_encode(&format!("default|{img_url}"));
+        assert_eq!(key.len(), 32);
         let cache_file = dir
             .join("storage")
             .join("cache")
             .join("images")
-            .join(format!("{}.png", &key[..16]));
+            .join(format!("{key}.png"));
         assert!(cache_file.exists(), "首次拉取应写缓存文件: {cache_file:?}");
 
         // 二次：磁盘命中 + 长缓存 + 不再回源

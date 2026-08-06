@@ -7,6 +7,7 @@
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -90,9 +91,11 @@ pub async fn fetch_get(
     fetch(url, headers, timeout_secs, "GET", None, None).await
 }
 
-/// 图片代理抓取（GAP #88/125）：二进制安全 + 限流下载
+/// 图片代理抓取（GAP #88/125）：二进制安全 + 限流下载 + SSRF 防护
 ///
 /// - 自动附加书源登录态（cookie + 记录的 UA，按用户命名空间）与 Referer（防盗链绕过）
+/// - SSRF 防护（M1）：每跳（含重定向）DNS 解析后校验目标为公网地址——私网/回环/链路本地
+///   一律拒绝；非 secure 模式同样生效（本函数是 /assets/proxy 唯一回源入口）
 /// - 超时 timeout_secs；Content-Length 超限直接拒绝，流式读取累计超 max_bytes 截断报错
 /// - 返回 (图片字节, Content-Type, HTTP 状态码)
 pub async fn fetch_image(
@@ -106,43 +109,167 @@ pub async fn fetch_image(
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        // 禁用自动重定向：手动逐跳跟进并在每跳都做 SSRF 校验（防 302 跳回内网）
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
         .build()?;
-    let mut req = client.get(url);
-    if let Some(r) = referer.filter(|r| !r.trim().is_empty()) {
-        req = req.header("Referer", r);
-    }
-    // 书源登录态（cookie + UA）按用户命名空间附加
-    let (cookie, stored_ua) = session_for(ns, url).await.unwrap_or_default();
-    if !cookie.is_empty() {
-        req = req.header("Cookie", cookie);
-    }
-    if !stored_ua.is_empty() {
-        req = req.header("User-Agent", stored_ua);
-    }
-    let resp = req.send().await?;
-    let status = resp.status().as_u16();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string());
-    // Content-Length 预检（超限拒绝，避免无谓下载）
-    if resp.content_length().is_some_and(|cl| cl > max_bytes) {
-        anyhow::bail!("图片超过大小上限");
-    }
-    // 流式读取 + 累计上限（服务端不守 Content-Length 时兜底）
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if bytes.len().saturating_add(chunk.len()) > max_bytes as usize {
+    let mut current = url.to_string();
+    for _hop in 0..=10 {
+        validate_public_target(&current).await?;
+        let mut req = client.get(&current);
+        if let Some(r) = referer.filter(|r| !r.trim().is_empty()) {
+            req = req.header("Referer", r);
+        }
+        // 书源登录态（cookie + UA）按用户命名空间附加
+        let (cookie, stored_ua) = session_for(ns, &current).await.unwrap_or_default();
+        if !cookie.is_empty() {
+            req = req.header("Cookie", cookie);
+        }
+        if !stored_ua.is_empty() {
+            req = req.header("User-Agent", stored_ua);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        // 重定向：手动跟进（每跳重新校验目标）
+        if status.is_redirection() {
+            if let Some(loc) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                let next = url::Url::parse(&current)?.join(loc)?;
+                current = next.to_string();
+                continue;
+            }
+            // 无 Location 的重定向状态：空体透传
+            return Ok((Vec::new(), None, status.as_u16()));
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+        // Content-Length 预检（超限拒绝，避免无谓下载）
+        if resp.content_length().is_some_and(|cl| cl > max_bytes) {
             anyhow::bail!("图片超过大小上限");
         }
-        bytes.extend_from_slice(&chunk);
+        // 流式读取 + 累计上限（服务端不守 Content-Length 时兜底）
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len().saturating_add(chunk.len()) > max_bytes as usize {
+                anyhow::bail!("图片超过大小上限");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        return Ok((bytes, content_type, status.as_u16()));
     }
-    Ok((bytes, content_type, status))
+    anyhow::bail!("图片重定向次数过多")
+}
+
+// ==================== SSRF 防护（/assets/proxy 回源目标校验，M1） ====================
+
+/// 测试钩子：允许私网/回环回源目标（仅测试代码设置；生产恒为 false）。
+/// 生产代码不读环境变量、无配置入口——所有请求强制校验。
+pub static SSRF_ALLOW_PRIVATE: AtomicBool = AtomicBool::new(false);
+
+/// 测试互斥锁：所有读写 `SSRF_ALLOW_PRIVATE` 的测试持同一把锁（串行），
+/// 避免并行测试互相干扰（放行态与拦截态断言互斥）。
+#[cfg(test)]
+static SSRF_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// 测试用 RAII 守卫：持全局互斥锁并将私网放行开关置为 `allow`；Drop 时恢复原值。
+/// 用法：`let _g = ssrf_allow_private_guard(true);`（mock 服务器绑定 127.0.0.1 的测试）；
+/// 拦截断言测试用 `ssrf_allow_private_guard(false)` 持锁确保无并发放行。
+#[cfg(test)]
+pub struct SsrfAllowGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: bool,
+}
+
+/// 取测试守卫（见 [`SsrfAllowGuard`]）
+#[cfg(test)]
+pub fn ssrf_allow_private_guard(allow: bool) -> SsrfAllowGuard {
+    let _lock = SSRF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = SSRF_ALLOW_PRIVATE.swap(allow, Ordering::Relaxed);
+    SsrfAllowGuard { _lock, prev }
+}
+
+#[cfg(test)]
+impl Drop for SsrfAllowGuard {
+    fn drop(&mut self) {
+        SSRF_ALLOW_PRIVATE.store(self.prev, Ordering::Relaxed);
+    }
+}
+
+/// 目标 IP 是否为应拦截的私网/回环/链路本地地址：
+/// IPv4：127.0.0.0/8（回环）、10/8、172.16/12、192.168/16（私网）、169.254/16（链路本地）、
+/// 0.0.0.0（未指定）、255.255.255.255（广播）；
+/// IPv6：::1（回环）、fc00::/7（ULA）、fe80::/10（链路本地）、::（未指定）、
+/// IPv4 映射地址（::ffff:a.b.c.d）递归按 IPv4 判定。
+pub fn is_private_target_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_private_target_ip(std::net::IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// 校验回源目标为公网地址（SSRF 防护，M1）：
+/// - 字面 IP：直接判定（回环/私网/链路本地/未指定/广播一律拒绝）；
+/// - 域名：DNS 解析后逐个 IP 校验（任一解析到私网即拒绝）；localhost 直接拒绝；
+/// - 解析失败 / 无地址 → 拒绝。
+/// 供 fetch_image 每跳调用（含重定向目标）——/assets/proxy 非 secure 模式同样生效。
+pub async fn validate_public_target(url: &str) -> Result<()> {
+    if SSRF_ALLOW_PRIVATE.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(url).map_err(|e| anyhow!("目标 URL 非法: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("目标 URL 缺少主机名"))?;
+    // 字面 IP 快速路径（不经 DNS）
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_private_target_ip(ip) {
+            anyhow::bail!("目标地址为内网/回环地址（{ip}），已拦截");
+        }
+        return Ok(());
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        anyhow::bail!("目标地址 localhost 为回环地址，已拦截");
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let mut resolved_any = false;
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| anyhow!("目标域名解析失败（{host}）: {e}"))?;
+    for addr in addrs {
+        resolved_any = true;
+        if is_private_target_ip(addr.ip()) {
+            anyhow::bail!(
+                "目标域名 {host} 解析到内网/回环地址（{}），已拦截",
+                addr.ip()
+            );
+        }
+    }
+    if !resolved_any {
+        anyhow::bail!("目标域名 {host} 无可用地址");
+    }
+    Ok(())
 }
 
 // ==================== 书源 cookie（按用户隔离） ====================
@@ -1002,6 +1129,7 @@ mod tests {
     /// GAP #88/125：fetch_image——二进制透传 + Content-Type + Referer/书源 cookie 附加
     #[tokio::test]
     async fn test_fetch_image_binary_and_headers() {
+        let _ssrf = ssrf_allow_private_guard(true); // mock 服务器绑定 127.0.0.1
         clear_cookie_storage();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let png = vec![0x89u8, b'P', b'N', b'G', 1, 2, 3, 4];
@@ -1042,6 +1170,7 @@ mod tests {
     /// GAP #88/125：大小上限——Content-Length 预检与流式累计双重拦截
     #[tokio::test]
     async fn test_fetch_image_size_cap() {
+        let _ssrf = ssrf_allow_private_guard(true); // mock 服务器绑定 127.0.0.1
         clear_cookie_storage();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let body = vec![b'x'; 2048];
@@ -1060,5 +1189,121 @@ mod tests {
         // 正常上限内通过
         let (bytes, _, _) = fetch_image("default", &url, None, 10, 4096).await.unwrap();
         assert_eq!(bytes, body);
+    }
+
+    /// M1 SSRF：私网/回环/链路本地字面 IP 一律拒绝（127.0.0.1、10/8、172.16/12、
+    /// 192.168/16、169.254/16、::1、fc00::/7、0.0.0.0、IPv4 映射回环）
+    #[tokio::test]
+    async fn test_ssrf_rejects_private_literal_ips() {
+        let _g = ssrf_allow_private_guard(false); // 持锁：确保无测试并发放行私网
+        for (url, label) in [
+            ("http://127.0.0.1:8085/reader3/getSystemInfo", "回环 127/8"),
+            ("http://127.1.2.3/x.png", "回环 127/8 非 .0.1"),
+            ("http://10.0.0.6/x.png", "私网 10/8"),
+            ("http://172.16.5.5/x.png", "私网 172.16/12"),
+            ("http://172.31.255.255/x.png", "私网 172.16/12 上界"),
+            ("http://192.168.1.1/x.png", "私网 192.168/16"),
+            (
+                "http://169.254.169.254/latest/meta-data",
+                "链路本地（云元数据）",
+            ),
+            ("http://0.0.0.0/x.png", "未指定"),
+            ("http://[::1]:8085/x.png", "IPv6 回环"),
+            ("http://[fc00::1]/x.png", "IPv6 ULA fc00::/7"),
+            ("http://[fd12:3456::1]/x.png", "IPv6 ULA fd00::/8"),
+            ("http://[::ffff:127.0.0.1]/x.png", "IPv4 映射回环"),
+            ("http://localhost:8085/x.png", "localhost 字面量"),
+        ] {
+            let err = validate_public_target(url).await.unwrap_err();
+            assert!(
+                err.to_string().contains("已拦截"),
+                "{label}（{url}）应被拦截: {err}"
+            );
+        }
+    }
+
+    /// M1 SSRF：公网地址放行——字面公网 IP 与公网域名（DNS 解析后校验）
+    #[tokio::test]
+    async fn test_ssrf_allows_public_targets() {
+        let _g = ssrf_allow_private_guard(false);
+        validate_public_target("https://8.8.8.8/x.png")
+            .await
+            .expect("公网字面 IP 应放行");
+        validate_public_target("https://1.1.1.1/x.png")
+            .await
+            .expect("公网字面 IP 应放行");
+        // 公网域名：DNS 解析后应为公网地址（example.com 固定公网；离线环境跳过该断言）
+        if tokio::net::lookup_host(("example.com", 443)).await.is_ok() {
+            validate_public_target("https://example.com/x.png")
+                .await
+                .expect("公网域名解析后应放行");
+        }
+    }
+
+    /// M1 SSRF：fetch_image 整体拒绝私网目标（不经 DNS 也拦截）——代理端点唯一回源入口
+    #[tokio::test]
+    async fn test_fetch_image_rejects_private_url() {
+        let _g = ssrf_allow_private_guard(false);
+        let err = fetch_image("default", "http://127.0.0.1:1/x.png", None, 3, 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("已拦截"),
+            "私网 URL 应在发请求前被拦截: {err}"
+        );
+    }
+
+    /// M1 SSRF 回归：手动重定向跟进仍正常（Policy::none + 每跳校验）——302 → 公网目标可拉取；
+    /// 跳转目标为私网时由 validate_public_target 拦截（该函数本身有独立单测）
+    #[tokio::test]
+    async fn test_fetch_image_follows_redirect() {
+        let _g = ssrf_allow_private_guard(true); // mock 服务器绑定 127.0.0.1
+                                                 // 目标服务器：返回 png
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = target.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = [0x89u8, b'P', b'N', b'G', 7, 7, 7];
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut resp = head.into_bytes();
+            resp.extend_from_slice(&body);
+            let _ = sock.write_all(&resp).await;
+        });
+        // 入口服务器：302 → 目标
+        let entry = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entry_addr = entry.local_addr().unwrap();
+        let loc = format!("http://{target_addr}/final.png");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = entry.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+        });
+        let (bytes, ct, status) = fetch_image(
+            "default",
+            &format!("http://{entry_addr}/start.png"),
+            None,
+            5,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(ct.as_deref(), Some("image/png"));
+        assert_eq!(bytes, vec![0x89, b'P', b'N', b'G', 7, 7, 7]);
     }
 }

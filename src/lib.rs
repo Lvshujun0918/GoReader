@@ -126,7 +126,12 @@ impl AppConfig {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         tracing::info!("reader-dev (Rust) listening on {addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        // M3：启用 ConnectInfo（直连对端 IP）——登录限流不再信任可伪造的 X-Forwarded-For
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
         Ok(())
     }
 }

@@ -523,14 +523,14 @@ impl Browser {
             .join("; ")
     }
 
-    /// 鼠标拖拽（滑块：按下 → 贝塞尔轨迹移动（随机噪声+微停）→ 释放）
+    /// 鼠标拖拽（滑块：按下 → 贝塞尔轨迹移动（随机噪声+微停）→ 释放）。
+    /// **obscura 不向页面投递 CDP Input.dispatchMouseEvent**（坐标事件不触发页面
+    /// 监听器——实测零事件），故改用 JS 合成事件（new MouseEvent + dispatchEvent，
+    /// clientX/clientY 直达监听器）：对 DOM 监听型滑块（含 mock）有效；要求
+    /// isTrusted 事件的真实滑块（geetest 等）在 obscura 下不可自动拖拽（明确限制）。
+    /// 事件双投递：elementFromPoint 命中元素 + document（委托式与元素式监听器均触发）。
     pub async fn mouse_drag(&mut self, x1: f64, y1: f64, x2: f64, y2: f64) -> Result<()> {
-        self.command(
-            "Input.dispatchMouseEvent",
-            json!({ "type": "mousePressed", "x": x1, "y": y1, "button": "left", "clickCount": 1 }),
-        )
-        .await?;
-        // 人类轨迹：三次贝塞尔 + 随机噪声 + 随机步数/微停
+        // 人类轨迹：三次贝塞尔 + 随机噪声 + 随机步数（与 Input 路径同参）
         let steps = 28 + rand::random::<u64>() % 25;
         let ctrl1 = (
             x1 + (x2 - x1) * 0.4 + rand::random::<f64>() * 20.0 - 10.0,
@@ -540,6 +540,8 @@ impl Browser {
             x1 + (x2 - x1) * 0.6 + rand::random::<f64>() * 20.0 - 10.0,
             y2,
         );
+        let mut pts: Vec<(f64, f64)> = Vec::with_capacity(steps as usize + 2);
+        pts.push((x1, y1));
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
             let inv = 1.0 - t;
@@ -552,21 +554,29 @@ impl Browser {
                 + 3.0 * inv * inv * t * ctrl1.1
                 + 3.0 * inv * t * t * ctrl2.1
                 + t * t * t * y2;
-            // 随机噪声（±2px）+ 微停（6-28ms）
-            let nx = x + rand::random::<f64>() * 4.0 - 2.0;
-            let ny = y + rand::random::<f64>() * 4.0 - 2.0;
-            self.command(
-                "Input.dispatchMouseEvent",
-                json!({ "type": "mouseMoved", "x": nx, "y": ny, "button": "none" }),
-            )
-            .await?;
-            tokio::time::sleep(Duration::from_millis(6 + rand::random::<u64>() % 22)).await;
+            // 随机噪声（±2px）
+            pts.push((
+                x + rand::random::<f64>() * 4.0 - 2.0,
+                y + rand::random::<f64>() * 4.0 - 2.0,
+            ));
         }
-        self.command(
-            "Input.dispatchMouseEvent",
-            json!({ "type": "mouseReleased", "x": x2, "y": y2, "button": "left", "clickCount": 1 }),
-        )
-        .await?;
+        pts.push((x2, y2));
+        let js = format!(
+            r#"(function(pts){{
+  function ev(t, x, y) {{ return new MouseEvent(t, {{ bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }}); }}
+  var start = pts[0], end = pts[pts.length - 1];
+  var target = document.elementFromPoint(start[0], start[1]) || document.body;
+  target.dispatchEvent(ev('mousedown', start[0], start[1]));
+  document.dispatchEvent(ev('mousedown', start[0], start[1]));
+  for (var i = 1; i < pts.length; i++) {{
+    document.dispatchEvent(ev('mousemove', pts[i][0], pts[i][1]));
+  }}
+  document.dispatchEvent(ev('mouseup', end[0], end[1]));
+  return true;
+}})({})"#,
+            serde_json::to_string(&pts).map_err(|e| anyhow!("轨迹序列化失败: {e}"))?
+        );
+        let _ = self.evaluate(&js).await?;
         Ok(())
     }
 
@@ -1088,10 +1098,7 @@ async fn solve_with(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let body_children = state
-                    .get("bodyChildren")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let body_children = state.get("bodyChildren").and_then(num_u64).unwrap_or(0);
                 if challenge {
                     saw_classic_challenge = true;
                 }
@@ -1153,10 +1160,7 @@ async fn solve_with(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let body_children = state
-                    .get("bodyChildren")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let body_children = state.get("bodyChildren").and_then(num_u64).unwrap_or(0);
                 let url_changed = !cur_url.is_empty() && cur_url != initial_url;
                 let page_loaded = ready == "complete" || (ready != "loading" && body_children > 0);
                 if !challenge && (page_loaded || url_changed) {
@@ -1272,6 +1276,13 @@ fn cookie_domain_matches(domain: &str, host: &str) -> bool {
         return false;
     }
     host == d || (d.contains('.') && host.ends_with(&format!(".{d}")))
+}
+
+/// 数值提取（兼容两种 JSON 数字表示）：obscura 的 V8 数字一律序列化为浮点
+/// （`Number(42.0)`）——`as_u64()` 对浮点返回 None；整数由 Chrome 路径产生。
+/// 先试整数，再试浮点截断
+fn num_u64(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_f64().map(|f| f as u64))
 }
 
 /// 页面验证码检测 JS（DOM 启发式）——返回 {kind, ...} 或 null
