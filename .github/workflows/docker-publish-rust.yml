@@ -76,7 +76,9 @@ jobs:
 
       - name: 安装 musl 链接器（musl-gcc——libsqlite3-sys/ring/zstd-sys 等 C 依赖）
         run: |
-          if command -v sudo >/dev/null 2>&1; then
+          if command -v musl-gcc >/dev/null 2>&1; then
+            echo "musl-gcc 已安装——跳过 apt（DE 常驻）"
+          elif command -v sudo >/dev/null 2>&1; then
             sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
           else
             apt-get update -qq && apt-get install -y -qq musl-tools
