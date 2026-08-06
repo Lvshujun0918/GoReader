@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import LogoMark from '@/components/LogoMark.vue'
+import TopNav from '@/components/TopNav.vue'
 import { deleteHttpTts, getHttpTtsList, saveHttpTts } from '@/api/httpTts'
 import { uploadFile, mkdir } from '@/api/file'
 import { loadCustomCss, saveCustomCss, applyCustomCss } from '@/utils/customCss'
@@ -38,6 +38,7 @@ import {
   type PageMode,
 } from '@/utils/readerConfig'
 import { applyUiTheme, loadUiTheme, uiThemeFromServer, uiThemeToServer, type UiTheme } from '@/utils/uiTheme'
+import { isNotImplemented } from '@/utils/errors'
 import { DAILY_STATS_KEY, last7Days, parseDailyStats } from '@/utils/dailyStats'
 import { useUserStore } from '@/stores/user'
 import { downloadBlob } from '@/utils/download'
@@ -388,15 +389,6 @@ onMounted(() => {
 
 /* ================= 阅读偏好（多端同步：GET/POST /reader3/getUserConfig|saveUserConfig，服务器优先） ================= */
 
-/** 判断是否接口未实现（404 / 后端未就绪） */
-function isNotImplemented(err: unknown): boolean {
-  const e = err as { response?: { status?: number }; message?: string } | null | undefined
-  const status = e?.response?.status
-  if (status === 404 || status === 501) return true
-  const msg = e?.message ?? ''
-  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
-}
-
 const pref = ref<ReaderConfig>(loadReaderConfig())
 const prefSaving = ref(false)
 const prefMsg = ref('')
@@ -491,7 +483,8 @@ async function loadServerPref() {
   }
 }
 
-/** 保存阅读偏好：本地立即生效（阅读页读取 localStorage）+ POST /reader3/saveUserConfig */
+/** 保存阅读偏好：本地立即生效（阅读页读取 localStorage）+ POST /reader3/saveUserConfig
+ *  P2：先读云端现有配置再合并更新已知字段（整量覆盖会删除云端未知字段——多端/未来版本共存字段） */
 async function savePref() {
   if (prefSaving.value) return
   prefSaving.value = true
@@ -499,7 +492,24 @@ async function savePref() {
   prefMsgError.value = false
   applyReaderConfig(pref.value)
   try {
-    await saveUserConfig({ ...toServerConfig(pref.value), ...uiThemeToServer(uiTheme.value) })
+    // ① 读现有云端配置（失败不影响保存——仅提交已知字段）
+    let existing: Record<string, unknown> = {}
+    try {
+      const res = await getUserConfig()
+      const cfg =
+        res.data && typeof res.data === 'object'
+          ? (res.data as Record<string, unknown>).config
+          : undefined
+      if (cfg && typeof cfg === 'object') existing = cfg as Record<string, unknown>
+    } catch {
+      /* 读取失败：仅保存已知字段 */
+    }
+    // ② 合并：云端未知字段保留，仅更新已知字段
+    await saveUserConfig({
+      ...existing,
+      ...toServerConfig(pref.value),
+      ...uiThemeToServer(uiTheme.value),
+    })
     prefMsg.value = '已保存到服务器，多端一致'
   } catch (err) {
     prefMsg.value = isNotImplemented(err)
@@ -1139,22 +1149,8 @@ async function runExportData() {
 
 <template>
   <div class="settings-page">
-    <!-- 极简导航：字标 + 页面入口 -->
-    <header class="topbar">
-      <div class="brand">
-        <LogoMark class="brand-logo" />
-        <span class="brand-name">夜读<span class="brand-dot">.</span></span>
-      </div>
-
-      <div class="user-area">
-        <button class="nav-link" type="button" @click="router.push('/')">书架</button>
-        <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
-        <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
-        <button class="nav-link" type="button" @click="router.push('/rules')">替换规则</button>
-        <button class="nav-link active" type="button" @click="router.push('/settings')">设置</button>
-        <span class="user-chip">{{ store.username || '未登录' }}</span>
-      </div>
-    </header>
+    <!-- 顶部导航（P3-A：共享 TopNav） -->
+    <TopNav active="/settings" :links="['bookshelf', 'search', 'sources', 'rules', 'settings']" />
 
     <main class="content">
       <div class="section-head">

@@ -99,6 +99,9 @@ pub async fn run_debug(
     target_url: &str,
     mut on_step: impl FnMut(&DebugStep),
 ) -> Result<Value> {
+    // P2：每轮开始清空线程局部 LAST_JS_ERROR——上一轮（同一 tokio 工作线程）遗留的
+    // JS 错误记录不得错挂到本轮步骤（attach_js_error 只应取走本轮 eval 产生的错误）
+    let _ = crate::parser::js::take_last_js_error();
     match action {
         "search" => debug_search(ns, source, key, &mut on_step).await,
         "explore" => debug_explore(ns, source, target_url, &mut on_step).await,
@@ -639,5 +642,81 @@ mod tests {
         let mut step = DebugStep::new("规则应用");
         attach_js_error(&mut step, Some("@js:JSON.stringify([{a:1}])"));
         assert!(step.error.is_none(), "成功 eval 不应挂错误");
+    }
+
+    /// P2：每轮 run_debug 清空线程局部 LAST_JS_ERROR——上一轮（同一 tokio 工作线程）
+    /// 遗留的 JS 错误不得错挂到本轮步骤（attach_js_error 只取本轮 eval 产生的错误）
+    #[tokio::test]
+    async fn test_run_debug_clears_stale_js_error_per_round() {
+        use std::collections::HashMap;
+        // 模拟上一轮遗留：eval 失败留下线程局部记录且未取走
+        let vars = HashMap::new();
+        let _ = crate::parser::js::eval_js_json("throw new Error('stale-round')", &vars);
+        assert!(
+            crate::parser::js::take_last_js_error().is_some(),
+            "预置遗留错误记录"
+        );
+        let _ = crate::parser::js::eval_js_json("throw new Error('stale-round')", &vars);
+
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"<html><body><div class="content">正文内容。</div></body></html>"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let source = BookSource {
+            book_source_url: format!("http://{addr}/sources.json"),
+            rule_content: Some(serde_json::json!({ "content": "div.content@text" })),
+            ..Default::default()
+        };
+        let mut steps: Vec<DebugStep> = Vec::new();
+        let chapter_url = format!("http://{addr}/ch1.html");
+        let result = run_debug("default", &source, "content", "", &chapter_url, |s| {
+            steps.push(s.clone())
+        })
+        .await;
+        assert!(result.is_ok(), "content 调试应成功: {:?}", result.err());
+        // 本轮任何步骤不得携带上一轮遗留的 stale 错误
+        assert!(!steps.is_empty(), "应产出步骤");
+        for s in &steps {
+            if let Some(e) = &s.error {
+                assert!(
+                    !e.contains("stale-round"),
+                    "步骤 {} 不得携带遗留错误: {e}",
+                    s.rule_name
+                );
+            }
+            if let Some(d) = s.detail.as_object() {
+                assert!(
+                    !d.contains_key("jsError"),
+                    "步骤 {} 不得携带遗留 jsError",
+                    s.rule_name
+                );
+            }
+        }
+        // 本轮无 JS 失败 → 线程局部已清空
+        assert!(
+            crate::parser::js::take_last_js_error().is_none(),
+            "运行后不应残留错误记录"
+        );
+        // 控制组：不带 run_debug 的 attach 仍会取到遗留错误（证明清空发生在 run_debug 内）
+        let _ = crate::parser::js::eval_js_json("throw new Error('stale-round')", &vars);
+        let mut step = DebugStep::new("x");
+        attach_js_error(&mut step, None);
+        assert!(
+            step.error.is_some(),
+            "控制组：遗留错误应被 attach 捕获（无清空时）"
+        );
     }
 }

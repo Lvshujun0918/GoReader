@@ -1,4 +1,5 @@
 import { get, post } from './request'
+import { onBackendReachable } from './backendFlag'
 import type { ReturnData, SourceSub } from '@/types'
 
 /**
@@ -50,7 +51,7 @@ let backendDown = false
 /** GET /reader3/getSourceSubs（后端优先；失败降级 localStorage 并镜像缓存） */
 export async function getSourceSubs(): Promise<ReturnData<SourceSub[]>> {
   if (backendDown) {
-    return { isSuccess: true, errorMsg: '', data: loadSourceSubs() }
+    return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: loadSourceSubs() }
   }
   try {
     const res = await get<SourceSub[]>('/getSourceSubs', undefined, { silent: true })
@@ -58,7 +59,7 @@ export async function getSourceSubs(): Promise<ReturnData<SourceSub[]>> {
     return res
   } catch {
     backendDown = true
-    return { isSuccess: true, errorMsg: '', data: loadSourceSubs() }
+    return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: loadSourceSubs() }
   }
 }
 
@@ -94,7 +95,7 @@ export async function saveSourceSub(
     list.push({ url, name, enabled: true })
   }
   persistSourceSubs(list)
-  return { isSuccess: true, errorMsg: '', data: null }
+  return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: null }
 }
 
 /** POST /reader3/deleteSourceSub（后端优先；失败降级 localStorage） */
@@ -109,7 +110,7 @@ export async function deleteSourceSub(url: string): Promise<ReturnData<null>> {
     }
   }
   persistSourceSubs(loadSourceSubs().filter((s) => s.url !== url))
-  return { isSuccess: true, errorMsg: '', data: null }
+  return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: null }
 }
 
 /**
@@ -132,3 +133,6 @@ export async function refreshSourceSub(url: string): Promise<ReturnData<{ count:
 export function resetBackendFlag(): void {
   backendDown = false
 }
+
+// P2：任一后端请求成功（request.ts 拦截器）即复位短路标志——网络恢复后自动回到后端优先
+onBackendReachable(resetBackendFlag)

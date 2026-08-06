@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   deleteRssSource,
@@ -12,9 +11,8 @@ import {
 } from '@/api/rss'
 import { t } from '@/utils/i18n'
 import { sanitizeHtml } from '@/utils/sanitize'
+import TopNav from '@/components/TopNav.vue'
 import type { RssArticle, RssSource } from '@/types'
-
-const router = useRouter()
 
 /** 分页启发：一次拉满一页即认为还有更多（后端未返回总数） */
 const PAGE_SIZE = 20
@@ -317,19 +315,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="rss-page">
-    <!-- 极简导航：字标 + 细字链接 -->
-    <header class="topbar">
-      <div class="brand">
-        <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand-name">夜读<span class="brand-dot">.</span></span>
-      </div>
-      <nav class="nav-area">
-        <button class="nav-link" type="button" @click="router.push('/')">{{ t('nav.bookshelf') }}</button>
-        <button class="nav-link" type="button" @click="router.push('/search')">{{ t('nav.search') }}</button>
-        <button class="nav-link" type="button" @click="router.push('/sources')">{{ t('nav.sources') }}</button>
-        <button class="nav-link active" type="button" @click="router.push('/rss')">{{ t('nav.rss') }}</button>
-      </nav>
-    </header>
+    <!-- 顶部导航（P3-A：共享 TopNav） -->
+    <TopNav active="/rss" :links="['bookshelf', 'search', 'sources', 'rss']" />
 
     <main class="rss-main">
       <!-- 左栏：订阅源（分组胶囊 + 列表） -->

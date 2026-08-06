@@ -1,15 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { useUserStore } from '@/stores/user'
+import TopNav from '@/components/TopNav.vue'
 import { listFiles, getFile, saveFile, downloadFile, uploadFile, mkdir, deleteFile } from '@/api/file'
 import { isNeedSecureKey } from '@/api/users'
 import { downloadBlob } from '@/utils/download'
 import type { FileItem } from '@/types'
-
-const router = useRouter()
-const store = useUserStore()
 
 /** home 枚举（legacy 对齐）：书仓 / 用户数据 / WebDAV / 空=用户根 */
 const HOME_OPTIONS: { label: string; value: string }[] = [
@@ -571,21 +567,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="file-page">
-    <!-- 极简导航：字标 + 页面入口 -->
-    <header class="topbar">
-      <div class="brand">
-        <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand-name">夜读<span class="brand-dot">.</span></span>
-      </div>
-
-      <div class="user-area">
-        <button class="nav-link" type="button" @click="router.push('/')">书架</button>
-        <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
-        <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
-        <button class="nav-link active" type="button" @click="router.push('/files')">文件</button>
-        <span class="user-chip">{{ store.username || '未登录' }}</span>
-      </div>
-    </header>
+    <!-- 顶部导航（P3-A：共享 TopNav） -->
+    <TopNav active="/files" :links="['bookshelf', 'search', 'sources', 'files']" />
 
     <main class="content" :class="{ 'with-multi-bar': multiMode }">
       <div class="section-head">

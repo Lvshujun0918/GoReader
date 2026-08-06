@@ -2196,13 +2196,18 @@ const audioBuffering = ref(false)
 let hlsInstance: { destroy: () => void } | null = null
 const hlsFailed = ref(false)
 
-/** 动态加载 hls.js（仅 m3u8 且浏览器无原生 HLS 支持时） */
+/** 动态加载 hls.js（仅 m3u8 且浏览器无原生 HLS 支持时）
+ *  P3-A：固定版本 + SRI integrity（防 CDN 投毒；版本浮动 @1 会让 SRI 失效，故钉死 1.5.20） */
 function loadHlsJs(): Promise<{ default?: unknown } | null> {
   return new Promise((resolve) => {
     const win = window as unknown as { Hls?: { isSupported: () => boolean; new (): unknown } }
     if (win.Hls) return resolve({ default: win.Hls })
     const script = document.createElement('script')
-    script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js'
+    script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js'
+    // sha384 与 jsdelivr 发布的 hls.js@1.5.20 文件一致（本地计算 + registry sha256 双重核验）
+    script.integrity =
+      'sha384-V5ruNBgmYcC3SJRUQeNykAAAgde5gOFq/Hu0CZj7bygDP0yRIhkvX8+w0u/7mRvr'
+    script.crossOrigin = 'anonymous'
     script.onload = () => resolve(win.Hls ? { default: win.Hls } : null)
     script.onerror = () => resolve(null)
     document.head.appendChild(script)

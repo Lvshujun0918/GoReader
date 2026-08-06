@@ -72,11 +72,14 @@ export interface SSEStreamCallbacks extends SSEBookEndCallbacks {
   onStreamError?: (msg: string) => void
 }
 
-/** 增量消费 ReadableStream，按 \n\n 切分事件块 */
-export async function consumeSSEStream(
+/** 通用块消费：按 \n\n 切分事件块并逐块回调（cacheBookSSE / bookSourceDebugSSE 等
+ *  非 book/end/error 事件流共用——块内解析由 onBlock 自行调 parseSSEBlock/分发）。
+ *  用户取消（isAborted）静默返回；连接中断回调 onStreamError（缺省文案「连接中断，请重试」）。 */
+export async function consumeSSEStreamBlocks(
   body: ReadableStream<Uint8Array>,
-  cbs: SSEStreamCallbacks,
+  onBlock: (block: string) => void,
   isAborted: () => boolean,
+  onStreamError?: (msg: string) => void,
 ): Promise<void> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
@@ -91,14 +94,25 @@ export async function consumeSSEStream(
       while ((sep = buffer.indexOf('\n\n')) !== -1) {
         const block = buffer.slice(0, sep)
         buffer = buffer.slice(sep + 2)
-        dispatchSSEBlock(block, cbs)
+        onBlock(block)
       }
     }
-    if (buffer.trim()) dispatchSSEBlock(buffer, cbs)
-  } catch (err) {
+    if (buffer.trim()) onBlock(buffer)
+  } catch {
     if (isAborted()) return // 用户主动取消
-    cbs.onStreamError?.('连接中断，请重试')
+    onStreamError?.('连接中断，请重试')
   }
+}
+
+/** 增量消费 ReadableStream，按 \n\n 切分事件块（book/end/error 事件流，见 dispatchSSEBlock） */
+export async function consumeSSEStream(
+  body: ReadableStream<Uint8Array>,
+  cbs: SSEStreamCallbacks,
+  isAborted: () => boolean,
+): Promise<void> {
+  await consumeSSEStreamBlocks(body, (block) => dispatchSSEBlock(block, cbs), isAborted, (msg) =>
+    cbs.onStreamError?.(msg),
+  )
 }
 
 /**

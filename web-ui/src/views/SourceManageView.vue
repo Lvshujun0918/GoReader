@@ -16,7 +16,9 @@ import {
 } from '@/api/sourceLogin'
 import { downloadBlob } from '@/utils/download'
 import { t } from '@/utils/i18n'
+import TopNav from '@/components/TopNav.vue'
 import { hanText, syncHanMode } from '@/utils/hanMode'
+import { isNotImplemented } from '@/utils/errors'
 import type { BookSource, SourceSub } from '@/types'
 
 const router = useRouter()
@@ -222,15 +224,6 @@ const filtered = computed(() => {
 })
 
 const enabledCount = computed(() => sources.value.filter((s) => s.enabled).length)
-
-/** 判断是否接口未实现（404 / 后端未就绪） */
-function isNotImplemented(err: unknown): boolean {
-  const e = err as { response?: { status?: number }; message?: string } | null | undefined
-  const status = e?.response?.status
-  if (status === 404 || status === 501) return true
-  const msg = e?.message ?? ''
-  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
-}
 
 /* ================= 失效检测（GET /reader3/getInvalidBookSources） ================= */
 
@@ -1611,18 +1604,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="sources-page">
-    <!-- 极简顶栏：返回书架 -->
-    <header class="topbar">
-      <button class="back-btn" type="button" @click="router.push('/')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M19 12H5" />
-          <path d="M11 18l-6-6 6-6" />
-        </svg>
-        <span>书架</span>
-      </button>
-      <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand">夜读<span class="brand-dot">.</span></span>
-    </header>
+    <!-- 极简顶栏：返回书架（P3-A：共享 TopNav minimal） -->
+    <TopNav variant="minimal" back-label="书架" @back="router.push('/')" />
 
     <main class="content">
       <div class="section-head">

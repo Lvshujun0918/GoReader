@@ -450,7 +450,11 @@ pub fn escape_html(s: &str) -> String {
 // ==================== GAP 104 TXT 导出编码 ====================
 
 /// TXT 导出编码（encoding 参数：utf-8/gbk；gb2312 映射 GBK 超集，gb18030 全字符集）
-pub fn encode_txt(txt: &str, encoding: &str) -> Result<Vec<u8>, String> {
+///
+/// P2：GBK/GB2312 不可映射字符不再静默替换为 `?`——逐字符转义为 NCR（`&#x…;`，
+/// 原文可逆保留），并返回不可映射字符数（调用方转导出警告，前端提示）。
+/// 返回 (编码字节, 不可映射字符数)；gb18030/utf-8 全字符集恒为 0。
+pub fn encode_txt(txt: &str, encoding: &str) -> Result<(Vec<u8>, usize), String> {
     let enc = match encoding.trim().to_ascii_lowercase().as_str() {
         "" | "utf-8" | "utf8" | "utf_8" => encoding_rs::UTF_8,
         "gbk" | "gb2312" | "gb_2312" => encoding_rs::GBK,
@@ -461,30 +465,79 @@ pub fn encode_txt(txt: &str, encoding: &str) -> Result<Vec<u8>, String> {
             ))
         }
     };
-    let (bytes, _, _) = enc.encode(txt);
-    Ok(bytes.into_owned())
+    let mut out: Vec<u8> = Vec::with_capacity(txt.len() * 2);
+    let mut scratch = vec![0u8; 8192];
+    let mut encoder = enc.new_encoder();
+    let mut src = txt;
+    let mut unmappable = 0usize;
+    let mut last = false;
+    loop {
+        let (result, read, written) =
+            encoder.encode_from_utf8_without_replacement(src, &mut scratch, last);
+        out.extend_from_slice(&scratch[..written]);
+        src = &src[read..];
+        match result {
+            encoding_rs::EncoderResult::InputEmpty => {
+                if !last {
+                    last = true; // 末次调用（flush 尾部状态）
+                    continue;
+                }
+                break;
+            }
+            encoding_rs::EncoderResult::OutputFull => {
+                scratch.resize(scratch.len() * 2, 0); // 大块不可映射时扩容
+            }
+            encoding_rs::EncoderResult::Unmappable(c) => {
+                // P2：不可映射字符转义为 NCR（&#x…;）保留原文，并计数供警告
+                unmappable += 1;
+                out.extend_from_slice(format!("&#x{:X};", c as u32).as_bytes());
+            }
+        }
+    }
+    Ok((out, unmappable))
 }
 
 // ==================== 书源书导出并发抓章（GAP 104b） ====================
 
+/// 并发抓章失败记录（P2：不再静默丢弃——随导出响应警告返回，前端提示）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FetchChapterFailure {
+    /// 章节序号（原始目录顺序）
+    pub index: usize,
+    /// 章节标题
+    pub title: String,
+    /// 章节 URL
+    pub url: String,
+    /// 失败原因
+    pub error: String,
+}
+
+/// 并发抓章结果：成功章节（按原顺序重组）+ 失败记录
+#[derive(Debug, Clone, Default)]
+pub struct FetchChaptersOutcome {
+    pub chapters: Vec<(String, String)>,
+    pub failed: Vec<FetchChapterFailure>,
+}
+
 /// 并发抓取章节正文：`chapters` 为 (章节标题, 章节 URL) 原始顺序；
-/// 并发度 `concurrency`（默认 4）；结果按原章节顺序重组；失败章节跳过（不影响其他章）。
+/// 并发度 `concurrency`（默认 4）；结果按原章节顺序重组；失败章节不再静默丢弃——
+/// 逐条记录到 `outcome.failed`（含序号/标题/URL/原因），由调用方随导出响应警告返回。
 /// 瓶颈在网络抓取——本地书/文件书解析不走此路径（保持原有顺序逻辑）。
 pub async fn fetch_chapters_concurrent<F, Fut>(
     chapters: Vec<(String, String)>,
     concurrency: usize,
     fetch: F,
-) -> Vec<(String, String)>
+) -> FetchChaptersOutcome
 where
     F: Fn(usize, String) -> Fut + Send + Sync,
     Fut: std::future::Future<Output = Result<String, String>> + Send,
 {
-    let results: Vec<(usize, String, Result<String, String>)> =
+    let results: Vec<(usize, String, String, Result<String, String>)> =
         futures::stream::iter(chapters.into_iter().enumerate().map(|(i, (title, url))| {
             let f = &fetch;
             async move {
-                let r = f(i, url).await;
-                (i, title, r)
+                let r = f(i, url.clone()).await;
+                (i, title, url, r)
             }
         }))
         .buffer_unordered(concurrency.max(1))
@@ -493,11 +546,20 @@ where
 
     // 按章节索引重组（buffer_unordered 完成顺序 ≠ 章节顺序）
     let mut results = results;
-    results.sort_by_key(|(i, _, _)| *i);
-    results
-        .into_iter()
-        .filter_map(|(_, title, r)| r.ok().map(|content| (title, content)))
-        .collect()
+    results.sort_by_key(|(i, _, _, _)| *i);
+    let mut outcome = FetchChaptersOutcome::default();
+    for (i, title, url, r) in results {
+        match r {
+            Ok(content) => outcome.chapters.push((title, content)),
+            Err(error) => outcome.failed.push(FetchChapterFailure {
+                index: i,
+                title,
+                url,
+                error,
+            }),
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -882,10 +944,12 @@ mod tests {
     #[test]
     fn test_encode_txt_utf8_and_gbk() {
         let txt = "书名《测试》\n第一章 正文";
-        let utf8 = encode_txt(txt, "utf-8").unwrap();
+        let (utf8, n) = encode_txt(txt, "utf-8").unwrap();
+        assert_eq!(n, 0, "utf-8 全字符集无不可映射");
         assert_eq!(utf8, txt.as_bytes());
         // gbk：中文字符 2 字节（UTF-8 3 字节）——编码后长度变小且可解码回原文
-        let gbk = encode_txt(txt, "gbk").unwrap();
+        let (gbk, n) = encode_txt(txt, "gbk").unwrap();
+        assert_eq!(n, 0, "GBK 内字符（书名号/汉字）应可映射");
         assert!(
             gbk.len() < utf8.len(),
             "GBK 中文 2 字节: {} < {}",
@@ -896,11 +960,48 @@ mod tests {
         assert!(!had_errors);
         assert_eq!(decoded, txt);
         // 大小写/别名
-        assert_eq!(encode_txt("x", "GB2312").unwrap(), b"x");
-        assert_eq!(encode_txt("x", "GB18030").unwrap(), b"x");
+        let (b, _) = encode_txt("x", "GB2312").unwrap();
+        assert_eq!(b, b"x");
+        let (b, _) = encode_txt("x", "GB18030").unwrap();
+        assert_eq!(b, b"x");
         // 不支持的编码 → 明确错误
         let err = encode_txt("x", "latin1").unwrap_err();
         assert!(err.contains("不支持的导出编码"), "{err}");
+    }
+
+    /// P2：GBK 不可映射字符——不再静默替换为 ?，转义 NCR（&#x…;）保留原文 + 计数
+    #[test]
+    fn test_encode_txt_gbk_unmappable_escaped_with_count() {
+        // 😀(U+1F600)、𝕏(U+1D54F) 不在 GBK/GB2312；gb18030 全字符集可映射
+        let txt = "书名😀尾𝕏完";
+        let (gbk, n) = encode_txt(txt, "gbk").unwrap();
+        assert_eq!(n, 2, "两个不可映射字符应计数（实际 {n}）");
+        let s = encoding_rs::GBK.decode(&gbk).0.into_owned();
+        assert!(!s.contains('?'), "不可映射字符不应被替换为 ?: {s}");
+        assert!(s.contains("&#x1F600;"), "😀 应转义为 NCR: {s}");
+        assert!(s.contains("&#x1D54F;"), "𝕏 应转义为 NCR: {s}");
+        assert!(
+            s.contains("书名") && s.contains("尾") && s.contains("完"),
+            "可映射部分原样保留: {s}"
+        );
+        // gb18030 全字符集：不转义、计数 0
+        let (b18030, n) = encode_txt(txt, "gb18030").unwrap();
+        assert_eq!(n, 0, "gb18030 全字符集（实际 {n}）");
+        assert_eq!(encoding_rs::GB18030.decode(&b18030).0, txt);
+        // GB2312 与 GBK 同（映射超集语义一致）
+        let (_, n) = encode_txt(txt, "gb2312").unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// P2：大文本多段不可映射（跨 scratch 缓冲区）——计数与转义完整
+    #[test]
+    fn test_encode_txt_gbk_many_unmappable() {
+        let txt = "😀".repeat(50_000) + &"中".repeat(100);
+        let (gbk, n) = encode_txt(&txt, "gbk").unwrap();
+        assert_eq!(n, 50_000);
+        let s = encoding_rs::GBK.decode(&gbk).0;
+        assert_eq!(s.matches("&#x1F600;").count(), 50_000, "NCR 转义应完整");
+        assert_eq!(s.matches('中').count(), 100);
     }
 
     // ---------- GAP 104b 并发抓章 ----------
@@ -929,6 +1030,7 @@ mod tests {
             }
         })
         .await;
+        let fetched = fetched.chapters;
 
         // 顺序按章节索引重组
         assert_eq!(fetched.len(), 8);
@@ -948,7 +1050,7 @@ mod tests {
         let chapters: Vec<(String, String)> = (0..5)
             .map(|i| (format!("章{i}"), format!("/{i}")))
             .collect();
-        let fetched = fetch_chapters_concurrent(chapters, 2, |i, _url| async move {
+        let outcome = fetch_chapters_concurrent(chapters, 2, |i, _url| async move {
             if i == 1 || i == 3 {
                 Err("网络错误".to_string())
             } else {
@@ -957,12 +1059,28 @@ mod tests {
         })
         .await;
         assert_eq!(
-            fetched,
+            outcome.chapters,
             vec![
                 ("章0".to_string(), "正文0".to_string()),
                 ("章2".to_string(), "正文2".to_string()),
                 ("章4".to_string(), "正文4".to_string()),
             ]
         );
+        // P2：失败章节逐条记录（序号/标题/URL/原因）——不再静默丢弃
+        assert_eq!(outcome.failed.len(), 2, "两条失败记录");
+        assert_eq!(outcome.failed[0].index, 1);
+        assert_eq!(outcome.failed[0].title, "章1");
+        assert_eq!(outcome.failed[0].url, "/1");
+        assert_eq!(outcome.failed[0].error, "网络错误");
+        assert_eq!(outcome.failed[1].index, 3);
+        assert_eq!(outcome.failed[1].title, "章3");
+        // 全成功 → failed 为空
+        let ok = fetch_chapters_concurrent(
+            vec![("a".to_string(), "u".to_string())],
+            1,
+            |_, _| async move { Ok("c".to_string()) },
+        )
+        .await;
+        assert!(ok.failed.is_empty());
     }
 }

@@ -13,7 +13,9 @@ import { uploadFile, mkdir } from '@/api/file'
 import { post } from '@/api/request'
 import { downloadBlob } from '@/utils/download'
 import { relocateChapterIndex } from '@/utils/progressRelocate'
+import { buildTocEntries } from '@/utils/tocPreview'
 import { useUserStore } from '@/stores/user'
+import { isNotImplemented } from '@/utils/errors'
 import type { Book, BookChapter, BookInfo, ContentSearchHit, SearchBook } from '@/types'
 
 const route = useRoute()
@@ -392,21 +394,11 @@ const tocPreview = computed(() => {
   return out
 })
 
-/** 目录预览渲染条目（GAP 91：卷标题行 isVolume 渲染分隔行；GAP 147：当前章高亮 durChapterIndex；简繁按全站模式转换） */
-const tocEntries = computed<{ kind: 'volume' | 'chapter'; index: number; title: string }[]>(() => {
-  const out: { kind: 'volume' | 'chapter'; index: number; title: string }[] = []
-  let count = 0
-  tocChapters.value.forEach((c, i) => {
-    if (c.isVolume) {
-      out.push({ kind: 'volume', index: i, title: hanText(c.title) })
-      return
-    }
-    if (count >= TOC_PREVIEW_MAX) return
-    count++
-    out.push({ kind: 'chapter', index: i, title: hanText(c.title) })
-  })
-  return out
-})
+/** 目录预览渲染条目（GAP 91：卷标题行 isVolume 渲染分隔行；GAP 147：当前章高亮 durChapterIndex；简繁按全站模式转换）
+ *  P2：前 50 章截断后不再追加任何行（含分卷标题——分卷标题无限追加修复，逻辑见 utils/tocPreview.ts） */
+const tocEntries = computed<{ kind: 'volume' | 'chapter'; index: number; title: string }[]>(
+  () => buildTocEntries(tocChapters.value, TOC_PREVIEW_MAX, hanText),
+)
 
 /** GAP 147：书架进度章（durChapterIndex）——目录 tab 当前章高亮 */
 const currentChapterIndex = computed(() =>
@@ -515,15 +507,6 @@ const sourceDoneCount = ref(0)
 let sourceSSEHandle: { abort: () => void } | null = null
 /** 失效书源 URL 集合（GAP 20：getInvalidBookSources 探测，失败静默 → 空集不标注） */
 const invalidSourceUrls = ref<Set<string>>(new Set())
-
-/** 判断是否接口未实现（404 / 后端未就绪） */
-function isNotImplemented(err: unknown): boolean {
-  const e = err as { response?: { status?: number }; message?: string } | null | undefined
-  const status = e?.response?.status
-  if (status === 404 || status === 501) return true
-  const msg = e?.message ?? ''
-  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
-}
 
 /** 书架书且有书源才可换源（本地书无 origin 不显示入口） */
 function canSwitchSource(): boolean {
@@ -754,7 +737,11 @@ async function confirmExport() {
   exportMsg.value = ''
   exportMsgError.value = false
   try {
-    const blob = await exportBook(bookUrl.value, exportFormat.value, exportEncoding.value)
+    const { blob, warning } = await exportBook(
+      bookUrl.value,
+      exportFormat.value,
+      exportEncoding.value,
+    )
     // 后端错误体（HTTP 200 + JSON）：在此识别并展示（encoding 未就绪时后端忽略参数仍输出 UTF-8）
     if (blob.type.includes('application/json')) {
       try {
@@ -771,7 +758,14 @@ async function confirmExport() {
     const name = `${(display.value.name || 'book').replace(/[\\/:*?"<>|]/g, '_')}.${exportFormat.value}`
     const ok = await downloadBlob(blob, name)
     if (ok) {
-      exportMsg.value = `已下载 ${name}`
+      // P2：导出警告（并发抓章失败章节 / GBK 不可映射转义）——随下载成功提示展示
+      const warnParts: string[] = []
+      const failed = warning?.failedChapters?.length ?? 0
+      if (failed > 0) warnParts.push(`${failed} 章抓取失败已跳过`)
+      if (warning?.unmappableChars) warnParts.push(`GBK 无法编码 ${warning.unmappableChars} 个字符（已转义保留）`)
+      exportMsg.value = warnParts.length
+        ? `已下载 ${name}（警告：${warnParts.join('；')}）`
+        : `已下载 ${name}`
       window.setTimeout(() => {
         if (!exportBusy.value) closeExport()
       }, 900)
@@ -1086,6 +1080,12 @@ onMounted(() => {
   // 简繁模式可能在其他页面改动 → 挂载时同步全站状态（目录 tab 展示随其响应）
   syncHanMode()
   load()
+})
+
+// P2：路由参数变化（/book/A → /book/B 复用同一组件实例）时重新加载——
+// vue-router 仅替换 params，不会重新挂载组件，若不 watch 则展示旧书数据
+watch(bookUrl, () => {
+  void load()
 })
 </script>
 

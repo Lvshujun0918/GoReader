@@ -1,5 +1,6 @@
 import { useUserStore } from '@/stores/user'
 import { get, post } from './request'
+import { parseSSEBlock, consumeSSEStreamBlocks } from './sse'
 import type { ReturnData } from '@/types'
 
 /**
@@ -53,23 +54,6 @@ export function cacheBookOnServer(url: string): Promise<ReturnData<CacheStartRes
   return post<CacheStartResult>('/cacheBookOnServer', { url }, { silent: true })
 }
 
-interface ParsedSSEBlock {
-  event: string
-  data: string
-}
-
-function parseSSEBlock(block: string): ParsedSSEBlock | null {
-  let event = ''
-  const dataLines: string[] = []
-  for (const rawLine of block.split('\n')) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
-    if (line.startsWith('event:')) event = line.slice(6).trim()
-    else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''))
-  }
-  if (!dataLines.length) return null
-  return { event, data: dataLines.join('\n') }
-}
-
 function tryJson(s: string): unknown {
   try {
     return JSON.parse(s) as unknown
@@ -79,6 +63,7 @@ function tryJson(s: string): unknown {
 }
 
 function dispatchSSEBlock(block: string, cbs: CacheProgressCallbacks) {
+  // SSE 事件块解析统一走 api/sse.ts（P2：SSE 解析三处统一）
   const evt = parseSSEBlock(block)
   if (!evt || !evt.data) return
   const p = tryJson(evt.data) as (CacheSSEProgress & { type?: unknown; message?: unknown }) | null
@@ -106,28 +91,19 @@ async function consumeSSEStream(
   cbs: CacheProgressCallbacks,
   closed: () => boolean,
 ): Promise<void> {
-  const reader = body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      buffer = buffer.replace(/\r\n?/g, '\n')
-      let sep: number
-      while ((sep = buffer.indexOf('\n\n')) !== -1) {
-        const block = buffer.slice(0, sep)
-        buffer = buffer.slice(sep + 2)
-        dispatchSSEBlock(block, cbs)
-      }
-    }
-    if (buffer.trim()) dispatchSSEBlock(buffer, cbs)
-    cbs.onEnd?.()
-  } catch {
-    if (closed()) return // 用户主动关闭
-    cbs.onStreamError('缓存进度连接中断')
-  }
+  // 块切分/增量消费统一走 api/sse.ts（P2：SSE 解析三处统一）
+  let streamFailed = false
+  await consumeSSEStreamBlocks(
+    body,
+    (block) => dispatchSSEBlock(block, cbs),
+    closed,
+    (msg) => {
+      streamFailed = true
+      cbs.onStreamError(msg)
+    },
+  )
+  // 仅正常结束触发 onEnd（连接中断/用户关闭不触发——调用方据此判断「缓存完成」）
+  if (!streamFailed && !closed()) cbs.onEnd?.()
 }
 
 /** GET /reader3/cacheBookSSE?url=：订阅缓存进度流（原生 fetch 流式读取，accessToken 手动附加） */

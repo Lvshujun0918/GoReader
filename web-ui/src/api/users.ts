@@ -72,14 +72,8 @@ export function addUser(payload: AddUserPayload): Promise<ReturnData<unknown>> {
   return post('/addUser', payload, { silent: true })
 }
 
-/** 判断接口是否未实现（404/501/网络失败）——用于 addUser 未就绪时降级 register */
-export function isNotImplemented(err: unknown): boolean {
-  const e = err as { response?: { status?: number }; message?: string } | null | undefined
-  const status = e?.response?.status
-  if (status === 404 || status === 501) return true
-  const msg = e?.message ?? ''
-  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
-}
+/** 判断接口是否未实现（404/501/网络失败）——P3-A：收敛至 utils/errors（重导出保持兼容） */
+export { isNotImplemented } from '@/utils/errors'
 
 /**
  * 探测后端是否处于 secure 模式（决定书架导航「用户」入口是否显示）。

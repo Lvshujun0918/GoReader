@@ -1,4 +1,5 @@
 import { get, post } from './request'
+import { onBackendReachable } from './backendFlag'
 import type { ReplaceRule, ReturnData } from '@/types'
 
 /**
@@ -46,7 +47,7 @@ let backendDown = false
 /** GET /reader3/getReplaceRules（后端优先；失败降级 localStorage 并镜像缓存） */
 export async function getReplaceRules(): Promise<ReturnData<ReplaceRule[]>> {
   if (backendDown) {
-    return { isSuccess: true, errorMsg: '', data: loadReplaceRules() }
+    return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: loadReplaceRules() }
   }
   try {
     const res = await get<ReplaceRule[]>('/getReplaceRules')
@@ -54,7 +55,7 @@ export async function getReplaceRules(): Promise<ReturnData<ReplaceRule[]>> {
     return res
   } catch {
     backendDown = true
-    return { isSuccess: true, errorMsg: '', data: loadReplaceRules() }
+    return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: loadReplaceRules() }
   }
 }
 
@@ -81,7 +82,7 @@ export async function saveReplaceRule(rule: ReplaceRule): Promise<ReturnData<{ i
   if (i >= 0) list[i] = rule
   else list.push(rule)
   persistReplaceRules(list)
-  return { isSuccess: true, errorMsg: '', data: null }
+  return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: null }
 }
 
 /** POST /reader3/saveReplaceRules（批量；后端失败降级为整表本地覆盖） */
@@ -96,7 +97,7 @@ export async function saveReplaceRules(rules: ReplaceRule[]): Promise<ReturnData
     }
   }
   persistReplaceRules(rules)
-  return { isSuccess: true, errorMsg: '', data: { count: rules.length } }
+  return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: { count: rules.length } }
 }
 
 /** POST /reader3/deleteReplaceRule（后端优先；失败降级 localStorage） */
@@ -111,10 +112,13 @@ export async function deleteReplaceRule(id: string): Promise<ReturnData<null>> {
     }
   }
   persistReplaceRules(loadReplaceRules().filter((r) => r.id !== id))
-  return { isSuccess: true, errorMsg: '', data: null }
+  return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: null }
 }
 
 /** 恢复后端调用（登录态变化/网络恢复时由上层调用） */
 export function resetBackendFlag(): void {
   backendDown = false
 }
+
+// P2：任一后端请求成功（request.ts 拦截器）即复位短路标志——网络恢复后自动回到后端优先
+onBackendReachable(resetBackendFlag)

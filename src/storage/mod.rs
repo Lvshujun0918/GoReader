@@ -1475,6 +1475,9 @@ impl Storage {
     /// 删除本地书（含章节）
     /// 安全：book_chapters 无命名空间列——按书架归属（books.user_namespace）过滤后再删，
     /// 防止跨用户删他人本地书缓存（P1-C1）
+    /// P3-A 标注：当前无生产调用点——本地书删除走 [`Self::delete_book`]（P1-C1 已含章节
+    /// 清理）；本函数保留为 storage 层原语（ns 隔离校验 + 测试覆盖），供后续
+    /// 本地书专属删除 API 复用。
     pub async fn delete_local_book(&self, ns: &str, book_url: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(

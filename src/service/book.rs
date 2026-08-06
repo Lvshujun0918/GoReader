@@ -4,7 +4,7 @@
 //! v1：CSS/JSONPath/JS（简单）规则；多页目录/正文（nextTocUrl/nextContentUrl）循环支持
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::model::book_chapter::{BookChapter, BookInfo};
 use crate::model::BookSource;
@@ -297,32 +297,14 @@ fn chapters_from_items(
         .collect()
 }
 
-/// 非文本正文返回结构（legacy getBookContent 对音频/漫画/视频/文件书的返回契约）
+/// 音频 URL → contentType（m3u8 走 HLS，其余按扩展名映射；未知默认 audio/mpeg）
 ///
-/// - 音频书（book_type=1）：`{audioUrl, contentType}`（contentType：m3u8 →
-///   `application/vnd.apple.mpegurl`，其余按扩展名 audio/*）
+/// 非文本正文返回契约（legacy getBookContent，由 router 直接以 JSON 构造，
+/// P3-A：原 MediaContent 枚举从未被构造 → 已删除，此处保留 contentType 映射）：
+/// - 音频书（book_type=1）：`{audioUrl, contentType}`
 /// - 漫画书（book_type=2）：`{images: [url, ...]}`（章节 = 图片列表）
 /// - 文件书（book_type=3）：`{downloadUrl}`
 /// - 视频书（book_type=4）：`{videoUrl}`
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub enum MediaContent {
-    Audio {
-        audio_url: String,
-        content_type: String,
-    },
-    Comic {
-        images: Vec<String>,
-    },
-    Video {
-        video_url: String,
-    },
-    File {
-        download_url: String,
-    },
-}
-
-/// 音频 URL → contentType（m3u8 走 HLS，其余按扩展名映射；未知默认 audio/mpeg）
 pub fn audio_content_type(url: &str) -> &'static str {
     let path = url.split('?').next().unwrap_or(url).to_lowercase();
     if path.ends_with(".m3u8") {

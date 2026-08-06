@@ -605,49 +605,54 @@ fn css_escape_ident(s: &str) -> String {
 }
 
 /// 提取 `[attr~=regex]`（jsoup 语义：正则匹配，大小写不敏感）→ (基础选择器, 过滤器)
+///
+/// P2：按 char 扫描（char_indices）——旧实现按字节逐位 `c as char`，非 ASCII
+/// （中文选择器/属性值）被拆成乱码字节，且 `sel[i..]`/`inner[i..]` 在非字符边界
+/// 切片会 panic。
 fn extract_tilde_attr(sel: &str) -> (String, Vec<(String, crate::util::regex::Regex)>) {
-    let bytes = sel.as_bytes();
+    let chars: Vec<(usize, char)> = sel.char_indices().collect();
     let mut base = String::new();
     let mut filters: Vec<(String, crate::util::regex::Regex)> = Vec::new();
-    let mut i = 0;
+    let mut i = 0; // 字符下标
     let mut in_single = false;
     let mut in_double = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c == b'\'' && !in_double {
+    while i < chars.len() {
+        let (_, c) = chars[i];
+        if c == '\'' && !in_double {
             in_single = !in_single;
-            base.push(c as char);
+            base.push(c);
             i += 1;
             continue;
         }
-        if c == b'"' && !in_single {
+        if c == '"' && !in_single {
             in_double = !in_double;
-            base.push(c as char);
+            base.push(c);
             i += 1;
             continue;
         }
-        if c == b'[' && !in_single && !in_double {
+        if c == '[' && !in_single && !in_double {
             // 找到匹配的 ]
-            let mut j = i + 1;
+            let mut j = i + 1; // 字符下标
             let mut qs = false;
             let mut qd = false;
-            while j < bytes.len() {
-                let d = bytes[j];
-                if d == b'\'' && !qd {
+            while j < chars.len() {
+                let d = chars[j].1;
+                if d == '\'' && !qd {
                     qs = !qs;
-                } else if d == b'"' && !qs {
+                } else if d == '"' && !qs {
                     qd = !qd;
-                } else if d == b']' && !qs && !qd {
+                } else if d == ']' && !qs && !qd {
                     break;
                 }
                 j += 1;
             }
-            if j >= bytes.len() {
+            if j >= chars.len() {
                 // 未闭合——原样保留
-                base.push_str(&sel[i..]);
+                base.push_str(&sel[chars[i].0..]);
                 break;
             }
-            let inner = &sel[i + 1..j];
+            let j_byte = chars[j].0;
+            let inner = &sel[chars[i].0 + 1..j_byte];
             if let Some(tilde_pos) = find_attr_op(inner, "~=") {
                 let attr = inner[..tilde_pos].trim();
                 let val = inner[tilde_pos + 2..].trim();
@@ -663,32 +668,28 @@ fn extract_tilde_attr(sel: &str) -> (String, Vec<(String, crate::util::regex::Re
                     }
                 }
             }
-            base.push_str(&sel[i..=j]);
+            base.push_str(&sel[chars[i].0..=j_byte]);
             i = j + 1;
             continue;
         }
-        base.push(c as char);
+        base.push(c);
         i += 1;
     }
     (base, filters)
 }
 
-/// 在属性选择器内容中查找操作符位置（跳过引号内）
+/// 在属性选择器内容中查找操作符位置（跳过引号内）；返回字节偏移（字符边界）
 fn find_attr_op(inner: &str, op: &str) -> Option<usize> {
-    let bytes = inner.as_bytes();
-    let mut i = 0;
     let mut qs = false;
     let mut qd = false;
-    while i + op.len() <= bytes.len() {
-        let c = bytes[i];
-        if c == b'\'' && !qd {
+    for (i, c) in inner.char_indices() {
+        if c == '\'' && !qd {
             qs = !qs;
-        } else if c == b'"' && !qs {
+        } else if c == '"' && !qs {
             qd = !qd;
         } else if !qs && !qd && inner[i..].starts_with(op) {
             return Some(i);
         }
-        i += 1;
     }
     None
 }
@@ -1130,5 +1131,54 @@ mod tests {
             html,
         );
         assert!(r3.is_empty());
+    }
+
+    // ==================== P2：非 ASCII 按 char 处理（中文选择器/属性值不按字节拆） ====================
+
+    /// extract_tilde_attr：中文属性值（~= 正则）——旧实现 find_attr_op 按字节切片
+    /// 在非字符边界 panic；按 char 后正常提取过滤
+    #[test]
+    fn test_extract_tilde_attr_chinese_value() {
+        // 中文正则值（旧实现：find_attr_op 内 inner[i..] 在汉字中间切片 → panic）
+        let (base, filters) = extract_tilde_attr("div[title~=中文]");
+        assert_eq!(base, "div");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].0, "title");
+        assert!(filters[0].1.is_match("中文内容"), "正则应匹配中文");
+        assert!(!filters[0].1.is_match("英文"));
+
+        // 中文选择器（base）原样保留——不再按字节拆成乱码
+        let (base, filters) = extract_tilde_attr("div.书[title~=ok]");
+        assert_eq!(base, "div.书");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].0, "title");
+
+        // 无 ~= 的普通属性选择器原样保留（含中文）
+        let (base, filters) = extract_tilde_attr("div[data-名=值]");
+        assert_eq!(base, "div[data-名=值]");
+        assert!(filters.is_empty());
+
+        // 未闭合 [ 原样保留（含中文）不 panic
+        let (base, filters) = extract_tilde_attr("div[title~=中文");
+        assert_eq!(base, "div[title~=中文");
+        assert!(filters.is_empty());
+
+        // 引号内 ~= 不参与
+        let (base, filters) = extract_tilde_attr("div[data-x='a~=b']");
+        assert_eq!(base, "div[data-x='a~=b']");
+        assert!(filters.is_empty());
+    }
+
+    /// css_chain 端到端：中文属性正则过滤正常出结果（旧实现此路径 panic）
+    #[test]
+    fn test_css_chain_chinese_tilde_filter() {
+        let html =
+            r#"<div title="中文内容"><p>命中</p></div><div title="English"><p>不命中</p></div>"#;
+        let r = css_chain("div[title~=中文]@p@text", html);
+        assert_eq!(r, vec!["命中".to_string()]);
+        // 中文属性值 + 中文选择器链
+        let html2 = r#"<div class="书架"><span data-名="好书">甲</span></div>"#;
+        let r2 = css_chain("div.书架 span[data-名~=好书]@text", html2);
+        assert_eq!(r2, vec!["甲".to_string()]);
     }
 }

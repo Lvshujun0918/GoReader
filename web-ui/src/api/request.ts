@@ -2,6 +2,7 @@ import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import router from '@/router'
 import { useUserStore } from '@/stores/user'
+import { notifyBackendReachable } from './backendFlag'
 import type { ReturnData } from '@/types'
 
 /** 自定义请求配置：silent=true 时失败不弹全局错误提示（探测待实现后端契约接口等场景，调用方自行降级处理） */
@@ -35,6 +36,9 @@ request.interceptors.request.use((config) => {
 
 request.interceptors.response.use(
   (response) => {
+    // 任一后端响应（含业务失败）都证明后端可达 → 复位降级模块的 backendDown 短路标志
+    // （P2：backendDown 永不重置修复——网络恢复/重新登录后自动回到后端优先）
+    notifyBackendReachable()
     const res = response.data as ReturnData
     // 兼容 legacy：HTTP 恒为 200，业务结果在 isSuccess
     if (res && typeof res === 'object' && 'isSuccess' in res) {
@@ -59,6 +63,8 @@ request.interceptors.response.use(
     return response
   },
   (error) => {
+    // 有 HTTP 响应（4xx/5xx）说明后端可达；纯网络错误不算
+    if (error.response) notifyBackendReachable()
     const silent = !!(error.config as { silent?: boolean } | undefined)?.silent
     if (error.response?.status === 401) {
       const store = useUserStore()

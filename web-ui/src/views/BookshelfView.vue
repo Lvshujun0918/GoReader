@@ -17,11 +17,13 @@ import { getBookmarks, deleteBookmark } from '@/api/bookmarks'
 import { uploadLocalBook, importBookPreview } from '@/api/upload'
 import { searchBookContent } from '@/api/cache'
 import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export'
-import { probeSecureMode } from '@/api/users'
 import { downloadBlob } from '@/utils/download'
 import { canRescanBook } from '@/utils/localBook'
+import { moveGroupTo } from '@/utils/groupOrder'
 import { parseShelfView, shelfViewMetrics, type ShelfViewMode } from '@/utils/shelfView'
 import { useUserStore } from '@/stores/user'
+import { isNotImplemented } from '@/utils/errors'
+import TopNav from '@/components/TopNav.vue'
 import type { Book, BookGroup, Bookmark, ContentSearchHit, ImportPreview } from '@/types'
 
 const router = useRouter()
@@ -108,9 +110,6 @@ function hoverPreview(book: Book): string | null {
   return intro.length > 120 ? `${intro.slice(0, 120)}…` : intro
 }
 
-/** 后端 secure 模式（用户管理入口仅 secure 模式显示，探测见 api/users.ts） */
-const secureMode = ref(false)
-
 const books = ref<Book[]>([])
 const loading = ref(true)
 const refreshing = ref(false)
@@ -149,8 +148,9 @@ let viewportRaf: number | undefined
 let wrapObserver: ResizeObserver | undefined
 
 /* ================= 搜索范围：书名 / 全书 ================= */
-/** 'name'=书名/作者（本地）；'full'=全书内容搜索（后端契约 GET /reader3/searchBookContent 待实现，
- *  简化实现：本地匹配书名/作者/简介，并标注「全书搜索后端待实现」） */
+/** 'name'=书名/作者（本地）；'full'=全书内容搜索（GET /reader3/searchBookContent——
+ *  逐本地书并发聚合命中，结果面板展示书 + 章节命中，点击跳阅读器该章；
+ *  网格仍按书名/作者/简介匹配兜底） */
 const searchMode = ref<'name' | 'full'>('name')
 
 
@@ -200,6 +200,16 @@ watch(searchMode, (m) => {
     contentSearchDone.value = false
   }
 })
+
+/** 点击命中 → 阅读器定位该章（与阅读页 ?chapter 语义一致） */
+function goContentHit(book: Book, hit: ContentSearchHit) {
+  void router.push(`/reader/${encodeURIComponent(book.bookUrl)}?chapter=${hit.chapterIndex}`)
+}
+
+/** 命中总数（面板标题：共 N 书 · M 章命中） */
+const contentHitTotal = computed(() =>
+  contentResults.value.reduce((n, r) => n + r.hits.length, 0),
+)
 
 /* ================= 书架排序（前端排序 books.value 副本——不改服务端顺序；localStorage: reader_shelf_sort） ================= */
 
@@ -274,15 +284,6 @@ const shelfSummary = computed(() => ({
 const renamingId = ref<number | null>(null)
 const renameName = ref('')
 const renameBusy = ref(false)
-
-/** 判断是否接口未实现（404 / 后端未就绪） */
-function isNotImplemented(err: unknown): boolean {
-  const e = err as { response?: { status?: number }; message?: string } | null | undefined
-  const status = e?.response?.status
-  if (status === 404 || status === 501) return true
-  const msg = e?.message ?? ''
-  return !e?.response && (msg.includes('404') || msg.includes('Network Error'))
-}
 
 /** 分组内书数：优先用后端契约 bookCount，未返回时本地统计兜底 */
 function groupCount(id: number): number {
@@ -896,7 +897,11 @@ async function confirmExport() {
   exportMsg.value = ''
   exportMsgError.value = false
   try {
-    const blob = await exportBook(exportBookUrl.value, exportFormat.value, exportEncoding.value)
+    const { blob, warning } = await exportBook(
+      exportBookUrl.value,
+      exportFormat.value,
+      exportEncoding.value,
+    )
     // 后端错误体（HTTP 200 + JSON）：在此识别并展示（encoding 未就绪时后端忽略参数仍输出 UTF-8）
     if (blob.type.includes('application/json')) {
       try {
@@ -913,7 +918,14 @@ async function confirmExport() {
     const name = `${exportName.value.replace(/[\\/:*?"<>|]/g, '_')}.${exportFormat.value}`
     const ok = await downloadBlob(blob, name)
     if (ok) {
-      exportMsg.value = `已下载 ${name}`
+      // P2：导出警告（并发抓章失败章节 / GBK 不可映射转义）——随下载成功提示展示
+      const warnParts: string[] = []
+      const failed = warning?.failedChapters?.length ?? 0
+      if (failed > 0) warnParts.push(`${failed} 章抓取失败已跳过`)
+      if (warning?.unmappableChars) warnParts.push(`GBK 无法编码 ${warning.unmappableChars} 个字符（已转义保留）`)
+      exportMsg.value = warnParts.length
+        ? `已下载 ${name}（警告：${warnParts.join('；')}）`
+        : `已下载 ${name}`
       window.setTimeout(() => {
         if (!exportBusy.value) closeExport()
       }, 900)
@@ -1303,19 +1315,14 @@ function onGroupDragOver(g: BookGroup, e: DragEvent) {
   if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
 }
 
-/** 放下：把拖拽分组插入到目标分组位置（本地重排） */
+/** 放下：把拖拽分组插入到目标分组位置（本地重排）
+ *  P2：目标索引在移除源分组后重新定位——直接使用移除前的 toIdx 在向下拖拽时偏移一位 */
 function onGroupDrop(g: BookGroup, e: DragEvent) {
   e.preventDefault()
   const from = draggingId.value
   draggingId.value = null
   if (from === null || from === g.id) return
-  const list = groups.value.slice()
-  const fromIdx = list.findIndex((x) => x.id === from)
-  const toIdx = list.findIndex((x) => x.id === g.id)
-  if (fromIdx < 0 || toIdx < 0) return
-  const [moved] = list.splice(fromIdx, 1)
-  list.splice(toIdx, 0, moved)
-  groups.value = list
+  groups.value = moveGroupTo(groups.value, from, g.id)
 }
 
 function onGroupDragEnd() {
@@ -1697,22 +1704,19 @@ onMounted(() => {
   // GAP 70：全局快捷键
   window.addEventListener('keydown', onGlobalKeydown)
   load()
-  // 探测 secure 模式：仅 secure 模式显示「用户」管理入口（后端未就绪/非 secure → 隐藏）
-  void probeSecureMode().then((v) => {
-    secureMode.value = v
-  })
 })
 </script>
 
 <template>
   <div class="bookshelf-page">
-    <!-- 极简导航：字标 + 搜索 + 用户 -->
-    <header class="topbar">
-      <div class="brand">
-        <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand-name">夜读<span class="brand-dot">.</span></span>
-      </div>
-
+    <!-- 顶部导航（P3-A：共享 TopNav——品牌/导航链接/用户区） -->
+    <TopNav
+      active="/"
+      :links="['search', 'explore', 'sources', 'rules', 'rss', 'files', 'store', 'monitor']"
+      show-logout
+      show-users-link
+      @logout="logout"
+    >
       <div class="search-box">
         <div class="search-main">
           <svg
@@ -1772,22 +1776,11 @@ onMounted(() => {
         </div>
       </div>
 
-      <div class="user-area">
-        <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
+      <template #extra>
         <button class="nav-link" type="button" title="全部书签（跨书）" @click="openBookmarks">书签</button>
-        <button class="nav-link" type="button" @click="router.push('/explore')">探索</button>
-        <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
-        <button class="nav-link" type="button" @click="router.push('/rules')">替换规则</button>
-        <button class="nav-link" type="button" @click="router.push('/rss')">RSS</button>
-        <button class="nav-link" type="button" @click="router.push('/files')">文件</button>
-        <button class="nav-link" type="button" title="共享书仓（storage/localStore，浏览并批量导入书架）" @click="router.push('/store')">书仓</button>
-        <button class="nav-link" type="button" title="服务监控（内存/CPU/请求量/在线会话）" @click="router.push('/server-stats')">监控</button>
         <button class="nav-link" type="button" title="OPDS 服务器（外部阅读器连接）" @click="openOpds">OPDS</button>
-        <button v-if="secureMode" class="nav-link" type="button" @click="router.push('/users')">用户</button>
-        <span class="user-chip">{{ store.username || '未登录' }}</span>
-        <button class="logout-btn" type="button" @click="logout">退出</button>
-      </div>
-    </header>
+      </template>
+    </TopNav>
 
     <main class="content" :class="{ 'with-manage-bar': manageMode }">
       <!-- GAP 86：移动端下拉刷新指示（下拉 >60px 释放触发刷新） -->
@@ -1809,6 +1802,43 @@ onMounted(() => {
           <span>{{ pullReady ? '释放刷新' : '下拉刷新' }}</span>
         </div>
       </Transition>
+
+      <!-- 全书搜索命中面板（范围=全书：本地书正文命中，书 + 章节列表，点击跳阅读器该章） -->
+      <div v-if="searchMode === 'full' && keyword.trim()" class="content-hits">
+        <div v-if="contentSearching" class="chits-state">
+          <svg class="mini-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <path d="M21 12a9 9 0 1 1-6.2-8.56" />
+          </svg>
+          <span>正在全书搜索（逐本地书并发）…</span>
+        </div>
+        <template v-else-if="contentSearchDone">
+          <p v-if="contentResults.length === 0" class="chits-state">
+            全书未找到匹配内容（仅本地书正文参与搜索）
+          </p>
+          <div v-else class="chits-panel">
+            <p class="chits-title">
+              全书命中：{{ contentResults.length }} 本书 · {{ contentHitTotal }} 章——点击跳转阅读器该章
+            </p>
+            <div class="chits-list">
+              <div v-for="r in contentResults" :key="r.book.bookUrl" class="chits-book">
+                <p class="chits-book-name" :title="r.book.name">
+                  {{ r.book.name }}
+                  <span class="chits-book-meta">{{ r.book.author || '佚名' }} · {{ r.hits.length }} 章命中</span>
+                </p>
+                <ul class="chits-hits">
+                  <li v-for="(hit, i) in r.hits" :key="`${r.book.bookUrl}-${hit.chapterIndex}-${i}`">
+                    <button class="chits-hit" type="button" @click="goContentHit(r.book, hit)">
+                      <span class="chits-hit-ch">第 {{ hit.chapterIndex + 1 }} 章</span>
+                      <span class="chits-hit-title" :title="hit.title">{{ hit.title || '（无标题）' }}</span>
+                      <span class="chits-hit-snippet" :title="hit.snippet">{{ hit.snippet }}</span>
+                    </button>
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
 
       <!-- 标题区 -->
       <div class="section-head">
@@ -3315,6 +3345,113 @@ onMounted(() => {
   font-weight: 300;
   letter-spacing: 1px;
   color: var(--text-3);
+}
+
+/* ================= 全书搜索命中面板（范围=全书；书 + 章节命中，点击跳阅读器） ================= */
+.content-hits {
+  margin: -8px 0 28px;
+}
+.chits-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 0;
+  font-size: 12.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.chits-panel {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+}
+.chits-title {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  color: var(--accent);
+}
+.chits-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 340px;
+  overflow-y: auto;
+}
+.chits-book + .chits-book {
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+.chits-book-name {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chits-book-meta {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.chits-hits {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chits-hit {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  text-align: left;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.chits-hit:hover {
+  background: var(--hover);
+}
+.chits-hit-ch {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 300;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.chits-hit-title {
+  flex-shrink: 0;
+  max-width: 36%;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chits-hit-snippet {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 旋转（刷新按钮 / 登录 spinner 共用） */

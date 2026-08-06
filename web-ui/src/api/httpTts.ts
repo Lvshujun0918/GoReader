@@ -1,4 +1,5 @@
 import { get, post } from './request'
+import { onBackendReachable } from './backendFlag'
 import type { HttpTts, ReturnData } from '@/types'
 
 /**
@@ -44,7 +45,7 @@ let backendDown = false
 /** GET /reader3/getHttpTTSList（后端优先；失败降级 localStorage 并镜像缓存） */
 export async function getHttpTtsList(): Promise<ReturnData<HttpTts[]>> {
   if (backendDown) {
-    return { isSuccess: true, errorMsg: '', data: loadHttpTtsList() }
+    return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: loadHttpTtsList() }
   }
   try {
     const res = await get<HttpTts[]>('/getHttpTTSList')
@@ -52,7 +53,7 @@ export async function getHttpTtsList(): Promise<ReturnData<HttpTts[]>> {
     return res
   } catch {
     backendDown = true
-    return { isSuccess: true, errorMsg: '', data: loadHttpTtsList() }
+    return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: loadHttpTtsList() }
   }
 }
 
@@ -76,7 +77,7 @@ export async function saveHttpTts(tts: HttpTts): Promise<ReturnData<null>> {
   if (i >= 0) list[i] = tts
   else list.push(tts)
   persistHttpTtsList(list)
-  return { isSuccess: true, errorMsg: '', data: null }
+  return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: null }
 }
 
 /** POST /reader3/deleteHttpTTS（后端优先；失败降级 localStorage） */
@@ -91,10 +92,13 @@ export async function deleteHttpTts(id: string): Promise<ReturnData<null>> {
     }
   }
   persistHttpTtsList(loadHttpTtsList().filter((t) => t.id !== id))
-  return { isSuccess: true, errorMsg: '', data: null }
+  return { isSuccess: false, errorMsg: '服务端暂不可用，已降级本地数据', data: null }
 }
 
 /** 恢复后端调用（登录态变化/网络恢复时由上层调用） */
 export function resetBackendFlag(): void {
   backendDown = false
 }
+
+// P2：任一后端请求成功（request.ts 拦截器）即复位短路标志——网络恢复后自动回到后端优先
+onBackendReachable(resetBackendFlag)

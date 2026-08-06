@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseSSEBlock, dispatchSSEBlock, consumeSSEStream } from './sse.ts'
+import { parseSSEBlock, dispatchSSEBlock, consumeSSEStream, consumeSSEStreamBlocks } from './sse.ts'
 import type { SSEStreamCallbacks } from './sse.ts'
 
 test('GAP 81：parseSSEBlock 解析 event:/data: 块（兼容 CRLF 与 data 前导空格）', () => {
@@ -84,4 +84,58 @@ test('GAP 81：consumeSSEStream 用户取消不触发 onStreamError', async () =
   })
   await consumeSSEStream(stream, cbs, () => true)
   assert.equal(streamErr, '')
+})
+
+test('P2 SSE 统一：consumeSSEStreamBlocks 按块回调 + 跨 chunk 拼接（cacheBook/sourceDebug 共用）', async () => {
+  const blocks: string[] = []
+  const raw =
+    'data: {"type":"step","message":"1"}\n\ndata: {"type":"step","message":"2"}\n\ndata: {"type":"result","data":1}\n\n'
+  const cut = Math.floor(raw.length / 2)
+  const chunks = [raw.slice(0, cut), raw.slice(cut)]
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const c of chunks) controller.enqueue(new TextEncoder().encode(c))
+      controller.close()
+    },
+  })
+  await consumeSSEStreamBlocks(stream, (b) => blocks.push(b), () => false)
+  assert.equal(blocks.length, 3)
+  assert.match(blocks[0], /message.:.1/)
+  assert.match(blocks[2], /result/)
+})
+
+test('P2 SSE 统一：consumeSSEStreamBlocks 连接中断回调 onStreamError；用户取消静默', async () => {
+  let errMsg = ''
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"a":1}\n\n'))
+      controller.error(new Error('boom'))
+    },
+  })
+  await consumeSSEStreamBlocks(
+    stream,
+    () => {},
+    () => false,
+    (msg) => {
+      errMsg = msg
+    },
+  )
+  assert.ok(errMsg.includes('连接中断'))
+
+  // 用户取消：不回调 onStreamError
+  errMsg = ''
+  const stream2 = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.error(new Error('aborted'))
+    },
+  })
+  await consumeSSEStreamBlocks(
+    stream2,
+    () => {},
+    () => true,
+    (msg) => {
+      errMsg = msg
+    },
+  )
+  assert.equal(errMsg, '')
 })

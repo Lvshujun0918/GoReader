@@ -42,7 +42,8 @@ fn manager_ok(config: &AppConfig, params: &HashMap<String, String>, body: Option
     if config.secure_key.is_empty() {
         return false;
     }
-    str_param(params, body, "secureKey") == config.secure_key
+    // P3-A：常量时间比较（防时序侧信道逐字节探测 secureKey）
+    crate::util::constant_time::ct_eq(&str_param(params, body, "secureKey"), &config.secure_key)
 }
 
 fn manager_required() -> ReturnData {

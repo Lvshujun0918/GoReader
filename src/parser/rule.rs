@@ -37,7 +37,8 @@ pub enum RuleKind {
     Regex,
     XPath, // v2 支持（sxd-xpath）
     Js,    // v2 支持（boa）
-    Url,   // 直接拼接/替换（保留兼容；现无检测路径）
+           // P3-A：Url 变体已删除——无检测路径（detect_kind 无分支产生它），
+           // 匹配臂与 url_replace 为不可达死代码；legacy @url 规则现落入 Css 分支。
 }
 
 /// 解析规则字符串（对齐 legado SourceRule + makeUpRule）
@@ -109,6 +110,54 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     } else {
         None
     }
+}
+
+/// 在 `start..` 内寻找花括号（`{{...}}`）之外的 `<js>` / `@js:` 标记
+/// （大小写不敏感，同 find_ci 语义；P3-A：{{}} 内嵌模板中的标记是规则引用而非 JS 段）
+fn find_js_markers(rule: &str, start: usize) -> (Option<usize>, Option<usize>) {
+    let b = rule.as_bytes();
+    let mut i = start;
+    let mut depth = 0i32;
+    let mut js_tag = None;
+    let mut js_at = None;
+    while i < rule.len() {
+        // 只处理字符边界（{{/}}/@js:/<js> 均为 ASCII；多字节字符逐字跳过）
+        if !rule.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if b[i] == b'{' && i + 1 < rule.len() && b[i + 1] == b'{' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if b[i] == b'}' && i + 1 < rule.len() && b[i + 1] == b'}' && depth > 0 {
+            depth -= 1;
+            i += 2;
+            continue;
+        }
+        if depth == 0 {
+            if js_at.is_none()
+                && rule[i..]
+                    .get(..4)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("@js:"))
+            {
+                js_at = Some(i);
+            }
+            if js_tag.is_none()
+                && rule[i..]
+                    .get(..4)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("<js>"))
+            {
+                js_tag = Some(i);
+            }
+            if js_at.is_some() && js_tag.is_some() {
+                break;
+            }
+        }
+        i += rule[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    }
+    (js_tag, js_at)
 }
 
 /// 按 `##` 切分（避开 `{{...}}` 内嵌规则——其内容可含 `##` 替换链）
@@ -218,8 +267,15 @@ fn apply_single(rule_str: &str, html: &str, depth: usize) -> Vec<String> {
 fn apply_rule_inner(rule: &Rule, html: &str, depth: usize) -> Vec<String> {
     // {{...}} 内嵌表达式：先展开，再重新解析执行（类型可能变化，如 {{$.x}} 拼接出 CSS）
     let rule = if depth < 4 && rule.body.contains("{{") {
-        let expanded = expand_inline_depth(&rule.body, html, depth);
+        let (expanded, unsafe_value) = expand_inline_depth_checked(&rule.body, html, depth);
         if expanded != rule.body {
+            if unsafe_value {
+                // P2：模板替换值本身含规则控制标记（## 段切分 / {{ 二次模板 / @js:<js>
+                // JS 标记 / @、// 规则前缀）——视为纯文本结果，不再重新解析执行
+                // （防数据驱动二次执行：书内容可借 {{$.x}} 注入 @js: 代码被再次 eval）。
+                // 原规则的前缀/替换段仍应用。
+                return apply_post(vec![expanded], rule);
+            }
             // 重建完整规则串（保留 ##前缀/##替换段）后重新解析
             let mut full = expanded.clone();
             if let Some(p) = &rule.prefix {
@@ -275,7 +331,6 @@ fn apply_rule_inner(rule: &Rule, html: &str, depth: usize) -> Vec<String> {
                 _ => vec![],
             }
         }
-        RuleKind::Url => vec![url_replace(rule, html)],
     };
     // 前缀/替换处理（legado：@@/替换在结果上应用）
     apply_post(results, rule)
@@ -289,14 +344,21 @@ fn apply_rule_inner(rule: &Rule, html: &str, depth: usize) -> Vec<String> {
 ///
 /// 注意：JS 字符串内若含 `}}` 会提前截断（v1 限制，规则 JS 避免字面 `}}`）
 fn expand_inline_depth(body: &str, text: &str, depth: usize) -> String {
+    expand_inline_depth_checked(body, text, depth).0
+}
+
+/// 展开 `{{...}}`（返回展开串 + 是否含规则控制值）——见 [`expand_inline_depth`] 语义；
+/// 第二个返回值供调用方决定是否安全地重新解析（P2：含控制标记的值不再二次解析）
+fn expand_inline_depth_checked(body: &str, text: &str, depth: usize) -> (String, bool) {
     let mut out = String::new();
     let mut rest = body;
+    let mut unsafe_value = false;
     while let Some(start) = rest.find("{{") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let end = match after.find("}}") {
             Some(e) => e,
-            None => return body.to_string(), // 未闭合：不处理
+            None => return (body.to_string(), false), // 未闭合：不处理
         };
         let expr = after[..end].trim();
         let replaced = if expr.starts_with("$.") || expr.starts_with("$[") {
@@ -307,11 +369,26 @@ fn expand_inline_depth(body: &str, text: &str, depth: usize) -> String {
         } else {
             inline_js(expr, text)
         };
+        if is_rule_control_value(&replaced) {
+            unsafe_value = true;
+        }
         out.push_str(&replaced);
         rest = &after[end + 2..];
     }
     out.push_str(rest);
-    out
+    (out, unsafe_value)
+}
+
+/// 模板替换值是否含规则控制标记（重新解析会改变语义 / 触发二次执行）：
+/// - `##`：段切分（值可拆出新的规则链）；`{{`：二次模板展开
+/// - `@js:`/`<js>`（任意位置，大小写不敏感）：JS 代码执行标记
+/// - 以 `@` / `//` 开头：规则引用/类型前缀（值被当作规则而非文本）
+fn is_rule_control_value(v: &str) -> bool {
+    v.contains("##")
+        || v.contains("{{")
+        || contains_js_marker(v)
+        || v.starts_with('@')
+        || v.starts_with("//")
 }
 
 /// 展开 `{{...}}`（测试/外部便捷入口，无递归深度）
@@ -1108,8 +1185,10 @@ pub fn split_js_chain(rule: &str) -> Vec<JsSeg<'_>> {
     let mut segs: Vec<JsSeg<'_>> = Vec::new();
     let mut start = 0;
     while start < rule.len() {
-        let js_tag = find_ci(&rule[start..], "<js>").map(|p| p + start);
-        let js_at = find_ci(&rule[start..], "@js:").map(|p| p + start);
+        // P3-A 修复：{{...}} 内嵌模板内的 @js:/<js> 不视为 JS 段——{{@js:...}} 是
+        // 规则引用语法（legado isRule），须留给 expand_inline 处理；原先会被切成
+        // 文本段 "{{" + JS 段 "'@js:1+1'}}"（含未闭合 }}）导致求值失败
+        let (js_tag, js_at) = find_js_markers(rule, start);
         // <js> 需有闭合 </js> 才成为 JS 段（legado 非贪婪匹配失败则跳过）
         let tag_ok = js_tag.and_then(|p| find_ci(&rule[p + 4..], "</js>").map(|q| (p, p + 4 + q)));
         enum Kind {
@@ -1245,16 +1324,6 @@ pub fn split_combined(rule: &str) -> (Option<&'static str>, Vec<&str>) {
             subs.push(&rest[start..]);
             (Some(sep_kind), subs)
         }
-    }
-}
-
-/// URL 规则：@{url} 或直接替换（v1：原样返回拼接；现无检测路径，保留兼容）
-fn url_replace(rule: &Rule, input: &str) -> String {
-    let body = rule.body.trim_start_matches('@');
-    if body.is_empty() {
-        input.to_string()
-    } else {
-        format!("{body}{input}")
     }
 }
 
@@ -1617,6 +1686,65 @@ mod tests {
                 r#"{"list":[{"name":"书1"},{"name":"书2"}]}"#
             ),
             "书1\n书2"
+        );
+    }
+
+    /// P2：{{}} 模板替换值含规则控制标记（@js:/##/{{/@// 前缀）——替换后不再递归
+    /// 重新解析执行（防数据驱动二次执行），按纯文本返回；安全值拼接照常重新解析
+    #[test]
+    fn dbg_tmp_rule() {
+        let html = "<html><body></body></html>";
+        let r = apply_depth("@js:'@js:1+1'", html, 1);
+        eprintln!("DBG apply_depth = {:?}", r);
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("result".to_string(), html.to_string());
+        eprintln!(
+            "DBG eval_js = {:?}",
+            crate::parser::js::eval_js("'@js:1+1'", &vars)
+        );
+        eprintln!("DBG segs len = {}", split_js_chain("@js:'@js:1+1'").len());
+    }
+
+    #[test]
+    fn test_inline_template_no_double_parse_of_control_values() {
+        let html = "<html><body></body></html>";
+        // 值以 @js: 开头：旧实现重新解析会再次执行（返回执行结果）；现按纯文本
+        let r = apply("{{$.x}}", r#"{"x":"@js:result + '!'"}"#);
+        assert_eq!(
+            r,
+            vec!["@js:result + '!'".to_string()],
+            "@js: 前缀值不得二次执行"
+        );
+        // 值中间含 @js:（后缀链标记）：同样不再执行
+        let r = apply("{{$.x}}", r#"{"x":"abc@js:1+1"}"#);
+        assert_eq!(r, vec!["abc@js:1+1".to_string()]);
+        // 值含 ##：旧实现重新解析会切出新规则链；现按纯文本
+        let r = apply("x{{$.a}}y", r###"{"a":"##"}"###);
+        assert_eq!(r, vec!["x##y".to_string()]);
+        // 值含 {{：不再二次模板展开
+        let r = apply("{{$.x}}", r#"{"x":"{{'div'}}"}"#);
+        assert_eq!(r, vec!["{{'div'}}".to_string()]);
+        // 值以 // 开头：不再按 XPath 规则解析
+        let r = apply("{{$.x}}", r#"{"x":"//div"}"#);
+        assert_eq!(r, vec!["//div".to_string()]);
+        // {{@js:...}} 规则引用：内层求值结果含控制标记 → 外层按纯文本（不二次执行）
+        let r = apply("{{@js:'@js:1+1'}}", html);
+        assert_eq!(r, vec!["@js:1+1".to_string()]);
+        // 前缀/替换段在控制值路径仍应用（##pat##rep）
+        let r = apply("{{$.x}}##x##y", r#"{"x":"@js:xx"}"#);
+        assert_eq!(r, vec!["@js:yy".to_string()]);
+        // 安全值：拼接 CSS/正则仍照常重新解析执行（既有语义不受影响）
+        let html2 = r#"<div class="book">书名A</div>"#;
+        let r = apply("{{'div.' + 'book'}}", html2);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].contains("书名A"), "CSS 拼接应重新解析执行: {r:?}");
+        // 安全 CSS 值经 JSON 上下文提取（html 为 JSON 文本，无 HTML 可匹配）→
+        // 按 legado 语义返回展开文本（{{}} 规则执行无果 → 规则串本身即结果）
+        let r = apply("{{$.x}}", r#"{"x":"div.book"}"#);
+        assert_eq!(
+            r,
+            vec!["div.book".to_string()],
+            "JSON 上下文安全值按展开文本返回: {r:?}"
         );
     }
 

@@ -35,7 +35,10 @@ pub fn store_password(password: &str) -> String {
 /// 校验存储串 `{salt}${hash}`（格式不符返回 false）
 pub fn verify_password(password: &str, stored: &str) -> bool {
     match stored.split_once('$') {
-        Some((salt, hash)) => !salt.is_empty() && hash_password(password, salt) == hash,
+        Some((salt, hash)) => {
+            !salt.is_empty()
+                && crate::util::constant_time::ct_eq(&hash_password(password, salt), &hash)
+        }
         None => false,
     }
 }

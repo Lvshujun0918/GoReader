@@ -1,33 +1,37 @@
 <template>
   <div class="page">
-    <!-- 顶栏 -->
-    <header class="topbar">
-      <button class="back-btn" type="button" @click="source ? backToSources() : router.push('/')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M19 12H5" /><path d="M11 18l-6-6 6-6" />
-        </svg>
-      </button>
-      <img class="brand-logo" src="/logo.svg" alt="夜读" />
+    <!-- 顶栏（P3-A：共享 TopNav——dense 紧凑变体；探索页保留自身按钮/标题样式） -->
+    <TopNav variant="minimal" dense>
+      <template #leading>
+        <button class="back-btn" type="button" @click="source ? backToSources() : router.push('/')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19 12H5" /><path d="M11 18l-6-6 6-6" />
+          </svg>
+        </button>
+        <img class="brand-logo" src="/logo.svg" alt="夜读" />
         <span class="brand">夜读<em>.</em></span>
+      </template>
       <span class="title">{{ source ? applyHan(source.bookSourceName, hanMode) : '探索' }}</span>
-      <div class="top-actions">
-        <button class="han-btn" type="button" :title="'简繁转换（当前：' + hanLabel + '）'" @click="toggleHan()">
-          {{ hanLabel }}
-        </button>
-        <button class="han-btn" type="button" title="内容宽度（与阅读页同一设置）" @click="cycleWidth">
-          {{ WIDTH_OPTIONS.find((o) => o.value === contentWidth)?.label ?? '适中' }}
-        </button>
-        <button
-          class="han-btn"
-          :class="{ active: favSourcesOnly }"
-          type="button"
-          :title="favSourcesOnly ? '显示全部探索书源' : '只看收藏的书源（我的探索）'"
-          @click="favSourcesOnly = !favSourcesOnly"
-        >
-          {{ favSourcesOnly ? '全部' : '我的探索' }}
-        </button>
-      </div>
-    </header>
+      <template #trailing>
+        <div class="top-actions">
+          <button class="han-btn" type="button" :title="'简繁转换（当前：' + hanLabel + '）'" @click="toggleHan()">
+            {{ hanLabel }}
+          </button>
+          <button class="han-btn" type="button" title="内容宽度（与阅读页同一设置）" @click="cycleWidth">
+            {{ WIDTH_OPTIONS.find((o) => o.value === contentWidth)?.label ?? '适中' }}
+          </button>
+          <button
+            class="han-btn"
+            :class="{ active: favSourcesOnly }"
+            type="button"
+            :title="favSourcesOnly ? '显示全部探索书源' : '只看收藏的书源（我的探索）'"
+            @click="favSourcesOnly = !favSourcesOnly"
+          >
+            {{ favSourcesOnly ? '全部' : '我的探索' }}
+          </button>
+        </div>
+      </template>
+    </TopNav>
 
     <!-- 书源列表（legado 语义：所有 enabledExplore 书源） -->
     <main v-if="!source" class="main" :style="{ maxWidth: contentWidth }">
@@ -251,6 +255,7 @@ import { ElMessage } from 'element-plus'
 import { applyHan } from '@/utils/chinese'
 import { useHanMode, setGlobalHanMode, syncHanMode } from '@/utils/hanMode'
 import { useRouter } from 'vue-router'
+import TopNav from '@/components/TopNav.vue'
 import { getExploreSources, getExploreUrls, exploreBook } from '@/api/explore'
 import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
 import type { BookSource, ExploreCategory, ExploreSourceInfo, SearchBook } from '@/types'

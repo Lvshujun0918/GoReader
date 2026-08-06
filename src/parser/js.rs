@@ -777,6 +777,8 @@ fn build_bridge_objects(bridge: &JsBridge, context: &mut Context) -> (JsObject, 
             2,
         )
         .function(bind(bridge, java_ajax), JsString::from("ajax"), 2)
+        .function(bind(bridge, java_post), JsString::from("post"), 3)
+        .function(bind(bridge, java_ajax_all), JsString::from("ajaxAll"), 2)
         .function(
             bind(bridge, java_start_browser_await),
             JsString::from("startBrowserAwait"),
@@ -1233,11 +1235,7 @@ fn parse_ajax_suffix(url: &str) -> (String, AjaxSuffix) {
 }
 
 /// `java.ajax(urlOrSpec)`：带书源 cookie 的同步请求（阻塞等待结果），返回响应体文本。
-/// - 支持 `url,{...}` 后缀（method/body/charset/headers，同 crawler 解析）
-/// - url 为空 → 用书源 URL（baseUrl）兜底（legado 语义；兼容 `java.ajax(source.key)` 类写法）
-/// - 请求头基底为 `java.headerMap`（书源 header）+ 后缀 headers + 书源 cookie
-/// - 可选第 2 参：超时秒数（legado callTimeout 兼容；默认 15s，上限 60s）
-/// - 失败/超时 → 抛 JS 异常
+/// 委托 [`java_ajax_impl`]（GET 默认）。
 fn java_ajax(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let url_spec = js_value_to_string(args.get_or_undefined(0), context);
     let timeout_secs = args
@@ -1245,7 +1243,96 @@ fn java_ajax(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> 
         .and_then(|v| v.as_number())
         .map(|n| (n as u64).clamp(1, 60))
         .unwrap_or(15);
-    let (mut url, suffix) = parse_ajax_suffix(&url_spec);
+    java_ajax_impl(
+        inner,
+        &url_spec,
+        "GET",
+        None,
+        timeout_secs,
+        "java.ajax",
+        context,
+    )
+}
+
+/// `java.post(url[, body[, timeoutSecs]])`：POST 请求（legado 文档化 API，P3-A 实现）。
+/// 复用 [`java_ajax_impl`] 完整管线：书源 header + cookie + `,{...}` 后缀解析
+/// （后缀显式 method 覆盖 POST；body 优先取显式参数，其次后缀 body）。
+fn java_post(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let url_spec = js_value_to_string(args.get_or_undefined(0), context);
+    let body = js_value_to_string(args.get_or_undefined(1), context);
+    let timeout_secs = args
+        .get(2)
+        .and_then(|v| v.as_number())
+        .map(|n| (n as u64).clamp(1, 60))
+        .unwrap_or(15);
+    java_ajax_impl(
+        inner,
+        &url_spec,
+        "POST",
+        Some(&body),
+        timeout_secs,
+        "java.post",
+        context,
+    )
+}
+
+/// `java.ajaxAll(urls[, timeoutSecs])`：逐个同步请求 URL 数组（legado 文档化 API，P3-A 实现）。
+/// 每个元素可为 URL 或 `url,{...}` 后缀形式（同 java.ajax）；返回响应体文本数组；
+/// 任一个失败 → 抛 JS 异常。
+fn java_ajax_all(
+    inner: &JsBridgeInner,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let arr = args.get_or_undefined(0);
+    let obj = arr
+        .as_object()
+        .ok_or_else(|| js_native_error("java.ajaxAll 参数应为 URL 数组"))?;
+    if !obj.is_array() {
+        return Err(js_native_error("java.ajaxAll 参数应为 URL 数组"));
+    }
+    let len = obj
+        .get(JsString::from("length"), context)?
+        .to_u32(context)?;
+    let timeout_secs = args
+        .get(1)
+        .and_then(|v| v.as_number())
+        .map(|n| (n as u64).clamp(1, 60))
+        .unwrap_or(15);
+    let mut bodies = Vec::with_capacity(len as usize);
+    for k in 0..len {
+        let item = obj.get(k, context)?;
+        let spec = js_value_to_string(&item, context);
+        let body = java_ajax_impl(
+            inner,
+            &spec,
+            "GET",
+            None,
+            timeout_secs,
+            "java.ajaxAll",
+            context,
+        )?;
+        bodies.push(body);
+    }
+    Ok(JsArray::from_iter(bodies, context).into())
+}
+
+/// java.ajax / java.post / java.ajaxAll 共享实现：
+/// - 支持 `url,{...}` 后缀（method/body/charset/headers，同 crawler 解析）
+/// - url 为空 → 用书源 URL（baseUrl）兜底（legado 语义；兼容 `java.ajax(source.key)` 类写法）
+/// - 请求头基底为 `java.headerMap`（书源 header）+ 后缀 headers + 书源 cookie
+/// - 可选超时秒数（legado callTimeout 兼容；默认 15s，上限 60s）
+/// - 失败/超时 → 抛 JS 异常（消息含 op 名）
+fn java_ajax_impl(
+    inner: &JsBridgeInner,
+    url_spec: &str,
+    default_method: &str,
+    body_override: Option<&str>,
+    timeout_secs: u64,
+    op: &str,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    let (mut url, suffix) = parse_ajax_suffix(url_spec);
     if url.is_empty() {
         // 空 url 兜底：书源 URL（legado：java.ajax 空参/undefined → 书源地址）
         url = inner.source_key.clone();
@@ -1258,6 +1345,13 @@ fn java_ajax(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> 
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let fut_url = url.clone();
+    let method = suffix
+        .method
+        .clone()
+        .unwrap_or_else(|| default_method.to_string());
+    let body = body_override
+        .map(|b| b.to_string())
+        .or_else(|| suffix.body.clone());
     let fut = async move {
         let mut headers = headers_base;
         if let Some(extra) = &suffix.headers {
@@ -1271,21 +1365,20 @@ fn java_ajax(inner: &JsBridgeInner, args: &[JsValue], context: &mut Context) -> 
                 headers.insert("Cookie".to_string(), cookie_str);
             }
         }
-        let method = suffix.method.as_deref().unwrap_or("GET");
         let resp = crate::service::crawler::fetch(
             &fut_url,
             &headers,
             timeout_secs,
-            method,
-            suffix.body.as_deref(),
+            &method,
+            body.as_deref(),
             suffix.charset.as_deref(),
         )
         .await?;
         Ok::<_, anyhow::Error>(resp.body)
     };
-    let body = match block_on_task(fut, BRIDGE_WAIT_TIMEOUT, "java.ajax") {
+    let body = match block_on_task(fut, BRIDGE_WAIT_TIMEOUT, op) {
         Ok(b) => b,
-        Err(e) => return Err(js_native_error(format!("java.ajax 失败（{url}）: {e}"))),
+        Err(e) => return Err(js_native_error(format!("{op} 失败（{url}）: {e}"))),
     };
     Ok(JsValue::from(JsString::from(body)))
 }
@@ -3102,6 +3195,52 @@ mod tests {
             err.to_string().contains("java.ajax 失败"),
             "应报 ajax 失败: {err}"
         );
+    }
+
+    /// P3-A：java.post——POST 请求（复用 ajax 管线：书源 header/cookie + 显式 body）
+    #[test]
+    fn bridge_java_post_sends_post_with_body() {
+        // P1 SSRF：mock 绑定 127.0.0.1，持放行守卫
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let url = rt.block_on(serve_echo(b"post-ok".to_vec(), captured.clone()));
+        let bridge = JsBridge::new("", "").with_namespace("default");
+        let code = format!("java.post('{url}/p', 'a=1&b=2')");
+        let r = eval_js_with_bridge(&code, &vars(&[]), &bridge);
+        assert_eq!(r.unwrap(), "post-ok");
+        let req = captured.lock().unwrap()[0].clone();
+        assert!(req.starts_with("POST /p"), "应 POST 到 /p: {req}");
+        assert!(req.contains("a=1&b=2"), "应携带 body: {req}");
+    }
+
+    /// P3-A：java.ajaxAll——URL 数组逐个 GET，返回响应体数组
+    #[test]
+    fn bridge_java_ajax_all_returns_bodies() {
+        // P1 SSRF：mock 绑定 127.0.0.1，持放行守卫
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true);
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let url = rt.block_on(serve_echo(b"hello-ajax".to_vec(), captured.clone()));
+        let bridge = JsBridge::new("", "").with_namespace("default");
+        let code = format!(
+            "var r = java.ajaxAll(['{url}/a', '{url}/b']); r.length + '|' + r[0] + '|' + r[1]"
+        );
+        let r = eval_js_with_bridge(&code, &vars(&[]), &bridge);
+        assert_eq!(r.unwrap(), "2|hello-ajax|hello-ajax");
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "应请求 2 次");
+        assert!(reqs[0].starts_with("GET /a"), "req0: {}", reqs[0]);
+        assert!(reqs[1].starts_with("GET /b"), "req1: {}", reqs[1]);
+    }
+
+    /// P3-A：java.ajaxAll 非数组参数 → 抛 JS 异常（明确错误）
+    #[test]
+    fn bridge_java_ajax_all_rejects_non_array() {
+        let bridge = JsBridge::new("", "").with_namespace("default");
+        let err =
+            eval_js_with_bridge("java.ajaxAll('not-an-array')", &vars(&[]), &bridge).unwrap_err();
+        assert!(err.to_string().contains("URL 数组"), "应报参数错误: {err}");
     }
 
     /// P1-3：source.put 条数上限——第 1001 条拒绝，已有 key 更新不受条数限制

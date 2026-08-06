@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   addUser,
@@ -16,9 +15,9 @@ import {
 } from '@/api/users'
 import { login } from '@/api/auth'
 import { useUserStore } from '@/stores/user'
+import TopNav from '@/components/TopNav.vue'
 import type { ReaderUser, UserUpdatePayload } from '@/types'
 
-const router = useRouter()
 const store = useUserStore()
 
 type PermField = 'enableWebdav' | 'enableLocalStore' | 'enableBookSource' | 'enableRssSource'
@@ -378,24 +377,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="users-page">
-    <!-- 极简导航：字标 + 页面入口 -->
-    <header class="topbar">
-      <div class="brand">
-        <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand-name">夜读<span class="brand-dot">.</span></span>
-      </div>
-
-      <div class="user-area">
-        <button class="nav-link" type="button" @click="router.push('/')">书架</button>
-        <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
-        <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
-        <button class="nav-link" type="button" @click="router.push('/rules')">替换规则</button>
-        <button class="nav-link" type="button" @click="router.push('/files')">文件</button>
-        <button class="nav-link active" type="button" @click="router.push('/users')">用户</button>
-        <button class="nav-link" type="button" @click="router.push('/settings')">设置</button>
-        <span class="user-chip">{{ store.username || '未登录' }}</span>
-      </div>
-    </header>
+    <!-- 顶部导航（P3-A：共享 TopNav） -->
+    <TopNav active="/users" :links="['bookshelf', 'search', 'sources', 'rules', 'files', 'users', 'settings']" />
 
     <main class="content">
       <!-- 标题区 -->

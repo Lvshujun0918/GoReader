@@ -8,6 +8,7 @@ import { useUserStore } from '@/stores/user'
 import { clearSearchHistory, loadSearchHistory, pushSearchHistory } from '@/utils/searchHistory'
 import { hanText, syncHanMode } from '@/utils/hanMode'
 import { t } from '@/utils/i18n'
+import TopNav from '@/components/TopNav.vue'
 import type { Book, ReturnData, SearchBook } from '@/types'
 
 const router = useRouter()
@@ -519,18 +520,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="search-page">
-    <!-- 极简顶栏：返回书架 -->
-    <header class="topbar">
-      <button class="back-btn" type="button" @click="router.push('/')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M19 12H5" />
-          <path d="M11 18l-6-6 6-6" />
-        </svg>
-        <span>{{ t('nav.backShelf') }}</span>
-      </button>
-      <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand">{{ t('brand.name') }}<span class="brand-dot">.</span></span>
-    </header>
+    <!-- 极简顶栏：返回书架（P3-A：共享 TopNav minimal） -->
+    <TopNav variant="minimal" :back-label="t('nav.backShelf')" @back="router.push('/')" />
 
     <main class="content">
       <h1 class="page-title">{{ t('search.title') }}</h1>

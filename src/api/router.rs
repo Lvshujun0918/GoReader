@@ -847,6 +847,40 @@ pub(crate) fn check_upload_content_length(
     }
 }
 
+/// F-7 书源数上限校验（saveBookSource / saveBookSources / saveFromRemoteSource 三处收敛，
+/// P3-A 抽共享函数）：
+/// - limit <= 0 → 不限制（book_source_limit_for 查询失败按不限制处理，同原语义）
+/// - 已存在书源不计名额（覆盖更新不占名额）
+/// - 返回 Ok(true) = 超限；Ok(false) = 未超限；Err(()) = 统计失败（调用方记日志/报错）
+async fn book_source_limit_exceeded(
+    storage: &crate::storage::Storage,
+    ns: &str,
+    candidate_urls: &[&str],
+) -> Result<bool, ()> {
+    let Some(limit) = storage.book_source_limit_for(ns).await.ok().flatten() else {
+        return Ok(false);
+    };
+    if limit <= 0 {
+        return Ok(false);
+    }
+    let mut new_count = 0i64;
+    for url in candidate_urls {
+        let exists = storage
+            .find_book_source(ns, url)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !exists {
+            new_count += 1;
+        }
+    }
+    match storage.count_book_sources(ns).await {
+        Ok(count) => Ok(count + new_count > limit),
+        Err(_) => Err(()),
+    }
+}
+
 /// POST /reader3/saveBookSource：保存单个书源（body = 完整书源 JSON）
 async fn save_book_source(
     State(state): State<AppState>,
@@ -869,34 +903,10 @@ async fn save_book_source(
         return Json(ReturnData::err("参数错误"));
     }
     // F-7 书源数上限（users.book_source_limit；limit<=0 不限制；已存在覆盖不计名额）
-    if let Some(limit) = state
-        .storage
-        .book_source_limit_for(&namespace)
-        .await
-        .ok()
-        .flatten()
-    {
-        if limit > 0 {
-            let exists = state
-                .storage
-                .find_book_source(&namespace, &source.book_source_url)
-                .await
-                .ok()
-                .flatten()
-                .is_some();
-            if !exists {
-                let count = match state.storage.count_book_sources(&namespace).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("统计书源数失败: {e}");
-                        return Json(ReturnData::err("系统错误"));
-                    }
-                };
-                if count >= limit {
-                    return Json(ReturnData::err("超过书源数上限"));
-                }
-            }
-        }
+    match book_source_limit_exceeded(&state.storage, &namespace, &[&source.book_source_url]).await {
+        Ok(true) => return Json(ReturnData::err("超过书源数上限")),
+        Ok(false) => {}
+        Err(()) => return Json(ReturnData::err("系统错误")),
     }
     match state.storage.save_book_source(&namespace, &source).await {
         Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
@@ -929,38 +939,11 @@ async fn save_book_sources(
         return Json(ReturnData::err("参数错误"));
     }
     // F-7 书源数上限：逐条统计新增数（已存在覆盖不计名额），超限整批拒绝
-    if let Some(limit) = state
-        .storage
-        .book_source_limit_for(&namespace)
-        .await
-        .ok()
-        .flatten()
-    {
-        if limit > 0 {
-            let mut new_count = 0i64;
-            for s in &sources {
-                let exists = state
-                    .storage
-                    .find_book_source(&namespace, &s.book_source_url)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if !exists {
-                    new_count += 1;
-                }
-            }
-            let count = match state.storage.count_book_sources(&namespace).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("统计书源数失败: {e}");
-                    return Json(ReturnData::err("系统错误"));
-                }
-            };
-            if count + new_count > limit {
-                return Json(ReturnData::err("超过书源数上限"));
-            }
-        }
+    let urls: Vec<&str> = sources.iter().map(|s| s.book_source_url.as_str()).collect();
+    match book_source_limit_exceeded(&state.storage, &namespace, &urls).await {
+        Ok(true) => return Json(ReturnData::err("超过书源数上限")),
+        Ok(false) => {}
+        Err(()) => return Json(ReturnData::err("系统错误")),
     }
     match state.storage.save_book_sources(&namespace, &sources).await {
         Ok(_) => Json(ReturnData::ok(
@@ -1011,39 +994,12 @@ async fn save_from_remote_source(
     if sources.is_empty() || sources.iter().any(|s| s.book_source_url.trim().is_empty()) {
         return Json(ReturnData::err("书源数据格式错误"));
     }
-    // F-7 书源数上限（同 saveBookSources）
-    if let Some(limit) = state
-        .storage
-        .book_source_limit_for(&namespace)
-        .await
-        .ok()
-        .flatten()
-    {
-        if limit > 0 {
-            let mut new_count = 0i64;
-            for s in &sources {
-                let exists = state
-                    .storage
-                    .find_book_source(&namespace, &s.book_source_url)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if !exists {
-                    new_count += 1;
-                }
-            }
-            match state.storage.count_book_sources(&namespace).await {
-                Ok(count) if count + new_count > limit => {
-                    return Json(ReturnData::err("超过书源数上限"));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!("统计书源数失败: {e}");
-                    return Json(ReturnData::err("系统错误"));
-                }
-            }
-        }
+    // F-7 书源数上限（同 saveBookSources——共享 book_source_limit_exceeded）
+    let urls: Vec<&str> = sources.iter().map(|s| s.book_source_url.as_str()).collect();
+    match book_source_limit_exceeded(&state.storage, &namespace, &urls).await {
+        Ok(true) => return Json(ReturnData::err("超过书源数上限")),
+        Ok(false) => {}
+        Err(()) => return Json(ReturnData::err("系统错误")),
     }
     match state.storage.save_book_sources(&namespace, &sources).await {
         Ok(_) => Json(ReturnData::ok(
@@ -2736,7 +2692,7 @@ async fn export_book(
         Ok(f) => f,
         Err(msg) => return Json(ReturnData::err(msg)).into_response(),
     };
-    let (title, author, chapters) = match collect_export_chapters(
+    let (title, author, chapters, failed_chapters) = match collect_export_chapters(
         &state,
         &namespace,
         &url,
@@ -2758,6 +2714,8 @@ async fn export_book(
             content: c.clone(),
         })
         .collect();
+    // P2：GBK 不可映射字符转义计数（仅 txt/gbk 路径非 0）——随警告头返回
+    let mut unmappable_chars = 0usize;
     let (bytes, mime, ext) = match format {
         // GAP 111：epub 导出携带封面（OPF manifest properties="cover-image" +
         // <meta name="cover"> + OEBPS/cover.{jpg,png} 图片条目）；本地封面直读，
@@ -2785,10 +2743,12 @@ async fn export_book(
         ),
         _ => {
             let txt = crate::service::export_book::build_txt(&title, &export_chapters);
-            let bytes = match crate::service::export_book::encode_txt(&txt, &encoding) {
-                Ok(b) => b,
+            let (bytes, unmappable) = match crate::service::export_book::encode_txt(&txt, &encoding)
+            {
+                Ok(v) => v,
                 Err(msg) => return Json(ReturnData::err(msg)).into_response(),
             };
+            unmappable_chars = unmappable;
             let charset = match encoding.trim().to_ascii_lowercase().as_str() {
                 "gbk" | "gb2312" | "gb_2312" => "gbk",
                 "gb18030" => "gb18030",
@@ -2805,15 +2765,36 @@ async fn export_book(
     };
     // RFC 5987：非 ASCII 文件名百分号编码（HeaderValue 需可见 ASCII）
     let encoded = percent_encode_filename(&filename);
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", mime)
         .header(
             "Content-Disposition",
             format!("attachment; filename=\"{encoded}.{ext}\""),
-        )
-        .body(Body::from(bytes))
-        .unwrap()
+        );
+    // P2：导出警告头（X-Export-Warning：percent 编码 JSON，纯 ASCII 可作 HeaderValue）——
+    // failedChapters 并发抓章失败列表（不再静默丢弃）；unmappableChars GBK 不可映射
+    // 转义计数——前端解析提示
+    if !failed_chapters.is_empty() || unmappable_chars > 0 {
+        let mut warning = serde_json::Map::new();
+        if !failed_chapters.is_empty() {
+            warning.insert(
+                "failedChapters".to_string(),
+                serde_json::to_value(&failed_chapters).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if unmappable_chars > 0 {
+            warning.insert(
+                "unmappableChars".to_string(),
+                serde_json::json!(unmappable_chars),
+            );
+        }
+        builder = builder.header(
+            "X-Export-Warning",
+            percent_encode_filename(&serde_json::Value::Object(warning).to_string()),
+        );
+    }
+    builder.body(Body::from(bytes)).unwrap()
 }
 
 /// 文件名百分号编码（保留 ASCII 字母数字与 -_. 空格，其余 UTF-8 字节 %XX）
@@ -2865,14 +2846,23 @@ async fn book_cover_bytes(state: &AppState, ns: &str, book_url: &str) -> Option<
     None
 }
 
-/// 收集导出章节：(书名, 作者, [(章节标题, 正文)])——本地书/文件书/书源书统一入口
+/// 收集导出章节：(书名, 作者, [(章节标题, 正文)], 并发抓章失败记录)——
+/// 本地书/文件书/书源书统一入口；书源书失败章节逐条记录（P2：不再静默丢弃）
 async fn collect_export_chapters(
     state: &AppState,
     ns: &str,
     url: &str,
     params: &HashMap<String, String>,
     body_json: Option<&serde_json::Value>,
-) -> Result<(String, String, Vec<(String, String)>), String> {
+) -> Result<
+    (
+        String,
+        String,
+        Vec<(String, String)>,
+        Vec<crate::service::export_book::FetchChapterFailure>,
+    ),
+    String,
+> {
     let shelf = state.storage.find_book(ns, url).await.ok().flatten();
     let is_local = url.starts_with("local://");
     let is_file = url.starts_with("storage/")
@@ -2898,7 +2888,7 @@ async fn collect_export_chapters(
                 .unwrap_or_default();
             chapters.push((title, content));
         }
-        return Ok((book.name, book.author, chapters));
+        return Ok((book.name, book.author, chapters, Vec::new()));
     }
     // ② 文件型本地书：解析原文件（TXT 用用户规则）。P0-7：必须当前 ns 书架归属
     //（防跨用户任意文件读取——url 直传不再放行）
@@ -2919,7 +2909,7 @@ async fn collect_export_chapters(
             .iter()
             .map(|c| (c.title.clone(), c.content.clone()))
             .collect();
-        return Ok((name, imported.meta.author, chapters));
+        return Ok((name, imported.meta.author, chapters, Vec::new()));
     }
     // ③ 书源书：书架 origin 定位书源（兜底 bookSource 参数）→ 目录 → 逐章正文（优先缓存）
     let book = shelf.ok_or_else(|| "书籍不存在（请先加入书架）".to_string())?;
@@ -2961,7 +2951,7 @@ async fn collect_export_chapters(
     let ns_owned = ns.to_string();
     let book_url = url.to_string();
     let src = source.clone();
-    let chapters =
+    let outcome =
         crate::service::export_book::fetch_chapters_concurrent(jobs, 4, move |_i, chapter_url| {
             let storage = storage.clone();
             let ns = ns_owned.clone();
@@ -2983,7 +2973,7 @@ async fn collect_export_chapters(
             }
         })
         .await;
-    Ok((book.name, book.author, chapters))
+    Ok((book.name, book.author, outcome.chapters, outcome.failed))
 }
 
 /// 文件名净化（去路径分隔符/非法字符，截断 80 字符）
@@ -4310,7 +4300,7 @@ async fn clear_inactive_users(
     // secureKey 管理校验（legacy checkManagerAuth）
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let secure_key = param_of(&params, body_json.as_ref(), "secureKey");
-    if secure_key != config.secure_key {
+    if !crate::util::constant_time::ct_eq(&secure_key, &config.secure_key) {
         return Json(ReturnData {
             is_success: false,
             error_msg: "请输入管理密码".to_string(),
@@ -4601,7 +4591,7 @@ fn check_manager_auth(
         return Err(ReturnData::err("不支持的操作"));
     }
     let secure_key = param_of(params, body, "secureKey");
-    if secure_key != config.secure_key {
+    if !crate::util::constant_time::ct_eq(&secure_key, &config.secure_key) {
         return Err(ReturnData {
             is_success: false,
             error_msg: "请输入管理密码".to_string(),
@@ -7966,6 +7956,71 @@ mod tests {
         .await;
         assert!(ret.0.is_success);
 
+        cleanup(state, dir).await;
+    }
+
+    /// P3-A：共享书源数上限函数 book_source_limit_exceeded 直接单测
+    /// （三个端点 saveBookSource/saveBookSources/saveFromRemoteSource 均委托它）
+    #[tokio::test]
+    async fn test_book_source_limit_exceeded_shared_fn() {
+        let (state, dir) = test_state("bslimit-fn").await;
+        state
+            .storage
+            .insert_user(&User {
+                username: "default".into(),
+                book_source_limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let storage = &state.storage;
+        // 空库：2 个名额内不超限
+        assert!(
+            !book_source_limit_exceeded(storage, "default", &["https://a.com", "https://b.com"])
+                .await
+                .unwrap(),
+            "2 个新源恰好 2 名额不应超限"
+        );
+        // 入库 2 个后：再新增 1 个超限
+        storage
+            .save_book_sources(
+                "default",
+                &[
+                    serde_json::from_value(source_json(1)).unwrap(),
+                    serde_json::from_value(source_json(2)).unwrap(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(
+            book_source_limit_exceeded(storage, "default", &["https://c.com"])
+                .await
+                .unwrap(),
+            "已满 2 个再新增应超限"
+        );
+        // 覆盖已存在不计名额 → 不超限（s1.com 已入库，覆盖不占名额）
+        assert!(
+            !book_source_limit_exceeded(storage, "default", &["https://s1.com"])
+                .await
+                .unwrap(),
+            "覆盖已存在书源不计名额"
+        );
+        // limit=0（不限制）→ 不超限
+        state
+            .storage
+            .insert_user(&User {
+                username: "default".into(),
+                book_source_limit: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !book_source_limit_exceeded(storage, "default", &["https://d.com"])
+                .await
+                .unwrap(),
+            "limit=0 不限制"
+        );
         cleanup(state, dir).await;
     }
 
@@ -13081,6 +13136,263 @@ mod tests {
         assert!(txt.contains("正文二。"));
 
         cleanup(state, dir).await;
+    }
+
+    /// P2：书源书导出——并发抓章失败章节不再静默丢弃：X-Export-Warning 头携带
+    /// failedChapters 列表（percent 编码 JSON），成功章节照常导出
+    #[tokio::test]
+    async fn test_export_book_web_failed_chapters_warning() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1
+        let (state, dir) = test_state("exportwarn").await;
+        // 第二章指向死端口（无监听）→ 抓章失败；其余正常（路径寻址保证并发序确定性）
+        let toc_html = r#"<ul class="chapters"><li><a href="/ch1.html">第一章</a></li><li><a href="http://127.0.0.1:1/ch2.html">第二章（死端口）</a></li><li><a href="/ch3.html">第三章</a></li></ul>"#;
+        let base_url = serve_bodies_by_path(vec![
+            // book_url 路径也供目录（upsert_book 不持久化 toc_url——collect 回退抓 book_url 当目录页）
+            ("/book/warn".to_string(), toc_html.to_string()),
+            ("/toc".to_string(), toc_html.to_string()),
+            (
+                "/ch1.html".to_string(),
+                r#"<html><body><div class="content">正文一。</div></body></html>"#.to_string(),
+            ),
+            (
+                "/ch3.html".to_string(),
+                r#"<html><body><div class="content">正文三。</div></body></html>"#.to_string(),
+            ),
+        ])
+        .await;
+        let base = base_url.trim_end_matches("/sources.json").to_string();
+        state
+            .storage
+            .save_book_source(
+                "default",
+                &crate::model::BookSource {
+                    book_source_url: base.clone(),
+                    book_source_name: "导出源2".into(),
+                    rule_toc: Some(serde_json::json!({
+                        "chapterList": "ul.chapters@li", "chapterName": "a@text", "chapterUrl": "a@href"
+                    })),
+                    rule_content: Some(serde_json::json!({ "content": "div.content@text" })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let book_url = format!("{base}/book/warn");
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: book_url.clone(),
+                    name: "网文书2".into(),
+                    origin: base.clone(),
+                    toc_url: format!("{base}/toc"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let params: HashMap<String, String> =
+            [("url".into(), book_url.clone())].into_iter().collect();
+        let resp = export_book(
+            AxumState(state.clone()),
+            Query(params),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "失败章不应阻塞导出");
+        // 警告头：failedChapters 含死端口章（percent 编码 JSON，解码后可解析）
+        let warn = resp
+            .headers()
+            .get("X-Export-Warning")
+            .and_then(|v| v.to_str().ok())
+            .expect("应返回 X-Export-Warning 警告头");
+        assert!(
+            warn.is_ascii(),
+            "警告头必须纯 ASCII（HeaderValue 约束）: {warn}"
+        );
+        let decoded = percent_decode(&warn);
+        let json: serde_json::Value =
+            serde_json::from_str(&decoded).expect("警告头应为合法 JSON: {decoded}");
+        let failed = json["failedChapters"]
+            .as_array()
+            .expect("failedChapters 数组");
+        assert_eq!(failed.len(), 1, "仅失败章入列表: {json}");
+        assert_eq!(failed[0]["title"], "第二章（死端口）");
+        assert_eq!(failed[0]["index"], 1);
+        assert!(
+            failed[0]["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("获取正文失败"),
+            "失败原因: {json}"
+        );
+        // 成功章节照常导出，失败章不出现
+        let txt = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(txt.contains("第一章") && txt.contains("正文一。"));
+        assert!(txt.contains("第三章") && txt.contains("正文三。"));
+        assert!(!txt.contains("死端口"), "失败章不应出现在导出正文");
+
+        cleanup(state, dir).await;
+    }
+
+    /// P2：GBK 导出不可映射字符——不再静默替换为 ?：正文转义 NCR（&#x…;），
+    /// X-Export-Warning 携带 unmappableChars 计数；utf-8 导出无警告头
+    #[tokio::test]
+    async fn test_export_book_gbk_unmappable_warning() {
+        let (state, dir) = test_state("exportgbk").await;
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "local://gbk1".into(),
+                    name: "GBK书".into(),
+                    author: "作者".into(),
+                    origin: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_chapters(
+                "local://gbk1",
+                &[("第一章".to_string(), "正文😀结束。".to_string())],
+            )
+            .await
+            .unwrap();
+        let params = |extra: &[(&str, &str)]| -> HashMap<String, String> {
+            let mut m: HashMap<String, String> = [("url".into(), "local://gbk1".into())]
+                .into_iter()
+                .collect();
+            for (k, v) in extra {
+                m.insert(k.to_string(), v.to_string());
+            }
+            m
+        };
+        // 第二本书用独立闭包（url 指向 gbk2——修复：原闭包硬编码 gbk1 导致导出错误书）
+        let params_gbk2 = |extra: &[(&str, &str)]| -> HashMap<String, String> {
+            let mut m: HashMap<String, String> = [("url".into(), "local://gbk2".into())]
+                .into_iter()
+                .collect();
+            for (k, v) in extra {
+                m.insert(k.to_string(), v.to_string());
+            }
+            m
+        };
+        // gbk：😀 不可映射 → 转义 + 计数警告
+        let resp = export_book(
+            AxumState(state.clone()),
+            Query(params(&[("format", "txt"), ("encoding", "gbk")])),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let warn = resp
+            .headers()
+            .get("X-Export-Warning")
+            .and_then(|v| v.to_str().ok())
+            .expect("GBK 不可映射应返回警告头");
+        assert!(warn.is_ascii());
+        let json: serde_json::Value =
+            serde_json::from_str(&percent_decode(warn)).expect("合法 JSON");
+        assert_eq!(json["unmappableChars"], 1, "一个不可映射字符: {json}");
+        let raw = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec();
+        let txt = encoding_rs::GBK.decode(&raw).0.into_owned();
+        assert!(txt.contains("&#x1F600;"), "😀 应转义为 NCR: {txt}");
+        assert!(!txt.contains('?'), "不应替换为 ?: {txt}");
+        assert!(txt.contains("正文") && txt.contains("结束。"));
+
+        // 全部可映射 → 无警告头
+        state
+            .storage
+            .upsert_book(
+                "default",
+                &crate::model::Book {
+                    book_url: "local://gbk2".into(),
+                    name: "GBK书2".into(),
+                    author: "作者".into(),
+                    origin: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_chapters(
+                "local://gbk2",
+                &[("第一章".to_string(), "纯中文正文。".to_string())],
+            )
+            .await
+            .unwrap();
+        let resp = export_book(
+            AxumState(state.clone()),
+            Query(params_gbk2(&[("format", "txt"), ("encoding", "gbk")])),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let warn = resp
+            .headers()
+            .get("X-Export-Warning")
+            .map(|v| v.to_str().unwrap_or("").to_string());
+        assert!(warn.is_none(), "全部可映射时不应有警告头: {warn:?}");
+        // utf-8 导出同样无警告头
+        let resp = export_book(
+            AxumState(state.clone()),
+            Query(params_gbk2(&[("format", "txt"), ("encoding", "utf-8")])),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("X-Export-Warning").is_none());
+
+        cleanup(state, dir).await;
+    }
+
+    /// percent 解码（测试用：解析 X-Export-Warning）
+    fn percent_decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                // 严格：% 后必须是两位十六进制
+                let hex = |c: u8| -> Option<u8> {
+                    match c {
+                        b'0'..=b'9' => Some(c - b'0'),
+                        b'a'..=b'f' => Some(c - b'a' + 10),
+                        b'A'..=b'F' => Some(c - b'A' + 10),
+                        _ => None,
+                    }
+                };
+                if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                    out.push(h * 16 + l);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8(out).unwrap_or_default()
     }
 
     /// bookSourceDebugSSE：search 动作逐步骤事件（规则解析/URL 构造/请求/规则应用）→ result

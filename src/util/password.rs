@@ -52,7 +52,10 @@ pub fn check_password(user: &User, password: &str) -> (bool, bool) {
     if is_argon2id(&user.password) {
         (verify_argon2id(password, &user.password), false)
     } else {
-        let ok = crate::util::md5::gen_encrypted_password(password, &user.salt) == user.password;
+        let ok = crate::util::constant_time::ct_eq(
+            &crate::util::md5::gen_encrypted_password(password, &user.salt),
+            &user.password,
+        );
         (ok, ok)
     }
 }
