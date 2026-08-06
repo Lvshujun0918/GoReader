@@ -3586,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "reader-dev"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
