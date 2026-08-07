@@ -1,4 +1,3 @@
-/target
 /storage/
 *.db
 *.db-shm
@@ -9,4 +8,3 @@ scripts/_diag*.py
 scripts/_probe_*.py
 scripts/_test_69shuba*.py
 scripts/_ua_probe.py
-target/e2e-dom/

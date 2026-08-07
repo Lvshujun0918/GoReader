@@ -1,10 +1,8 @@
-# docker build 上下文瘦身（构建性能：target/ 可达数 GB，.git 含完整历史）
+# docker build 上下文瘦身（构建性能；.git 含完整历史）
 # 注意：scripts/camoufox_solver.py 被 Dockerfile 引用，scripts 必须保留在上下文中
 .git
-target
 storage
 docs
-tests
 web-simple
 .github
 __pycache__
