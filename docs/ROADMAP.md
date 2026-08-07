@@ -1,15 +1,16 @@
 # Reader-dev 路线图（Roadmap）
 
-> 状态：**Rust 重构已成型（v5.0.0）**——核心功能全部落地；本文档记录已完成项与剩余待办。
-> 更新日期：2026-08-06。版本号以 `Cargo.toml` 为准（当前 `5.0.0`）。
+> 状态：**Go 重构迁移中（v5.0.0）**——后端已迁移 Go（gin+gorm），核心 API/存储/规则引擎完成；
+> 本文档已完成区为 Rust 版成果记录，Go 端完成度见 `docs/ARCHITECTURE.md`。
+> 更新日期：2026-08-07。版本号以 `go.mod` 为准（当前 `5.0.0`）。
 > 原则：**只列已实现/已确认的事实**；未实现项一律标注「计划/未实现」。
 
 ---
 
 ## ✅ 已完成（v5.0.0）
 
-### Rust 重构主体
-- [x] axum + SQLite 服务端（`/reader3/*` API 与 legacy 兼容，ReturnData 结构一致）
+### Go 重构主体
+- [x] gin + SQLite 服务端（`/reader3/*` API 与 legacy 兼容，ReturnData 结构一致，gorm 17 张表）
 - [x] JSON→SQLite 自动迁移（检测/备份/逐表/校验回滚/JSON 保留只读归档/raw_json 保底）
 - [x] 多用户：注册/登录、权限开关（WebDAV/本地书仓/书源/RSS）、用户管理
 - [x] 多设备 token（uuid v4，每用户 5 个并存）+ token 过期（`READER_TOKEN_TTL_DAYS` 默认 30 天）
@@ -37,11 +38,11 @@
 - [x] 上传上限（`READER_UPLOAD_MAX_MB` 默认 100MB，413 明确错误）
 
 ### 工程
-- [x] 新前端（Vue3 + Vite + Element Plus，15 视图，vue-tsc 严格类型检查 CI）
-- [x] CI：rust-ci（fmt/clippy/test）、frontend-ci、docker-publish-rust（`v1.*` 标签触发 + `origin/master` 祖先 guard + 多架构镜像）
-- [x] Docker 镜像：`debian:trixie-slim`（GLIBC）+ **tini 入口**（1Panel 兼容）+ 内置 obscura/camoufox/python + CA/时区
-- [x] Release 资产：`reader-dev-linux-x64-musl`（musl 静态）+ `reader-dev-windows-x64.exe`（签名 job）
-- [x] 后端测试 480+（规则引擎/迁移/OPDS/9 格式/CF 端到端/Turnstile/WebDAV/obscura）
+- [x] 新前端（Vue3 + Vite + shadcn-vue，15 视图，vue-tsc 严格类型检查 CI）
+- [x] CI：go-ci（vet/test-race/静态校验/交叉编译）、frontend-ci、docker-publish-go（`v5.*` 标签触发 + master 祖先 guard + 多架构镜像）
+- [x] Docker 镜像：`debian:trixie-slim`（GLIBC）+ **tini 入口**（1Panel 兼容）+ 内置 obscura/camoufox/python + CA/时区（Go 静态二进制，golang:1.25 构建）
+- [x] Release 资产：`reader-dev-linux-x64`（纯 Go 静态）+ `reader-dev-windows-x64.exe`（Go 交叉编译）
+- [x] 后端 Go 单测（配置/规则引擎/存储/密码）
 
 ---
 
@@ -49,20 +50,21 @@
 
 | # | 项 | 状态与说明 |
 |---|---|---|
-| 1 | **Windows 签名发布首次验证** | `build-windows-signed` job 已就绪（Authenticode + PFX secrets，secrets 缺失时拒绝发布）；但 `WINDOWS_CODESIGN_PFX` / `WINDOWS_CODESIGN_PASSWORD` **尚未配置验证过**——首次签名发布需确认证书加载/签名产物可用 |
-| 2 | **69shuba 住宅代理验证** | 数据中心 IP 被 Turnstile 风控（实测 `400030` 环境风控——与 UA/指纹无关）；**代码无代理配置项**（`READER_PROXY_URL`/书源代理字段为设计方向，未实现）；需先接线代理配置再做全自动验证 |
-| 3 | **argon2 密码哈希升级** | **实现中**（工作区已接线：`src/util/password.rs` argon2id PHC m=65536,t=3,p=4；新用户/改密直接 argon2id，legacy 双 MD5 兼容校验 + 登录自动升级；未合入发布版）。OPDS 独立账号保持 sha256(salt\|\|pwd) |
-| 4 | **服务端 TLS + HTTP/2/3** | 计划（未实现）。当前服务端纯 HTTP（TCP 监听，无 TLS/QUIC）；设计：`READER_APP_TLS_CERT`/`READER_APP_TLS_KEY` + quinn+h3 双栈监听 |
-| 5 | **客户端 HTTP/3 启用** | reqwest `http3` feature 已编译入但**未调用**（未启用 `reqwest_unstable` cfg）——书源直连实际 HTTP/1.1（也无 `http2` feature）；需 cfg 启用 + QUIC 传输参数指纹细化 |
-| 6 | **EPUB zip 炸弹防护** | 条目大小/数量上限缺失（PDF 已有 8MB 解压上限）；当前受 `READER_UPLOAD_MAX_MB` 缓解 |
-| 7 | **多实例部署支持** | 单实例假设：SQLite + 内存态缓存（目录/正文/语音列表/登录限流）不跨进程协调；多副本需按实例拆分数据目录或前置外部限流 |
-| 8 | **macOS 发布资产** | 当前 Release 仅 `linux-x64-musl` + `windows-x64.exe`（Windows 签名未验证，见 #1） |
+| 1 | **Windows exe 未签名** | Go 原生交叉编译产出，未签名（SmartScreen 提示属预期）；如需签名需引入签名服务 |
+| 2 | **69shuba 住宅代理验证** | 数据中心 IP 被 Turnstile 风控（实测 `400030` 环境风控——与 UA/指纹无关）；代理配置为设计方向，未实现 |
+| 3 | **服务端 TLS + HTTP/2/3** | 计划（未实现）。当前服务端纯 HTTP（TCP 监听，无 TLS/QUIC）；设计：`READER_APP_TLS_CERT`/`READER_APP_TLS_KEY` |
+| 4 | **客户端 QUIC（HTTP/3）** | 计划（未实现）。Go `net/http` 默认 HTTP/1.1（TLS ALPN 可协商 HTTP/2）；QUIC 不启用 |
+| 5 | **EPUB zip 炸弹防护** | 条目大小/数量上限缺失；当前受 `READER_UPLOAD_MAX_MB` 缓解 |
+| 6 | **多实例部署支持** | 单实例假设：SQLite + 内存态缓存（目录/正文/登录限流）不跨进程协调 |
+| 7 | **macOS 发布资产** | CI 交叉编译矩阵已验证 darwin/arm64 构建，Release 暂未发布 mac 资产 |
+| 8 | **本地书导入（9 格式）** | Go 端 `importBookPreview`/`uploadLocalBook` 等为骨架，EPUB/TXT/MOBI 解析迭代中 |
+| 9 | **浏览器自动化（obscura/camoufox）** | Go 端质询求解/书源登录浏览器流未接入（Rust 版已实现，按 ARCHITECTURE 迭代） |
 
 ---
 
 ## 开发与发布策略（当前）
 
-- **分支布局**：`master` = Rust 重构发布主线（本文档）；`legacy` = Kotlin 稳定版（v4.x，ghcr.io/warpdotsys/reader-dev:latest）
-- **发布工作流**（`docker-publish-rust.yml`）：`v1.*` 标签触发 + 发版 guard（要求触发 SHA 为 `origin/master` 祖先，防止误发）+ 多架构镜像推送 + GitHub Release 资产
-- **版本号**：以 `Cargo.toml` 为准（当前 `5.0.0`）
+- **分支布局**：`master` = Go 重构发布主线（本文档）；`legacy` = Kotlin 稳定版（v4.x，ghcr.io/warpdotsys/reader-dev:latest）
+- **发布工作流**（`docker-publish-go.yml`）：`v5.*` 标签触发 + 发版 guard（要求触发 SHA 为 `origin/master` 祖先，防止误发）+ 多架构镜像推送 + GitHub Release 资产
+- **版本号**：以 `go.mod` 为准（当前 `5.0.0`）
 - 许可策略：**永久不做用户/功能限制**（`READER_APP_USERLIMIT` 等 env 默认宽松）

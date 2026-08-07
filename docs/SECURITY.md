@@ -13,15 +13,14 @@
 - WebDAV：Basic 认证 → `gen_encrypted_password` 校验 + `enable_webdav` 门控；home 严格限定 `storage/data/{user}/webdav`。
 
 ### 2. 文件系统路径（防穿越）
-- `files.rs`：
-  - `home` 参数白名单：`__HOME__` / `__WEBDAV__` / `__LOCAL_STORE__` / `__STORAGE__`（后者需 manager）/ 空——其余一律"非法访问"。
-  - `resolve_secure_path`：组件级归一化（`..` 逐级弹出，越出 base 即拒绝）+ `starts_with(base)` 最终校验——所有 list/save/mkdir/delete/upload/download 均走此函数。
-  - upload 文件名只取 `basename`（`../x`、`a/b` 收敛为安全名）+ 跳过隐藏文件。
+- 文件管理（`internal/api/handlers_files.go` 的 `safeFilePath`）：
+  - `path` 参数绝对路径归一化 + `starts_with(root)` 校验——越出 storage 根即拒绝；所有 list/save/mkdir/delete/upload/download 均走此函数。
+  - upload 文件名只取 `basename`（`../x`、`a/b` 收敛为安全名）。
 - `resolve_storage_path`（本地书解析）：`canonicalize` + `starts_with(storage_dir)` 校验。
-- `opds.rs` 下载/获取同样经白名单路径解析。
+- OPDS 下载/获取同样经白名单路径解析。
 
 ### 3. SQL 注入
-- 全部使用 sqlx 参数化绑定（`?1/?2/...`），无字符串拼接 SQL。
+- 全部使用 gorm 参数化绑定（`?` 占位），无字符串拼接 SQL。
 
 ### 4. 上传
 - 文件名/路径均收敛（见上）；书源导入仅 JSON 白名单字段；本地书导入只做解析不入壳执行（EPUB zip 解包 + TXT 编码检测；PDF 另有 8MB 解压上限防炸弹）。
@@ -29,27 +28,27 @@
 ### 5. 书源 cookie 按用户隔离
 - `book_source_cookies` 表：`user_namespace + source_url` 联合主键——书源登录态（cookie/user_agent）严格按用户命名空间存取，`cookie_for(ns, url)` 只读本命名空间行，跨用户不可见、不可覆盖。
 - 抓取入口（`crawler::fetch_book`）按当前请求命名空间注入 cookie；FlareSolverr/camoufox/obscura 求解返回的 cookie 与用户原 cookie **按 name 合并**后仍存回该用户命名空间。
-- 浏览器实例同样按用户命名空间独立（`service/browser.rs`——每用户独立 CDP 会话，防跨用户 cookie 泄漏）。
+- 浏览器实例按用户命名空间独立（Rust 版 `service/browser.rs` 每用户独立 CDP 会话；Go 端浏览器自动化接入中，见 ROADMAP 待办 9）。
 
 ### 6. FlareSolverr 转发
 - 仅当环境变量 `FLARESOLVERR_URL` 配置时才启用（默认禁用，零外部依赖）。
 - 仅书源抓取（`fetch_book`）命中 Cloudflare 质询特征（503 + 特征 HTML）时转发；RSS/TTS 等原始抓取（`fetch`/`fetch_get`）不经 FlareSolverr。
 - 转发请求携带当前用户的 cookie（保持书源会话连续性），响应 cookie 按 name 合并后按用户存库，UA 一并记录。
 
-## 🔒 2026-08-06 审计修复（6 个 major）
+## 🔒 2026-08-06 审计修复（6 个 major，Rust 版；Go 端按此标准落地）
 
-### M1 SSRF：/assets/proxy 回源目标校验（crawler.rs）
-- 图片代理是唯一回源入口（`fetch_image`），**每跳（含重定向）DNS 解析后校验目标为公网地址**——私网/回环/链路本地一律拒绝（`SSRF_ALLOW_PRIVATE` 仅供测试互斥开关）。
+### M1 SSRF：/assets/proxy 回源目标校验（internal/service/crawler）
+- 图片代理是唯一回源入口，**每跳（含重定向）DNS 解析后校验目标为公网地址**——私网/回环/链路本地一律拒绝（`ssrfAllowed`）。
 - 禁用自动重定向、**手动逐跳跟进**（防 302 跳回内网），每跳重新校验。
 - **非 secure 模式同样生效**（不依赖 secure 开关）。
 
-### M2 图片缓存跨用户隔离（image_cache.rs）
+### M2 图片缓存跨用户隔离（Rust 版 image_cache.rs；Go 端 assets/proxy 暂为直连转发）
 - 缓存键 = `md5("{ns}|{url}")` 全 32 位——**命名空间并入键**：用户 A 的会话 cookie 回源结果不会串给用户 B（同 URL 不同命名空间互不命中）。
 - in-flight 去重键同样含命名空间；容量 LRU（`READER_IMAGE_CACHE_MB` 默认 512MB）。
 - 启动时识别并删除**旧格式键**（`md5(url)` 前 16 位、无命名空间——跨用户串图残留）。
 
-### M3 登录限流：直连 IP（router.rs）
-- 限流键 = **直连 socket 对端 IP**（axum `ConnectInfo`）——`X-Forwarded-For` / `X-Real-IP` 可伪造，**完全忽略**。
+### M3 登录限流：直连 IP（internal/api/clientip.go）
+- 限流键 = **直连 socket 对端 IP**（Gin `ClientIP`）——`X-Forwarded-For` / `X-Real-IP` 可伪造，**仅可信代理白名单（`READER_TRUSTED_PROXIES`）命中才信 XFF**。
 - 用户名 + IP 双键：失败 5 次 → 锁 5 分钟；锁定中直接拒绝（「尝试过多请稍后」），不泄露用户是否存在；成功登录清零。
 - 覆盖登录/注册入口；纯内存计数（单实例部署无需配置；多实例部署需前置外部限流，见已知限制）。
 
@@ -60,8 +59,8 @@
 - `/reader3` 与 `/assets/proxy` 走**网络直连/网络优先**（动态路径不缓存，避免陈旧数据/串用户）；
 - 静态资源缓存上限 200 条；避免 SW 拦截动态接口导致缓存污染。
 
-### M6 JS 桥接超时（parser/js.rs）
-- `java.*` 桥接调用超时 **60s → 10s**——挂起页面不再阻塞等待，失败明确报错。
+### M6 JS 桥接超时（internal/parser/rule——goja 引擎）
+- 书源 JS 求值带超时保护——挂起脚本不阻塞请求，失败明确报错。
 
 ## 🔧 此前已修复（保留）
 
@@ -79,8 +78,7 @@
 
 ## ⚠️ 已知限制与计划（如实标注——未实现的不写为已实现）
 
-1. **密码哈希为 legacy 兼容算法（argon2 升级实现中）**：系统用户 = legacy 双 MD5（`md5(md5(pw+salt)+salt)`——兼容旧数据）；OPDS 独立账号 = `sha256(salt||pwd)`（`util::sha256`，16 字节随机盐）。
-   **实现中——argon2 升级**（`src/util/password.rs`，未合入发布版）：新用户/改密直接存 **argon2id PHC**（`$argon2id$v=19$m=65536,t=3,p=4`，随机 16 字节盐）；登录时**并存迁移**——argon2id 优先校验，legacy 双 MD5 兼容校验通过后自动升级写回 argon2id。
+1. **密码哈希（argon2 升级已完成）**：系统用户 = **argon2id PHC**（`internal/util/password`，m=65536,t=3,p=4；新用户/改密直接 argon2id，legacy 双 MD5 兼容校验 + 登录自动升级）；OPDS 独立账号 = `sha256(salt||pwd)`（16 字节随机盐）。
    缓解（现状）：HTTPS（反向代理）+ 强密码策略（`READER_APP_MINUSERPASSWORDLENGTH` 默认 8）。
 2. **accessToken 走 URL query**——可能进入代理/访问日志。缓解：部署 HTTPS；**服务端本身为纯 HTTP（无 TLS）**——TLS 必须由反向代理终止（服务端 TLS 为计划项，见 ROADMAP 待办 4）。
 3. ~~登录无速率限制~~ **已解决**：登录限流（用户名+直连 IP 失败 5 次锁 5 分钟）已内置（见 M3）；多实例部署时内存计数不跨进程，仍需前置反向代理限流。

@@ -149,24 +149,27 @@ READER_APP_WORKDIR=/storage READER_APP_SECURE=true ./reader-dev-linux-x64-musl
 ## 🧑‍💻 开发
 
 ```bash
-cargo test          # 480+ 单测与集成（规则引擎/格式解析/obscura/CF 质询/WebDAV）
+go test ./...       # Go 单测（配置/规则引擎/存储/密码）
 cd web-ui && npm run build   # 前端（vue-tsc + vite）
 npm test            # 前端单测（54+）
 ```
 
 ### 结构
 ```
-src/
-├── api/          # axum 路由
-├── model/        # 数据模型
-├── parser/       # 规则引擎（css_chain/js/rule/xpath/jsonpath）
-├── service/      # 业务（browser(obscura CDP)/crawler/search/explore/local_book/opds/...）
-├── storage/      # SQLite（迁移/CRUD/缓存/统计）
-└── util/         # password(argon2)/regex/md5/...
-web-ui/src/       # Vue3 视图/组件/api/utils
-web-simple/       # Kindle 轻量页
-scripts/          # 审计/测试工具（api-scan/mock 站点等）
-docs/             # SECURITY/ARCHITECTURE/ROADMAP/FRONTEND
+cmd/               # Go 入口（server）
+internal/
+├── api/           # gin 路由（/reader3/*、OPDS、WebDAV）
+├── model/         # gorm 数据模型
+├── parser/        # 规则引擎（css/xpath/json/regex/js）
+├── service/       # 业务（crawler/bookfetch）
+├── storage/       # SQLite（迁移/CRUD/缓存/统计）
+├── middleware/    # 缓存/限流/统计中间件
+├── config/        # 配置（READER_APP_* env）
+└── util/          # password(argon2)/md5/登录限流/...
+web-ui/src/        # Vue3 + shadcn-vue 视图/组件/api/utils
+web-simple/        # Kindle 轻量页
+scripts/           # 测试工具（e2e-smoke/api-scan/camoufox_solver）
+docs/              # SECURITY/ARCHITECTURE/ROADMAP/FRONTEND
 ```
 
 ---
@@ -180,7 +183,7 @@ docs/             # SECURITY/ARCHITECTURE/ROADMAP/FRONTEND
 ## 📌 分支
 | 分支 | 说明 |
 |---|---|
-| `master` | **Rust 版（当前）——v5.0.0** |
+| `master` | **Go 版（当前）——v5.0.0** |
 | `legacy` | Kotlin 稳定版（ghcr v4.x） |
 
 ## 💝 赞助

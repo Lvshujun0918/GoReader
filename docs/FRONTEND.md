@@ -1,4 +1,4 @@
-# reader-dev 前端规划（Rust 版）
+# reader-dev 前端规划（Go 版）
 
 > 决策：**不复用 legacy 前端构建产物**（安全漏洞过多），全新前端。
 > 状态：**已成型（v5.0.0）**——全部视图与后端联调完成，见文末「已实现进度」。本文 §1–§6 为技术选型与设计要求（§2 中部分要求尚未落地，见 §7 标注）。
@@ -13,9 +13,9 @@
 | 构建 | **Vite** | 现代、快、tree-shaking 好 |
 | 语言 | **TypeScript** | 类型安全（API 契约可共享） |
 | 状态 | **Pinia** | Vue 3 官方推荐 |
-| UI | **Element Plus**（或 Naive UI） | 组件完备（legacy 用 Element UI，迁移平滑） |
+| UI | **shadcn-vue**（Tailwind + reka-ui + sonner） | shadcn 风格、可访问性佳（迁移自 Element Plus，兼容层见 `web-ui/src/lib/feedback.ts`） |
 | 请求 | **axios** | 与后端 /reader3/* 对接 |
-| 内嵌 | **rust-embed**（后端编译时嵌入 dist） | 单二进制全功能 |
+| 内嵌 | 目录形态（`web-ui/dist`，由 `READER_APP_WEB_ROOT` 指向） | 前端构建产物独立部署/内嵌均支持 |
 
 ## 2. 安全要求（硬性）
 
@@ -40,7 +40,7 @@
 /settings          设置
 ```
 
-## 4. API 对接（Rust 后端 /reader3/*）
+## 4. API 对接（Go 后端 /reader3/*）
 
 | 前端功能 | API |
 |---|---|
@@ -57,7 +57,7 @@
 2. 书架页（虚拟列表）+ 搜索页
 3. 阅读页（核心：翻页渲染 + 进度）
 4. 书源/设置/文件管理
-5. rust-embed 内嵌 + CSP + 构建流水线（GitHub Actions）
+5. shadcn-vue 组件库接入 + CSP + 构建流水线（GitHub Actions）
 
 ## 6. 与后端开发并行
 
@@ -85,7 +85,7 @@
 
 - **CSP 头**（§2 要求）：后端当前**未下发** Content-Security-Policy——待办
 - **npm audit 门禁**（§2 要求）：CI 中**未配置**阻断高危依赖——待办
-- **rust-embed 内嵌 dist**（§1 选型）：未采用——前端产物由 `READER_APP_WEB_ROOT` 指向目录（默认 `web-ui/dist`）
+- **dist 内嵌单二进制**（§1 选型）：未采用——前端产物由 `READER_APP_WEB_ROOT` 指向目录（默认 `web-ui/dist`）
 
 ### 目录结构
 

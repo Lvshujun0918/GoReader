@@ -31,8 +31,7 @@ Go 重构，**API 兼容 + 数据兼容迁移**：
 │   ├── service/     crawler（SSRF 防护+书源 cookie）/ bookfetch（详情/目录/正文）
 │   └── util/        password（argon2id+MD5 兼容）/ loginlimit / dbbackup / md5 / ct
 web-ui/               Vue3 + Vite + shadcn-vue 前端（Tailwind + reka-ui + sonner）
-scripts/              api-scan.py / mock-*-site.py / camoufox_solver.py / e2e-smoke.py
-src/                  Rust 旧后端（迁移参照，随迁移进度清理）
+scripts/              camoufox_solver.py / e2e-smoke.py / api-scan.py / 69shuba.json
 ```
 
 ## 3. API 兼容约定（硬性）
@@ -56,13 +55,13 @@ src/                  Rust 旧后端（迁移参照，随迁移进度清理）
 
 ## 5. 规则解析引擎（legado 多规则——全量落地）
 
-| 规则类型 | Rust 实现 | 状态 |
+| 规则类型 | Go 实现 | 状态 |
 |---|---|---|
-| CSS Selector | `scraper` | ✅（含 @CSS:/@@ 前缀、a@href 属性、链式选择器） |
-| JSONPath | 自实现遍历 | ✅（@Json:/$./$[ 前缀、[*] 通配、{{$.x}} 内嵌） |
-| Regex | `regex` + `fancy-regex` | ✅（$N 引用、##替换；**lookbehind 经 fancy-regex 兼容层**） |
-| XPath | `sxd-xpath`/`sxd-document` | ✅（`//` 前缀、`{{//xpath}}` 内嵌） |
-| JavaScript | `boa_engine`（纯 Rust 沙箱） | ✅（含 `{{}}` 内嵌 JS、`java.*`/`source.*` shim、AES 解密、`java.startBrowserAwait` 浏览器桥） |
+| CSS Selector | `cascadia` | ✅（含 @CSS:/@@ 前缀、a@href 属性、链式选择器） |
+| JSONPath | `PaesslerAG/jsonpath` | ✅（@Json:/$./$[ 前缀、[*] 通配、{{$.x}} 内嵌） |
+| Regex | `dlclark/regexp2` | ✅（$N 引用、##替换；**lookbehind 兼容层**） |
+| XPath | `antchfx/htmlquery` | ✅（`//` 前缀、`{{//xpath}}` 内嵌） |
+| JavaScript | `dop251/goja`（纯 Go 沙箱） | 🔄（{{}} 内嵌 JS、java.* shim 子集；浏览器桥/AES 迭代中） |
 
 对齐 `warpdotsys/legado`（阅读Sigma）的 analyzeRule 语义（参考 docs/legado-ref/）：
 - 规则标志：@@ / @CSS: / @XPath: / @Json: / $. / $[ / // / @js:
@@ -71,16 +70,16 @@ src/                  Rust 旧后端（迁移参照，随迁移进度清理）
 
 ## 6. 本地书籍格式（9 格式全量）
 
-| 格式 | Rust 实现 | 状态 |
+| 格式 | Go 实现 | 状态 |
 |---|---|---|
-| TXT | 内置（编码自动检测 encoding_rs） | ✅ |
-| EPUB | `zip` + XML | ✅ |
-| PDF | `lopdf`（8MB 解压上限防炸弹） | ✅ |
-| MOBI / AZW3 | `mobi` | ✅ |
-| FB2 | quick-xml（body/section 分章） | ✅ |
-| DOCX | zip + XML（标题样式分章） | ✅ |
-| CBZ | zip 图片列表 → 图片页章节 | ✅ |
-| UMD | 手写解析（对齐 me.ag2s.umdlib 状态机） | ✅ |
+| TXT | 本地书导入模块 | 🔄（迭代中） |
+| EPUB | 本地书导入模块 | 🔄（迭代中） |
+| PDF | 本地书导入模块 | 🔄（迭代中） |
+| MOBI / AZW3 | 本地书导入模块 | 🔄（迭代中） |
+| FB2 | 本地书导入模块 | 🔄（迭代中） |
+| DOCX | 本地书导入模块 | 🔄（迭代中） |
+| CBZ | 本地书导入模块 | 🔄（迭代中） |
+| UMD | 本地书导入模块 | 🔄（迭代中） |
 
 ## 6.5 OPDS（已实现）
 
@@ -92,15 +91,16 @@ src/                  Rust 旧后端（迁移参照，随迁移进度清理）
 ## 6.8 网络协议层现状（v5.0.0——如实）
 
 ### 出站（书源抓取 / 图片回源）
-- **HTTP/1.1 是唯一可用协议**：`reqwest` 依赖**未启用 `http2` feature**（`Cargo.toml`：`rustls-tls, http3, json, gzip, brotli, deflate, cookies, stream`）——书源直连固定 HTTP/1.1（含 HTTPS）。
-- `http3` feature 虽在 `Cargo.toml` 启用，但**客户端代码未调用 QUIC 接口**（未使用 `http3_prior_knowledge()` 等，未启用 `reqwest_unstable` cfg）——**实际不会发起 HTTP/3 连接**。
-- 计划（未实现）：启用客户端 QUIC 需 `reqwest_unstable` cfg + 传输参数指纹细化（ROADMAP 待办 5）。
+- Go `net/http` 客户端（`internal/service/crawler`）：默认 HTTP/1.1 直连（书源兼容性优先），
+  自动 gzip/deflate 解压、书源自定义 header/cookie 附加、SSRF 防护（内网/回环拒绝）。
+- HTTP/2 由 `net/http` TLS ALPN 自动协商；QUIC（HTTP/3）**不启用**。
+- 计划（未实现）：FlareSolverr / camoufox / obscura 质询求解接入（见 ROADMAP 待办）。
 
 ### 服务端（对外服务）
-- `axum` 监听 **TCP 纯 HTTP**——**无 TLS、无 QUIC**，HTTP/2 / HTTP/3 **暂不提供**；公网 HTTPS 由反向代理终止（nginx/Caddy），H2/H3 如需同样由代理层提供。
+- `gin` 监听 **TCP 纯 HTTP**——**无 TLS、无 QUIC**，HTTP/2 / HTTP/3 **暂不提供**；公网 HTTPS 由反向代理终止（nginx/Caddy），H2/H3 如需同样由代理层提供。
 - 计划（未实现）：服务端 TLS（设计为 `READER_APP_TLS_CERT`/`READER_APP_TLS_KEY`）+ quinn+h3 双栈监听（ROADMAP 待办 4）。
-- **响应压缩已落地**：tower-http `CompressionLayer`（router 内层 + lib.rs 外层兜底，SSE/已编码响应自动跳过）。
-- 弱网项：reqwest 连接复用（pool/keep-alive）、crawler 超时分级 + 5xx 重试退避、SSE 流式已实现。
+- **响应压缩**：Go 端未启用 gzip 压缩层（计划项，见 ROADMAP）——当前直出未压缩响应。
+- 弱网项：Go `net/http` 连接复用（Transport keep-alive）、crawler 超时分级（10s 拨号/15s 响应头/30s 总超时）、SSE 流式已实现。
 
 ## 6.9 验证码/反爬 bypass 架构（已实现）
 
@@ -172,24 +172,24 @@ src/                  Rust 旧后端（迁移参照，随迁移进度清理）
 2. **浏览器后端唯一化**：`service/browser.rs` = **obscura（唯一浏览器后端）**——替代并移除 Chrome/Edge；CDP 兼容；`READER_OBSCURA_URL` 直连既有服务时不 spawn 进程；每用户命名空间独立浏览器实例（防跨用户 cookie 泄漏）。
 3. **cookie 复用**：`cf_clearance`/`cf-turnstile-response` 按 name 与用户原 cookie 合并后存库（`book_source_cookies`，按用户命名空间隔离），同源后续请求自动携带——避免重复求解；UA 一并记录（部分站点校验 UA 与 cookie 绑定）。
 4. **POST 保真**：求解阶段浏览器只会 GET 首页；必须以**原 method/body/headers + 新 cookie** 重试原请求，才能让 POST 场景（69shuba search.php 等）拿到真实结果；重试仍质询才兜底返回求解 HTML。
-5. **真实站点验证**：`scripts/69shuba.json`（真实书源）驱动集成测试（tests/cf_solve.rs / turnstile_solve.rs / captcha_matrix.rs / obscura_browser.rs / 69shuba_probe.rs），另配 mock 站点（mock-cf-site.py / mock-slider-site.py / mock-turnstile-site.py）。
+5. **真实站点验证**：`scripts/69shuba.json`（真实书源）+ `scripts/e2e-smoke.py`（端到端冒烟）验证抓取链路。
 6. **JS 规则共享同一浏览器**：`java.startBrowserAwait(url, title, isForeground)` shim 走与验证码求解相同的浏览器流（含 stealth/UA 覆盖），书源 JS 规则可直接打开页面取 DOM。
 7. **降级次序固定**：直连 → FlareSolverr（配置了才启用）→ obscura CDP → camoufox（可 FIRST 提前）→ 明确报错；任一环节解出即返回，不重复消耗。
 
 ## 7. 产物策略（当前）
 
 - **Docker 镜像**（多阶段）：
-  - 构建阶段：Rust 编译（`rust:1.97-slim`）+ 前端构建（`node:20-slim`）+ obscura release 下载（stealth 构建，amd64/arm64 自动选资产）+ camoufox（`python:3.12-slim` pip 安装 + 浏览器二进制）
+  - 构建阶段：Go 编译（`golang:1.25`，CGO_ENABLED=0 静态）+ 前端构建（`node:20-slim`）+ obscura release 下载（stealth 构建，amd64/arm64 自动选资产）+ camoufox（`python:3.12-slim` pip 安装 + 浏览器二进制）
   - 运行镜像：**`debian:trixie-slim`（GLIBC 运行时）**——内置 CA 证书、时区（`TZ=Asia/Shanghai`）、python3 + `camoufox_solver.py`、obscura（`/opt/obscura/obscura`）
   - 入口：**tini**（`ENTRYPOINT ["/usr/bin/tini", "--"]` + `CMD ["reader-dev"]`——PID 1 信号转发/僵尸回收，1Panel 等面板兼容）
   - 数据目录 `/data`（`VOLUME`），`READER_APP_WORKDIR=/data`
-- **GitHub Release 资产**：`reader-dev-linux-x64-musl`（musl 静态链接——无 glibc 依赖，任意发行版直跑）+ `reader-dev-windows-x64.exe`（`build-windows-signed` job——Authenticode 签名，PFX 来自 secrets，secrets 未配置时拒绝发布未签名 exe）
+- **GitHub Release 资产**：`reader-dev-linux-x64`（CGO_ENABLED=0 纯 Go 静态链接——无 glibc 依赖，任意发行版直跑）+ `reader-dev-windows-x64.exe`（Go 原生交叉编译）
 - 前端**不内嵌**（`web-ui/dist` 目录由 `READER_APP_WEB_ROOT` 指定）
-- CI：`rust-ci.yml`（fmt/clippy/test）、`frontend-ci.yml`（vue-tsc 严格类型检查 + vite 构建）、`docker-publish-rust.yml`（`v1.*` 标签触发 + `origin/master` 祖先发版 guard + 多架构镜像 + Windows 签名）
+- CI：`go-ci.yml`（vet/test-race/静态构建校验/交叉编译矩阵）、`frontend-ci.yml`（vue-tsc 严格类型检查 + vite 构建 + 产物上传）、`docker-publish-go.yml`（`v5.*` 标签触发 + master 祖先发版 guard + 多架构镜像 + Windows 交叉编译）
 
 ## 8. 迭代路线（现状核对）
 
-- [x] 0. 骨架：axum + SQLite 初始化 + /health + /reader3/getBookshelf
+- [x] 0. 骨架：gin + SQLite 初始化 + /health + /reader3/getBookshelf
 - [x] 1. 数据迁移（JSON→SQLite 零丢失：raw_json 保底，真实 169 本/429 源验证）+ login/token
 - [x] 2. 规则引擎全量：CSS/JSONPath/Regex（含 lookbehind）/XPath/JS（boa 沙箱 + shim + 浏览器桥）
 - [x] 3. 详情/目录/正文 + 阅读页 API + 新前端（Vue3+Vite+TS，15 视图）
