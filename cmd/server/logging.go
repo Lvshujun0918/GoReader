@@ -14,7 +14,7 @@ func parseIntSafe(s string) (int, error) {
 	return strconv.Atoi(s)
 }
 
-// rotatingFileWriter 按大小轮转的日志 writer（对齐 Rust 版 RotatingFileWriter）。
+// rotatingFileWriter 按大小轮转的日志 writer。
 // 文件命名：{dir}/{prefix}.log（当前）、{dir}/{prefix}.log.1 …（历史，编号越大越旧）。
 type rotatingFileWriter struct {
 	mu        sync.Mutex

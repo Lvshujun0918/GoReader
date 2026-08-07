@@ -1085,7 +1085,7 @@ watch(replaceEnabled, (v) => {
 /* ---------------- 7. 听书（后端语音合成：POST /reader3/tts → blob → audio 元素播放；Edge/HttpTTS 引擎；本章播完自动下一章） ---------------- */
 
 const TTS_DEFAULT_VOICE = 'zh-CN-XiaoxiaoNeural'
-/** 后端单次合成文本上限（service/tts.rs MAX_TEXT_CHARS） */
+/** 后端单次合成文本上限（internal/service/tts MAX_TEXT_CHARS） */
 const TTS_MAX_CHARS = 20000
 const TTS_VOICE_KEY = 'reader_tts_voice'
 const TTS_RATE_KEY = 'reader_tts_rate'

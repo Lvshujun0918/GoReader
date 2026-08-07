@@ -1,4 +1,4 @@
-// Package model 数据模型（gorm ↔ SQLite，对齐 Rust 版 serde camelCase + sqlx snake_case 列）。
+// Package model 数据模型（gorm ↔ SQLite，camelCase JSON + snake_case 列，兼容 legacy）。
 package model
 
 import "time"

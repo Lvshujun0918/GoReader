@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// Config 应用配置（对齐 Rust 版 AppConfig）。
+// Config 应用配置（兼容 legacy READER_APP_* env）。
 type Config struct {
 	// WorkDir 工作目录（storage 根，兼容 READER_APP_WORKDIR）
 	WorkDir string

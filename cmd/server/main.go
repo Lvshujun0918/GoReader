@@ -1,7 +1,7 @@
 // reader-dev（Go 版）入口
 //
 // 启动流程：加载 .env → 初始化日志 → 构建配置 → 启动前数据库备份 → serve。
-// 与 Rust 版行为对齐：workDir 下的 storage/reader.db（WAL），监听 0.0.0.0:port。
+// 与 legacy 行为对齐：workDir 下的 storage/reader.db（WAL），监听 0.0.0.0:port。
 package main
 
 import (
