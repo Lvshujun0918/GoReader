@@ -154,7 +154,6 @@ async function submit() {
         >
           {{ mode === 'login' ? t('login.goRegister') : t('login.goLogin') }}
         </button>
-        <a class="tg-foot" href="https://t.me/readerdev" target="_blank" rel="noopener">{{ t('login.tgGroup') }}</a>
       </p>
     </main>
 
@@ -183,6 +182,11 @@ async function submit() {
   flex-direction: column;
   align-items: center;
   margin-bottom: 36px;
+}
+.wordmark .login-logo {
+  width: 72px;
+  height: 72px;
+  margin-bottom: 12px;
 }
 .wordmark-text {
   margin: 0;
