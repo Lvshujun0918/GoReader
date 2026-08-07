@@ -21,8 +21,23 @@
  * - extra: 导航行内的附加按钮（书架的书签/OPDS 等视图专属动作）
  * - trailing: minimal 变体下导航行位置的附加内容（探索页 top-actions）
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, type Component } from 'vue'
 import { useRouter } from 'vue-router'
+import {
+  Activity,
+  ArrowLeft,
+  BookMarked,
+  Compass,
+  Folder,
+  Library,
+  LogOut,
+  Rss,
+  Search,
+  Settings,
+  SlidersHorizontal,
+  Store,
+  Users,
+} from 'lucide-vue-next'
 import { useUserStore } from '@/stores/user'
 import { probeSecureMode } from '@/api/users'
 import { t } from '@/utils/i18n'
@@ -67,19 +82,19 @@ const emit = defineEmits<{ logout: []; back: [] }>()
 const router = useRouter()
 const store = useUserStore()
 
-/** 导航键 → 路由与 i18n 文案（键名与 i18n nav.* 对齐；缺失回退 zh/原文） */
-const NAV_LINKS: Record<string, { to: string; i18n: string }> = {
-  bookshelf: { to: '/', i18n: 'nav.bookshelf' },
-  search: { to: '/search', i18n: 'nav.search' },
-  explore: { to: '/explore', i18n: 'nav.explore' },
-  sources: { to: '/sources', i18n: 'nav.sources' },
-  rules: { to: '/rules', i18n: 'nav.rules' },
-  rss: { to: '/rss', i18n: 'nav.rss' },
-  files: { to: '/files', i18n: 'nav.files' },
-  store: { to: '/store', i18n: 'nav.store' },
-  monitor: { to: '/server-stats', i18n: 'nav.serverStats' },
-  users: { to: '/users', i18n: 'nav.users' },
-  settings: { to: '/settings', i18n: 'nav.settings' },
+/** 导航键 → 路由 / i18n 文案 / lucide 图标（键名与 i18n nav.* 对齐；缺失回退 zh/原文） */
+const NAV_LINKS: Record<string, { to: string; i18n: string; icon: Component }> = {
+  bookshelf: { to: '/', i18n: 'nav.bookshelf', icon: BookMarked },
+  search: { to: '/search', i18n: 'nav.search', icon: Search },
+  explore: { to: '/explore', i18n: 'nav.explore', icon: Compass },
+  sources: { to: '/sources', i18n: 'nav.sources', icon: Library },
+  rules: { to: '/rules', i18n: 'nav.rules', icon: SlidersHorizontal },
+  rss: { to: '/rss', i18n: 'nav.rss', icon: Rss },
+  files: { to: '/files', i18n: 'nav.files', icon: Folder },
+  store: { to: '/store', i18n: 'nav.store', icon: Store },
+  monitor: { to: '/server-stats', i18n: 'nav.serverStats', icon: Activity },
+  users: { to: '/users', i18n: 'nav.users', icon: Users },
+  settings: { to: '/settings', i18n: 'nav.settings', icon: Settings },
 }
 
 /** secure 模式（仅 showUsersLink 时探测；决定「用户」入口显隐） */
@@ -93,12 +108,12 @@ onMounted(() => {
 })
 
 const visibleLinks = computed(() => {
-  const out: { to: string; label: string }[] = []
+  const out: { to: string; label: string; icon: Component }[] = []
   for (const key of props.links) {
     if (key === 'users' && !(props.showUsersLink && secureMode.value)) continue
     const def = NAV_LINKS[key]
     if (!def) continue
-    out.push({ to: def.to, label: t(def.i18n) })
+    out.push({ to: def.to, label: t(def.i18n), icon: def.icon })
   }
   return out
 })
@@ -109,17 +124,7 @@ const visibleLinks = computed(() => {
     <slot name="leading">
       <template v-if="variant === 'minimal'">
         <button class="back-btn" type="button" @click="emit('back')">
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.6"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M19 12H5" />
-            <path d="M11 18l-6-6 6-6" />
-          </svg>
+          <ArrowLeft :size="14" aria-hidden="true" />
           <span v-if="backLabel">{{ backLabel }}</span>
         </button>
       </template>
@@ -140,12 +145,14 @@ const visibleLinks = computed(() => {
         type="button"
         @click="router.push(link.to)"
       >
-        {{ link.label }}
+        <component :is="link.icon" :size="14" aria-hidden="true" />
+        <span>{{ link.label }}</span>
       </button>
       <slot name="extra" />
       <span v-if="showUser" class="user-chip">{{ store.username || '未登录' }}</span>
       <button v-if="showLogout" class="logout-btn" type="button" @click="emit('logout')">
-        {{ t('nav.logout') }}
+        <LogOut :size="14" aria-hidden="true" />
+        <span>{{ t('nav.logout') }}</span>
       </button>
     </div>
     <slot v-else name="trailing" />
@@ -218,19 +225,23 @@ const visibleLinks = computed(() => {
 .user-area {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   margin-left: auto;
   flex-shrink: 0;
 }
 .nav-link {
-  padding: 5px 2px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 3px;
   border: none;
   background: none;
   color: var(--text-2);
   font-family: inherit;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 300;
-  letter-spacing: 1px;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
   cursor: pointer;
   transition: color 0.2s ease;
 }
@@ -247,7 +258,10 @@ const visibleLinks = computed(() => {
   color: var(--text-2);
 }
 .logout-btn {
-  padding: 6px 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: none;
@@ -255,6 +269,7 @@ const visibleLinks = computed(() => {
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
+  white-space: nowrap;
   cursor: pointer;
   transition:
     color 0.2s ease,
