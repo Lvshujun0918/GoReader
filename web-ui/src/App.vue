@@ -6,6 +6,8 @@ import { applyCustomCss } from '@/utils/customCss'
 import { applyDocLang, lang, t } from '@/utils/i18n'
 import ErrorBoundary from '@/components/ErrorBoundary.vue'
 import CommandPalette from '@/components/CommandPalette.vue'
+import GlobalConfirmDialog from '@/components/GlobalConfirmDialog.vue'
+import { Toaster } from '@/components/ui/sonner'
 
 // GAP 69 全局错误处理：未被子组件捕获的渲染/生命周期/异步错误统一记录
 // （子组件渲染错误由 ErrorBoundary 的 onErrorCaptured 拦截并展示重载页，
@@ -53,4 +55,7 @@ watch(lang, () => {
   </ErrorBoundary>
   <!-- GAP：全局命令面板（Ctrl+K——任意页可用） -->
   <CommandPalette />
+  <!-- shadcn-vue：全局 toast + 确认框（ElMessage/ElMessageBox 兼容层） -->
+  <Toaster position="top-center" rich-colors />
+  <GlobalConfirmDialog />
 </template>

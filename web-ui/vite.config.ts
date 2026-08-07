@@ -8,6 +8,8 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
+      // Element Plus → shadcn-vue 兼容层（ElMessage/ElMessageBox → sonner/reka-ui）
+      'element-plus': fileURLToPath(new URL('./src/lib/feedback.ts', import.meta.url)),
     },
   },
   server: {
