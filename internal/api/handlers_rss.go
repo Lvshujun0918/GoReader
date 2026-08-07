@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -154,8 +155,13 @@ func (a *API) handleSaveRssSource(c *gin.Context) {
 		NeedLogin(c)
 		return
 	}
-	var src model.RssSource
-	if err := c.ShouldBindJSON(&src); err != nil {
+	var raw map[string]any
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		Fail(c, "参数错误")
+		return
+	}
+	src, err := normalizeRssSourceMap(raw)
+	if err != nil {
 		Fail(c, "参数错误")
 		return
 	}
@@ -163,7 +169,7 @@ func (a *API) handleSaveRssSource(c *gin.Context) {
 		Fail(c, "RSS 源地址不能为空")
 		return
 	}
-	if err := a.Storage.SaveRssSource(ns, &src); err != nil {
+	if err := a.Storage.SaveRssSource(ns, src); err != nil {
 		Fail(c, "系统错误")
 		return
 	}
@@ -176,8 +182,20 @@ func (a *API) handleSaveRssSources(c *gin.Context) {
 		NeedLogin(c)
 		return
 	}
-	var list []*model.RssSource
-	if err := c.ShouldBindJSON(&list); err != nil {
+	var raw []map[string]any
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		Fail(c, "参数错误")
+		return
+	}
+	list := make([]*model.RssSource, 0, len(raw))
+	for _, m := range raw {
+		src, err := normalizeRssSourceMap(m)
+		if err != nil || src.RssSourceURL == "" {
+			continue
+		}
+		list = append(list, src)
+	}
+	if len(list) == 0 {
 		Fail(c, "参数错误")
 		return
 	}
@@ -186,6 +204,29 @@ func (a *API) handleSaveRssSources(c *gin.Context) {
 		return
 	}
 	OK(c, nil)
+}
+
+// normalizeRssSourceMap 宽松归一化 RSS 源（legado 布尔 enabled → 0/1，后端 int 列）。
+func normalizeRssSourceMap(m map[string]any) (*model.RssSource, error) {
+	switch v := m["enabled"].(type) {
+	case bool:
+		if v {
+			m["enabled"] = 1
+		} else {
+			m["enabled"] = 0
+		}
+	case nil:
+		m["enabled"] = 1 // 缺省默认启用
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	var src model.RssSource
+	if err := json.Unmarshal(b, &src); err != nil {
+		return nil, err
+	}
+	return &src, nil
 }
 
 func (a *API) handleDeleteRssSource(c *gin.Context) {
