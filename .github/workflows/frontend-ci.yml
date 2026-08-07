@@ -11,6 +11,11 @@ on:
 permissions:
   contents: read
 
+# 并发控制：同分支新提交取消旧 run
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,11 +29,21 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          # 命中 package-lock 哈希的 ~/.npm 缓存（官方缓存优先于手写 actions/cache）
           cache: npm
           cache-dependency-path: web-ui/package-lock.json
 
-      - name: npm ci
+      - name: npm ci（lockfile 精确安装——快且可复现）
         run: npm ci
 
       - name: 前端构建（vue-tsc 类型检查 + vite）
         run: npm run build
+
+      # 产物仅用于验证（不留缓存）；如需发布可在此上传 artifact
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-ui-dist
+          path: web-ui/dist
+          retention-days: 3
+          if-no-files-found: error
