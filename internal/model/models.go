@@ -93,8 +93,8 @@ type BookSource struct {
 	BookSourceType    int    `gorm:"column:book_source_type;default:0" json:"bookSourceType"`
 	BookURLPattern    string `gorm:"column:book_url_pattern" json:"bookUrlPattern"`
 	CustomOrder       int    `gorm:"column:custom_order;default:0" json:"customOrder"`
-	Enabled           int    `gorm:"column:enabled;default:1" json:"enabled"`
-	EnabledExplore    int    `gorm:"column:enabled_explore;default:1" json:"enabledExplore"`
+	Enabled           int    `gorm:"column:enabled" json:"enabled"`
+	EnabledExplore    int    `gorm:"column:enabled_explore" json:"enabledExplore"`
 	EnabledCookieJar  int    `gorm:"column:enabled_cookie_jar" json:"enabledCookieJar"`
 	ConcurrentRate    string `gorm:"column:concurrent_rate" json:"concurrentRate"`
 	Header            string `gorm:"column:header" json:"header"`
@@ -138,7 +138,7 @@ type RssSource struct {
 	RssSourceURL  string `gorm:"column:rss_source_url;primaryKey" json:"rssSourceUrl"`
 	RssSourceName string `gorm:"column:rss_source_name;default:''" json:"rssSourceName"`
 	RssSourceGroup string `gorm:"column:rss_source_group" json:"rssSourceGroup"`
-	Enabled       int    `gorm:"column:enabled;default:1" json:"enabled"`
+	Enabled       int    `gorm:"column:enabled" json:"enabled"`
 	UserNamespace string `gorm:"column:user_namespace;primaryKey;default:''" json:"-"`
 	RawJSON       string `gorm:"column:raw_json" json:"-"`
 }

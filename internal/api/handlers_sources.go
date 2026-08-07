@@ -233,23 +233,41 @@ func fetchRemoteSources(url string) ([]*model.BookSource, error) {
 	return out, nil
 }
 
+// sourceStringFields 后端 string 列中可能收到 legado 对象/数组值的字段（规则、header 等）。
+// legado 新版规则可为对象（如 {"bookList":"...","name":"..."}），须转 JSON 字符串存储。
+var sourceStringFields = []string{
+	"bookSourceComment", "bookSourceGroup", "bookSourceName", "bookUrlPattern",
+	"concurrentRate", "header", "proxyUrl", "loginUrl", "loginUi", "loginCheckJs", "loginJS",
+	"variableComment", "exploreUrl", "searchUrl",
+	"ruleExplore", "ruleSearch", "ruleBookInfo", "ruleToc", "ruleContent", "ruleRelated",
+	"searchRule", "exploreRule", "bookInfoRule", "tocRule", "contentRule",
+	"key", "tag", "logger", "variable",
+}
+
 // normalizeSourceMap 将宽松 JSON 书源对象归一化为 model.BookSource：
 //   - legado 布尔字段（enabled/enabledExplore/enabledCookieJar）→ 0/1（后端 int 列）
-//   - 对象型字段（header 等）→ JSON 字符串（兼容嵌套对象）
+//   - 对象/数组字段（rule*、header 等 string 列）→ JSON 字符串
 //
 // 未知字段由 encoding/json 忽略；返回 err 表示字段类型无法归一化。
 func normalizeSourceMap(m map[string]any) (*model.BookSource, error) {
 	for _, k := range []string{"enabled", "enabledExplore", "enabledCookieJar"} {
-		if v, ok := m[k].(bool); ok {
+		switch v := m[k].(type) {
+		case bool:
 			if v {
 				m[k] = 1
 			} else {
 				m[k] = 0
 			}
+		case nil:
+			// 缺省默认：enabled/enabledExplore 默认启用，enabledCookieJar 默认关闭
+			if k == "enabled" || k == "enabledExplore" {
+				m[k] = 1
+			}
 		}
 	}
-	for _, k := range []string{"header"} {
-		if v, ok := m[k].(map[string]any); ok {
+	for _, k := range sourceStringFields {
+		switch v := m[k].(type) {
+		case map[string]any, []any:
 			b, err := json.Marshal(v)
 			if err != nil {
 				return nil, err
