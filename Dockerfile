@@ -1,22 +1,22 @@
 # ============================================================
-# reader-dev (Rust) 多阶段构建
-#   - 运行镜像内置 obscura（唯一浏览器后端）：书源登录/滑块验证码/CF 质询浏览器流
-#     （browser.rs spawn `obscura serve --stealth`——READER_OBSCURA_BIN=/opt/obscura/obscura）
-#   - GAP 175：运行镜像内置 python3 + camoufox（验证码求解 HTTP 后端
-#     scripts/camoufox_solver.py——CDP 失败后的强质询兜底，端口 8196）
+# reader-dev (Go) 多阶段构建
+#   - Go 后端：CGO_ENABLED=0 静态链接（纯 Go SQLite 驱动 glebarez/sqlite，
+#     无 C 依赖；goja JS 引擎纯 Go——比 Rust 版 musl 构建更简单）
+#   - 前端：web-ui（Vue 3 + shadcn-vue）→ dist
+#   - 运行镜像内置 obscura（浏览器后端）+ python3/camoufox（验证码求解）
 #   - 构建：docker build -t reader-dev .
 # ============================================================
 
-# ---------- 阶段 1：后端编译 ----------
-FROM rust:1.97-slim AS builder
+# ---------- 阶段 1：Go 后端编译 ----------
+FROM golang:1.25 AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY .cargo ./.cargo
-# GAP 176：epub 导出内嵌中文字体（include_bytes 编译期内嵌 web-ui/public/fonts/）
-COPY web-ui/public/fonts ./web-ui/public/fonts
-ENV RUSTFLAGS="--cfg reqwest_unstable"
-RUN cargo build --release
+# 依赖层缓存（go.mod/go.sum 未变则复用层）
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+ENV CGO_ENABLED=0
+RUN go build -trimpath -ldflags="-s -w" -o /out/reader-dev ./cmd/server
 
 # ---------- 阶段 2：前端构建 ----------
 FROM node:20-slim AS web
@@ -26,19 +26,16 @@ RUN npm install
 COPY web-ui ./
 RUN npm run build
 
-# ---------- 阶段 2.5：camoufox 求解后端（pip 包 + 浏览器二进制，构建期下载） ----------
+# ---------- 阶段 3：camoufox 求解后端（pip 包 + 浏览器二进制，构建期下载） ----------
 FROM python:3.12-slim AS camo
 RUN pip install --no-cache-dir camoufox==0.5.4 \
     && python -m camoufox fetch
 
-# ---------- 阶段 3：obscura 浏览器（release stealth 构建——BoringSSL TLS 指纹模拟/反检测/追踪器拦截） ----------
+# ---------- 阶段 4：obscura 浏览器（release stealth 构建——BoringSSL TLS 指纹模拟/反检测/追踪器拦截） ----------
 FROM debian:trixie-slim AS obscura
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-# 仓库无安装脚本——直接下载官方 release 资产（-stealth 后缀为 stealth 构建，
-# 含 BoringSSL/wreq 传输层）。TARGETARCH 由 buildx --platform 自动注入（amd64/arm64）；
-# 普通 docker build 未注入时默认 x86_64。资产内含 obscura + obscura-worker（同目录）
 RUN set -eux; \
     case "${TARGETARCH:-}" in \
       ""|amd64|x86_64) ASSET="obscura-x86_64-linux-stealth.tar.gz" ;; \
@@ -53,14 +50,15 @@ RUN set -eux; \
     test -x /opt/obscura/obscura; \
     ls -la /opt/obscura
 
-# ---------- 阶段 4：运行镜像 ----------
+# ---------- 阶段 5：运行镜像 ----------
 FROM debian:trixie-slim
 
-# 时区 + CA + python3（camoufox 后端）——obscura 为静态依赖少的 Rust 二进制（无需 chromium）
+# 时区 + CA + tini（PID 1 信号转发）+ python3（camoufox 后端）
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         tzdata \
+        tini \
         fonts-noto-cjk \
         python3 \
         python3-pip \
@@ -87,7 +85,7 @@ ENV READER_APP_WEB_ROOT=/app/web-ui/dist
 ENV READER_OBSCURA_BIN=/opt/obscura/obscura
 ENV READER_CAMOUFOX_URL=http://127.0.0.1:8196
 
-COPY --from=builder /app/target/release/reader-dev /usr/local/bin/reader-dev
+COPY --from=builder /out/reader-dev /usr/local/bin/reader-dev
 COPY --from=web /web/dist /app/web-ui/dist
 
 EXPOSE 8080
