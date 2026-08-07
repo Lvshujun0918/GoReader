@@ -207,7 +207,7 @@ func (a *API) handleGetBookInfo(c *gin.Context) {
 		Fail(c, "未找到书源")
 		return
 	}
-	fetcher := bookfetch.New(a.Storage, ns)
+	fetcher := bookfetch.New(a.Storage, ns, a.Solver)
 	info, err := fetcher.BookInfo(source, url)
 	if err != nil {
 		Fail(c, "获取书籍信息失败："+err.Error())
@@ -251,7 +251,7 @@ func (a *API) handleGetBookToc(c *gin.Context) {
 		Fail(c, "未找到书源")
 		return
 	}
-	fetcher := bookfetch.New(a.Storage, ns)
+	fetcher := bookfetch.New(a.Storage, ns, a.Solver)
 	chapters, _, err := fetcher.BookToc(source, tocURL)
 	if err != nil {
 		Fail(c, "获取目录失败："+err.Error())
@@ -301,7 +301,7 @@ func (a *API) handleGetBookContent(c *gin.Context) {
 		Fail(c, "未找到书源")
 		return
 	}
-	fetcher := bookfetch.New(a.Storage, ns)
+	fetcher := bookfetch.New(a.Storage, ns, a.Solver)
 	res, err := fetcher.BookContent(source, url, 10)
 	if err != nil {
 		Fail(c, "获取正文失败："+err.Error())
@@ -330,7 +330,7 @@ func (a *API) handleGetChapterListByRule(c *gin.Context) {
 		Fail(c, "未找到书源")
 		return
 	}
-	fetcher := bookfetch.New(a.Storage, ns)
+	fetcher := bookfetch.New(a.Storage, ns, a.Solver)
 	chapters, _, err := fetcher.BookToc(source, url)
 	if err != nil {
 		Fail(c, "获取目录失败："+err.Error())

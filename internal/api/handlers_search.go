@@ -11,6 +11,7 @@ import (
 	"github.com/Lvshujun0918/reader-dev/internal/parser/rule"
 	"github.com/Lvshujun0918/reader-dev/internal/service/bookfetch"
 	"github.com/Lvshujun0918/reader-dev/internal/service/crawler"
+	"github.com/Lvshujun0918/reader-dev/internal/service/solver"
 )
 
 // SearchResult 搜索结果（兼容 legacy SearchBook camelCase）。
@@ -30,8 +31,8 @@ type SearchResult struct {
 	Time               int64  `json:"time"`
 }
 
-// SearchSource 单书源搜索。
-func SearchSource(src *model.BookSource, keyword string) ([]*SearchResult, error) {
+// SearchSource 单书源搜索。solverOpt 可选传入质询求解器（书源 cookie 自动附加 + 质询求解）。
+func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.Solver) ([]*SearchResult, error) {
 	ruleStr := src.RuleSearch
 	if ruleStr == "" {
 		ruleStr = src.SearchRule
@@ -44,8 +45,8 @@ func SearchSource(src *model.BookSource, keyword string) ([]*SearchResult, error
 	searchURL = strings.ReplaceAll(searchURL, "{key}", urlEncodeKeyword(keyword))
 	searchURL = strings.ReplaceAll(searchURL, "{searchKey}", urlEncodeKeyword(keyword))
 
-	client := crawler.New(nil, "")
-	body, err := client.FetchWithHeaders(searchURL, nil)
+	client := crawler.New(nil, "", solverOpt...)
+	body, err := client.Fetch(searchURL, src)
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +166,7 @@ func (a *API) handleSearchBook(c *gin.Context) {
 		Fail(c, "未找到书源")
 		return
 	}
-	results, err := SearchSource(src, keyword)
+	results, err := SearchSource(src, keyword, a.Solver)
 	if err != nil {
 		Fail(c, "搜索失败："+err.Error())
 		return
@@ -204,7 +205,7 @@ func (a *API) handleSearchBookMulti(c *gin.Context) {
 		if src.Enabled != 1 || src.SearchURL == "" {
 			continue
 		}
-		if results, err := SearchSource(&src, keyword); err == nil {
+		if results, err := SearchSource(&src, keyword, a.Solver); err == nil {
 			all = append(all, results...)
 		}
 		count++
@@ -240,7 +241,7 @@ func (a *API) handleSearchBookMultiSSE(c *gin.Context) {
 		if src.Enabled != 1 || src.SearchURL == "" {
 			continue
 		}
-		results, err := SearchSource(&src, keyword)
+		results, err := SearchSource(&src, keyword, a.Solver)
 		if err != nil {
 			continue
 		}

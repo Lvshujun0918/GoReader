@@ -95,8 +95,8 @@ func (a *API) handleExploreBook(c *gin.Context) {
 	if ruleStr == "" {
 		ruleStr = src.ExploreRule
 	}
-	client := crawlerClient(ns)
-	body, err := client.FetchWithHeaders(url, nil)
+	client := a.crawlerClient(ns)
+	body, err := client.Fetch(url, src)
 	if err != nil {
 		Fail(c, "探索失败："+err.Error())
 		return

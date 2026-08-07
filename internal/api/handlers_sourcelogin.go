@@ -6,9 +6,9 @@ import (
 	"github.com/Lvshujun0918/reader-dev/internal/service/crawler"
 )
 
-// crawlerClient 创建无存储抓取客户端。
-func crawlerClient(ns string) *crawler.Client {
-	return crawler.New(nil, ns)
+// crawlerClient 创建抓取客户端（带全局质询求解器）。
+func (a *API) crawlerClient(ns string) *crawler.Client {
+	return crawler.New(nil, ns, a.Solver)
 }
 
 // handleLoginBookSource GET/POST /reader3/loginBookSource：书源登录（HTTP 直连表单）。
@@ -41,7 +41,7 @@ func (a *API) handleLoginBookSource(c *gin.Context) {
 		return
 	}
 	// HTTP 直连登录（GET/POST 表单）
-	client := crawlerClient(ns)
+	client := a.crawlerClient(ns)
 	form := map[string]string{}
 	if username != "" {
 		form["username"] = username

@@ -5,6 +5,7 @@ import (
 
 	"github.com/Lvshujun0918/reader-dev/internal/config"
 	"github.com/Lvshujun0918/reader-dev/internal/middleware"
+	"github.com/Lvshujun0918/reader-dev/internal/service/solver"
 	"github.com/Lvshujun0918/reader-dev/internal/storage"
 )
 
@@ -13,11 +14,17 @@ type API struct {
 	Storage *storage.Storage
 	Config  *config.Config
 	Stats   *middleware.RequestStats
+	Solver  *solver.Solver // 全局 obscura 质询求解器（READER_OBSCURA_URL/BIN 配置）
 }
 
 // New 创建 API 处理器。
 func New(st *storage.Storage, cfg *config.Config, stats *middleware.RequestStats) *API {
-	return &API{Storage: st, Config: cfg, Stats: stats}
+	return &API{
+		Storage: st,
+		Config:  cfg,
+		Stats:   stats,
+		Solver:  solver.New(cfg.ObscuraURL, cfg.ObscuraBin, cfg.ObscuraProxy),
+	}
 }
 
 // Engine 构建 gin 引擎。

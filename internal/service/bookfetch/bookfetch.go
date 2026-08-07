@@ -8,6 +8,7 @@ import (
 	"github.com/Lvshujun0918/reader-dev/internal/model"
 	"github.com/Lvshujun0918/reader-dev/internal/parser/rule"
 	"github.com/Lvshujun0918/reader-dev/internal/service/crawler"
+	"github.com/Lvshujun0918/reader-dev/internal/service/solver"
 	"github.com/Lvshujun0918/reader-dev/internal/storage"
 )
 
@@ -16,9 +17,9 @@ type Fetcher struct {
 	Client *crawler.Client
 }
 
-// New 创建抓取器。
-func New(st *storage.Storage, ns string) *Fetcher {
-	return &Fetcher{Client: crawler.New(st, ns)}
+// New 创建抓取器。solverOpt 可选传入质询求解器（转发给 crawler）。
+func New(st *storage.Storage, ns string, solverOpt ...*solver.Solver) *Fetcher {
+	return &Fetcher{Client: crawler.New(st, ns, solverOpt...)}
 }
 
 // BookInfo 书籍详情（ruleBookInfo）。
