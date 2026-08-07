@@ -53,16 +53,11 @@ type Config struct {
 	LocalBookDir string
 	// AutoBackupHour 每日自动备份小时
 	AutoBackupHour int
-	// CamoufoxURL camoufox 求解服务地址
-	CamoufoxURL string
-	// CamoufoxDisable / First  camoufox 开关
-	CamoufoxDisable bool
-	CamoufoxFirst bool
-	// FlareSolverrURL FlareSolverr 服务地址
+	// FlareSolverrURL 外部 FlareSolverr 服务地址（可选，未实现客户端）
 	FlareSolverrURL string
-	// ObscuraURL / Bin / Proxy 浏览器自动化后端
-	ObscuraURL string
-	ObscuraBin string
+	// ObscuraURL / Bin / Proxy 浏览器自动化后端（质询求解，见 internal/service/solver）
+	ObscuraURL   string
+	ObscuraBin   string
 	ObscuraProxy string
 	// CDPNoStealth 跳过 stealth JS 注入（测试钩子）
 	CDPNoStealth bool
@@ -94,9 +89,6 @@ func FromEnv() *Config {
 		TrustedProxies:           envList("READER_TRUSTED_PROXIES"),
 		LocalBookDir:             os.Getenv("READER_LOCAL_BOOK_DIR"),
 		AutoBackupHour:           envInt("READER_AUTO_BACKUP_HOUR", 3),
-		CamoufoxURL:              envStr("READER_CAMOUFOX_URL", "http://127.0.0.1:8196"),
-		CamoufoxDisable:          envFlag("READER_CAMOUFOX_DISABLE"),
-		CamoufoxFirst:            envFlag("READER_CAMOUFOX_FIRST"),
 		FlareSolverrURL:          os.Getenv("FLARESOLVERR_URL"),
 		ObscuraURL:               os.Getenv("READER_OBSCURA_URL"),
 		ObscuraBin:               os.Getenv("READER_OBSCURA_BIN"),
