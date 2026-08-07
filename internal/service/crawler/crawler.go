@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +33,8 @@ type Client struct {
 	Storage *storage.Storage
 	NS      string
 	Solver  *solver.Solver // 可选：obscura 质询求解器（配置了 READER_OBSCURA_URL/BIN 时启用）
+	// AllowPrivate 允许访问内网/回环地址（READER_ALLOW_PRIVATE_NETWORK=1，测试与本地代理场景）
+	AllowPrivate bool
 }
 
 // New 创建抓取客户端。solverOpt 可选传入质询求解器。
@@ -48,9 +51,10 @@ func New(st *storage.Storage, ns string, solverOpt ...*solver.Solver) *Client {
 		ResponseHeaderTimeout: 15 * time.Second,
 	}
 	c := &Client{
-		HTTP:    &http.Client{Transport: transport, Timeout: 30 * time.Second},
-		Storage: st,
-		NS:      ns,
+		HTTP:         &http.Client{Transport: transport, Timeout: 30 * time.Second},
+		Storage:      st,
+		NS:           ns,
+		AllowPrivate: os.Getenv("READER_ALLOW_PRIVATE_NETWORK") == "1",
 	}
 	if len(solverOpt) > 0 && solverOpt[0] != nil {
 		c.Solver = solverOpt[0]
@@ -80,7 +84,7 @@ func (c *Client) doFetch(rawURL string, source *model.BookSource) ([]byte, int, 
 	if err != nil {
 		return nil, 0, nil, "", err
 	}
-	if !ssrfAllowed(u.Hostname()) {
+	if !ssrfAllowed(u.Hostname(), c.AllowPrivate) {
 		return nil, 0, nil, "", fmt.Errorf("%w: %s", ErrSSRF, u.Hostname())
 	}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, rawURL, nil)
@@ -211,7 +215,7 @@ func (c *Client) FetchWithHeaders(rawURL string, headers map[string]string) ([]b
 	if err != nil {
 		return nil, err
 	}
-	if !ssrfAllowed(u.Hostname()) {
+	if !ssrfAllowed(u.Hostname(), c.AllowPrivate) {
 		return nil, fmt.Errorf("%w: %s", ErrSSRF, u.Hostname())
 	}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, rawURL, nil)
@@ -273,7 +277,11 @@ func applySourceHeaders(req *http.Request, raw string) {
 }
 
 // ssrfAllowed SSRF 防护：回环/内网/链路本地/多播地址拒绝。
-func ssrfAllowed(host string) bool {
+// allowPrivate=true（READER_ALLOW_PRIVATE_NETWORK）时放行（测试/本地代理）。
+func ssrfAllowed(host string, allowPrivate bool) bool {
+	if allowPrivate {
+		return true
+	}
 	ip := net.ParseIP(host)
 	if ip == nil {
 		// 域名：解析后检查
