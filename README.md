@@ -70,7 +70,7 @@ cd web-ui && npm install && npm run build && cd ..
 # 运行
 export READER_APP_WORKDIR="$PWD/data"
 export READER_APP_SECURE=true
-./target/release/reader-dev
+./reader-dev
 ```
 浏览器打开 `http://localhost:8080`。
 
@@ -112,10 +112,11 @@ docker run -d --name reader-dev-rust \
 #    原 JSON 文件保留（可回退）
 ```
 
-### 直接跑二进制
+### Docker 镜像（每次提交自动构建）
 ```bash
-# release 资产 reader-dev-linux-x64-musl（静态——任何发行版）
-READER_APP_WORKDIR=/storage READER_APP_SECURE=true ./reader-dev-linux-x64-musl
+# master 每次提交自动推送，版本标签 = 短 SHA（7 位，如 ghcr.io/warpdotsys/reader-dev:abc1234）
+# latest = master 最新滚动标签
+READER_APP_WORKDIR=/storage READER_APP_SECURE=true docker run ... ghcr.io/warpdotsys/reader-dev:latest
 ```
 
 ### 迁移覆盖

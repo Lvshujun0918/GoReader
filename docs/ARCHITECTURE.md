@@ -183,9 +183,9 @@ scripts/              camoufox_solver.py / e2e-smoke.py / api-scan.py / 69shuba.
   - 运行镜像：**`debian:trixie-slim`（GLIBC 运行时）**——内置 CA 证书、时区（`TZ=Asia/Shanghai`）、python3 + `camoufox_solver.py`、obscura（`/opt/obscura/obscura`）
   - 入口：**tini**（`ENTRYPOINT ["/usr/bin/tini", "--"]` + `CMD ["reader-dev"]`——PID 1 信号转发/僵尸回收，1Panel 等面板兼容）
   - 数据目录 `/data`（`VOLUME`），`READER_APP_WORKDIR=/data`
-- **GitHub Release 资产**：`reader-dev-linux-x64`（CGO_ENABLED=0 纯 Go 静态链接——无 glibc 依赖，任意发行版直跑）+ `reader-dev-windows-x64.exe`（Go 原生交叉编译）
+- **镜像版本**：master 每次提交自动构建推送（`docker-publish-go.yml`）——版本标签 = **短 SHA**（7 位，可追溯）；`latest` 为 master 最新滚动标签；**不再发布 GitHub Release 二进制**
 - 前端**不内嵌**（`web-ui/dist` 目录由 `READER_APP_WEB_ROOT` 指定）
-- CI：`go-ci.yml`（vet/test-race/静态构建校验/交叉编译矩阵）、`frontend-ci.yml`（vue-tsc 严格类型检查 + vite 构建 + 产物上传）、`docker-publish-go.yml`（`v5.*` 标签触发 + master 祖先发版 guard + 多架构镜像 + Windows 交叉编译）
+- CI：`go-ci.yml`（vet/test-race/静态构建校验/交叉编译矩阵）、`frontend-ci.yml`（vue-tsc 严格类型检查 + vite 构建 + 产物上传）、`docker-publish-go.yml`（master push 触发 + 短 SHA 版本标签 + 多架构镜像，gha 缓存）
 
 ## 8. 迭代路线（现状核对）
 
@@ -199,4 +199,4 @@ scripts/              camoufox_solver.py / e2e-smoke.py / api-scan.py / 69shuba.
 - [x] 7. 反爬（obscura 唯一浏览器后端 + camoufox 兜底 + FlareSolverr 可选 + 真实站点 69shuba 验证）
 - [x] 8. 安全审计 6 major 修复（SSRF/跨用户缓存/限流绕过/封面墙/PWA SW/JS 阻塞）
 - [x] 9. 双轨书仓 / 备份恢复闭环 / 启动快照 + 每日自动备份 / Docker（trixie + tini + 内置 obscura/camoufox）
-- [ ] 剩余项（未实现）：见 `docs/ROADMAP.md`（Windows 签名发布验证 / 69shuba 住宅代理 / argon2 / 服务端 TLS+H2/H3 / zip 炸弹强化 / 多实例 / macOS 资产）
+- [ ] 剩余项（未实现）：见 `docs/ROADMAP.md`（69shuba 住宅代理 / 服务端 TLS+H2/H3 / zip 炸弹强化 / 多实例 / 本地书导入 / 浏览器自动化）
