@@ -19,7 +19,7 @@ ENV CGO_ENABLED=0
 RUN go build -trimpath -ldflags="-s -w" -o /out/reader-dev ./cmd/server
 
 # ---------- 阶段 2：前端构建 ----------
-FROM node:20-slim AS web
+FROM node:22-slim AS web
 WORKDIR /web
 COPY web-ui/package.json web-ui/package-lock.json* ./
 RUN npm install
