@@ -2310,7 +2310,7 @@ async function runExportData() {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: rgba(24, 24, 27, 0.35);
+  background: var(--overlay);
 }
 .dlg {
   width: min(420px, 100%);
@@ -2318,7 +2318,7 @@ async function runExportData() {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+  box-shadow: var(--shadow-lg);
   outline: none;
 }
 .dlg-confirm {

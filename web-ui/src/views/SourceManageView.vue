@@ -2684,7 +2684,7 @@ onBeforeUnmount(() => {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 10px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.1);
+  box-shadow: var(--shadow-md);
 }
 .ctx-title {
   padding: 4px 10px 8px;
@@ -3382,7 +3382,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: rgba(24, 24, 27, 0.35);
+  background: var(--overlay);
 }
 .dlg {
   width: min(420px, 100%);
@@ -3390,7 +3390,7 @@ onBeforeUnmount(() => {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+  box-shadow: var(--shadow-lg);
   outline: none;
 }
 .dlg-confirm {

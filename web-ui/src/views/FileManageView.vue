@@ -1357,7 +1357,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: rgba(24, 24, 27, 0.32);
+  background: var(--overlay);
   animation: fade-in 0.2s ease both;
 }
 .dlg {
@@ -1366,7 +1366,7 @@ onBeforeUnmount(() => {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 12px 40px rgba(24, 24, 27, 0.12);
+  box-shadow: var(--shadow-lg);
 }
 .dlg-title {
   margin: 0 0 6px;
@@ -1570,7 +1570,7 @@ onBeforeUnmount(() => {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 999px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+  box-shadow: var(--shadow-md);
 }
 .multi-count {
   font-size: 12.5px;

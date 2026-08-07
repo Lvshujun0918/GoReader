@@ -4306,7 +4306,7 @@ onBeforeUnmount(() => {
   font-size: 20px;
   font-family: inherit;
   cursor: pointer;
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+  box-shadow: var(--shadow-md);
   transition: transform 0.15s ease;
 }
 .media-play:hover:not(:disabled) {
@@ -4452,7 +4452,7 @@ onBeforeUnmount(() => {
   font-size: 14px;
   letter-spacing: 3px;
   text-decoration: none;
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.15);
+  box-shadow: var(--shadow-md);
   transition: transform 0.15s ease;
 }
 .download-btn:hover {
@@ -4548,7 +4548,7 @@ onBeforeUnmount(() => {
   background: var(--bg-float);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+  box-shadow: var(--shadow-lg);
   padding: 4px;
 }
 .font-item {
@@ -4625,7 +4625,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(24, 24, 27, 0.28);
+  background: var(--overlay);
 }
 .pop-enter-active,
 .pop-leave-active {
@@ -4973,7 +4973,7 @@ onBeforeUnmount(() => {
   position: fixed;
   inset: 0;
   z-index: 50;
-  background: rgba(24, 24, 27, 0.32);
+  background: var(--overlay);
 }
 .chapter-drawer {
   position: absolute;
@@ -5379,7 +5379,7 @@ onBeforeUnmount(() => {
   font-size: 15px;
   line-height: 1;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.14);
+  box-shadow: var(--shadow-sm);
   transition:
     color 0.2s ease,
     border-color 0.2s ease,
