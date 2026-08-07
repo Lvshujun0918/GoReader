@@ -170,6 +170,7 @@ const visibleLinks = computed(() => {
   padding: 14px 32px;
   background: var(--bg-float);
   border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
 }

@@ -34,6 +34,13 @@
   --accent-soft: rgba(79, 70, 229, 0.08);
   /* 强调色上的文字（浅色主题白字 / 深色主题深字） */
   --on-accent: #ffffff;
+  /* 阴影 token（Soft UI 多层柔和阴影——微/小/中/大四级，hover→卡片→浮层） */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 12px -4px rgba(0, 0, 0, 0.1);
+  --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.05), 0 10px 28px -10px rgba(0, 0, 0, 0.16);
+  --shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.06), 0 20px 48px -16px rgba(0, 0, 0, 0.24);
+  /* 弹窗/浮层遮罩（随主题） */
+  --overlay: rgba(24, 24, 27, 0.4);
   --radius: 8px;
   --font-sans:
     -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter',
@@ -62,6 +69,12 @@ html[data-theme='dark'] {
   --accent-deep: #a5a2ff;
   --accent-soft: rgba(139, 135, 255, 0.14);
   --on-accent: #16161c;
+  /* 阴影 token（深色：阴影更深更重才可见） */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 14px -4px rgba(0, 0, 0, 0.45);
+  --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.35), 0 12px 32px -12px rgba(0, 0, 0, 0.55);
+  --shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.4), 0 24px 56px -20px rgba(0, 0, 0, 0.65);
+  --overlay: rgba(0, 0, 0, 0.55);
   /* Element Plus 深色映射 */
   --el-bg-color: #212126;
   --el-bg-color-overlay: #26262c;

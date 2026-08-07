@@ -282,7 +282,7 @@ async function submit() {
 .login-card {
   border: 1px solid var(--border);
   background: var(--card);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 12px 32px -16px rgba(0, 0, 0, 0.22);
+  box-shadow: var(--shadow-md);
 }
 
 /* ---------- 输入框（框内 icon，不占用横向布局） ---------- */
