@@ -5,6 +5,12 @@ import { ElMessage } from 'element-plus'
 import { login as loginApi } from '@/api/auth'
 import { useUserStore } from '@/stores/user'
 import { t } from '@/utils/i18n'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 const router = useRouter()
 const route = useRoute()
@@ -69,76 +75,75 @@ async function submit() {
         <p class="wordmark-sub">READER</p>
       </div>
 
-      <!-- 登录 / 注册 切换（细字 + 下划线指示） -->
-      <div class="mode-switch" role="tablist">
-        <button
-          type="button"
-          :class="{ active: mode === 'login' }"
-          @click="switchMode('login')"
-        >
-          {{ t('login.title') }}
-        </button>
-        <button
-          type="button"
-          :class="{ active: mode === 'register' }"
-          @click="switchMode('register')"
-        >
-          {{ t('login.register') }}
-        </button>
-      </div>
+      <!-- 登录 / 注册 切换（shadcn-vue Tabs） -->
+      <Tabs :model-value="mode" class="login-tabs">
+        <TabsList class="login-tabs-list">
+          <TabsTrigger value="login" @click="switchMode('login')">
+            {{ t('login.title') }}
+          </TabsTrigger>
+          <TabsTrigger value="register" @click="switchMode('register')">
+            {{ t('login.register') }}
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
 
-      <!-- 下划线风格表单 -->
-      <form class="login-form" @submit.prevent="submit">
-        <label class="field">
-          <span class="field-label">{{ t('login.username') }}</span>
-          <input
-            v-model="form.username"
-            class="field-input"
-            type="text"
-            :placeholder="t('login.placeholder.username')"
-            maxlength="32"
-            autocomplete="username"
-            spellcheck="false"
-          />
-        </label>
+      <!-- shadcn-vue Card 表单 -->
+      <Card class="login-card">
+        <CardContent class="pt-6">
+          <form class="grid gap-4" @submit.prevent="submit">
+            <div class="grid gap-2">
+              <Label for="login-username">{{ t('login.username') }}</Label>
+              <Input
+                id="login-username"
+                v-model="form.username"
+                type="text"
+                :placeholder="t('login.placeholder.username')"
+                maxlength="32"
+                autocomplete="username"
+                spellcheck="false"
+              />
+            </div>
 
-        <label class="field">
-          <span class="field-label">{{ t('login.password') }}</span>
-          <input
-            v-model="form.password"
-            class="field-input"
-            type="password"
-            :placeholder="t('login.placeholder.password')"
-            maxlength="64"
-            autocomplete="current-password"
-          />
-        </label>
+            <div class="grid gap-2">
+              <Label for="login-password">{{ t('login.password') }}</Label>
+              <Input
+                id="login-password"
+                v-model="form.password"
+                type="password"
+                :placeholder="t('login.placeholder.password')"
+                maxlength="64"
+                autocomplete="current-password"
+              />
+            </div>
 
-        <!-- GAP 90：注册模式邀请码（后端开启邀请注册时必填；未开启可留空） -->
-        <label v-if="mode === 'register'" class="field">
-          <span class="field-label">{{ t('login.inviteCode') }}</span>
-          <input
-            v-model="form.code"
-            class="field-input"
-            type="text"
-            :placeholder="t('login.placeholder.code')"
-            maxlength="64"
-            autocomplete="off"
-            spellcheck="false"
-          />
-        </label>
+            <!-- GAP 90：注册模式邀请码（后端开启邀请注册时必填；未开启可留空） -->
+            <div v-if="mode === 'register'" class="grid gap-2">
+              <Label for="login-code">{{ t('login.inviteCode') }}</Label>
+              <Input
+                id="login-code"
+                v-model="form.code"
+                type="text"
+                :placeholder="t('login.placeholder.code')"
+                maxlength="64"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
 
-        <!-- GAP 150：记住我（不勾选 → sessionStorage 存 token，关闭标签页即登出） -->
-        <label class="remember-row">
-          <input v-model="remember" class="remember-box" type="checkbox" />
-          <span class="remember-label">{{ t('login.remember') }}</span>
-        </label>
+            <!-- GAP 150：记住我（不勾选 → sessionStorage 存 token，关闭标签页即登出） -->
+            <div class="flex items-center gap-2">
+              <Checkbox id="login-remember" v-model:checked="remember" />
+              <Label for="login-remember" class="font-normal cursor-pointer">
+                {{ t('login.remember') }}
+              </Label>
+            </div>
 
-        <button class="submit-btn" type="submit" :disabled="loading">
-          <span v-if="loading" class="btn-spinner" aria-hidden="true"></span>
-          <span v-else>{{ mode === 'login' ? t('login.submit') : t('login.registerSubmit') }}</span>
-        </button>
-      </form>
+            <Button type="submit" :disabled="loading" class="w-full">
+              {{ mode === 'login' ? t('login.submit') : t('login.registerSubmit') }}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
 
       <p class="login-foot">
         {{ mode === 'login' ? t('login.noAccount') : t('login.hasAccount') }}
@@ -168,7 +173,7 @@ async function submit() {
 }
 
 .login-panel {
-  width: min(340px, 100%);
+  width: min(360px, 100%);
   padding: 56px 8px 40px;
 }
 
@@ -177,7 +182,7 @@ async function submit() {
   display: flex;
   flex-direction: column;
   align-items: center;
-  margin-bottom: 48px;
+  margin-bottom: 36px;
 }
 .wordmark-text {
   margin: 0;
@@ -200,192 +205,43 @@ async function submit() {
   color: var(--text-3);
 }
 
-/* ---------- 模式切换（细字 + 下划线） ---------- */
-.mode-switch {
+/* ---------- shadcn-vue 卡片 ---------- */
+.login-tabs {
   display: flex;
   justify-content: center;
-  gap: 36px;
-  margin-bottom: 44px;
+  margin-bottom: 24px;
 }
-.mode-switch button {
-  padding: 2px 0 8px;
-  border: none;
-  border-bottom: 1px solid transparent;
-  background: none;
-  color: var(--text-3);
-  font-size: 14px;
-  font-weight: 400;
-  letter-spacing: 2px;
-  cursor: pointer;
-  transition:
-    color 0.2s ease,
-    border-color 0.2s ease;
+.login-card {
+  box-shadow: var(--shadow-1);
 }
-.mode-switch button:hover {
-  color: var(--text-2);
-}
-.mode-switch button.active {
-  color: var(--text-1);
-  border-bottom-color: var(--accent);
-}
-
-/* ---------- 表单（下划线输入） ---------- */
-.login-form {
-  display: flex;
-  flex-direction: column;
-  gap: 30px;
-}
-.field {
-  display: block;
-}
-.field-label {
-  display: block;
-  margin-bottom: 8px;
-  font-size: 12.5px;
-  font-weight: 400;
-  color: var(--text-2);
-  letter-spacing: 1px;
-}
-.field-input {
-  width: 100%;
-  padding: 9px 2px;
-  border: none;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
-  background: transparent;
-  color: var(--text-1);
-  font-family: inherit;
-  font-size: 15px;
-  font-weight: 400;
-  outline: none;
-  transition: border-color 0.2s ease;
-}
-.field-input::placeholder {
-  color: var(--text-3);
-  font-weight: 300;
-}
-.field-input:focus {
-  border-bottom-color: var(--accent);
-}
-
-/* ---------- 记住我（GAP 150） ---------- */
-.remember-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: -12px;
-  cursor: pointer;
-}
-.remember-box {
-  width: 14px;
-  height: 14px;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-.remember-label {
-  font-size: 12px;
-  font-weight: 300;
-  letter-spacing: 0.5px;
-  color: var(--text-3);
-  cursor: pointer;
-  user-select: none;
-}
-
-/* ---------- 提交按钮（纯色无渐变） ---------- */
-.submit-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  width: 100%;
-  height: 44px;
-  margin-top: 8px;
-  border: none;
-  border-radius: var(--radius);
-  background: var(--accent);
-  color: var(--on-accent);
-  font-family: inherit;
-  font-size: 14.5px;
-  font-weight: 400;
-  letter-spacing: 6px;
-  cursor: pointer;
-  transition: background 0.2s ease;
-}
-.submit-btn:hover:not(:disabled) {
-  background: var(--accent-deep);
-}
-.submit-btn:active:not(:disabled) {
-  background: var(--accent-deep);
-}
-.submit-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-.btn-spinner {
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  border: 2px solid color-mix(in srgb, var(--on-accent) 35%, transparent);
-  border-top-color: var(--on-accent);
-  animation: spin 0.7s linear infinite;
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-/* ---------- 底部 ---------- */
 .login-foot {
-  margin: 36px 0 0;
+  margin-top: 20px;
   text-align: center;
   font-size: 13px;
-  color: var(--text-3);
+  color: var(--text-2);
 }
 .link-btn {
-  border: none;
-  background: none;
-  padding: 0;
   color: var(--accent);
-  font-family: inherit;
-  font-size: 13px;
+  background: none;
+  border: none;
+  padding: 0 4px;
   cursor: pointer;
-  transition: color 0.2s ease;
+  font-size: 13px;
 }
-.link-btn:hover {
-  color: var(--accent-deep);
+.tg-foot {
+  margin-left: 12px;
+  color: var(--text-3);
+  font-size: 12px;
+  text-decoration: none;
 }
-
 .login-footer {
   position: fixed;
-  bottom: 20px;
+  bottom: 18px;
   left: 0;
   right: 0;
   text-align: center;
   font-size: 11px;
-  font-weight: 300;
-  letter-spacing: 2px;
+  letter-spacing: 1px;
   color: var(--text-3);
-}
-.tg-foot {
-  display: block;
-  margin-top: 18px;
-  text-align: center;
-  font-size: 12px;
-  font-weight: 300;
-  letter-spacing: 0.5px;
-  color: var(--text-3, #aaa);
-  text-decoration: none;
-  transition: color 0.2s ease;
-}
-.tg-foot:hover {
-  color: var(--accent, #4f46e5);
-}
-.login-logo {
-  width: 76px;
-  height: 76px;
-  border-radius: 20px;
-  margin-bottom: 16px;
-  box-shadow: 0 2px 14px rgba(30, 27, 75, 0.2);
 }
 </style>
