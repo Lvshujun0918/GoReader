@@ -4,7 +4,7 @@
 
 **自托管 Web 阅读服务 —— 书源搜索 · 本地书仓 · OPDS · WebDAV · 多用户**
 
-Rust + Vue 3 实现。书源规则引擎、9 种本地书格式、OPDS 1.2/2.0 + PSE、进程内反检测浏览器（obscura stealth）、多用户隔离。
+Go + Vue 3 实现（后端 gin+gorm，前端 shadcn-vue）。书源规则引擎、9 种本地书格式、OPDS 1.2/2.0 + PSE、反检测浏览器（obscura stealth）、多用户隔离。
 
 </div>
 
@@ -53,7 +53,9 @@ EPUB · TXT · MOBI · AZW3 · PDF · FB2 · DOCX · CBZ（漫画）· UMD —�
 - 服务监控页（内存/CPU/请求/在线/书源成功率）、日志
 
 ### 🎨 前端
-Vue 3 + Vite + Element Plus，极简风格、响应式、深色主题、虚拟滚动、SSE 流式、PWA、i18n（中/英）、命令面板（Ctrl+K）
+Vue 3 + Vite + **shadcn-vue**（Tailwind + reka-ui + sonner），极简风格、响应式、深色主题、虚拟滚动、SSE 流式、PWA、i18n（中/英）、命令面板（Ctrl+K）
+
+> ⚠️ **迁移状态**：后端已从 Rust 迁移到 **Go（gin + gorm）**——核心 API/存储/规则引擎已完成，浏览器自动化与本地书导入等模块按 ROADMAP 迭代中；前端已接入 shadcn-vue（Element Plus → sonner 兼容层，见 `web-ui/src/lib/feedback.ts`）。
 
 ---
 
@@ -61,8 +63,8 @@ Vue 3 + Vite + Element Plus，极简风格、响应式、深色主题、虚拟�
 
 ### 直接运行（Linux/Windows/macOS）
 ```bash
-# 后端
-cargo build --release
+# 后端（Go 1.25+；CGO_ENABLED=0 纯 Go SQLite，无需 C 工具链）
+go build -o reader-dev ./cmd/server
 # 前端
 cd web-ui && npm install && npm run build && cd ..
 # 运行

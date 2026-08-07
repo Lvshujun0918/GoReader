@@ -1,41 +1,38 @@
-# reader-dev (Rust) — 架构设计
+# reader-dev (Go) — 架构设计
 
-> 状态：**v5.0.0 已成型**——Rust 重构主功能齐备（书源/阅读/本地书 9 格式/OPDS/WebDAV/反爬/多用户/双轨书仓/备份），
-> 剩余待办见 `docs/ROADMAP.md`。版本号以 `Cargo.toml` 为准（当前 `5.0.0`）。
-> 本文各节均按当前代码状态核对（2026-08-06）——**未实现的能力不写为已实现**。
+> 状态：**v5.0.0 Go 迁移中**——后端由 Rust 迁移至 **Go（gin + gorm + 纯 Go SQLite）**，
+> 核心 API/存储/规则引擎已完成并冒烟验证；浏览器自动化、TTS WebSocket、本地书导入、
+> 整书缓存等按 `docs/ROADMAP.md` 迭代。版本号以 `go.mod` 为准（当前 `5.0.0`）。
+> 本文各节均按当前代码状态核对——**未实现的能力不写为已实现**。
 
 ---
 
 ## 1. 目标（已完成态）
 
-Rust 重构，**API 兼容 + 数据兼容迁移**，远期计划已全部吸收落地：
-- ✅ SQLite 兼容迁移（远期 2：JSON→SQLite 自动迁移，raw_json 保底）
-- ✅ legado 多规则解析（远期 3：CSS/JSONPath/XPath/Regex/JS 五类规则）
-- ✅ 书籍格式扩展（远期 4：9 种本地格式）
+Go 重构，**API 兼容 + 数据兼容迁移**：
+- ✅ SQLite 兼容迁移（JSON→SQLite 自动迁移，raw_json 保底）
+- ✅ legado 多规则解析（CSS/JSONPath/XPath/Regex/JS 五类规则——goja JS 引擎）
+- ✅ 统一响应契约（ReturnData）+ 命名空间鉴权（accessToken 三通道）
+- 🔄 书籍格式扩展（EPUB 导入等本地书模块迭代中）
 
 ## 2. 模块结构
 
 ```
-src/
-├── main.rs        启动/配置（READER_APP_* env）+ 启动 DB 快照（READER_DB_BACKUP）
-├── lib.rs         AppConfig（env 解析）/ serve()（axum 组装 + 压缩/缓存中间件挂载）
-├── api/           axum 路由（/reader3/*、/opds、/opds-save、/assets/proxy）+ ReturnData
-├── middleware/    upload_limit（multipart 上限 413）/ cache_control（静态资源缓存）
-├── model/         实体（兼容 legacy：User/Book/BookChapter/BookSource/RssSource...）
-├── parser/        legado 多规则引擎（css_chain / js(boa 沙箱) / rule / xpath）
-├── service/       业务（search / crawler(SSRF+质询) / explore / local_book(9 格式) /
-│                  browser(obscura CDP——唯一浏览器后端) / camoufox(强质询兜底) /
-│                  image_cache(跨用户隔离图片缓存) / login(书源登录) / export_book /
-│                  debug / cache_job / health / tts / local_sync(双轨书仓) /
-│                  schedule(定时任务) / imaging(webp 代理) / opds / epub / rss）
-├── storage/       SQLite（迁移/CRUD/书源 cookie/正文缓存/阅读统计）
-└── util/          md5 / sha256 / login_limit(登录限流) / db_backup / 编码检测
-
-web-ui/            Vue3 + Vite + Element Plus 全新前端（非 legacy 产物）
-scripts/           api-scan.py / mock-*-site.py（质询 mock）/ camoufox_solver.py /
-                   69shuba.json（真实书源验证）/ e2e-smoke.py / source-audit.py
-tests/             集成测试（cf_solve / turnstile_solve / captcha_matrix /
-                   obscura_browser / 69shuba_probe）
+├── cmd/server/      入口（.env 加载 / 日志轮转 / 启动 DB 备份 / serve）
+├── internal/
+│   ├── app/         Serve 组装（存储初始化 → 后台任务 → 路由 → 监听 0.0.0.0:port）
+│   ├── config/      AppConfig（READER_APP_* env，与 legacy 完全一致）
+│   ├── api/         gin 路由（/reader3/*、/opds、/opds-save、/webdav*、/assets/proxy）
+│   │                + ReturnData / resolve_namespace / 全部 handler
+│   ├── middleware/  upload_limit（413 JSON）/ cache_control / stats（请求计数）
+│   ├── model/       实体（gorm：User/Book/BookSource/... 17 张表，复合主键隔离）
+│   ├── storage/     SQLite（WAL / AutoMigrate / JSON 迁移 / 复合主键重建 / CRUD）
+│   ├── parser/      legado 多规则引擎（rule：css/xpath/json/regex/js/get）
+│   ├── service/     crawler（SSRF 防护+书源 cookie）/ bookfetch（详情/目录/正文）
+│   └── util/        password（argon2id+MD5 兼容）/ loginlimit / dbbackup / md5 / ct
+web-ui/               Vue3 + Vite + shadcn-vue 前端（Tailwind + reka-ui + sonner）
+scripts/              api-scan.py / mock-*-site.py / camoufox_solver.py / e2e-smoke.py
+src/                  Rust 旧后端（迁移参照，随迁移进度清理）
 ```
 
 ## 3. API 兼容约定（硬性）
@@ -45,7 +42,7 @@ tests/             集成测试（cf_solve / turnstile_solve / captcha_matrix /
 - 认证：`accessToken`（`username:token` query/header），`secure` 模式行为一致
 - legacy 已知 bug 清单（重写时修复）：见 `docs/LEGACY-BUGS.md`
 - 参数名/语义与 legacy 一致（书源规则格式、搜索参数、分页等）
-- **前端**：全新 Vue 3（`web-ui/`），不再复用 legacy 构建产物；构建产物由 `READER_APP_WEB_ROOT` 指向（默认 `web-ui/dist`——目录形态，**未用 rust-embed 内嵌**）
+- **前端**：全新 Vue 3 + shadcn-vue（`web-ui/`），构建产物由 `READER_APP_WEB_ROOT` 指向（默认 `web-ui/dist`——目录形态）
 
 ## 4. 数据兼容迁移（已实现）
 
