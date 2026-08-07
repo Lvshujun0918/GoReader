@@ -3117,7 +3117,7 @@ onMounted(() => {
   opacity: 1;
 }
 .detail-btn:hover {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 .cover-wrap {
   position: relative;
@@ -3578,7 +3578,7 @@ onMounted(() => {
   margin: 10px 2px 0;
   font-size: 12px;
   font-weight: 300;
-  color: #cf4444;
+  color: var(--danger);
 }
 
 /* 文件列表 */
@@ -3633,10 +3633,10 @@ onMounted(() => {
   font-weight: 400;
 }
 .file-state.done {
-  color: #529b2e;
+  color: var(--success);
 }
 .file-state.error {
-  color: #cf4444;
+  color: var(--danger);
   min-width: 0;
   max-width: 130px;
   white-space: nowrap;
@@ -3667,7 +3667,7 @@ onMounted(() => {
   transition: color 0.2s ease;
 }
 .file-remove:hover {
-  color: #cf4444;
+  color: var(--danger);
 }
 .file-remove svg {
   width: 10px;
@@ -3691,7 +3691,7 @@ onMounted(() => {
   color: var(--text-2);
 }
 .overall.hasError {
-  color: #cf4444;
+  color: var(--danger);
 }
 .dlg-actions {
   display: flex;
@@ -4164,11 +4164,11 @@ onMounted(() => {
   opacity: 0.5;
 }
 .ctx-item.danger {
-  color: #cf4444;
+  color: var(--danger);
 }
 .ctx-item.danger:hover:not(:disabled) {
-  color: #b33535;
-  background: rgba(207, 68, 68, 0.07);
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 .ctx-item svg {
   width: 13px;
@@ -4270,8 +4270,8 @@ onMounted(() => {
     background-color 0.2s ease;
 }
 .group-del:hover {
-  color: #cf4444;
-  background: rgba(207, 68, 68, 0.08);
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 .group-del:disabled {
   cursor: not-allowed;
@@ -4493,8 +4493,8 @@ onMounted(() => {
     background-color 0.2s ease;
 }
 .bm-del:hover:not(:disabled) {
-  color: #cf4444;
-  background: rgba(207, 68, 68, 0.08);
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 .bm-del:disabled {
   cursor: not-allowed;
@@ -4563,7 +4563,7 @@ onMounted(() => {
   color: var(--text-2);
 }
 .export-msg.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .field-tip {
   margin: 0 0 10px;
@@ -4707,12 +4707,12 @@ onMounted(() => {
     background-color 0.2s ease;
 }
 .manage-act.danger {
-  color: #cf4444;
+  color: var(--danger);
   border-color: rgba(207, 68, 68, 0.35);
 }
 .manage-act.danger:hover:not(:disabled) {
-  background: rgba(207, 68, 68, 0.08);
-  border-color: #cf4444;
+  background: var(--danger-soft);
+  border-color: var(--danger);
 }
 .manage-act.accent {
   color: var(--accent);

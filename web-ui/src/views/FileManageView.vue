@@ -1113,8 +1113,8 @@ onBeforeUnmount(() => {
   border-color: var(--accent);
 }
 .tool-btn.danger:hover:not(:disabled) {
-  color: #cf4444;
-  border-color: #cf4444;
+  color: var(--danger);
+  border-color: var(--danger);
 }
 .tool-btn:disabled {
   opacity: 0.4;
@@ -1603,12 +1603,12 @@ onBeforeUnmount(() => {
   border-color: var(--accent);
 }
 .multi-act.danger {
-  color: #cf4444;
+  color: var(--danger);
   border-color: rgba(207, 68, 68, 0.35);
 }
 .multi-act.danger:hover:not(:disabled) {
-  background: rgba(207, 68, 68, 0.08);
-  border-color: #cf4444;
+  background: var(--danger-soft);
+  border-color: var(--danger);
 }
 .multi-act.accent {
   color: var(--accent);

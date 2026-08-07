@@ -999,8 +999,8 @@ onMounted(() => {
   border-color: var(--accent);
 }
 .op-btn.danger:hover {
-  color: #cf4444;
-  border-color: #cf4444;
+  color: var(--danger);
+  border-color: var(--danger);
 }
 
 .foot-tip {
@@ -1060,7 +1060,7 @@ onMounted(() => {
   padding: 40px 0;
   text-align: center;
   font-size: 13px;
-  color: #cf4444;
+  color: var(--danger);
 }
 .retry-btn {
   margin-left: 8px;
@@ -1146,7 +1146,7 @@ onMounted(() => {
 .test-error {
   margin: 0;
   font-size: 12.5px;
-  color: #cf4444;
+  color: var(--danger);
   word-break: break-all;
 }
 .cmp + .cmp {
@@ -1279,7 +1279,7 @@ onMounted(() => {
 }
 .field-label em {
   font-style: normal;
-  color: #cf4444;
+  color: var(--danger);
   margin-left: 2px;
 }
 .field-input {
@@ -1360,9 +1360,9 @@ onMounted(() => {
 .danger-btn {
   padding: 7px 18px;
   border-radius: var(--radius);
-  border: 1px solid #cf4444;
+  border: 1px solid var(--danger);
   background: none;
-  color: #cf4444;
+  color: var(--danger);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -1373,7 +1373,7 @@ onMounted(() => {
     color 0.2s ease;
 }
 .danger-btn:hover:not(:disabled) {
-  background: rgba(207, 68, 68, 0.08);
+  background: var(--danger-soft);
 }
 .danger-btn:disabled {
   cursor: not-allowed;

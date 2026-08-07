@@ -100,12 +100,12 @@ function reset() {
     background-color 0.2s ease;
 }
 .eb-btn:hover {
-  color: var(--accent, #4f46e5);
-  border-color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
+  border-color: var(--accent, var(--accent));
 }
 .eb-btn.primary {
-  border-color: var(--accent, #4f46e5);
-  background: var(--accent, #4f46e5);
+  border-color: var(--accent, var(--accent));
+  background: var(--accent, var(--accent));
   color: var(--on-accent, #fff);
 }
 .eb-btn.primary:hover {

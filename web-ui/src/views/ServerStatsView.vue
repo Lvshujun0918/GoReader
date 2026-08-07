@@ -345,8 +345,8 @@ function sourceTimeText(): string {
   margin-bottom: 14px;
   padding: 10px 14px;
   border-radius: 10px;
-  background: color-mix(in srgb, var(--danger, #e5484d) 12%, transparent);
-  color: var(--danger, #e5484d);
+  background: color-mix(in srgb, var(--danger, var(--danger)) 12%, transparent);
+  color: var(--danger, var(--danger));
   font-size: 13px;
 }
 
@@ -382,13 +382,13 @@ function sourceTimeText(): string {
   color: var(--text-3);
 }
 .big-num.good {
-  color: var(--ok, #30a46c);
+  color: var(--ok, var(--success));
 }
 .big-num.mid {
   color: var(--warn, #f5a524);
 }
 .big-num.bad {
-  color: var(--danger, #e5484d);
+  color: var(--danger, var(--danger));
 }
 
 /* ================= 纯 CSS 条形 ================= */
@@ -405,19 +405,19 @@ function sourceTimeText(): string {
   transition: width 0.6s ease;
 }
 .bar-fill.mem {
-  background: linear-gradient(90deg, #30a46c, #46a758);
+  background: linear-gradient(90deg, var(--success), #46a758);
 }
 .bar-fill.cpu {
   background: linear-gradient(90deg, #3e63dd, #5e8af0);
 }
 .bar-fill.good {
-  background: linear-gradient(90deg, #30a46c, #46a758);
+  background: linear-gradient(90deg, var(--success), #46a758);
 }
 .bar-fill.mid {
   background: linear-gradient(90deg, #f5a524, #f7b750);
 }
 .bar-fill.bad {
-  background: linear-gradient(90deg, #e5484d, #f2555a);
+  background: linear-gradient(90deg, var(--danger), #f2555a);
 }
 .bar-label {
   display: flex;

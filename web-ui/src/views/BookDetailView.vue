@@ -2349,7 +2349,7 @@ watch(bookUrl, () => {
   color: var(--text-2);
 }
 .search-msg.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .search-hits {
   list-style: none;
@@ -2417,7 +2417,7 @@ watch(bookUrl, () => {
   transition: border-color 0.2s ease;
 }
 .source-filter:focus {
-  border-color: var(--accent, #4f46e5);
+  border-color: var(--accent, var(--accent));
 }
 .source-refresh {
   display: inline-flex;
@@ -2434,8 +2434,8 @@ watch(bookUrl, () => {
   transition: all 0.2s ease;
 }
 .source-refresh:hover {
-  border-color: var(--accent, #4f46e5);
-  color: var(--accent, #4f46e5);
+  border-color: var(--accent, var(--accent));
+  color: var(--accent, var(--accent));
 }
 .source-refresh svg {
   width: 13px;
@@ -2545,7 +2545,7 @@ watch(bookUrl, () => {
 }
 .source-cur.invalid {
   border-color: rgba(207, 68, 68, 0.5);
-  color: #cf4444;
+  color: var(--danger);
 }
 .source-retry {
   display: flex;
@@ -2746,7 +2746,7 @@ watch(bookUrl, () => {
   color: var(--text-2);
 }
 .field-label em {
-  color: #cf4444;
+  color: var(--danger);
   font-style: normal;
 }
 .field-input {
@@ -2793,7 +2793,7 @@ watch(bookUrl, () => {
   font-weight: 300;
 }
 .field-tip.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 
 /* ================= 标签 chips（GAP 145） ================= */

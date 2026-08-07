@@ -750,7 +750,7 @@ onBeforeUnmount(() => {
   letter-spacing: 1px;}
 .brand em {
   font-style: normal;
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 .title {
   flex: 1;
@@ -777,12 +777,12 @@ onBeforeUnmount(() => {
   transition: all 0.2s ease;
 }
 .han-btn:hover {
-  border-color: var(--accent, #4f46e5);
-  color: var(--accent, #4f46e5);
+  border-color: var(--accent, var(--accent));
+  color: var(--accent, var(--accent));
 }
 .han-btn.active {
-  border-color: var(--accent, #4f46e5);
-  color: var(--accent, #4f46e5);
+  border-color: var(--accent, var(--accent));
+  color: var(--accent, var(--accent));
   background: var(--accent-soft, rgba(79, 70, 229, 0.08));
 }
 .main {
@@ -811,7 +811,7 @@ onBeforeUnmount(() => {
   transition: border-color 0.2s ease;
 }
 .explore-search:focus-within {
-  border-bottom-color: var(--accent, #4f46e5);
+  border-bottom-color: var(--accent, var(--accent));
 }
 .search-icon {
   width: 15px;
@@ -821,7 +821,7 @@ onBeforeUnmount(() => {
   transition: color 0.2s ease;
 }
 .explore-search:focus-within .search-icon {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 .search-input {
   flex: 1;
@@ -845,9 +845,9 @@ onBeforeUnmount(() => {
   font-size: 12px;
   font-weight: 400;
   letter-spacing: 1px;
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
   background: none;
-  border: 1px solid var(--accent, #4f46e5);
+  border: 1px solid var(--accent, var(--accent));
   border-radius: 999px;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -894,7 +894,7 @@ onBeforeUnmount(() => {
   transition: color 0.2s ease;
 }
 .dropdown-clear:hover {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 .dropdown-list {
   list-style: none;
@@ -956,9 +956,9 @@ onBeforeUnmount(() => {
   margin-left: 8px;
   padding: 4px 12px;
   font-size: 12px;
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
   background: none;
-  border: 1px solid var(--accent, #4f46e5);
+  border: 1px solid var(--accent, var(--accent));
   border-radius: 999px;
   cursor: pointer;
 }
@@ -966,7 +966,7 @@ onBeforeUnmount(() => {
   display: inline-block;
   margin-top: 12px;
   font-size: 13px;
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
   text-decoration: none;
 }
 .source-list {
@@ -989,7 +989,7 @@ onBeforeUnmount(() => {
   transition: border-color 0.2s ease, transform 0.2s ease;
 }
 .source-item:hover {
-  border-color: var(--accent, #4f46e5);
+  border-color: var(--accent, var(--accent));
   transform: translateY(-1px);
 }
 .src-star {
@@ -1002,7 +1002,7 @@ onBeforeUnmount(() => {
   transition: color 0.2s ease, transform 0.2s ease;
 }
 .src-star:hover {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
   transform: scale(1.15);
 }
 .src-star.fav {
@@ -1057,12 +1057,12 @@ onBeforeUnmount(() => {
   transition: all 0.2s ease;
 }
 .cat:hover {
-  border-color: var(--accent, #4f46e5);
-  color: var(--accent, #4f46e5);
+  border-color: var(--accent, var(--accent));
+  color: var(--accent, var(--accent));
 }
 .cat.active {
-  border-color: var(--accent, #4f46e5);
-  color: var(--accent, #4f46e5);
+  border-color: var(--accent, var(--accent));
+  color: var(--accent, var(--accent));
   background: var(--accent-soft, #eef2ff);
 }
 .cat.link {
@@ -1082,13 +1082,13 @@ onBeforeUnmount(() => {
   transform: scale(1.25);
 }
 .cat-star.fav {
-  color: #eab308;
+  color: var(--warning);
 }
 .cat:hover .cat-star {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 .cat:hover .cat-star.fav {
-  color: #eab308;
+  color: var(--warning);
 }
 
 /* GAP 123：收藏的书单（探索页入口） */
@@ -1109,9 +1109,9 @@ onBeforeUnmount(() => {
   gap: 6px;
   max-width: 100%;
   padding: 5px 13px;
-  border: 1px solid color-mix(in srgb, #eab308 55%, var(--border, #ececec));
+  border: 1px solid color-mix(in srgb, var(--warning) 55%, var(--border, #ececec));
   border-radius: 999px;
-  background: color-mix(in srgb, #eab308 7%, transparent);
+  background: color-mix(in srgb, var(--warning) 7%, transparent);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -1120,13 +1120,13 @@ onBeforeUnmount(() => {
   transition: all 0.2s ease;
 }
 .fav-chip:hover {
-  border-color: #eab308;
+  border-color: var(--warning);
   color: var(--text-1, #1a1a1a);
 }
 .fav-star {
   flex-shrink: 0;
   font-size: 11px;
-  color: #eab308;
+  color: var(--warning);
 }
 .fav-name {
   white-space: nowrap;
@@ -1239,9 +1239,9 @@ onBeforeUnmount(() => {
   padding: 8px 24px;
   font-size: 13px;
   font-weight: 400;
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
   background: none;
-  border: 1px solid var(--accent, #4f46e5);
+  border: 1px solid var(--accent, var(--accent));
   border-radius: 999px;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -1270,10 +1270,10 @@ onBeforeUnmount(() => {
   transition: border-color 0.2s ease;
 }
 .list-search:focus-within {
-  border-bottom-color: var(--accent, #4f46e5);
+  border-bottom-color: var(--accent, var(--accent));
 }
 .list-search:focus-within .search-icon {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 .list-search-clear {
   flex-shrink: 0;
@@ -1287,7 +1287,7 @@ onBeforeUnmount(() => {
   transition: color 0.2s ease;
 }
 .list-search-clear:hover {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 .explore-view-toggle {
   flex-shrink: 0;
@@ -1311,10 +1311,10 @@ onBeforeUnmount(() => {
   transition: all 0.2s ease;
 }
 .view-btn:hover {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 .view-btn.active {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
   background: var(--accent-soft, #eef2ff);
 }
 .paging-note {

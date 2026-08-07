@@ -2767,11 +2767,11 @@ onBeforeUnmount(() => {
   opacity: 0.5;
 }
 .ctx-item.danger {
-  color: #cf4444;
+  color: var(--danger);
 }
 .ctx-item.danger:hover:not(:disabled) {
-  color: #b33535;
-  background: rgba(207, 68, 68, 0.07);
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 .ctx-item svg {
   width: 13px;
@@ -2834,7 +2834,7 @@ onBeforeUnmount(() => {
   color: var(--text-3);
 }
 .state-text.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .mini-spin {
   width: 13px;
@@ -3022,7 +3022,7 @@ onBeforeUnmount(() => {
     background-color 0.2s ease;
 }
 .delete-btn:hover {
-  color: #cf4444;
+  color: var(--danger);
   background: rgba(207, 68, 68, 0.06);
 }
 .delete-btn svg {
@@ -3049,7 +3049,7 @@ onBeforeUnmount(() => {
 }
 .refresh-btn:hover:not(:disabled) {
   color: var(--accent);
-  background: rgba(64, 158, 120, 0.06);
+  background: var(--success-soft);
 }
 .refresh-btn:disabled {
   cursor: not-allowed;
@@ -3069,14 +3069,14 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 .invalid-note.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 /* 失效书源：整行置灰 + 名称/徽标红色 */
 .source-row.invalid {
   opacity: 0.62;
 }
 .source-row.invalid .source-name {
-  color: #cf4444;
+  color: var(--danger);
 }
 
 /* ================= 多选模式（GAP 27）：行勾选 + 底部批量操作栏 ================= */
@@ -3147,12 +3147,12 @@ onBeforeUnmount(() => {
   border-color: var(--border-strong);
 }
 .batch-btn.danger {
-  color: #cf4444;
+  color: var(--danger);
   border-color: rgba(207, 68, 68, 0.4);
 }
 .batch-btn.danger:hover:not(:disabled) {
-  background: rgba(207, 68, 68, 0.08);
-  border-color: #cf4444;
+  background: var(--danger-soft);
+  border-color: var(--danger);
 }
 .batch-btn:disabled {
   opacity: 0.45;
@@ -3222,7 +3222,7 @@ onBeforeUnmount(() => {
   letter-spacing: 1px;
 }
 .source-badge.invalid {
-  color: #cf4444;
+  color: var(--danger);
   border: 1px solid rgba(207, 68, 68, 0.5);
   background: rgba(207, 68, 68, 0.06);
 }
@@ -3230,7 +3230,7 @@ onBeforeUnmount(() => {
 .source-badge.logged {
   color: var(--accent);
   border: 1px solid rgba(64, 158, 120, 0.5);
-  background: rgba(64, 158, 120, 0.06);
+  background: var(--success-soft);
 }
 
 /* 测试按钮（细字描边） */
@@ -3315,7 +3315,7 @@ onBeforeUnmount(() => {
   word-break: break-all;
 }
 .debug-line.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .debug-line.running {
   color: var(--text-3);
@@ -3327,7 +3327,7 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 .debug-msg.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 
 /* ================= 订阅源区块 ================= */
@@ -3370,7 +3370,7 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 .subs-msg.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .subs-empty {
   margin: 16px 0 0;
@@ -3497,7 +3497,7 @@ onBeforeUnmount(() => {
 }
 .field-label em {
   font-style: normal;
-  color: #cf4444;
+  color: var(--danger);
   margin-left: 2px;
 }
 .field-input {
@@ -3528,7 +3528,7 @@ onBeforeUnmount(() => {
   color: var(--text-3);
 }
 .field-tip.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .confirm-text {
   margin: 0 0 18px;
@@ -3565,9 +3565,9 @@ onBeforeUnmount(() => {
 .danger-btn {
   padding: 7px 18px;
   border-radius: var(--radius);
-  border: 1px solid #cf4444;
+  border: 1px solid var(--danger);
   background: none;
-  color: #cf4444;
+  color: var(--danger);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -3578,7 +3578,7 @@ onBeforeUnmount(() => {
     color 0.2s ease;
 }
 .danger-btn:hover:not(:disabled) {
-  background: rgba(207, 68, 68, 0.08);
+  background: var(--danger-soft);
 }
 
 /* ================= 编辑书源弹窗（规则字段 textarea） ================= */
@@ -3746,7 +3746,7 @@ onBeforeUnmount(() => {
 }
 .login-status.logged {
   border-color: rgba(64, 158, 120, 0.45);
-  background: rgba(64, 158, 120, 0.06);
+  background: var(--success-soft);
 }
 .login-status.not {
   border-color: rgba(207, 68, 68, 0.45);
@@ -3763,7 +3763,7 @@ onBeforeUnmount(() => {
   background: var(--accent);
 }
 .login-status.not .login-state-dot {
-  background: #cf4444;
+  background: var(--danger);
 }
 .login-state-text {
   font-size: 12.5px;
@@ -3872,7 +3872,7 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 .login-msg.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .dlg-foot {
   margin-top: 16px;

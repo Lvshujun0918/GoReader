@@ -1045,7 +1045,7 @@ onBeforeUnmount(() => {
   color: var(--text-3);
 }
 .state-text.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .mini-spin {
   width: 13px;
@@ -1117,7 +1117,7 @@ onBeforeUnmount(() => {
   color: var(--text-3);
 }
 .result-note.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .result-list {
   list-style: none;
@@ -1216,7 +1216,7 @@ onBeforeUnmount(() => {
   justify-content: center;
   font-size: 18px;
   font-weight: 300;
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 .result-cover img {
   width: 100%;
@@ -1327,8 +1327,8 @@ onBeforeUnmount(() => {
   cursor: default;
 }
 .quick-add.done {
-  border-color: #529b2e;
-  color: #529b2e;
+  border-color: var(--success);
+  color: var(--success);
   opacity: 1;
   transform: scale(1);
   pointer-events: none;

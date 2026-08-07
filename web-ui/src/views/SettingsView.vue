@@ -2241,8 +2241,8 @@ async function runExportData() {
     background-color 0.2s ease;
 }
 .tts-del:hover {
-  color: #cf4444;
-  background: rgba(207, 68, 68, 0.08);
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 .tts-del svg {
   width: 12px;
@@ -2382,7 +2382,7 @@ async function runExportData() {
 }
 .field-label em {
   font-style: normal;
-  color: #cf4444;
+  color: var(--danger);
   margin-left: 2px;
 }
 .field-input {
@@ -2423,7 +2423,7 @@ async function runExportData() {
   color: var(--text-2);
 }
 .pwd-msg.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .dlg-actions {
   display: flex;
@@ -2476,9 +2476,9 @@ async function runExportData() {
 .danger-btn {
   padding: 7px 18px;
   border-radius: var(--radius);
-  border: 1px solid #cf4444;
+  border: 1px solid var(--danger);
   background: none;
-  color: #cf4444;
+  color: var(--danger);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -2489,7 +2489,7 @@ async function runExportData() {
     color 0.2s ease;
 }
 .danger-btn:hover:not(:disabled) {
-  background: rgba(207, 68, 68, 0.08);
+  background: var(--danger-soft);
 }
 .danger-btn:disabled {
   cursor: not-allowed;
@@ -2594,7 +2594,7 @@ async function runExportData() {
   color: #2e9e5b;
 }
 .row-value.opds-test.fail {
-  color: #cf4444;
+  color: var(--danger);
 }
 .row-hint {
   flex-shrink: 0;
@@ -2724,12 +2724,12 @@ async function runExportData() {
   opacity: 0.45;
 }
 .cache-clear {
-  color: #cf4444;
+  color: var(--danger);
   border-color: rgba(207, 68, 68, 0.45);
 }
 .cache-clear:hover:not(:disabled) {
-  color: #cf4444;
-  border-color: #cf4444;
+  color: var(--danger);
+  border-color: var(--danger);
 }
 .cache-clear:disabled {
   cursor: not-allowed;
@@ -2742,9 +2742,9 @@ async function runExportData() {
 .danger-btn {
   padding: 8px 20px;
   border-radius: var(--radius);
-  border: 1px solid #cf4444;
+  border: 1px solid var(--danger);
   background: none;
-  color: #cf4444;
+  color: var(--danger);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -2757,8 +2757,8 @@ async function runExportData() {
 }
 .danger-btn:hover {
   color: #ffffff;
-  background: #cf4444;
-  border-color: #cf4444;
+  background: var(--danger);
+  border-color: var(--danger);
 }
 
 /* ================= 阅读偏好控件 ================= */
@@ -2810,7 +2810,7 @@ async function runExportData() {
   border-color: var(--accent);
 }
 .card-note.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 
 /* ================= 阅读背景（GAP 4） ================= */
@@ -3010,7 +3010,7 @@ async function runExportData() {
   color: var(--text-3);
 }
 .stats-msg.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 
 /* ================= 响应式 ================= */
@@ -3057,6 +3057,6 @@ async function runExportData() {
   transition: color 0.2s ease;
 }
 .tg-link:hover {
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
 }
 </style>

@@ -43,10 +43,10 @@ const router = useRouter()
 .nf-btn {
   margin-top: 10px;
   padding: 9px 34px;
-  border: 1px solid var(--accent, #4f46e5);
+  border: 1px solid var(--accent, var(--accent));
   border-radius: var(--radius, 8px);
   background: none;
-  color: var(--accent, #4f46e5);
+  color: var(--accent, var(--accent));
   font-family: inherit;
   font-size: 13px;
   font-weight: 400;

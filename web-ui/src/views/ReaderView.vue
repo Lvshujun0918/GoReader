@@ -4302,7 +4302,7 @@ onBeforeUnmount(() => {
   border: none;
   border-radius: 50%;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 20px;
   font-family: inherit;
   cursor: pointer;
@@ -4448,7 +4448,7 @@ onBeforeUnmount(() => {
   padding: 12px 44px;
   border-radius: var(--radius);
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 14px;
   letter-spacing: 3px;
   text-decoration: none;
@@ -4965,7 +4965,7 @@ onBeforeUnmount(() => {
   color: var(--text-3);
 }
 .text-btn.danger:hover {
-  color: #cf4444;
+  color: var(--danger);
 }
 
 /* ================= 章节侧栏 ================= */
@@ -5256,7 +5256,7 @@ onBeforeUnmount(() => {
   transition: color 0.2s ease;
 }
 .bm-del:hover {
-  color: #cf4444;
+  color: var(--danger);
 }
 .bm-del svg {
   width: 12px;

@@ -41,6 +41,15 @@
   --shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.06), 0 20px 48px -16px rgba(0, 0, 0, 0.24);
   /* 弹窗/浮层遮罩（随主题） */
   --overlay: rgba(24, 24, 27, 0.4);
+  /* 语义色 token（成功/警告/危险/信息——随主题） */
+  --success: #16a34a;
+  --success-soft: rgba(22, 163, 74, 0.1);
+  --warning: #d97706;
+  --warning-soft: rgba(217, 119, 6, 0.1);
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.1);
+  --info: #0284c7;
+  --info-soft: rgba(2, 132, 199, 0.1);
   --radius: 8px;
   --font-sans:
     -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter',
@@ -75,6 +84,15 @@ html[data-theme='dark'] {
   --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.35), 0 12px 32px -12px rgba(0, 0, 0, 0.55);
   --shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.4), 0 24px 56px -20px rgba(0, 0, 0, 0.65);
   --overlay: rgba(0, 0, 0, 0.55);
+  /* 语义色 token（深色：提亮保证对比度） */
+  --success: #4ade80;
+  --success-soft: rgba(74, 222, 128, 0.14);
+  --warning: #fbbf24;
+  --warning-soft: rgba(251, 191, 36, 0.14);
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.14);
+  --info: #38bdf8;
+  --info-soft: rgba(56, 189, 248, 0.14);
   /* Element Plus 深色映射 */
   --el-bg-color: #212126;
   --el-bg-color-overlay: #26262c;

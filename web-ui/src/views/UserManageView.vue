@@ -1068,10 +1068,10 @@ onBeforeUnmount(() => {
   color: var(--accent);
 }
 .op-btn.danger {
-  color: #cf4444;
+  color: var(--danger);
 }
 .op-btn.danger:hover:not(:disabled) {
-  color: #b33535;
+  color: var(--danger);
 }
 .op-btn:disabled {
   cursor: not-allowed;
@@ -1159,7 +1159,7 @@ onBeforeUnmount(() => {
 }
 .field-label em {
   font-style: normal;
-  color: #cf4444;
+  color: var(--danger);
   margin-left: 2px;
 }
 .field-input {
@@ -1204,7 +1204,7 @@ onBeforeUnmount(() => {
   margin: -4px 0 0;
   font-size: 12px;
   font-weight: 400;
-  color: #cf4444;
+  color: var(--danger);
 }
 .perm-rows {
   display: flex;
@@ -1271,9 +1271,9 @@ onBeforeUnmount(() => {
 .danger-btn {
   padding: 7px 18px;
   border-radius: var(--radius);
-  border: 1px solid #cf4444;
+  border: 1px solid var(--danger);
   background: none;
-  color: #cf4444;
+  color: var(--danger);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -1284,7 +1284,7 @@ onBeforeUnmount(() => {
     color 0.2s ease;
 }
 .danger-btn:hover:not(:disabled) {
-  background: rgba(207, 68, 68, 0.08);
+  background: var(--danger-soft);
 }
 .ghost-btn:disabled,
 .accent-btn:disabled,

@@ -902,7 +902,7 @@ onBeforeUnmount(() => {
   opacity: 1;
 }
 .source-del:hover {
-  color: #cf4444;
+  color: var(--danger);
   background: var(--hover);
 }
 .source-del svg {
@@ -1314,9 +1314,9 @@ onBeforeUnmount(() => {
 .danger-btn {
   padding: 7px 18px;
   border-radius: var(--radius);
-  border: 1px solid #cf4444;
+  border: 1px solid var(--danger);
   background: none;
-  color: #cf4444;
+  color: var(--danger);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 400;
@@ -1327,7 +1327,7 @@ onBeforeUnmount(() => {
     color 0.2s ease;
 }
 .danger-btn:hover:not(:disabled) {
-  background: #cf4444;
+  background: var(--danger);
   color: #ffffff;
 }
 .ghost-btn:disabled,

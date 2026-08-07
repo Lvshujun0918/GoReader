@@ -405,9 +405,9 @@ onMounted(async () => {
   letter-spacing: 0.5px;
 }
 .perm-note.error {
-  background: rgba(207, 68, 68, 0.07);
+  background: var(--danger-soft);
   border-color: rgba(207, 68, 68, 0.35);
-  color: #cf4444;
+  color: var(--danger);
 }
 
 /* 面包屑 */
@@ -595,7 +595,7 @@ onMounted(async () => {
   color: var(--text-2);
 }
 .import-note.error {
-  color: #cf4444;
+  color: var(--danger);
 }
 .import-bar {
   position: sticky;
