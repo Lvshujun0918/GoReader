@@ -2,6 +2,16 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  ArrowUpDown,
+  Cookie,
+  FileDown,
+  Globe,
+  ListChecks,
+  Plus,
+  ShieldCheck,
+  Upload,
+} from 'lucide-vue-next'
 import { deleteBookSource, deleteBookSources, getBookSources, getInvalidBookSources, saveBookSource, saveBookSources, setAsDefaultBookSources } from '@/api/sources'
 import { deleteSourceSub, getSourceSubs, refreshSourceSub, saveSourceSub } from '@/api/sourceSubs'
 import { exportBookSources } from '@/api/system'
@@ -1613,9 +1623,13 @@ onBeforeUnmount(() => {
         <span class="count">{{ sources.length }} 个 · {{ enabledCount }} 启用</span>
         <div class="head-actions">
           <button class="ghost-btn" type="button" :disabled="localImportBusy" @click="openLocalImport">
-            {{ localImportBusy ? '导入中…' : '本地导入' }}
+            <Upload :size="14" aria-hidden="true" />
+            <span>{{ localImportBusy ? '导入中…' : '本地导入' }}</span>
           </button>
-          <button class="ghost-btn" type="button" @click="openImport">远程导入</button>
+          <button class="ghost-btn" type="button" @click="openImport">
+            <Globe :size="14" aria-hidden="true" />
+            <span>远程导入</span>
+          </button>
           <button
             class="ghost-btn"
             type="button"
@@ -1623,7 +1637,8 @@ onBeforeUnmount(() => {
             title="检测失效书源（GET /reader3/getInvalidBookSources）"
             @click="checkInvalid"
           >
-            {{ invalidChecking ? '检测中…' : '检测失效' }}
+            <ShieldCheck :size="14" aria-hidden="true" />
+            <span>{{ invalidChecking ? '检测中…' : '检测失效' }}</span>
           </button>
           <button
             class="ghost-btn"
@@ -1632,8 +1647,10 @@ onBeforeUnmount(() => {
             :title="manageMode && selectedCount > 0 ? `导出勾选的 ${selectedCount} 个书源（bookSource.json）` : '下载当前账号全部书源（bookSource.json）'"
             @click="doExport"
           >
-            {{ exporting ? '导出中…' : manageMode && selectedCount > 0 ? `导出勾选 (${selectedCount})` : '导出' }}
+            <FileDown :size="14" aria-hidden="true" />
+            <span>{{ exporting ? '导出中…' : manageMode && selectedCount > 0 ? `导出勾选 (${selectedCount})` : '导出' }}</span>
           </button>
+          <span class="head-sep" aria-hidden="true"></span>
           <button
             class="ghost-btn"
             type="button"
@@ -1641,7 +1658,8 @@ onBeforeUnmount(() => {
             :title="manageMode ? '退出多选模式' : '多选模式：勾选行后批量启用/禁用/删除/导出'"
             @click="toggleManage"
           >
-            {{ manageMode ? '完成' : '多选' }}
+            <ListChecks :size="14" aria-hidden="true" />
+            <span>{{ manageMode ? '完成' : '多选' }}</span>
           </button>
           <button
             class="ghost-btn"
@@ -1650,17 +1668,23 @@ onBeforeUnmount(() => {
             :title="sortMode ? '退出排序模式（未保存的排序将自动保存）' : '排序模式：拖动手柄调整书源顺序，保存到权重（越大越靠前）'"
             @click="toggleSortMode"
           >
-            {{ sortMode ? '完成' : '排序' }}
+            <ArrowUpDown :size="14" aria-hidden="true" />
+            <span>{{ sortMode ? '完成' : '排序' }}</span>
           </button>
+          <span class="head-sep" aria-hidden="true"></span>
           <button
             class="ghost-btn"
             type="button"
             title="Cookie 管理：已登录书源列表 + 清除登录态（POST /reader3/setBookSourceCookie）"
             @click="openCookieMgr"
           >
-            Cookie 管理
+            <Cookie :size="14" aria-hidden="true" />
+            <span>Cookie 管理</span>
           </button>
-          <button class="accent-outline-btn" type="button" @click="openAdd">新增书源</button>
+          <button class="accent-outline-btn" type="button" @click="openAdd">
+            <Plus :size="14" aria-hidden="true" />
+            <span>新增书源</span>
+          </button>
           <input
             ref="localFileInput"
             class="local-file-input"
@@ -2548,13 +2572,27 @@ onBeforeUnmount(() => {
 .head-actions {
   margin-left: auto;
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
+  row-gap: 8px;
+}
+.head-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  margin: 0 2px;
+  flex-shrink: 0;
 }
 .local-file-input {
   display: none;
 }
 .ghost-btn {
-  padding: 7px 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 13px;
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: none;
@@ -2563,6 +2601,7 @@ onBeforeUnmount(() => {
   font-size: 12.5px;
   font-weight: 400;
   letter-spacing: 1px;
+  white-space: nowrap;
   cursor: pointer;
   transition:
     color 0.2s ease,
@@ -2573,7 +2612,10 @@ onBeforeUnmount(() => {
   border-color: var(--border-strong);
 }
 .accent-outline-btn {
-  padding: 7px 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 15px;
   border-radius: var(--radius);
   border: 1px solid var(--accent);
   background: none;
@@ -2582,6 +2624,7 @@ onBeforeUnmount(() => {
   font-size: 12.5px;
   font-weight: 400;
   letter-spacing: 1px;
+  white-space: nowrap;
   cursor: pointer;
   transition:
     color 0.2s ease,
