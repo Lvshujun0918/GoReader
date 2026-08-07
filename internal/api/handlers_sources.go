@@ -58,8 +58,13 @@ func (a *API) handleSaveBookSource(c *gin.Context) {
 		NeedLogin(c)
 		return
 	}
-	var src model.BookSource
-	if err := c.ShouldBindJSON(&src); err != nil {
+	var raw map[string]any
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		Fail(c, "参数错误")
+		return
+	}
+	src, err := normalizeSourceMap(raw)
+	if err != nil {
 		Fail(c, "参数错误")
 		return
 	}
@@ -74,7 +79,7 @@ func (a *API) handleSaveBookSource(c *gin.Context) {
 			return
 		}
 	}
-	if err := a.Storage.SaveBookSource(ns, &src); err != nil {
+	if err := a.Storage.SaveBookSource(ns, src); err != nil {
 		Fail(c, "系统错误")
 		return
 	}
@@ -88,8 +93,20 @@ func (a *API) handleSaveBookSources(c *gin.Context) {
 		NeedLogin(c)
 		return
 	}
-	var sources []*model.BookSource
-	if err := c.ShouldBindJSON(&sources); err != nil {
+	var raw []map[string]any
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		Fail(c, "参数错误")
+		return
+	}
+	sources := make([]*model.BookSource, 0, len(raw))
+	for _, m := range raw {
+		src, err := normalizeSourceMap(m)
+		if err != nil || src.BookSourceURL == "" {
+			continue // 跳过无法归一化/缺地址的项（legado 合集常含空壳）
+		}
+		sources = append(sources, src)
+	}
+	if len(sources) == 0 {
 		Fail(c, "参数错误")
 		return
 	}
@@ -97,7 +114,7 @@ func (a *API) handleSaveBookSources(c *gin.Context) {
 		Fail(c, "系统错误")
 		return
 	}
-	OK(c, nil)
+	OK(c, map[string]any{"count": len(sources)})
 }
 
 // handleDeleteBookSource POST /reader3/deleteBookSource。
@@ -185,7 +202,7 @@ func (a *API) handleSaveFromRemoteSource(c *gin.Context) {
 	Fail(c, "远程源获取失败")
 }
 
-// fetchRemoteSources 抓取远程书源（JSON 数组形态）。
+// fetchRemoteSources 抓取远程书源（JSON 数组形态，宽松归一化——legado 布尔 enabled 兼容）。
 func fetchRemoteSources(url string) ([]*model.BookSource, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Get(url)
@@ -200,11 +217,55 @@ func fetchRemoteSources(url string) ([]*model.BookSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	var sources []*model.BookSource
-	if err := json.Unmarshal(body, &sources); err != nil {
+	var raw []map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
-	return sources, nil
+	out := make([]*model.BookSource, 0, len(raw))
+	for _, m := range raw {
+		if src, err := normalizeSourceMap(m); err == nil && src.BookSourceURL != "" {
+			out = append(out, src)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("未识别到书源")
+	}
+	return out, nil
+}
+
+// normalizeSourceMap 将宽松 JSON 书源对象归一化为 model.BookSource：
+//   - legado 布尔字段（enabled/enabledExplore/enabledCookieJar）→ 0/1（后端 int 列）
+//   - 对象型字段（header 等）→ JSON 字符串（兼容嵌套对象）
+//
+// 未知字段由 encoding/json 忽略；返回 err 表示字段类型无法归一化。
+func normalizeSourceMap(m map[string]any) (*model.BookSource, error) {
+	for _, k := range []string{"enabled", "enabledExplore", "enabledCookieJar"} {
+		if v, ok := m[k].(bool); ok {
+			if v {
+				m[k] = 1
+			} else {
+				m[k] = 0
+			}
+		}
+	}
+	for _, k := range []string{"header"} {
+		if v, ok := m[k].(map[string]any); ok {
+			b, err := json.Marshal(v)
+			if err != nil {
+				return nil, err
+			}
+			m[k] = string(b)
+		}
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	var src model.BookSource
+	if err := json.Unmarshal(b, &src); err != nil {
+		return nil, err
+	}
+	return &src, nil
 }
 
 // handleGetAvailableBookSource GET/POST /reader3/getAvailableBookSource。
