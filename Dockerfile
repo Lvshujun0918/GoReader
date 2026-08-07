@@ -26,19 +26,13 @@ RUN npm install
 COPY web-ui ./
 RUN npm run build
 
-# ---------- 阶段 3：obscura 浏览器（release stealth 构建——BoringSSL TLS 指纹模拟/反检测/追踪器拦截） ----------
+# ---------- 阶段 3：obscura 浏览器（release stealth 构建——BoringSSL TLS 指纹模拟/反检测/追踪器拦截；仅 amd64） ----------
 FROM debian:trixie-slim AS obscura
-ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
-    case "${TARGETARCH:-}" in \
-      ""|amd64|x86_64) ASSET="obscura-x86_64-linux-stealth.tar.gz" ;; \
-      arm64|aarch64) ASSET="obscura-aarch64-linux-stealth.tar.gz" ;; \
-      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
     curl -fL --retry 3 -o /tmp/obscura.tar.gz \
-      "https://github.com/h4ckf0r0day/obscura/releases/latest/download/${ASSET}"; \
+      "https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux-stealth.tar.gz"; \
     mkdir -p /opt/obscura; \
     tar xzf /tmp/obscura.tar.gz -C /opt/obscura; \
     rm /tmp/obscura.tar.gz; \

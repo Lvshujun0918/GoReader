@@ -177,13 +177,13 @@ scripts/              e2e-smoke.py / api-scan.py / 69shuba.json
 ## 7. 产物策略（当前）
 
 - **Docker 镜像**（多阶段）：
-  - 构建阶段：Go 编译（`golang:1.25`，CGO_ENABLED=0 静态）+ 前端构建（`node:22-slim`）+ obscura release 下载（stealth 构建，amd64/arm64 自动选资产）
+  - 构建阶段：Go 编译（`golang:1.25`，CGO_ENABLED=0 静态）+ 前端构建（`node:22-slim`）+ obscura release 下载（stealth 构建，amd64 资产）
   - 运行镜像：**`debian:trixie-slim`（GLIBC 运行时）**——内置 CA 证书、时区（`TZ=Asia/Shanghai`）、obscura（`/opt/obscura/obscura`）；**无 Python**（camoufox 已由 Go 原生 solver 替代）
   - 入口：**tini**（`ENTRYPOINT ["/usr/bin/tini", "--"]` + `CMD ["reader-dev"]`——PID 1 信号转发/僵尸回收，1Panel 等面板兼容）
   - 数据目录 `/data`（`VOLUME`），`READER_APP_WORKDIR=/data`
 - **镜像版本**：master 每次提交自动构建推送（`docker-publish-go.yml`）——版本标签 = **短 SHA**（7 位，可追溯）；`latest` 为 master 最新滚动标签；**不再发布 GitHub Release 二进制**
 - 前端**不内嵌**（`web-ui/dist` 目录由 `READER_APP_WEB_ROOT` 指定）
-- CI：`go-ci.yml`（vet/test-race/静态构建校验/交叉编译矩阵）、`frontend-ci.yml`（vue-tsc 严格类型检查 + vite 构建 + 产物上传）、`docker-publish-go.yml`（master push 触发 + 短 SHA 版本标签 + 多架构镜像，gha 缓存）
+- CI：`go-ci.yml`（vet/test-race/静态构建校验/交叉编译矩阵）、`frontend-ci.yml`（vue-tsc 严格类型检查 + vite 构建 + 产物上传）、`docker-publish-go.yml`（master push 触发 + 短 SHA 版本标签 + amd64 镜像，gha 缓存）
 
 ## 8. 迭代路线（现状核对）
 

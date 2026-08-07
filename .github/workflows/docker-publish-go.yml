@@ -30,9 +30,6 @@ jobs:
         shell: bash
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU（多架构模拟）
-        uses: docker/setup-qemu-action@v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -54,12 +51,12 @@ jobs:
             type=raw,value=${{ steps.sha.outputs.short }}
             type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
-      - name: 构建并推送多架构镜像（gha 远程缓存——hosted runner 跨 run 复用）
+      - name: 构建并推送镜像（amd64，gha 远程缓存——hosted runner 跨 run 复用）
         uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

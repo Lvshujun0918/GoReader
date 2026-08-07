@@ -38,7 +38,7 @@
 
 ### 工程
 - [x] 新前端（Vue3 + Vite + shadcn-vue，15 视图，vue-tsc 严格类型检查 CI）
-- [x] CI：go-ci（vet/test-race/静态校验/交叉编译）、frontend-ci、docker-publish-go（master push 触发 + 短 SHA 版本 + 多架构镜像）
+- [x] CI：go-ci（vet/test-race/静态校验/交叉编译）、frontend-ci、docker-publish-go（master push 触发 + 短 SHA 版本 + amd64 镜像）
 - [x] Docker 镜像：`debian:trixie-slim`（GLIBC）+ **tini 入口**（1Panel 兼容）+ 内置 obscura + CA/时区（Go 静态二进制，golang:1.25 构建；无 Python）
 - [x] 镜像发布：每次提交自动推送 Docker（短 SHA 版本 + latest 滚动），不再发布 Release 二进制
 - [x] 后端 Go 单测（配置/规则引擎/存储/密码）
@@ -62,6 +62,6 @@
 ## 开发与发布策略（当前）
 
 - **分支布局**：`master` = Go 重构发布主线（本文档）；`legacy` = Kotlin 稳定版（v4.x，ghcr.io/warpdotsys/reader-dev:latest）
-- **镜像发布**（`docker-publish-go.yml`）：master **每次提交**自动触发 + 短 SHA 版本标签（7 位可追溯）+ `latest` 滚动 + 多架构镜像推送（gha 缓存）；**不再发布 GitHub Release 二进制**
+- **镜像发布**（`docker-publish-go.yml`）：master **每次提交**自动触发 + 短 SHA 版本标签（7 位可追溯）+ `latest` 滚动 + amd64 镜像推送（gha 缓存）；**不再发布 GitHub Release 二进制**
 - **版本号**：以 `go.mod` 为准（当前 `5.0.0`）
 - 许可策略：**永久不做用户/功能限制**（`READER_APP_USERLIMIT` 等 env 默认宽松）
