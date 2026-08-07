@@ -139,6 +139,9 @@ func cssValue(n *html.Node, attr string, ctx *Context) string {
 	switch {
 	case attr == "" || attr == "@text" || attr == ":text":
 		return extractText(n)
+	case attr == "@html":
+		// 返回元素 OuterHTML（bookList 等需要子规则再解析的场景）
+		return htmlquery.OutputHTML(n, true)
 	case strings.HasPrefix(attr, "@"):
 		key := strings.TrimPrefix(attr, "@")
 		return attrValue(n, key)

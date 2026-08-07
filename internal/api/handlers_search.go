@@ -59,7 +59,7 @@ func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.So
 		key, val := splitKeyVal(item)
 		switch key {
 		case "bookList", "books":
-			items := rule.Parse(htmlStr, val, ctx)
+			items := rule.Parse(htmlStr, ensureListHTML(val), ctx)
 			results = make([]*SearchResult, 0, len(items))
 			for range items {
 				results = append(results, &SearchResult{})
@@ -80,6 +80,15 @@ func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.So
 	return nil, nil
 }
 
+// ensureListHTML bookList 的 CSS 规则需返回元素 HTML 供子规则再解析：
+// 无属性后缀时补 @html（legado 默认返回元素文本，无法作为子规则输入）。
+func ensureListHTML(val string) string {
+	if strings.HasPrefix(val, "@css:") && !strings.Contains(val[5:], "@") {
+		return val + "@html"
+	}
+	return val
+}
+
 // fillSearchFields 填充搜索结果字段（列表规则或单书规则）。
 func fillSearchFields(htmlStr, ruleStr string, results []*SearchResult, ctx *rule.Context, src *model.BookSource, baseURL string) {
 	items := []string{}
@@ -87,7 +96,7 @@ func fillSearchFields(htmlStr, ruleStr string, results []*SearchResult, ctx *rul
 		for _, item := range splitSemicolonRule(ruleStr) {
 			key, val := splitKeyVal(item)
 			if key == "bookList" || key == "books" {
-				items = rule.Parse(htmlStr, val, ctx)
+				items = rule.Parse(htmlStr, ensureListHTML(val), ctx)
 				break
 			}
 		}
