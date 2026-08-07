@@ -169,7 +169,7 @@ internal/
 └── util/          # password(argon2)/md5/登录限流/...
 web-ui/src/        # Vue3 + shadcn-vue 视图/组件/api/utils
 web-simple/        # Kindle 轻量页
-scripts/           # 测试工具（e2e-smoke/api-scan/camoufox_solver）
+scripts/           # 测试工具（e2e-smoke/api-scan）
 docs/              # SECURITY/ARCHITECTURE/ROADMAP/FRONTEND
 ```
 

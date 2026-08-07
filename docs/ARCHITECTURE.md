@@ -31,7 +31,7 @@ Go 重构，**API 兼容 + 数据兼容迁移**：
 │   ├── service/     crawler（SSRF 防护+书源 cookie）/ bookfetch（详情/目录/正文）
 │   └── util/        password（argon2id+MD5 兼容）/ loginlimit / dbbackup / md5 / ct
 web-ui/               Vue3 + Vite + shadcn-vue 前端（Tailwind + reka-ui + sonner）
-scripts/              camoufox_solver.py / e2e-smoke.py / api-scan.py / 69shuba.json
+scripts/              e2e-smoke.py / api-scan.py / 69shuba.json
 ```
 
 ## 3. API 兼容约定（硬性）
@@ -94,7 +94,7 @@ scripts/              camoufox_solver.py / e2e-smoke.py / api-scan.py / 69shuba.
 - Go `net/http` 客户端（`internal/service/crawler`）：默认 HTTP/1.1 直连（书源兼容性优先），
   自动 gzip/deflate 解压、书源自定义 header/cookie 附加、SSRF 防护（内网/回环拒绝）。
 - HTTP/2 由 `net/http` TLS ALPN 自动协商；QUIC（HTTP/3）**不启用**。
-- 计划（未实现）：FlareSolverr / camoufox / obscura 质询求解接入（见 ROADMAP 待办）。
+- 质询求解（已实现）：obscura CDP（Go 原生 solver，`internal/service/solver`）；FlareSolverr 可选客户端未实现（见 ROADMAP 待办）。
 
 ### 服务端（对外服务）
 - `gin` 监听 **TCP 纯 HTTP**——**无 TLS、无 QUIC**，HTTP/2 / HTTP/3 **暂不提供**；公网 HTTPS 由反向代理终止（nginx/Caddy），H2/H3 如需同样由代理层提供。
@@ -143,13 +143,11 @@ scripts/              camoufox_solver.py / e2e-smoke.py / api-scan.py / 69shuba.
         │       cf_clearance；Turnstile → widget 检测 → 点击   │
         │       → 读取 cf-turnstile-response                   │
         │                                                      │
-        │  C. camoufox 强质询兜底（READER_CAMOUFOX_URL 默认    │
-        │     127.0.0.1:8196——Docker 内置 python 后端）        │
-        │     Firefox 内核 + 真实指纹预设（navigator/screen/   │
-        │     WebGL/字体/canvas 噪声）——69shuba managed        │
-        │     challenge 级强质询；READER_CAMOUFOX_FIRST=1 可   │
-        │     提前到 CDP 之前；UA 默认 Chrome/131 Win（69shuba │
-        │     有 UA 门禁）                                     │
+        │  C. 兜底重试（Go 原生 solver 替代 Python camoufox） │
+        │     internal/service/solver 用 go-rod 驱动 obscura：│
+        │     注入 cookie → 导航 → 等 cf-turnstile-response /  │
+        │     质询特征消失 → Turnstile iframe 点击勾选；UA 默认│
+        │     Chrome/131 Win（69shuba UA 门禁）；不依赖 Python│
         │                                                      │
         │  全部失败 → 明确报错（不静默吞掉）                   │
         └───────────────────────┬──────────────────────────────┘
@@ -174,13 +172,13 @@ scripts/              camoufox_solver.py / e2e-smoke.py / api-scan.py / 69shuba.
 4. **POST 保真**：求解阶段浏览器只会 GET 首页；必须以**原 method/body/headers + 新 cookie** 重试原请求，才能让 POST 场景（69shuba search.php 等）拿到真实结果；重试仍质询才兜底返回求解 HTML。
 5. **真实站点验证**：`scripts/69shuba.json`（真实书源）+ `scripts/e2e-smoke.py`（端到端冒烟）验证抓取链路。
 6. **JS 规则共享同一浏览器**：`java.startBrowserAwait(url, title, isForeground)` shim 走与验证码求解相同的浏览器流（含 stealth/UA 覆盖），书源 JS 规则可直接打开页面取 DOM。
-7. **降级次序固定**：直连 → FlareSolverr（配置了才启用）→ obscura CDP → camoufox（可 FIRST 提前）→ 明确报错；任一环节解出即返回，不重复消耗。
+7. **降级次序固定**：直连 → FlareSolverr（配置了才启用）→ obscura CDP（Go 原生 solver）→ 明确报错；任一环节解出即返回，不重复消耗。
 
 ## 7. 产物策略（当前）
 
 - **Docker 镜像**（多阶段）：
-  - 构建阶段：Go 编译（`golang:1.25`，CGO_ENABLED=0 静态）+ 前端构建（`node:20-slim`）+ obscura release 下载（stealth 构建，amd64/arm64 自动选资产）+ camoufox（`python:3.12-slim` pip 安装 + 浏览器二进制）
-  - 运行镜像：**`debian:trixie-slim`（GLIBC 运行时）**——内置 CA 证书、时区（`TZ=Asia/Shanghai`）、python3 + `camoufox_solver.py`、obscura（`/opt/obscura/obscura`）
+  - 构建阶段：Go 编译（`golang:1.25`，CGO_ENABLED=0 静态）+ 前端构建（`node:22-slim`）+ obscura release 下载（stealth 构建，amd64/arm64 自动选资产）
+  - 运行镜像：**`debian:trixie-slim`（GLIBC 运行时）**——内置 CA 证书、时区（`TZ=Asia/Shanghai`）、obscura（`/opt/obscura/obscura`）；**无 Python**（camoufox 已由 Go 原生 solver 替代）
   - 入口：**tini**（`ENTRYPOINT ["/usr/bin/tini", "--"]` + `CMD ["reader-dev"]`——PID 1 信号转发/僵尸回收，1Panel 等面板兼容）
   - 数据目录 `/data`（`VOLUME`），`READER_APP_WORKDIR=/data`
 - **镜像版本**：master 每次提交自动构建推送（`docker-publish-go.yml`）——版本标签 = **短 SHA**（7 位，可追溯）；`latest` 为 master 最新滚动标签；**不再发布 GitHub Release 二进制**
@@ -196,7 +194,7 @@ scripts/              camoufox_solver.py / e2e-smoke.py / api-scan.py / 69shuba.
 - [x] 4. 本地书 9 格式（TXT/EPUB/PDF/MOBI/AZW3/FB2/DOCX/CBZ/UMD）
 - [x] 5. RSS/TTS/WebDAV/文件管理/OPDS 1.2+2.0+PSE
 - [x] 6. 多用户管理 + 管理 API 全量对齐（多设备 token/过期/限流/上传上限）
-- [x] 7. 反爬（obscura 唯一浏览器后端 + camoufox 兜底 + FlareSolverr 可选 + 真实站点 69shuba 验证）
+- [x] 7. 反爬（obscura 唯一浏览器后端 + Go 原生 CDP 质询求解替代 camoufox + FlareSolverr 可选 + 真实站点 69shuba 验证）
 - [x] 8. 安全审计 6 major 修复（SSRF/跨用户缓存/限流绕过/封面墙/PWA SW/JS 阻塞）
-- [x] 9. 双轨书仓 / 备份恢复闭环 / 启动快照 + 每日自动备份 / Docker（trixie + tini + 内置 obscura/camoufox）
+- [x] 9. 双轨书仓 / 备份恢复闭环 / 启动快照 + 每日自动备份 / Docker（trixie + tini + 内置 obscura）
 - [ ] 剩余项（未实现）：见 `docs/ROADMAP.md`（69shuba 住宅代理 / 服务端 TLS+H2/H3 / zip 炸弹强化 / 多实例 / 本地书导入 / 浏览器自动化）

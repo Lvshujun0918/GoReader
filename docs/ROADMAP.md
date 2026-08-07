@@ -32,15 +32,14 @@
 
 ### 反爬 / 安全
 - [x] **obscura 反检测浏览器集成**（唯一浏览器后端——替代 Chrome/Edge，无回退；stealth 构建：BoringSSL TLS 指纹/反检测/追踪器拦截；`READER_OBSCURA_URL` 直连或 spawn）
-- [x] camoufox 强质询兜底（Firefox 内核真实指纹，HTTP 后端；`READER_CAMOUFOX_URL/DISABLE/FIRST/UA`）+ FlareSolverr 可选
-- [x] CF 质询/Turnstile 求解 + POST 保真重试 + cookie 按 name 合并复用 + 真实书源 69shuba 实测
+- [x] Go 原生 CDP 质询求解（`internal/service/solver` go-rod 驱动 obscura——替代 Python camoufox；CF 质询/Turnstile + POST 保真重试 + cookie 按 name 合并复用）+ FlareSolverr 可选
 - [x] 安全审计 6 个 major 全修（2026-08-06，提交 `e5f12b4`）：SSRF 逐跳校验 / 图片缓存跨用户隔离 / 登录限流直连 IP（XFF 忽略）/ 封面墙 / PWA SW v2 / JS 桥超时 10s
 - [x] 上传上限（`READER_UPLOAD_MAX_MB` 默认 100MB，413 明确错误）
 
 ### 工程
 - [x] 新前端（Vue3 + Vite + shadcn-vue，15 视图，vue-tsc 严格类型检查 CI）
 - [x] CI：go-ci（vet/test-race/静态校验/交叉编译）、frontend-ci、docker-publish-go（master push 触发 + 短 SHA 版本 + 多架构镜像）
-- [x] Docker 镜像：`debian:trixie-slim`（GLIBC）+ **tini 入口**（1Panel 兼容）+ 内置 obscura/camoufox/python + CA/时区（Go 静态二进制，golang:1.25 构建）
+- [x] Docker 镜像：`debian:trixie-slim`（GLIBC）+ **tini 入口**（1Panel 兼容）+ 内置 obscura + CA/时区（Go 静态二进制，golang:1.25 构建；无 Python）
 - [x] 镜像发布：每次提交自动推送 Docker（短 SHA 版本 + latest 滚动），不再发布 Release 二进制
 - [x] 后端 Go 单测（配置/规则引擎/存储/密码）
 
@@ -56,7 +55,7 @@
 | 4 | **EPUB zip 炸弹防护** | 条目大小/数量上限缺失；当前受 `READER_UPLOAD_MAX_MB` 缓解 |
 | 5 | **多实例部署支持** | 单实例假设：SQLite + 内存态缓存（目录/正文/登录限流）不跨进程协调 |
 | 6 | **本地书导入（9 格式）** | Go 端 `importBookPreview`/`uploadLocalBook` 等为骨架，EPUB/TXT/MOBI 解析迭代中 |
-| 7 | **浏览器自动化（obscura/camoufox）** | Go 端质询求解/书源登录浏览器流未接入（Rust 版已实现，按 ARCHITECTURE 迭代） |
+| 7 | **书源登录浏览器流** | 质询求解已接入（obscura CDP，`internal/service/solver`）；书源登录浏览器流未接入（Rust 版已实现，按 ARCHITECTURE 迭代） |
 
 ---
 

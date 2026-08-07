@@ -27,7 +27,7 @@
 
 ### 5. 书源 cookie 按用户隔离
 - `book_source_cookies` 表：`user_namespace + source_url` 联合主键——书源登录态（cookie/user_agent）严格按用户命名空间存取，`cookie_for(ns, url)` 只读本命名空间行，跨用户不可见、不可覆盖。
-- 抓取入口（`crawler::fetch_book`）按当前请求命名空间注入 cookie；FlareSolverr/camoufox/obscura 求解返回的 cookie 与用户原 cookie **按 name 合并**后仍存回该用户命名空间。
+- 抓取入口（`crawler::fetch_book`）按当前请求命名空间注入 cookie；FlareSolverr/obscura 求解返回的 cookie 与用户原 cookie **按 name 合并**后仍存回该用户命名空间。
 - 浏览器实例按用户命名空间独立（Rust 版 `service/browser.rs` 每用户独立 CDP 会话；Go 端浏览器自动化接入中，见 ROADMAP 待办 9）。
 
 ### 6. FlareSolverr 转发
