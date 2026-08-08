@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/Lvshujun0918/reader-dev/internal/model"
@@ -90,17 +91,13 @@ type Chapter struct {
 }
 
 // BookToc 目录（ruleToc）。返回（章节列表, 下一页 URL, 错误）。
+// 支持 JSON 分页自动翻页：响应含 paging.{pi,ps,count} 且 pi*ps<count 时，
+// 自动请求 pi+1 拼接，直到 count 或最大页数（酷我 paging=1 分页目录等）。
 func (f *Fetcher) BookToc(source *model.BookSource, tocURL string) ([]Chapter, string, error) {
-	body, err := f.Client.Fetch(tocURL, source)
-	if err != nil {
-		return nil, "", err
-	}
-	htmlStr := string(body)
 	ruleStr := source.RuleToc
 	if ruleStr == "" {
 		ruleStr = source.TocRule
 	}
-	ctx := &rule.Context{BaseURL: tocURL}
 	rules := parseRuleMap(ruleStr)
 	listRule := firstNonEmpty(rules, "chapters", "chapterList", "tocList", "list")
 	if listRule == "" {
@@ -108,27 +105,54 @@ func (f *Fetcher) BookToc(source *model.BookSource, tocURL string) ([]Chapter, s
 	}
 	titleRule := firstNonEmpty(rules, "chapterTitle", "chapterName", "title")
 	urlRule := firstNonEmpty(rules, "chapterUrl", "url")
-	items := rule.Parse(htmlStr, listRule, ctx)
+	nextRule := firstNonEmpty(rules, "nextTocUrl", "nextUrl")
+
 	var chapters []Chapter
-	for i, item := range items {
-		ch := Chapter{Index: i}
-		if titleRule != "" {
-			if t := rule.Parse(item, titleRule, ctx); len(t) > 0 {
-				ch.Title = t[0]
+	curURL := tocURL
+	lastNext := ""
+	for page := 0; page < 100; page++ {
+		body, err := f.Client.Fetch(curURL, source)
+		if err != nil {
+			return nil, "", err
+		}
+		htmlStr := string(body)
+		ctx := &rule.Context{BaseURL: curURL}
+		items := rule.Parse(htmlStr, listRule, ctx)
+		for _, item := range items {
+			ch := Chapter{Index: len(chapters)}
+			if titleRule != "" {
+				if t := rule.Parse(item, titleRule, ctx); len(t) > 0 {
+					ch.Title = t[0]
+				}
+			}
+			if ch.Title == "" {
+				ch.Title = item
+			}
+			if urlRule != "" {
+				if u := rule.Parse(item, urlRule, ctx); len(u) > 0 {
+					ch.URL = resolveURL(u[0], curURL)
+				}
+			}
+			if ch.URL == "" {
+				ch.URL = curURL
+			}
+			chapters = append(chapters, ch)
+		}
+		// 下一页：nextTocUrl 规则优先，其次 JSON paging 自动翻页
+		next := ""
+		if nextRule != "" {
+			if res := rule.Parse(htmlStr, nextRule, ctx); len(res) > 0 {
+				next = resolveURL(res[0], curURL)
 			}
 		}
-		if ch.Title == "" {
-			ch.Title = item
+		if next == "" {
+			next = nextJSONPage(htmlStr, curURL)
 		}
-		if urlRule != "" {
-			if u := rule.Parse(item, urlRule, ctx); len(u) > 0 {
-				ch.URL = resolveURL(u[0], tocURL)
-			}
+		if next == "" || next == curURL {
+			lastNext = next
+			break
 		}
-		if ch.URL == "" {
-			ch.URL = tocURL
-		}
-		chapters = append(chapters, ch)
+		curURL = next
 	}
 	// 卷标题检测（isVolume）
 	for i := range chapters {
@@ -136,14 +160,36 @@ func (f *Fetcher) BookToc(source *model.BookSource, tocURL string) ([]Chapter, s
 			chapters[i].IsVolume = true
 		}
 	}
-	// 分页目录：nextTocUrl/nextUrl
-	next := ""
-	if v := firstNonEmpty(rules, "nextTocUrl", "nextUrl"); v != "" {
-		if res := rule.Parse(htmlStr, v, ctx); len(res) > 0 {
-			next = resolveURL(res[0], tocURL)
-		}
+	return chapters, lastNext, nil
+}
+
+// nextJSONPage JSON 分页目录的下一页 URL：响应含 paging.{pi,ps,count} 且未取完时，pi+1。
+func nextJSONPage(body, curURL string) string {
+	var p struct {
+		Paging struct {
+			PI    int `json:"pi"`
+			PS    int `json:"ps"`
+			Count int `json:"count"`
+		} `json:"paging"`
 	}
-	return chapters, next, nil
+	if json.Unmarshal([]byte(body), &p) != nil {
+		return ""
+	}
+	pg := p.Paging
+	if pg.PI <= 0 || pg.PS <= 0 || pg.Count <= 0 {
+		return ""
+	}
+	if pg.PI*pg.PS >= pg.Count {
+		return ""
+	}
+	u, err := url.Parse(curURL)
+	if err != nil {
+		return ""
+	}
+	q := u.Query()
+	q.Set("pi", strconv.Itoa(pg.PI+1))
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // ContentResult 正文结果（含下一页/字数）。
@@ -198,6 +244,9 @@ func (f *Fetcher) BookContent(source *model.BookSource, chapterURL string, maxPa
 		curURL = nextURL
 	}
 	content := strings.TrimSpace(strings.Join(parts, "\n\n"))
+	// 换行规范化：源站 CRLF → LF（前端按 \n 切段）
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
 	return &ContentResult{Content: content, WordCount: len([]rune(content))}, nil
 }
 

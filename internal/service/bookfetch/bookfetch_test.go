@@ -18,7 +18,7 @@ func kuwoServer(t *testing.T) *httptest.Server {
 		var body string
 		switch {
 		case strings.Contains(p, "/chapters/"):
-			body = `{"data":{"content":"第一章正文内容，测试用。\n\n第二段。"}}`
+			body = `{"data":{"content":"第一章正文内容，测试用。\r\n\u3000\u3000第二段。\r\n第三段。"}}`
 		case strings.HasSuffix(p, "/chapters"):
 			body = `{"data":[{"book_id":"2237","chapter_id":"c1","chapter_title":"第一章 风起","volume_name":"第一卷","original_words":"2300"},{"book_id":"2237","chapter_id":"c2","chapter_title":"第二章 云涌","volume_name":"第一卷","original_words":"1800"}]}`
 		default:
@@ -119,6 +119,13 @@ func TestBookContentJSONRule(t *testing.T) {
 	}
 	if !strings.Contains(res.Content, "第一章正文内容") {
 		t.Errorf("content=%q（$.data.content 提取）", res.Content)
+	}
+	// CRLF 规范化：源站 \r\n → \n
+	if strings.Contains(res.Content, "\r") {
+		t.Errorf("content 含未处理 CR: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "\n\u3000\u3000第二段") && !strings.Contains(res.Content, "\n第二段") {
+		t.Errorf("content 换行未规范化: %q", res.Content)
 	}
 	if res.WordCount <= 0 {
 		t.Errorf("wordCount=%d", res.WordCount)
