@@ -3,7 +3,9 @@ import { Toaster as Sonner } from 'vue-sonner'
 </script>
 
 <template>
+  <!-- class="toaster group"：提供 group-[.toaster] 上下文，使下方主题类生效（缺省则 toast 无背景/边框） -->
   <Sonner
+    class="toaster group"
     position="top-center"
     rich-colors
     :toast-options="{

@@ -7,6 +7,8 @@ import router from './router'
 import { lazy } from './directives/lazy'
 import './styles/main.css'
 import './styles/shadcn.css'
+// vue-sonner toast 基础样式（fixed 定位/宽度/动画）——不导入则 toast 渲染在页面流底部
+import 'vue-sonner/style.css'
 
 // 主题由阅读页顶部按钮切换（html[data-theme=light|dark|paper]，见 styles/main.css）
 // 旧 html.dark hack（强制 dark class + main.css 反向重映射）已清理
