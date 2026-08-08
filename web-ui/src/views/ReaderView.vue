@@ -2203,6 +2203,66 @@ function onNextClick() {
   nextChapter()
 }
 
+/* ---------------- 点击区域（GAP：整页分三区——左=上一页/上章，右=下一页/下章，中=弹/隐顶底栏） ---------------- */
+
+/** 顶栏 / 底栏 / 顶部进度条显隐（点击中间切换） */
+const chromeVisible = ref(true)
+function toggleChrome() {
+  chromeVisible.value = !chromeVisible.value
+}
+
+/** 上一页/上一章（按翻页模式：flip 翻页 / slide 逐屏 / scroll、hslide 切章） */
+function pagePrev() {
+  if (pageMode.value === 'flip') flipPage(-1)
+  else if (pageMode.value === 'slide') slideFlip(-1)
+  else prevChapter()
+}
+
+/** 下一页/下一章 */
+function pageNext() {
+  if (pageMode.value === 'flip') flipPage(1)
+  else if (pageMode.value === 'slide') slideFlip(1)
+  else nextChapter()
+}
+
+/**
+ * 整页点击委托：左 1/4 → 上一页/上章；右 1/4 → 下一页/下章；中间 → 弹/隐顶底栏。
+ * 仅文本书启用；自动排除：弹层/抽屉/选择条、顶底栏/按钮/图片/输入等自身有交互的元素，
+ * 以及拖选/长按选择后的合成 click（selection 非空时忽略）。
+ */
+function onReaderTap(e: MouseEvent) {
+  if (!isTextBook.value) return
+  if (e.button !== 0) return
+  const t = e.target as HTMLElement | null
+  if (!t) return
+  // 自身有交互的元素：不吞掉其行为
+  if (
+    t.closest(
+      '.topbar, .reader-toolbar, .progress-bar, .reading-progress, .chapter-nav, ' +
+        '.tb-btn, .icon-btn, .font-btn, .nav-btn, .retry-btn, .media-nav, ' +
+        '.pop-mask, .pop-card, .drawer-mask, .sel-bar, ' +
+        'button, input, textarea, select, a, img',
+    )
+  ) {
+    return
+  }
+  // 弹层/选择工具条打开时（中间点击会被 mask 自己处理）
+  if (selOpen.value) return
+  // 拖选/双击选词后的合成 click：忽略，避免误翻页
+  const sel = window.getSelection()
+  if (sel && sel.toString().trim()) return
+
+  const x = e.clientX
+  const w = window.innerWidth
+  if (x < w * 0.25) {
+    pagePrev()
+  } else if (x > w * 0.75) {
+    pageNext()
+  } else {
+    toggleChrome()
+  }
+}
+
 function retry() {
   if (chapters.value.length === 0) void init()
   else if (currentChapter.value) {
@@ -2720,10 +2780,17 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="pageRef" class="reader-page" :class="{ texture: effectiveTexture, 'flip-layout': pageMode === 'flip' && isTextBook }" :style="pageStyle">
+  <div
+    ref="pageRef"
+    class="reader-page"
+    :class="{ texture: effectiveTexture, 'flip-layout': pageMode === 'flip' && isTextBook }"
+    :style="pageStyle"
+    @click="onReaderTap"
+  >
     <!-- GAP 149：顶部细进度条（scroll 比例，1px 强调色；点击可跳章） -->
     <button
       v-if="!loading && !loadError && !notFound && realChapters.length > 0"
+      v-show="chromeVisible"
       class="reading-progress"
       type="button"
       :title="t('reader.jumpTip')"
@@ -2733,7 +2800,7 @@ onBeforeUnmount(() => {
     </button>
 
     <!-- 顶部极简栏 -->
-    <header class="topbar">
+    <header class="topbar" v-show="chromeVisible">
       <button class="icon-btn" type="button" :title="t('reader.back')" @click="goBack">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
           <path d="M19 12H5" />
@@ -3047,6 +3114,7 @@ onBeforeUnmount(() => {
     <!-- 底部工具栏（图标+文字上下布局：字号 / 主题 / 目录 / 设置） -->
     <div
       v-if="!loading && !loadError && !notFound && realChapters.length > 0"
+      v-show="chromeVisible"
       class="reader-toolbar"
     >
       <button
@@ -3099,6 +3167,7 @@ onBeforeUnmount(() => {
     <!-- 进度：底部细字 + 可点击跳章 -->
     <button
       v-if="!loading && !loadError && !notFound && realChapters.length > 0"
+      v-show="chromeVisible"
       class="progress-bar"
       type="button"
       title="跳转章节"
