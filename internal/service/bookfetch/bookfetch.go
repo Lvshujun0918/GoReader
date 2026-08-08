@@ -28,19 +28,58 @@ func New(st *storage.Storage, ns string, solverOpt ...*solver.Solver) *Fetcher {
 	return &Fetcher{Client: crawler.New(st, ns, solverOpt...)}
 }
 
+// fetchFunc 构造 ctx.Fetch（java.ajax 底层）：转发到 crawler.FetchGeneric。
+func (f *Fetcher) fetchFunc(source *model.BookSource) func(method, rawURL, body string, headers map[string]string) (string, error) {
+	return func(method, rawURL, body string, headers map[string]string) (string, error) {
+		b, err := f.Client.FetchGeneric(method, rawURL, body, headers)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+}
+
+// dahuilangServer 从书源变量提取 server（大灰狼聚合源：server=https://api.xxx）。
+func dahuilangServer(source *model.BookSource) string {
+	for _, seg := range strings.FieldsFunc(source.Variable, func(r rune) bool { return r == ';' || r == '&' }) {
+		kv := strings.SplitN(strings.TrimSpace(seg), "=", 2)
+		if len(kv) == 2 && strings.TrimSpace(kv[0]) == "server" {
+			return strings.TrimSpace(kv[1])
+		}
+	}
+	return ""
+}
+
+// ensureServer 大灰狼聚合源：ctx 注入书源变量（sourceVariable）并确保 server。
+func ensureServer(ctx *rule.Context, source *model.BookSource) {
+	ctx.Set("sourceVariable", source.Variable)
+	if ctx.Get("server") == "" {
+		ctx.Set("server", dahuilangServer(source))
+	}
+}
+
 // BookInfo 书籍详情（ruleBookInfo）。
 func (f *Fetcher) BookInfo(source *model.BookSource, bookURL string) (map[string]any, error) {
-	body, err := f.Client.Fetch(bookURL, source)
-	if err != nil {
-		return nil, err
+	var htmlStr string
+	if strings.HasPrefix(bookURL, "data:") {
+		// 大灰狼 qingtian 协议：不抓页面，init JS 用 java.ajax 请求 detail API
+		htmlStr = bookURL
+	} else {
+		body, err := f.Client.Fetch(bookURL, source)
+		if err != nil {
+			return nil, err
+		}
+		htmlStr = string(body)
 	}
-	htmlStr := string(body)
 	ruleStr := source.RuleBookInfo
 	if ruleStr == "" {
 		ruleStr = source.BookInfoRule
 	}
 	ctx := &rule.Context{BaseURL: bookURL}
 	ctx.Set("bookUrl", bookURL)
+	ctx.Set("baseUrl", bookURL)
+	ensureServer(ctx, source)
+	ctx.Fetch = f.fetchFunc(source)
 	info := map[string]any{
 		"bookUrl":    bookURL,
 		"origin":     source.BookSourceURL,
@@ -57,6 +96,18 @@ func (f *Fetcher) BookInfo(source *model.BookSource, bookURL string) (map[string
 	if v := rules["init"]; v != "" {
 		if res := rule.Parse(htmlStr, v, ctx); len(res) > 0 {
 			initVal = res[0]
+		}
+	}
+	// 大灰狼 qingtian 协议：detail 响应 {code:0,data:{...}}，字段规则用顶层路径
+	// （author=$.author 等）——字段上下文取 data 子对象。
+	if initVal != "" {
+		var obj map[string]any
+		if json.Unmarshal([]byte(initVal), &obj) == nil {
+			if data, ok := obj["data"].(map[string]any); ok {
+				if b, err := json.Marshal(data); err == nil {
+					initVal = string(b)
+				}
+			}
 		}
 	}
 	for key, val := range rules {
@@ -119,13 +170,42 @@ func (f *Fetcher) BookToc(source *model.BookSource, tocURL string) ([]Chapter, s
 	curURL := tocURL
 	lastNext := ""
 	for page := 0; page < 100; page++ {
-		body, err := f.Client.Fetch(curURL, source)
-		if err != nil {
-			return nil, "", err
+		var htmlStr string
+		if strings.HasPrefix(curURL, "data:") {
+			// 大灰狼 qingtian 协议：不抓页面，chapterList JS 用 java.ajax 请求 catalog API，
+			// 输入即 data: URL 本身。
+			htmlStr = curURL
+		} else {
+			body, err := f.Client.Fetch(curURL, source)
+			if err != nil {
+				return nil, "", err
+			}
+			htmlStr = string(body)
 		}
-		htmlStr := string(body)
 		ctx := &rule.Context{BaseURL: curURL}
+		ctx.Set("baseUrl", curURL)
+		ctx.Set("tocUrl", curURL)
+		ensureServer(ctx, source)
+		ctx.Fetch = f.fetchFunc(source)
 		items := rule.Parse(htmlStr, listRule, ctx)
+		// 链式/JSON 目录若返回单个 JSON 对象且含 data 数组 → 展开为章节
+		// （大灰狼 catalog 响应 {code:0,data:[{title,item_id,...}]}）
+		if len(items) == 1 {
+			var obj map[string]any
+			if json.Unmarshal([]byte(items[0]), &obj) == nil {
+				if arr, ok := obj["data"].([]any); ok && len(arr) > 0 {
+					var expanded []string
+					for _, it := range arr {
+						if s, err := json.Marshal(it); err == nil {
+							expanded = append(expanded, string(s))
+						}
+					}
+					if len(expanded) > 0 {
+						items = expanded
+					}
+				}
+			}
+		}
 		for _, item := range items {
 			ch := Chapter{Index: len(chapters)}
 			if titleRule != "" {
@@ -222,12 +302,22 @@ func (f *Fetcher) BookContent(source *model.BookSource, chapterURL string, maxPa
 	var parts []string
 	curURL := chapterURL
 	for i := 0; i < maxPages; i++ {
-		body, err := f.Client.Fetch(curURL, source)
-		if err != nil {
-			return nil, err
+		var htmlStr string
+		if strings.HasPrefix(curURL, "data:") {
+			// 大灰狼 qingtian 协议：content JS 用 java.ajax 请求 content API，输入即 data: URL
+			htmlStr = curURL
+		} else {
+			body, err := f.Client.Fetch(curURL, source)
+			if err != nil {
+				return nil, err
+			}
+			htmlStr = string(body)
 		}
-		htmlStr := string(body)
 		ctx := &rule.Context{BaseURL: curURL}
+		ctx.Set("baseUrl", curURL)
+		ctx.Set("chapterUrl", curURL)
+		ensureServer(ctx, source)
+		ctx.Fetch = f.fetchFunc(source)
 		var contentParts []string
 		if contentRule != "" {
 			contentParts = append(contentParts, rule.Parse(htmlStr, contentRule, ctx)...)
@@ -390,6 +480,10 @@ func resolveURL(raw, base string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ""
+	}
+	// data: 协议（大灰狼 qingtian：data:;base64,...）原样返回，不做相对解析
+	if strings.HasPrefix(raw, "data:") {
+		return raw
 	}
 	if strings.HasPrefix(raw, "//") {
 		idx := strings.Index(base, "://")

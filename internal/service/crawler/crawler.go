@@ -239,10 +239,50 @@ func (c *Client) FetchWithHeaders(rawURL string, headers map[string]string) ([]b
 	return io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes))
 }
 
+// FetchGeneric 通用请求（java.ajax 底层）：method/url/body/headers 全指定。
+func (c *Client) FetchGeneric(method, rawURL, body string, headers map[string]string) ([]byte, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if !ssrfAllowed(u.Hostname(), c.AllowPrivate) {
+		return nil, fmt.Errorf("%w: %s", ErrSSRF, u.Hostname())
+	}
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), method, rawURL, reader)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if body != "" && req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", solver.DefaultUA)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return b, nil
+}
+
 // FetchPost POST 表单请求（legado searchUrl 的 ,{'method':'POST','body':...} 描述）。
 // formBody 为已替换占位符的表单串（keyword=%E6%96%97...&page=1），UTF-8 百分号编码。
-func (c *Client) FetchPost(rawURL, formBody string, source *model.BookSource) ([]byte, error) {
-	u, err := url.Parse(rawURL)
+func (c *Client) FetchPost(rawURL, formBody string, source *model.BookSource) ([]byte, error) {	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
 	}

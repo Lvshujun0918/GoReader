@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -24,6 +25,27 @@ type Context struct {
 	Variables map[string]string
 	// BaseURL 相对链接解析基准
 	BaseURL string
+	// Store java.put/get 跨规则共享存储（大灰狼等聚合书源：chapterList 存 book_id，chapterUrl 取）
+	Store map[string]string
+	// Fetch 网络能力（java.ajax 用）：method/url/body/headers → 响应体字符串。
+	// 由调用方（bookfetch）注入；nil 时 java.ajax 抛错。
+	Fetch func(method, rawURL, body string, headers map[string]string) (string, error)
+}
+
+// SetStore 设置跨规则共享值。
+func (c *Context) SetStore(k, v string) {
+	if c.Store == nil {
+		c.Store = map[string]string{}
+	}
+	c.Store[k] = v
+}
+
+// GetStore 读跨规则共享值。
+func (c *Context) GetStore(k string) string {
+	if c.Store == nil {
+		return ""
+	}
+	return c.Store[k]
 }
 
 // Set 设置变量。
@@ -865,8 +887,43 @@ func evalJS(input, code string, ctx *Context) []string {
 	})
 	// cookie（书源 cookie 由调用方经 ctx 注入）
 	_ = vm.Set("cookie", map[string]any{
-		"getCookie": func(url string) string { return ctx.Get("cookie") },
+		"getCookie":    func(url string) string { return ctx.Get("cookie") },
+		"removeCookie": func(url string) {},
+		"setCookie":    func(url, val string) {},
 	})
+	// book（聚合书源兼容：book.type/order/variable 等属性赋值与读取不报错）
+	_ = vm.Set("book", map[string]any{
+		"getVariable": func(k string) string { return "" },
+		"setUseReplaceRule": func(...any) {
+		},
+		"variable":        "",
+		"durChapterIndex": 0,
+		"order":           0,
+		"readConfig":      map[string]any{"useReplaceRule": false},
+	})
+	// host 服务器列表（大灰狼线路切换 for (let h of host)）
+	host := []string{ctx.Get("server")}
+	if h := ctx.Get("host"); h != "" {
+		host = strings.Split(h, ",")
+	}
+	_ = vm.Set("host", host)
+	// setArguments/getArguments（书源变量更新）
+	_ = vm.Set("setArguments", func(text, key string) string {
+		if ctx.Variables != nil {
+			ctx.Variables[key] = text
+		}
+		return text
+	})
+	// getFanqieCookie/getSessionId/getKey（大灰狼番茄 cookie 相关，均空）
+	_ = vm.Set("getFanqieCookie", func() string { return "" })
+	_ = vm.Set("getSessionId", func() string { return "" })
+	_ = vm.Set("getKey", func() string { return "" })
+	// 大灰狼 content JS 辅助函数（评论 SVG/音色/图片处理，返回原样）
+	_ = vm.Set("removeAllImgTags", func(content string) string { return content })
+	_ = vm.Set("endclick", func(args ...any) string { return "" })
+	_ = vm.Set("paraForAndroid", func(content, sources string) string { return content })
+	_ = vm.Set("paraForiOS", func(content, sources string) string { return content })
+	_ = vm.Set("resolveShuqiToneId", func(id string) string { return id })
 	// java 兼容 shim
 	_ = vm.Set("java", map[string]any{
 		"url": map[string]any{
@@ -879,6 +936,33 @@ func evalJS(input, code string, ctx *Context) []string {
 		"base64Encode":         func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) },
 		"base64EncodeToString": func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) },
 		"base64Decode":         func(s string) string { b, _ := base64.StdEncoding.DecodeString(s); return string(b) },
+		// hexDecodeToString：data:;base64,XXXX 协议解码（大灰狼 qingtian 格式）
+		"hexDecodeToString": func(s string) string { return hexDecodeToString(s) },
+		// ajax：真实 HTTP 请求，支持 "url,{method,body,headers}" legado 请求描述
+		"ajax": func(args ...string) (string, error) {
+			raw := ""
+			for _, a := range args {
+				if raw == "" {
+					raw = a
+				} else {
+					raw += "," + a
+				}
+			}
+			if ctx.Fetch == nil {
+				return "", fmt.Errorf("java.ajax 不可用：上下文无网络能力")
+			}
+			method, u, body, headers := splitDescURL(raw)
+			return ctx.Fetch(method, u, body, headers)
+		},
+		"put": func(k, v string) { ctx.SetStore(k, v) },
+		"get": func(k string) string { return ctx.GetStore(k) },
+		"log": func(...any) {
+		},
+		"longToast":  func(...any) {},
+		"getCookie":  func(u string) string { return ctx.Get("cookie") },
+		"getWebViewUA": func() string {
+			return "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+		},
 		"toJSONString": func(v any) string {
 			b, _ := json.Marshal(v)
 			return string(b)
@@ -905,6 +989,60 @@ func evalJS(input, code string, ctx *Context) []string {
 		}
 		return []string{toStr(v)}
 	}
+}
+
+// hexDecodeToString 大灰狼 qingtian 协议解码：data:;base64,XXXX,{...} → base64 解码。
+// 兼容纯 base64 输入。
+func hexDecodeToString(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "base64,"); i >= 0 {
+		rest := s[i+len("base64,"):]
+		if j := strings.Index(rest, ","); j >= 0 {
+			rest = rest[:j]
+		} else if j := strings.IndexByte(rest, '{'); j >= 0 {
+			rest = rest[:j]
+		}
+		rest = strings.TrimSpace(rest)
+		if b, err := base64.StdEncoding.DecodeString(rest); err == nil {
+			return string(b)
+		}
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return string(b)
+	}
+	return s
+}
+
+// splitDescURL 解析 legado 请求描述 URL：url,{method,body,headers}。
+// 返回 (method, url, body, headers)；无描述时 method=GET。
+func splitDescURL(raw string) (string, string, string, map[string]string) {
+	method := "GET"
+	u := raw
+	var body string
+	var headers map[string]string
+	if i := strings.Index(raw, ",{"); i >= 0 {
+		u = raw[:i]
+		var desc struct {
+			Method  string            `json:"method"`
+			Body    any               `json:"body"`
+			Headers map[string]string `json:"headers"`
+		}
+		if json.Unmarshal([]byte(raw[i+1:]), &desc) == nil {
+			if desc.Method != "" {
+				method = desc.Method
+			}
+			switch b := desc.Body.(type) {
+			case string:
+				body = b
+			case map[string]any:
+				if bb, err := json.Marshal(b); err == nil {
+					body = string(bb)
+				}
+			}
+			headers = desc.Headers
+		}
+	}
+	return method, u, body, headers
 }
 
 // evalGet 从 URL/输入中提取：@get:regex|queryKey。

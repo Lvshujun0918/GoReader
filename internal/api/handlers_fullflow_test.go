@@ -8,19 +8,27 @@ import (
 )
 
 // TestFullFlowJianLai 真实全流程：《剑来》搜索 → 详情 → 目录 → 正文 → 上书架 → 书架验证。
-// 使用 xiu2 订阅合集里的真实书源（独步小说网/天天看小说/阅友小说/就爱文学/69书吧），
-// 取第一个全流程可跑通的书源；外站不可达/规则不兼容时逐源回退，全部失败则 Skip。
+// 使用 xiu2 订阅合集 + 大灰狼聚合的真实书源，取第一个全流程可跑通的书源；
+// 外站不可达/规则不兼容/服务端限流时逐源回退，全部失败则 Skip。
 func TestFullFlowJianLai(t *testing.T) {
 	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
-	candidates := []string{"独步小说网", "天天看小说", "阅友小说", "就爱文学", "69书吧"}
+	candidates := []string{"独步小说网", "天天看小说", "阅友小说", "就爱文学", "69书吧", "大灰狼"}
 	sources := loadRealShuyuan(t)
 
 	for _, name := range candidates {
 		var src map[string]any
-		for _, s := range sources {
-			if n, _ := s["bookSourceName"].(string); n == name {
-				src = s
-				break
+		if name == "大灰狼" {
+			// 大灰狼为独立 fixture（用户订阅的聚合书源，需配置 server）
+			src = loadDahuilang(t)
+			if v, _ := src["variable"].(string); v == "" {
+				src["variable"] = "server=https://api.langge.cf;media=小说;tab=小说;source="
+			}
+		} else {
+			for _, s := range sources {
+				if n, _ := s["bookSourceName"].(string); n == name {
+					src = s
+					break
+				}
 			}
 		}
 		if src == nil {
@@ -75,14 +83,15 @@ func runFullFlowJianLai(t *testing.T, src map[string]any) (bool, string) {
 	for _, b := range books {
 		m, _ := b.(map[string]any)
 		u, _ := m["bookUrl"].(string)
-		if strings.HasPrefix(u, "http") {
+		// http（普通书源）或 data:（大灰狼 qingtian 协议）均视为真实书
+		if strings.HasPrefix(u, "http") || strings.HasPrefix(u, "data:") {
 			bookURL = u
 			bookName, _ = m["name"].(string)
 			break
 		}
 	}
 	if bookURL == "" {
-		return false, "搜索无真实 http 书（仅提示项）"
+		return false, "搜索无真实书（仅提示项）"
 	}
 	t.Logf("  搜索到: %s -> %s", bookName, bookURL)
 
@@ -118,6 +127,10 @@ func runFullFlowJianLai(t *testing.T, src map[string]any) (bool, string) {
 	cm, _ := cRd.Data.(map[string]any)
 	content, _ := cm["content"].(string)
 	if len([]rune(content)) < 100 {
+		// 大灰狼等聚合源：正文接口服务端限流（每日免登录次数用尽），非实现失败
+		if strings.Contains(content, "免登录") || strings.Contains(content, "登录后") || strings.Contains(content, "访问次数") {
+			return false, "正文接口服务端限流（需配置登录 token）"
+		}
 		return false, "正文过短(" + strconv.Itoa(len([]rune(content))) + "字): " + chURL
 	}
 
