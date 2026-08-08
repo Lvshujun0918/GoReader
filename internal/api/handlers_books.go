@@ -189,6 +189,9 @@ func (a *API) handleGetBookInfo(c *gin.Context) {
 		url = paramOf(params, "bookUrl")
 	}
 	origin := paramOf(params, "origin")
+	if origin == "" {
+		origin = paramOf(params, "bookSource")
+	}
 	if url == "" {
 		Fail(c, "书源链接不能为空")
 		return
@@ -229,18 +232,21 @@ func (a *API) handleGetBookToc(c *gin.Context) {
 		url = paramOf(params, "bookUrl")
 	}
 	tocURL := paramOf(params, "tocUrl")
+	if tocURL == "" {
+		tocURL = url
+	}
 	origin := paramOf(params, "origin")
-	if url == "" {
+	if origin == "" {
+		origin = paramOf(params, "bookSource")
+	}
+	if url == "" && tocURL == "" {
 		Fail(c, "书源链接不能为空")
 		return
 	}
-	// 目录缓存（5 分钟 TTL）
-	if cache, err := a.Storage.GetTocCache(url); err == nil && cache != nil && cache.ChaptersJSON != "" {
+	// 目录缓存（5 分钟 TTL；key 用 tocURL）
+	if cache, err := a.Storage.GetTocCache(tocURL); err == nil && cache != nil && cache.ChaptersJSON != "" {
 		c.Data(200, "application/json; charset=utf-8", []byte(cache.ChaptersJSON))
 		return
-	}
-	if tocURL == "" {
-		tocURL = url
 	}
 	source, err := a.Storage.FindBookSource(ns, origin)
 	if err != nil {
@@ -281,8 +287,14 @@ func (a *API) handleGetBookContent(c *gin.Context) {
 	}
 	params := a.params(c)
 	url := paramOf(params, "url")
+	if url == "" {
+		url = paramOf(params, "chapterUrl")
+	}
 	index, _ := intParam(params, "chapterIndex")
 	origin := paramOf(params, "origin")
+	if origin == "" {
+		origin = paramOf(params, "bookSource")
+	}
 	if url == "" {
 		Fail(c, "章节链接不能为空")
 		return
