@@ -477,14 +477,27 @@ func evalXPath(input, expr string, ctx *Context) []string {
 
 // evalJSON JSONPath：@json:$.a.b[0]。
 func evalJSON(input, expr string, ctx *Context) []string {
+	// legado：$.path##pattern##repl（JSONPath 提取后正则替换，如
+	// $.chapter_title##正文卷.|正文.## / $.intro##(^|[。！？]+[”」）】]?)##$1<br>）
+	replSpec := ""
+	if idx := strings.Index(expr, "##"); idx >= 0 {
+		replSpec = expr[idx+2:]
+		expr = expr[:idx]
+	}
+	var out []string
 	// legado：&& 连接多个 JSONPath 表达式（结果合并，如 $..book_data[0]&&$.data[*]）
 	if strings.Contains(expr, "&&") {
-		var out []string
 		for _, part := range strings.Split(expr, "&&") {
-			out = append(out, evalJSON(input, strings.TrimSpace(part), ctx)...)
+			out = append(out, evalJSONPath(input, strings.TrimSpace(part), ctx)...)
 		}
-		return out
+	} else {
+		out = evalJSONPath(input, expr, ctx)
 	}
+	return applyJSONReplace(out, replSpec)
+}
+
+// evalJSONPath 单条 JSONPath 提取（无 ## 替换）。
+func evalJSONPath(input, expr string, ctx *Context) []string {
 	var v any
 	if err := json.Unmarshal([]byte(input), &v); err != nil {
 		return nil
@@ -509,6 +522,34 @@ func evalJSON(input, expr string, ctx *Context) []string {
 	default:
 		return []string{jsonScalarToString(res)}
 	}
+}
+
+// applyJSONReplace 对 JSONPath 结果应用 ##pattern##repl 正则替换（repl 缺省为删除匹配）。
+func applyJSONReplace(items []string, replSpec string) []string {
+	if replSpec == "" {
+		return items
+	}
+	parts := strings.SplitN(replSpec, "##", 2)
+	pattern := parts[0]
+	replacement := ""
+	if len(parts) >= 2 {
+		replacement = parts[1]
+	}
+	re, err := regexp2.Compile(pattern, regexp2.None)
+	if err != nil {
+		return items
+	}
+	var out []string
+	for _, s := range items {
+		if m, err := re.FindStringMatch(s); err == nil && m != nil {
+			if r, err := re.Replace(s, replacement, -1, -1); err == nil {
+				out = append(out, r)
+				continue
+			}
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 func jsonScalarToString(v any) string {
