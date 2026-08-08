@@ -15,7 +15,11 @@ export function searchBookMulti(
   page = 1,
   exact = false,
 ): Promise<ReturnData<SearchBook[]>> {
-  return post<SearchBook[]>('/searchBookMulti', { key, maxSources, page, exact: exact ? 1 : 0 }, { signal })
+  return post<SearchBook[]>(
+    '/searchBookMulti',
+    { key, maxSources, page, exact: exact ? 1 : 0 },
+    { signal, timeout: 120_000 },
+  )
 }
 
 /* ================= SSE 流式搜索（/reader3/searchBookMultiSSE） ================= */
@@ -35,6 +39,8 @@ export interface SearchSSEParams {
 }
 
 export interface SearchSSECallbacks {
+  /** 流开始（total=参与搜索的书源数） */
+  onStart?: (total: number) => void
   /** 单个书源结果到达（data 可能为空数组） */
   onBooks: (lastIndex: number, books: SearchBook[]) => void
   /** 流正常结束（event: end） */

@@ -18,6 +18,8 @@ export interface RequestOptions {
   silent?: boolean
   /** 中止信号（axios 原生支持，用于搜索取消等场景） */
   signal?: AbortSignal
+  /** 自定义超时（ms；缺省用实例默认 15s） */
+  timeout?: number
 }
 
 /** axios 实例：baseURL=/reader3，accessToken 自动携带（query），401/NEED_LOGIN 跳登录 */
@@ -90,10 +92,12 @@ export function post<T>(
   data?: unknown,
   paramsOrOpts?: Record<string, unknown> | RequestOptions,
 ): Promise<ReturnData<T>> {
-  const isOpts = !!paramsOrOpts && ('silent' in paramsOrOpts || 'signal' in paramsOrOpts)
+  const isOpts = !!paramsOrOpts && ('silent' in paramsOrOpts || 'signal' in paramsOrOpts || 'timeout' in paramsOrOpts)
   const params = isOpts ? undefined : (paramsOrOpts as Record<string, unknown> | undefined)
   const opts = isOpts ? (paramsOrOpts as RequestOptions) : undefined
-  return request.post(url, data, { params, silent: opts?.silent, signal: opts?.signal }).then((r) => r.data as ReturnData<T>)
+  return request
+    .post(url, data, { params, silent: opts?.silent, signal: opts?.signal, timeout: opts?.timeout })
+    .then((r) => r.data as ReturnData<T>)
 }
 
 export default request

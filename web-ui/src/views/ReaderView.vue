@@ -482,12 +482,27 @@ watch(pageMode, (mode, old) => {
     window.removeEventListener('touchmove', onTouchMove)
     window.removeEventListener('touchend', onTouchEnd)
   }
-  if (isPaged(mode) && isTextBook.value) {
-    // 进入分页模式（slide/hslide/flip）：回到章首并重测分页
+  const srcPaged = isPaged(old)
+  const dstPaged = isPaged(mode)
+  if (!isTextBook.value) return
+  if (dstPaged) {
+    // 进入/切换分页模式：保留进度（分页→分页=列轴；滚动→分页=纵向 scrollY 换算列）
+    const saved = srcPaged ? flipScrollLeft() : window.scrollY
     window.scrollTo(0, 0)
-    void nextTick(() => measureFlipColumns())
-  } else if (isPaged(old) && isTextBook.value) {
-    // 离开分页模式：列轴位置换算为纵向位置（同为距章首 px，直接沿用）
+    void nextTick(() => {
+      measureFlipColumns()
+      const v = flipViewRef.value
+      if (!v || saved <= 0) return
+      if (srcPaged) {
+        v.scrollTo({ left: saved, behavior: 'auto' })
+      } else {
+        // 滚动→分页：scrollY / 列高 ≈ 目标列
+        const h = v.clientHeight || 1
+        v.scrollTo({ left: Math.floor(saved / h) * flipStep(), behavior: 'auto' })
+      }
+    })
+  } else if (srcPaged) {
+    // 离开分页：列轴位置换算为纵向位置（同为距章首 px，直接沿用）
     window.scrollTo(0, flipScrollLeft())
   }
 })
@@ -2214,14 +2229,14 @@ function toggleChrome() {
   chromeVisible.value = !chromeVisible.value
 }
 
-/** 顶栏/底栏显隐变化 → 分页高度变化，重测分页 */
+/** 顶栏/底栏显隐变化 → 分页高度变化，重测分页并保持当前页 */
 watch(chromeVisible, () => {
   if (isPagedMode()) {
     void nextTick(() => {
-      measureFlipColumns()
-      // 列数变化后钳制当前页不越界
       const v = flipViewRef.value
-      if (v) flipGo(flipPageIdx.value)
+      const saved = v ? Math.round(v.scrollLeft / flipStep()) : 0
+      measureFlipColumns()
+      flipGo(saved)
     })
   }
 })

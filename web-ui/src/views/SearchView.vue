@@ -52,6 +52,8 @@ const results = ref<MergedResult[]>([])
 const failedCovers = new Set<string>()
 /** 已返回结果的书源数（SSE 每源一个 book 事件，lastIndex 去重计数） */
 const searchedSources = ref(0)
+/** 参与搜索的书源总数（SSE start 事件） */
+const totalSources = ref(0)
 
 const bookMap = new Map<string, MergedResult>()
 const completedSources = new Set<number>()
@@ -126,6 +128,7 @@ async function doSearch(kw?: string) {
   bookMap.clear()
   completedSources.clear()
   searchedSources.value = 0
+  totalSources.value = 0
   batchPage.value = 1
   batchExhausted.value = false
   batchLoadingMore.value = false
@@ -142,6 +145,10 @@ async function doSearch(kw?: string) {
         exact: exact.value,
       },
       {
+        onStart: (total) => {
+          if (seq !== searchSeq) return
+          totalSources.value = total
+        },
         onBooks: (lastIndex, books) => {
           if (seq !== searchSeq) return
           if (lastIndex >= 0) completedSources.add(lastIndex)
@@ -625,7 +632,7 @@ onBeforeUnmount(() => {
           <path d="M21 12a9 9 0 1 1-6.2-8.56" />
         </svg>
         <span class="state-text">
-          {{ usingSSE ? t('search.progress', { n: searchedSources }) : t('search.multi') }}
+          {{ usingSSE ? t('search.progress', { n: searchedSources, total: totalSources }) : t('search.multi') }}
         </span>
         <button class="stop-btn" type="button" @click="stopSearch">{{ t('search.stop') }}</button>
       </div>

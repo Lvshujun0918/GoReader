@@ -587,6 +587,9 @@ func TestSearchBookMultiSSEFormat(t *testing.T) {
 
 	w := perform(h, "GET", "/reader3/searchBookMultiSSE?key="+url.QueryEscape("测试"), nil)
 	body := w.Body.String()
+	if !strings.Contains(body, "event: start") || !strings.Contains(body, `"total":1`) {
+		t.Fatalf("SSE 缺 start 帧（total）:\n%s", body)
+	}
 	if !strings.Contains(body, "event: book") {
 		t.Fatalf("SSE 缺 event: book 帧:\n%s", body)
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -242,27 +243,42 @@ func (a *API) handleSearchBookMulti(c *gin.Context) {
 	} else if v, ok := intParam(params, "limit"); ok && v > 0 {
 		limit = int(v)
 	}
-	var all []*SearchResult
-	count := 0
-	for _, src := range sources {
-		if count >= limit {
-			break
+	// 参与搜索的书源（限并发 6 并行搜索，避免慢源拖垮整体）
+	var eligible []*model.BookSource
+	for i := range sources {
+		if sources[i].Enabled == 1 && sources[i].SearchURL != "" {
+			eligible = append(eligible, &sources[i])
 		}
-		if src.Enabled != 1 || src.SearchURL == "" {
-			continue
-		}
-		if results, err := SearchSource(&src, keyword, a.Solver); err == nil {
-			all = append(all, results...)
-		}
-		count++
 	}
+	if len(eligible) > limit {
+		eligible = eligible[:limit]
+	}
+	var mu sync.Mutex
+	var all []*SearchResult
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 6)
+	for _, src := range eligible {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(src *model.BookSource) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if results, err := SearchSource(src, keyword, a.Solver); err == nil {
+				mu.Lock()
+				all = append(all, results...)
+				mu.Unlock()
+			}
+		}(src)
+	}
+	wg.Wait()
 	OK(c, all)
 }
 
 // handleSearchBookMultiSSE GET/POST /reader3/searchBookMultiSSE：SSE 流式搜索。
 // 事件契约（与 web-ui/src/api/sse.ts 对齐）：
-//   event: book + data {"lastIndex": n, "data": [SearchBook]}  每个参与搜索的书源一帧
-//   event: end  + data {"lastIndex": n, "isEnd": true}         流结束
+//   event: start + data {"total": n}                             参与搜索的书源总数
+//   event: book  + data {"lastIndex": n, "data": [SearchBook]}  每个书源一帧（并发搜索，完成即推）
+//   event: end   + data {"lastIndex": n, "isEnd": true}         流结束
 func (a *API) handleSearchBookMultiSSE(c *gin.Context) {
 	ns, ok := a.ResolveNamespace(c)
 	if !ok {
@@ -280,29 +296,56 @@ func (a *API) handleSearchBookMultiSSE(c *gin.Context) {
 		Fail(c, "系统错误")
 		return
 	}
+	// 参与搜索的书源（启用 + 有搜索规则）
+	var eligible []*model.BookSource
+	for i := range sources {
+		if sources[i].Enabled == 1 && sources[i].SearchURL != "" {
+			eligible = append(eligible, &sources[i])
+		}
+	}
+
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 
-	idx := 0
-	for _, src := range sources {
-		if src.Enabled != 1 || src.SearchURL == "" {
-			continue
-		}
-		results, serr := SearchSource(&src, keyword, a.Solver)
-		payload := map[string]any{"lastIndex": idx, "data": results}
-		if serr != nil {
-			// 失败也推一帧（空结果 + 错误信息），让前端"已搜索 N 个书源"计数准确
+	// 总数帧：前端立即显示「共 N 个书源」而不是 0
+	fmt.Fprintf(c.Writer, "event: start\ndata: %s\n\n",
+		mustJSON(map[string]any{"total": len(eligible)}))
+	c.Writer.Flush()
+	if len(eligible) == 0 {
+		fmt.Fprintf(c.Writer, "event: end\ndata: %s\n\n",
+			mustJSON(map[string]any{"lastIndex": -1, "isEnd": true}))
+		return
+	}
+
+	// 并发搜索（限并发 6，Solver 自带 mutex 线程安全），完成即推帧
+	type srcResult struct {
+		idx  int
+		data []*SearchResult
+		err  error
+	}
+	results := make(chan srcResult, len(eligible))
+	sem := make(chan struct{}, 6)
+	for i, src := range eligible {
+		sem <- struct{}{}
+		go func(i int, src *model.BookSource) {
+			defer func() { <-sem }()
+			r, serr := SearchSource(src, keyword, a.Solver)
+			results <- srcResult{idx: i, data: r, err: serr}
+		}(i, src)
+	}
+	for i := 0; i < len(eligible); i++ {
+		r := <-results
+		payload := map[string]any{"lastIndex": r.idx, "data": r.data}
+		if r.err != nil {
 			payload["data"] = []*SearchResult{}
-			payload["error"] = serr.Error()
+			payload["error"] = r.err.Error()
 		}
-		b, _ := json.Marshal(payload)
-		fmt.Fprintf(c.Writer, "event: book\ndata: %s\n\n", b)
+		fmt.Fprintf(c.Writer, "event: book\ndata: %s\n\n", mustJSON(payload))
 		c.Writer.Flush()
-		idx++
 	}
 	fmt.Fprintf(c.Writer, "event: end\ndata: %s\n\n",
-		mustJSON(map[string]any{"lastIndex": idx - 1, "isEnd": true}))
+		mustJSON(map[string]any{"lastIndex": len(eligible) - 1, "isEnd": true}))
 }
 
 // mustJSON 序列化（失败返回空对象，SSE 结束帧用）。

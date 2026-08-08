@@ -5,6 +5,7 @@ import type { ReturnData, SearchBook } from '../types'
  * 纯函数 + 无外部依赖——node:test 可直接单测。
  *
  * 后端事件契约（legacy 兼容）：
+ *   event: start + data {"total": n}                        书源总数（搜索流式开始）
  *   event: book  + data {"lastIndex": n, "data": [SearchBook]}
  *   event: end   + data {"lastIndex": n, "isEnd": true}
  *   event: error + data ReturnData（{isSuccess, errorMsg, data}）
@@ -32,6 +33,8 @@ export function parseSSEBlock(block: string): ParsedSSEEvent | null {
 }
 
 export interface SSEBookEndCallbacks {
+  /** 流开始（book 事件前；total=参与搜索的书源数） */
+  onStart?: (total: number) => void
   /** 单个书源结果到达（data 可能为空数组） */
   onBooks: (lastIndex: number, books: SearchBook[]) => void
   /** 流正常结束（event: end） */
@@ -40,11 +43,18 @@ export interface SSEBookEndCallbacks {
   onErrorEvent: (ret: ReturnData) => void
 }
 
-/** 分发一个 SSE 事件块到对应回调（book/end/error；无法解析的数据块忽略） */
+/** 分发一个 SSE 事件块到对应回调（start/book/end/error；无法解析的数据块忽略） */
 export function dispatchSSEBlock(block: string, cbs: SSEBookEndCallbacks) {
   const evt = parseSSEBlock(block)
   if (!evt || !evt.data) return
-  if (evt.event === 'book') {
+  if (evt.event === 'start') {
+    try {
+      const payload = JSON.parse(evt.data) as { total?: number }
+      cbs.onStart?.(payload.total ?? 0)
+    } catch {
+      // 忽略
+    }
+  } else if (evt.event === 'book') {
     try {
       const payload = JSON.parse(evt.data) as { lastIndex?: number; data?: SearchBook[] }
       cbs.onBooks(payload.lastIndex ?? -1, Array.isArray(payload.data) ? payload.data : [])
