@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/Lvshujun0918/reader-dev/internal/api"
@@ -30,10 +29,6 @@ func Serve(cfg *config.Config) error {
 	apiHandler := api.New(st, cfg, stats)
 
 	router := apiHandler.Engine()
-	// 请求日志（默认开启，READER_REQUEST_LOG=0 关闭——docker logs 逐请求追踪）
-	if os.Getenv("READER_REQUEST_LOG") != "0" {
-		router.Use(middleware.RequestLog(true))
-	}
 	log.Printf("路由注册完成: %d 条", len(router.Routes()))
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)

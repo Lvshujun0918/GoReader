@@ -1,6 +1,8 @@
 package api
 
 import (
+	"os"
+
 	"github.com/gin-gonic/gin"
 
 	"github.com/Lvshujun0918/reader-dev/internal/config"
@@ -33,10 +35,15 @@ func (a *API) Engine() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	// 全局中间件（对齐 Rust serve() 挂载顺序——Gin 中间件先注册先执行）
+	// 全局中间件（对齐 Rust serve() 挂载顺序——Gin 中间件先注册先执行，
+	// 必须在路由注册之前 Use，才能并入每条路由的处理链）
 	r.Use(middleware.CacheControl())
 	r.Use(middleware.UploadLimit(a.Config.UploadMaxBytes()))
 	r.Use(a.Stats.Handler())
+	// 请求日志（默认开启，READER_REQUEST_LOG=0 关闭）
+	if os.Getenv("READER_REQUEST_LOG") != "0" {
+		r.Use(middleware.RequestLog(true))
+	}
 
 	// 基础路由
 	r.GET("/health", a.handleHealth)
