@@ -392,11 +392,6 @@ function isSupported(file: File): boolean {
   return (
     name.endsWith('.epub') ||
     name.endsWith('.txt') ||
-    name.endsWith('.mobi') ||
-    name.endsWith('.azw3') ||
-    name.endsWith('.pdf') ||
-    name.endsWith('.fb2') ||
-    name.endsWith('.docx') ||
     file.type === 'application/epub+zip' ||
     file.type === 'text/plain' ||
     file.type.startsWith('text/')
@@ -430,7 +425,7 @@ function addFiles(files: File[]) {
     importItems.value.push(item)
     added.push(item)
   }
-  acceptTip.value = ignored > 0 ? `已忽略 ${ignored} 个不支持的文件（支持 .epub / .txt / .mobi / .azw3 / .pdf / .fb2 / .docx）` : ''
+  acceptTip.value = ignored > 0 ? `已忽略 ${ignored} 个不支持的文件（仅支持 .txt / .epub）` : ''
   if (valid.length > 0) {
     importDone.value = false
     importSummary.value = ''
@@ -2116,12 +2111,12 @@ onMounted(() => {
                 <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
               </svg>
               <p class="dz-text">点击选择文件，或将文件拖拽到此处</p>
-              <p class="dz-sub">支持 .epub / .txt / .mobi / .azw3 / .pdf / .fb2 / .docx · 可多选</p>
+              <p class="dz-sub">支持 .txt / .epub（自动识别 GBK / UTF-8 编码）· 可多选</p>
               <input
                 ref="fileInput"
                 class="file-input"
                 type="file"
-                accept=".epub,.txt,.mobi,.azw3,.pdf,.fb2,.docx,application/epub+zip,text/plain"
+                accept=".epub,.txt,application/epub+zip,text/plain"
                 multiple
                 @change="onPick"
               />

@@ -252,6 +252,19 @@ func (a *API) handleGetBookToc(c *gin.Context) {
 		Fail(c, "书源链接不能为空")
 		return
 	}
+	// 本地书（loc://bookID）目录：缓存优先 → 章节表 → 文件重解析
+	if strings.HasPrefix(tocURL, locBookPrefix) {
+		b, err := a.Storage.FindBook(ns, tocURL)
+		if err == nil && b != nil {
+			items, err := a.resolveLocToc(ns, b)
+			if err != nil {
+				Fail(c, "获取目录失败："+err.Error())
+				return
+			}
+			OK(c, items)
+			return
+		}
+	}
 	// 目录缓存（5 分钟 TTL；key 用 tocURL）
 	if cache, err := a.Storage.GetTocCache(tocURL); err == nil && cache != nil && cache.ChaptersJSON != "" {
 		c.Data(200, "application/json; charset=utf-8", []byte(cache.ChaptersJSON))
@@ -308,6 +321,33 @@ func (a *API) handleGetBookContent(c *gin.Context) {
 		Fail(c, "章节链接不能为空")
 		return
 	}
+	// 本地书章节（loc://bookID@index）：读章节缓存；缓存被清则从原文件重解析恢复
+	if bookURL, chIndex, isLoc := parseLocChapterURL(url); isLoc {
+		ch, err := a.Storage.GetChapter(bookURL, chIndex)
+		if err == nil && ch != nil && ch.Content != "" {
+			OK(c, map[string]any{
+				"content": ch.Content, "chapterIndex": chIndex, "title": ch.Title,
+				"chapterWordCount": len([]rune(ch.Content)),
+			})
+			return
+		}
+		b, err := a.Storage.FindBook(ns, bookURL)
+		if err == nil && b != nil {
+			chapters, rerr := a.rebuildLocChapters(ns, b)
+			if rerr == nil && chIndex >= 0 && int(chIndex) < len(chapters) {
+				ch = &chapters[chIndex]
+				OK(c, map[string]any{
+					"content": ch.Content, "chapterIndex": chIndex, "title": ch.Title,
+					"chapterWordCount": len([]rune(ch.Content)),
+				})
+				return
+			}
+			Fail(c, "获取正文失败：章节不存在")
+			return
+		}
+		Fail(c, "未找到本地书")
+		return
+	}
 	// 章节缓存优先
 	if ch, err := a.Storage.GetChapter(url, index); err == nil && ch != nil && ch.Content != "" {
 		OK(c, map[string]any{"content": ch.Content, "chapterIndex": index, "title": ch.Title})
@@ -360,38 +400,8 @@ func (a *API) handleGetChapterListByRule(c *gin.Context) {
 	OK(c, chapters)
 }
 
-// handleMigrateLocBook / refreshLocalBook / importBookPreview / uploadLocalBook：本地书占位（迭代实现）。
+// handleMigrateLocBook：legacy 本地书迁移（迭代实现）。
 func (a *API) handleMigrateLocBook(c *gin.Context) {
-	ns, ok := a.ResolveNamespace(c)
-	if !ok {
-		NeedLogin(c)
-		return
-	}
-	_ = ns
-	Fail(c, "功能实现中")
-}
-
-func (a *API) handleRefreshLocalBook(c *gin.Context) {
-	ns, ok := a.ResolveNamespace(c)
-	if !ok {
-		NeedLogin(c)
-		return
-	}
-	_ = ns
-	Fail(c, "功能实现中")
-}
-
-func (a *API) handleImportBookPreview(c *gin.Context) {
-	ns, ok := a.ResolveNamespace(c)
-	if !ok {
-		NeedLogin(c)
-		return
-	}
-	_ = ns
-	Fail(c, "功能实现中")
-}
-
-func (a *API) handleUploadLocalBook(c *gin.Context) {
 	ns, ok := a.ResolveNamespace(c)
 	if !ok {
 		NeedLogin(c)
