@@ -1,7 +1,7 @@
 {
   "name": "夜读 · Reader",
   "short_name": "夜读",
-  "description": "夜读 Reader——自托管书源阅读器（书架 / 搜索 / 探索 / RSS）",
+  "description": "夜读 Reader——自托管书源阅读器（书架 / 搜索 / 探索 / 本地书导入 / 听书）",
   "lang": "zh-CN",
   "start_url": "/",
   "scope": "/",
@@ -9,6 +9,37 @@
   "orientation": "any",
   "background_color": "#fafafa",
   "theme_color": "#fafafa",
+  "categories": ["books", "reading", "productivity"],
+  "shortcuts": [
+    {
+      "name": "书架",
+      "short_name": "书架",
+      "description": "我的书架",
+      "url": "/",
+      "icons": [{ "src": "/logo.png", "sizes": "512x512", "type": "image/png" }]
+    },
+    {
+      "name": "搜索",
+      "short_name": "搜索",
+      "description": "全网搜书",
+      "url": "/search",
+      "icons": [{ "src": "/logo.png", "sizes": "512x512", "type": "image/png" }]
+    },
+    {
+      "name": "探索",
+      "short_name": "探索",
+      "description": "分类书源探索",
+      "url": "/explore",
+      "icons": [{ "src": "/logo.png", "sizes": "512x512", "type": "image/png" }]
+    },
+    {
+      "name": "书源管理",
+      "short_name": "书源",
+      "description": "书源管理",
+      "url": "/sources",
+      "icons": [{ "src": "/logo.png", "sizes": "512x512", "type": "image/png" }]
+    }
+  ],
   "icons": [
     {
       "src": "/logo.png",
