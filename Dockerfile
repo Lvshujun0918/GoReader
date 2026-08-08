@@ -4,11 +4,14 @@
 #     无 C 依赖；goja JS 引擎纯 Go——比 Rust 版 musl 构建更简单）
 #   - 前端：web-ui（Vue 3 + shadcn-vue）→ dist
 #   - 运行镜像内置 obscura（浏览器后端，CDP 质询求解——Go 原生，无 Python）
-#   - 构建：docker build -t reader-dev .
+#   - GIT_SHA：镜像版本号（CI 传入短 SHA；本地构建默认 dev）
+#   - 构建：docker build --build-arg GIT_SHA=abc1234 -t reader-dev .
 # ============================================================
+ARG GIT_SHA=dev
 
 # ---------- 阶段 1：Go 后端编译 ----------
 FROM golang:1.25 AS builder
+ARG GIT_SHA
 WORKDIR /app
 # 依赖层缓存（go.mod/go.sum 未变则复用层）
 COPY go.mod go.sum ./
@@ -16,14 +19,21 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 ENV CGO_ENABLED=0
-RUN go build -trimpath -ldflags="-s -w" -o /out/reader-dev ./cmd/server
+# -X main.buildVersion 注入版本号（后端启动日志/health 可见）
+RUN go build -trimpath -ldflags="-s -w -X main.buildVersion=${GIT_SHA}" -o /out/reader-dev ./cmd/server
 
 # ---------- 阶段 2：前端构建 ----------
 FROM node:22-slim AS web
+ARG GIT_SHA
 WORKDIR /web
 COPY web-ui/package.json web-ui/package-lock.json* ./
 RUN npm install
 COPY web-ui ./
+# 构建期校验：打印前端源码指纹与版本号，确认每次构建使用最新 web-ui
+RUN echo "== web-ui source fingerprint (md5) ==" \
+    && find . -type f -not -path "./node_modules/*" -not -name package-lock.json | sort | xargs md5sum | md5sum \
+    && echo "== build tag: ${GIT_SHA} =="
+ENV VITE_APP_VERSION=${GIT_SHA}
 RUN npm run build
 
 # ---------- 阶段 3：obscura 浏览器（release stealth 构建——BoringSSL TLS 指纹模拟/反检测/追踪器拦截；仅 amd64） ----------
