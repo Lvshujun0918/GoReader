@@ -340,7 +340,7 @@ const chapterAnimClass = computed(() =>
       ? { 'chapter-slide-in-right': true }
       : { 'chapter-slide-in-left': true },
 )
-/** 正文样式（flip 模式叠加多栏分页：列宽 = 容器宽，一列一页） */
+/** 正文样式（分页模式叠加多栏分页：列宽 = 容器宽，一列一页） */
 const contentStyle = computed(() => ({
   fontSize: `${fontSize.value}px`,
   lineHeight: `${lineHeight.value}`,
@@ -348,44 +348,23 @@ const contentStyle = computed(() => ({
   fontFamily: fontFamilyStyle.value || undefined,
   letterSpacing: letterSpacing.value > 0 ? `${letterSpacing.value}px` : undefined,
   textAlign: textAlign.value,
-  ...(pageMode.value === 'flip' && flipColWidth.value > 0
+  ...(isPagedMode() && flipColWidth.value > 0
     ? { columnWidth: `${flipColWidth.value}px`, columnGap: `${FLIP_GAP}px`, height: '100%' }
     : {}),
 }))
 
-/* ---- 上下翻页（slide）：滚轮/触屏纵向手势/浮动按钮逐屏滚动 ---- */
+/* ---- 分页翻页输入（slide/hslide/flip 共用）：滚轮/触屏手势/浮动按钮翻页（不滚动正文） ---- */
 
 let slideAcc = 0
-let slideCooldown = false
 let touchStartY = 0
 const SLIDE_THRESHOLD = 48
-const SLIDE_PAGE = 0.9
-
-function slideFlip(dir: 1 | -1) {
-  if (slideCooldown) return
-  slideCooldown = true
-  window.setTimeout(() => {
-    slideCooldown = false
-  }, 420)
-  window.scrollBy({ top: dir * window.innerHeight * SLIDE_PAGE, behavior: 'smooth' })
-}
 function isInsideOverlay(el: EventTarget | null): boolean {
   return el instanceof HTMLElement && !!el.closest('.drawer-mask, .pop-mask, .sel-bar')
 }
 function onWheel(e: WheelEvent) {
   if (isInsideOverlay(e.target)) return
-  if (pageMode.value === 'slide') {
-    e.preventDefault()
-    slideAcc += e.deltaY
-    if (slideAcc >= SLIDE_THRESHOLD) {
-      slideAcc = 0
-      slideFlip(1)
-    } else if (slideAcc <= -SLIDE_THRESHOLD) {
-      slideAcc = 0
-      slideFlip(-1)
-    }
-  } else if (pageMode.value === 'flip' && isTextBook.value) {
-    // 仿真翻页：纵向/横向滚轮增量都折算为翻页
+  // 分页模式（slide/hslide/flip）：滚轮增量折算为翻页（不滚动正文）
+  if (isPagedMode()) {
     e.preventDefault()
     slideAcc += e.deltaY + e.deltaX
     if (slideAcc >= SLIDE_THRESHOLD) {
@@ -408,8 +387,8 @@ function onTouchEnd(e: TouchEvent) {
   if (pageMode.value !== 'slide' || isInsideOverlay(e.target)) return
   const y = e.changedTouches[0]?.clientY ?? touchStartY
   const dy = touchStartY - y
-  if (dy >= SLIDE_THRESHOLD) slideFlip(1)
-  else if (dy <= -SLIDE_THRESHOLD) slideFlip(-1)
+  if (dy >= SLIDE_THRESHOLD) flipPage(1)
+  else if (dy <= -SLIDE_THRESHOLD) flipPage(-1)
 }
 
 /* ---- 仿真翻页（flip）：CSS 多栏分页（列高 = 视口高，一列一页）+ 横向平滑页过渡 ---- */
@@ -424,8 +403,12 @@ const flipPageIdx = ref(-1)
 const FLIP_GAP = 48
 const flipStep = () => flipColWidth.value + FLIP_GAP
 
-function isFlipMode(): boolean {
-  return pageMode.value === 'flip' && isTextBook.value
+/** 是否分页模式（flip 仿真 / slide 上下 / hslide 左右）：CSS 多栏按屏分页，正文不滚动 */
+function isPagedMode(): boolean {
+  return (
+    isTextBook.value &&
+    (pageMode.value === 'flip' || pageMode.value === 'slide' || pageMode.value === 'hslide')
+  )
 }
 
 /** 重测分页列宽（容器宽度变化/进入 flip 模式/换章渲染后调用） */
@@ -480,13 +463,14 @@ function onFlipScroll() {
 
 /** 窗口尺寸变化：flip 模式重测列宽 + 刷新进度 */
 function onResize() {
-  if (isFlipMode()) measureFlipColumns()
+  if (isPagedMode()) measureFlipColumns()
   updateScrollFrac()
 }
 
 watch(pageMode, (mode, old) => {
-  const needWheel = mode === 'slide' || mode === 'flip'
-  const hadWheel = old === 'slide' || old === 'flip'
+  const isPaged = (m: PageMode) => m === 'slide' || m === 'hslide' || m === 'flip'
+  const needWheel = isPaged(mode)
+  const hadWheel = isPaged(old)
   if (needWheel && !hadWheel) {
     window.addEventListener('wheel', onWheel, { passive: false })
     window.addEventListener('touchstart', onTouchStart, { passive: true })
@@ -498,19 +482,19 @@ watch(pageMode, (mode, old) => {
     window.removeEventListener('touchmove', onTouchMove)
     window.removeEventListener('touchend', onTouchEnd)
   }
-  if (mode === 'flip' && isTextBook.value) {
-    // 进入仿真翻页：回到章首并重测分页
+  if (isPaged(mode) && isTextBook.value) {
+    // 进入分页模式（slide/hslide/flip）：回到章首并重测分页
     window.scrollTo(0, 0)
     void nextTick(() => measureFlipColumns())
-  } else if (old === 'flip' && isTextBook.value) {
-    // 离开仿真翻页：列轴位置换算为纵向位置（同为距章首 px，直接沿用）
+  } else if (isPaged(old) && isTextBook.value) {
+    // 离开分页模式：列轴位置换算为纵向位置（同为距章首 px，直接沿用）
     window.scrollTo(0, flipScrollLeft())
   }
 })
 
-/** 正文内容宽度变化（720/900/1080）→ flip 模式重测列宽 */
+/** 正文内容宽度变化（720/900/1080）→ 分页模式重测列宽 */
 watch(contentWidth, () => {
-  if (isFlipMode()) void nextTick(() => measureFlipColumns())
+  if (isPagedMode()) void nextTick(() => measureFlipColumns())
 })
 
 /* ---- 左右滑动（hslide）：横向滑动手势/浮动按钮 → 章节级翻页（GAP 85 手势复用 + 切章过渡动画） ---- */
@@ -557,7 +541,7 @@ function onSwipeTouchEnd(e: TouchEvent) {
   if (Math.abs(dx) < SWIPE_THRESHOLD) return
   if (Math.abs(dy) > Math.abs(dx) * 1.2) return
   if ((window.getSelection()?.toString().trim() ?? '') !== '') return
-  if (isFlipMode()) {
+  if (isPagedMode()) {
     if (dx < 0) flipPage(1)
     else flipPage(-1)
     return
@@ -597,7 +581,7 @@ const jumpNum = ref('')
 
 function updateScrollFrac() {
   const v = flipViewRef.value
-  if (isFlipMode() && v) {
+  if (isPagedMode() && v) {
     const max = v.scrollWidth - v.clientWidth
     scrollFrac.value = max > 0 ? Math.min(1, Math.max(0, v.scrollLeft / max)) : 0
     return
@@ -735,7 +719,7 @@ async function applyRestoreParagraph() {
 function scrollToParagraph(idx: number) {
   const p = document.querySelectorAll<HTMLElement>('.reader-content .reader-para')[idx]
   if (!p) return
-  if (isFlipMode()) {
+  if (isPagedMode()) {
     // 仿真翻页：滚动到该段所在列（换算为容器滚动坐标）
     const v = flipViewRef.value
     if (!v) return
@@ -1536,6 +1520,25 @@ const autoInterval = () => (6 - autoSpeed.value) * 1000
 
 function autoTick() {
   if (loading.value || loadError.value || !currentChapter.value) return
+  // 分页模式（slide/hslide/flip）：自动翻页（不滚动）
+  if (isPagedMode()) {
+    const v = flipViewRef.value
+    if (v) {
+      // 已到末页：先尝试加载下一块内容；否则切章/停止
+      if (v.scrollLeft + v.clientWidth >= v.scrollWidth - 4) {
+        if (maybeLoadMoreChunk()) {
+          void nextTick(() => measureFlipColumns())
+          return
+        }
+        if (hasNext.value) nextChapter()
+        else stopAuto()
+        return
+      }
+    }
+    flipPage(1)
+    return
+  }
+  // 滚动模式：自动滚动
   const doc = document.documentElement
   if (doc.scrollHeight - window.innerHeight <= 0) return
   // GAP 155：长章还有未渲染段且已近底——先加载下一块，不切章
@@ -1887,7 +1890,7 @@ function progressKey(): string {
 /** 当前阅读位置（纵向滚动 px；仿真翻页为列轴 px；非文本书为媒体秒数/漫画页索引） */
 function currentPos(): number {
   if (isNonTextBook.value) return mediaPosition()
-  return isFlipMode() ? flipScrollLeft() : window.scrollY
+  return isPagedMode() ? flipScrollLeft() : window.scrollY
 }
 
 function saveProgress() {
@@ -1989,7 +1992,7 @@ function imagesReady(): Promise<void> {
 async function applyRestoreScroll() {
   if (restoreScrollY == null) return
   const v = flipViewRef.value
-  if (isFlipMode() && v) {
+  if (isPagedMode() && v) {
     // 仿真翻页：目标为列轴 px；不足时逐块加载直到可分页到目标
     const target = restoreScrollY
     while (hasMoreParagraphs.value) {
@@ -2059,10 +2062,10 @@ async function loadContent(chapterUrl: string) {
   }
   // 等正文真正渲染（loading 置 false 后）再滚动，避免被加载态高度钳制
   await nextTick()
-  if (isFlipMode()) measureFlipColumns()
+  if (isPagedMode()) measureFlipColumns()
   if (restoreParagraphIdx != null) {
     await applyRestoreParagraph()
-  } else if (isFlipMode()) {
+  } else if (isPagedMode()) {
     const v = flipViewRef.value
     if (v) v.scrollTo(0, restoreScrollY ?? 0)
     if (restoreScrollY != null) {
@@ -2211,17 +2214,27 @@ function toggleChrome() {
   chromeVisible.value = !chromeVisible.value
 }
 
-/** 上一页/上一章（按翻页模式：flip 翻页 / slide 逐屏 / scroll、hslide 切章） */
+/** 顶栏/底栏显隐变化 → 分页高度变化，重测分页 */
+watch(chromeVisible, () => {
+  if (isPagedMode()) {
+    void nextTick(() => {
+      measureFlipColumns()
+      // 列数变化后钳制当前页不越界
+      const v = flipViewRef.value
+      if (v) flipGo(flipPageIdx.value)
+    })
+  }
+})
+
+/** 上一页/上一章（分页模式 flipPage 翻页；滚动模式切章） */
 function pagePrev() {
-  if (pageMode.value === 'flip') flipPage(-1)
-  else if (pageMode.value === 'slide') slideFlip(-1)
+  if (isPagedMode()) flipPage(-1)
   else prevChapter()
 }
 
 /** 下一页/下一章 */
 function pageNext() {
-  if (pageMode.value === 'flip') flipPage(1)
-  else if (pageMode.value === 'slide') slideFlip(1)
+  if (isPagedMode()) flipPage(1)
   else nextChapter()
 }
 
@@ -2669,30 +2682,30 @@ function onKeydown(e: KeyboardEvent) {
       // 目录抽屉打开时 ←/→ 不翻章（避免浏览目录时误翻）
       if (drawerOpen.value) return
       e.preventDefault()
-      if (isFlipMode()) flipPage(-1)
+      if (isPagedMode()) flipPage(-1)
       else prevChapter()
       break
     case 'ArrowRight':
       if (drawerOpen.value) return
       e.preventDefault()
-      if (isFlipMode()) flipPage(1)
+      if (isPagedMode()) flipPage(1)
       else nextChapter()
       break
     case 'PageUp':
       e.preventDefault()
-      if (isFlipMode()) flipPage(-1)
+      if (isPagedMode()) flipPage(-1)
       else window.scrollBy({ top: -window.innerHeight * 0.9, behavior: 'auto' })
       break
     case 'PageDown':
       e.preventDefault()
-      if (isFlipMode()) flipPage(1)
+      if (isPagedMode()) flipPage(1)
       else window.scrollBy({ top: window.innerHeight * 0.9, behavior: 'auto' })
       break
     case 'Space':
       // 非文本书：空格 = 播放/暂停；文本书：仿真翻页翻页 / 其余模式自动阅读暂停/恢复（阻止默认的页面滚动）
       e.preventDefault()
       if (isNonTextBook.value) toggleMediaPlay()
-      else if (isFlipMode()) flipPage(1)
+      else if (isPagedMode()) flipPage(1)
       else toggleAuto()
       break
     case 'Escape':
@@ -2783,7 +2796,7 @@ onBeforeUnmount(() => {
   <div
     ref="pageRef"
     class="reader-page"
-    :class="{ texture: effectiveTexture, 'flip-layout': pageMode === 'flip' && isTextBook }"
+    :class="{ texture: effectiveTexture, 'flip-layout': isPagedMode() }"
     :style="pageStyle"
     @click="onReaderTap"
   >
@@ -2884,12 +2897,12 @@ onBeforeUnmount(() => {
             <p class="state-text">{{ t('reader.emptyChapter') }}</p>
           </div>
 
-          <!-- 正文（flip 模式：横向分页容器；其余模式：普通纵向流） -->
+          <!-- 正文（分页模式：横向分页容器；其余模式：普通纵向流） -->
           <div
             v-else
             ref="flipViewRef"
             class="flip-view"
-            :class="{ active: pageMode === 'flip' }"
+            :class="{ active: isPagedMode() }"
             @scroll.passive="onFlipScroll"
           >
             <article class="reader-content" :class="chapterAnimClass" :style="contentStyle">
@@ -4005,28 +4018,27 @@ onBeforeUnmount(() => {
       </div>
     </transition>
 
-    <!-- 翻页模式浮动按钮：上下翻页 ▲/▼ 逐屏；左右滑动 ‹/› 翻章；仿真翻页 ‹/› 翻页 -->
+    <!-- 翻页模式浮动按钮：上下翻页 ▲/▼ 翻页；左右翻页/仿真翻页 ‹/› 翻页 -->
     <template v-if="isTextBook && !loading && !loadError && paragraphs.length > 0">
       <div v-if="pageMode === 'slide'" class="flip-nav-vert">
-        <button class="flip-nav-btn" type="button" title="上一屏" @click="slideFlip(-1)">▲</button>
-        <button class="flip-nav-btn" type="button" title="下一屏" @click="slideFlip(1)">▼</button>
+        <button class="flip-nav-btn" type="button" :disabled="flipPageIdx <= 0" title="上一页" @click="flipPage(-1)">▲</button>
+        <button class="flip-nav-btn" type="button" title="下一页" @click="flipPage(1)">▼</button>
       </div>
       <template v-else-if="pageMode === 'hslide' || pageMode === 'flip'">
         <button
           class="flip-nav-btn flip-nav-side prev"
           type="button"
-          :disabled="pageMode === 'hslide' ? !hasPrev : flipPageIdx <= 0"
-          :title="pageMode === 'flip' ? '上一页' : t('common.prevChapter')"
-          @click="pageMode === 'flip' ? flipPage(-1) : prevChapter()"
+          :disabled="flipPageIdx <= 0"
+          title="上一页"
+          @click="flipPage(-1)"
         >
           ‹
         </button>
         <button
           class="flip-nav-btn flip-nav-side next"
           type="button"
-          :disabled="pageMode === 'hslide' ? !hasNext : false"
-          :title="pageMode === 'flip' ? '下一页' : t('common.nextChapter')"
-          @click="pageMode === 'flip' ? flipPage(1) : nextChapter()"
+          title="下一页"
+          @click="flipPage(1)"
         >
           ›
         </button>
@@ -5675,7 +5687,8 @@ onBeforeUnmount(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding-bottom: 32px;
+  /* 底部工具栏 + 进度条（fixed）约 90px：正文分页底部留白避免被遮挡 */
+  padding-bottom: 96px;
 }
 .reader-page.flip-layout .chapter-title,
 .reader-page.flip-layout .chapter-nav {
