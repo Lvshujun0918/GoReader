@@ -1,7 +1,7 @@
 package app
 
 import (
-	"github.com/Lvshujun0918/reader-dev/internal/storage"
+	"github.com/Lvshujun0918/GoReader/internal/storage"
 )
 
 // StartBackgroundJobs 后台任务（对齐 Rust service::schedule + local_sync）：

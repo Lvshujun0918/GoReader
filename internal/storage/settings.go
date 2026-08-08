@@ -6,7 +6,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/model"
 )
 
 func isNotFound(err error) bool {

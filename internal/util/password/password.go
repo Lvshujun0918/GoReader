@@ -15,9 +15,9 @@ import (
 
 	"golang.org/x/crypto/argon2"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
-	"github.com/Lvshujun0918/reader-dev/internal/util/ct"
-	"github.com/Lvshujun0918/reader-dev/internal/util/md5"
+	"github.com/Lvshujun0918/GoReader/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/util/ct"
+	"github.com/Lvshujun0918/GoReader/internal/util/md5"
 )
 
 const (

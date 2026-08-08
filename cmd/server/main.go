@@ -1,4 +1,4 @@
-// reader-dev（Go 版）入口
+// GoReader（Go 版）入口
 //
 // 启动流程：加载 .env → 初始化日志 → 构建配置 → 启动前数据库备份 → serve。
 // 与 legacy 行为对齐：workDir 下的 storage/reader.db（WAL），监听 0.0.0.0:port。
@@ -10,9 +10,9 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"github.com/Lvshujun0918/reader-dev/internal/app"
-	"github.com/Lvshujun0918/reader-dev/internal/config"
-	"github.com/Lvshujun0918/reader-dev/internal/util/dbbackup"
+	"github.com/Lvshujun0918/GoReader/internal/app"
+	"github.com/Lvshujun0918/GoReader/internal/config"
+	"github.com/Lvshujun0918/GoReader/internal/util/dbbackup"
 )
 
 // buildVersion 构建版本号（-ldflags "-X main.buildVersion=<git短SHA>" 注入；本地构建为 dev）。
@@ -27,7 +27,7 @@ func main() {
 	cfg := config.FromEnv()
 
 	// 启动配置摘要（镜像版本/端口/工作目录/鉴权等——docker logs 可直接定位构建）
-	log.Printf("===== reader-dev %s 启动 =====", buildVersion)
+	log.Printf("===== GoReader %s 启动 =====", buildVersion)
 	log.Printf("配置: 端口=%d workdir=%s secure=%v webRoot=%s", cfg.Port, cfg.StorageDir(), cfg.Secure, cfg.WebRoot)
 	log.Printf("配置: obscuraBin=%q obscuraURL=%q proxy=%q", cfg.ObscuraBin, cfg.ObscuraURL, cfg.ObscuraProxy)
 	log.Printf("配置: flareSolverr=%q", cfg.FlareSolverrURL)

@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/Lvshujun0918/reader-dev/internal/config"
-	"github.com/Lvshujun0918/reader-dev/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/config"
+	"github.com/Lvshujun0918/GoReader/internal/model"
 )
 
 func testStorage(t *testing.T) *Storage {

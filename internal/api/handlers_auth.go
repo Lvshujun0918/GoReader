@@ -8,11 +8,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
-	"github.com/Lvshujun0918/reader-dev/internal/storage"
-	"github.com/Lvshujun0918/reader-dev/internal/util/ct"
-	"github.com/Lvshujun0918/reader-dev/internal/util/loginlimit"
-	"github.com/Lvshujun0918/reader-dev/internal/util/password"
+	"github.com/Lvshujun0918/GoReader/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/storage"
+	"github.com/Lvshujun0918/GoReader/internal/util/ct"
+	"github.com/Lvshujun0918/GoReader/internal/util/loginlimit"
+	"github.com/Lvshujun0918/GoReader/internal/util/password"
 )
 
 var usernameRe = regexp.MustCompile(`^[a-zA-Z0-9]+$`)

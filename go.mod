@@ -1,4 +1,4 @@
-module github.com/Lvshujun0918/reader-dev
+module github.com/Lvshujun0918/GoReader
 
 go 1.25.0
 

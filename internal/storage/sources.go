@@ -4,7 +4,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/model"
 )
 
 // ListBookSources 按命名空间返回书源（legacy 语义：用户无书源回退 default）。

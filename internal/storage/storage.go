@@ -10,8 +10,8 @@ import (
 	"gorm.io/gorm"
 	glogger "gorm.io/gorm/logger"
 
-	"github.com/Lvshujun0918/reader-dev/internal/config"
-	"github.com/Lvshujun0918/reader-dev/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/config"
+	"github.com/Lvshujun0918/GoReader/internal/model"
 )
 
 // Storage 存储句柄。

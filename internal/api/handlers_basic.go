@@ -6,7 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Lvshujun0918/reader-dev/internal/service/crawler"
+	"github.com/Lvshujun0918/GoReader/internal/service/crawler"
 )
 
 // handleHealth GET /health。

@@ -9,11 +9,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"golang.org/x/text/encoding/simplifiedchinese"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
-	"github.com/Lvshujun0918/reader-dev/internal/parser/rule"
-	"github.com/Lvshujun0918/reader-dev/internal/service/bookfetch"
-	"github.com/Lvshujun0918/reader-dev/internal/service/crawler"
-	"github.com/Lvshujun0918/reader-dev/internal/service/solver"
+	"github.com/Lvshujun0918/GoReader/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/parser/rule"
+	"github.com/Lvshujun0918/GoReader/internal/service/bookfetch"
+	"github.com/Lvshujun0918/GoReader/internal/service/crawler"
+	"github.com/Lvshujun0918/GoReader/internal/service/solver"
 )
 
 // SearchResult 搜索结果（兼容 legacy SearchBook camelCase）。

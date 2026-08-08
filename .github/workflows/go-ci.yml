@@ -38,8 +38,8 @@ jobs:
 
       - name: 静态构建检查（CGO_ENABLED=0——与 Docker/发布一致）
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/reader-dev ./cmd/server
-          file /tmp/reader-dev | grep -q "statically linked" && echo "OK: 静态链接"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/GoReader ./cmd/server
+          file /tmp/GoReader | grep -q "statically linked" && echo "OK: 静态链接"
 
   # 交叉编译矩阵：发布目标平台提前暴露编译问题
   cross-build:
@@ -63,4 +63,4 @@ jobs:
       - name: 交叉编译 (${{ matrix.goos }}/${{ matrix.goarch }})
         run: |
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -trimpath -o /tmp/reader-dev ./cmd/server
+            go build -trimpath -o /tmp/GoReader ./cmd/server

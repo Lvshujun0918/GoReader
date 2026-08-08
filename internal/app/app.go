@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Lvshujun0918/reader-dev/internal/api"
-	"github.com/Lvshujun0918/reader-dev/internal/config"
-	"github.com/Lvshujun0918/reader-dev/internal/middleware"
-	"github.com/Lvshujun0918/reader-dev/internal/storage"
+	"github.com/Lvshujun0918/GoReader/internal/api"
+	"github.com/Lvshujun0918/GoReader/internal/config"
+	"github.com/Lvshujun0918/GoReader/internal/middleware"
+	"github.com/Lvshujun0918/GoReader/internal/storage"
 )
 
 // Serve 启动服务（对齐 Rust config.serve()）：
@@ -37,6 +37,6 @@ func Serve(cfg *config.Config) error {
 		Handler:           router,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	log.Printf("reader-dev (Go) listening on %s", addr)
+	log.Printf("GoReader (Go) listening on %s", addr)
 	return srv.ListenAndServe()
 }

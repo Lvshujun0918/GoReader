@@ -8,9 +8,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
-	"github.com/Lvshujun0918/reader-dev/internal/parser/rule"
-	"github.com/Lvshujun0918/reader-dev/internal/service/bookfetch"
+	"github.com/Lvshujun0918/GoReader/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/parser/rule"
+	"github.com/Lvshujun0918/GoReader/internal/service/bookfetch"
 )
 
 // ExploreCategory 探索分类（前端 ExploreCategory：{title, url, type?}）。

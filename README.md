@@ -1,6 +1,6 @@
 <div align="center">
 
-# Reader Dev
+# GoReader
 
 **自托管 Web 阅读服务 —— 书源搜索 · 本地书仓 · OPDS · WebDAV · 多用户**
 
@@ -64,13 +64,13 @@ Vue 3 + Vite + **shadcn-vue**（Tailwind + reka-ui + sonner），极简风格、
 ### 直接运行（Linux/Windows/macOS）
 ```bash
 # 后端（Go 1.25+；CGO_ENABLED=0 纯 Go SQLite，无需 C 工具链）
-go build -o reader-dev ./cmd/server
+go build -o GoReader ./cmd/server
 # 前端
 cd web-ui && npm install && npm run build && cd ..
 # 运行
 export READER_APP_WORKDIR="$PWD/data"
 export READER_APP_SECURE=true
-./reader-dev
+./GoReader
 ```
 浏览器打开 `http://localhost:8080`。
 
@@ -78,12 +78,12 @@ export READER_APP_SECURE=true
 
 ### Docker（推荐）
 ```bash
-docker pull ghcr.io/warpdotsys/reader-dev:latest
-docker run -d --name reader-dev -p 8080:8080 \
+docker pull ghcr.io/lvshujun0918/GoReader:latest
+docker run -d --name GoReader -p 8080:8080 \
   -v "$PWD/data:/storage" \
   -e READER_APP_WORKDIR=/storage \
   -e READER_APP_SECURE=true \
-  ghcr.io/warpdotsys/reader-dev:latest
+  ghcr.io/lvshujun0918/GoReader:latest
 ```
 镜像内置 obscura（stealth）+ chromium 依赖移除——**反检测能力开箱即用**。
 
@@ -101,12 +101,12 @@ docker cp <旧容器>:/tmp/backup.tar.gz .
 docker stop <旧容器>
 
 # 3. 起新容器（同一数据卷——挂载路径保持）
-docker run -d --name reader-dev-rust \
+docker run -d --name GoReader-rust \
   -v <同一数据卷>:/storage \
   -p 8080:8080 \
   -e READER_APP_WORKDIR=/storage \
   -e READER_APP_SECURE=true \
-  ghcr.io/warpdotsys/reader-dev:latest
+  ghcr.io/lvshujun0918/GoReader:latest
 
 # 4. 启动时自动迁移（JSON → SQLite 全量——日志见「JSON→SQLite 迁移完成」）
 #    原 JSON 文件保留（可回退）
@@ -114,9 +114,9 @@ docker run -d --name reader-dev-rust \
 
 ### Docker 镜像（每次提交自动构建）
 ```bash
-# master 每次提交自动推送，版本标签 = 短 SHA（7 位，如 ghcr.io/warpdotsys/reader-dev:abc1234）
+# master 每次提交自动推送，版本标签 = 短 SHA（7 位，如 ghcr.io/lvshujun0918/GoReader:abc1234）
 # latest = master 最新滚动标签
-READER_APP_WORKDIR=/storage READER_APP_SECURE=true docker run ... ghcr.io/warpdotsys/reader-dev:latest
+READER_APP_WORKDIR=/storage READER_APP_SECURE=true docker run ... ghcr.io/lvshujun0918/GoReader:latest
 ```
 
 ### 迁移覆盖

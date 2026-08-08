@@ -9,7 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/model"
 )
 
 // parseLooseJSON 宽松 JSON 解析（尾随逗号兼容）。标准解析失败且修复后仍失败时返回错误。

@@ -5,10 +5,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Lvshujun0918/reader-dev/internal/config"
-	"github.com/Lvshujun0918/reader-dev/internal/middleware"
-	"github.com/Lvshujun0918/reader-dev/internal/service/solver"
-	"github.com/Lvshujun0918/reader-dev/internal/storage"
+	"github.com/Lvshujun0918/GoReader/internal/config"
+	"github.com/Lvshujun0918/GoReader/internal/middleware"
+	"github.com/Lvshujun0918/GoReader/internal/service/solver"
+	"github.com/Lvshujun0918/GoReader/internal/storage"
 )
 
 // API 处理器集合（共享存储与配置）。

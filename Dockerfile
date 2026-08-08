@@ -1,11 +1,11 @@
 # ============================================================
-# reader-dev (Go) 多阶段构建
+# GoReader (Go) 多阶段构建
 #   - Go 后端：CGO_ENABLED=0 静态链接（纯 Go SQLite 驱动 glebarez/sqlite，
 #     无 C 依赖；goja JS 引擎纯 Go——比 Rust 版 musl 构建更简单）
 #   - 前端：web-ui（Vue 3 + shadcn-vue）→ dist
 #   - 运行镜像内置 obscura（浏览器后端，CDP 质询求解——Go 原生，无 Python）
 #   - GIT_SHA：镜像版本号（CI 传入短 SHA；本地构建默认 dev）
-#   - 构建：docker build --build-arg GIT_SHA=abc1234 -t reader-dev .
+#   - 构建：docker build --build-arg GIT_SHA=abc1234 -t GoReader .
 # ============================================================
 ARG GIT_SHA=dev
 
@@ -20,7 +20,7 @@ COPY cmd ./cmd
 COPY internal ./internal
 ENV CGO_ENABLED=0
 # -X main.buildVersion 注入版本号（后端启动日志/health 可见）
-RUN go build -trimpath -ldflags="-s -w -X main.buildVersion=${GIT_SHA}" -o /out/reader-dev ./cmd/server
+RUN go build -trimpath -ldflags="-s -w -X main.buildVersion=${GIT_SHA}" -o /out/GoReader ./cmd/server
 
 # ---------- 阶段 2：前端构建 ----------
 FROM node:22-slim AS web
@@ -69,10 +69,10 @@ ENV TZ=Asia/Shanghai
 ENV READER_APP_WEB_ROOT=/app/web-ui/dist
 ENV READER_OBSCURA_BIN=/opt/obscura/obscura
 
-COPY --from=builder /out/reader-dev /usr/local/bin/reader-dev
+COPY --from=builder /out/GoReader /usr/local/bin/GoReader
 COPY --from=web /web/dist /app/web-ui/dist
 
 EXPOSE 8080
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["reader-dev"]
+CMD ["GoReader"]

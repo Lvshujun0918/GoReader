@@ -191,7 +191,7 @@ async function submit() {
       </p>
     </main>
 
-    <footer class="login-footer">reader-dev · /reader3 · v{{ APP_VERSION }}</footer>
+    <footer class="login-footer">GoReader · /reader3 · v{{ APP_VERSION }}</footer>
   </div>
 </template>
 

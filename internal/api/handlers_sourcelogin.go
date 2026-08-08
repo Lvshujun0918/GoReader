@@ -5,8 +5,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Lvshujun0918/reader-dev/internal/service/bookfetch"
-	"github.com/Lvshujun0918/reader-dev/internal/service/crawler"
+	"github.com/Lvshujun0918/GoReader/internal/service/bookfetch"
+	"github.com/Lvshujun0918/GoReader/internal/service/crawler"
 )
 
 // crawlerClient 创建抓取客户端（带全局质询求解器）。

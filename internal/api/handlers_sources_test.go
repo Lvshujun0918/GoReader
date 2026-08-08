@@ -12,10 +12,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Lvshujun0918/reader-dev/internal/config"
-	"github.com/Lvshujun0918/reader-dev/internal/middleware"
-	"github.com/Lvshujun0918/reader-dev/internal/model"
-	"github.com/Lvshujun0918/reader-dev/internal/storage"
+	"github.com/Lvshujun0918/GoReader/internal/config"
+	"github.com/Lvshujun0918/GoReader/internal/middleware"
+	"github.com/Lvshujun0918/GoReader/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/storage"
 )
 
 // ---------- 测试辅助 ----------

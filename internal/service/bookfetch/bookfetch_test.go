@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/model"
 )
 
 // kuwoServer 模拟酷我小说 API（JSON）：/novels/api/book/{id} 详情、chapters 目录、chapters/{cid} 正文。

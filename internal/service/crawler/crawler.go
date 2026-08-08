@@ -16,9 +16,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
-	"github.com/Lvshujun0918/reader-dev/internal/service/solver"
-	"github.com/Lvshujun0918/reader-dev/internal/storage"
+	"github.com/Lvshujun0918/GoReader/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/service/solver"
+	"github.com/Lvshujun0918/GoReader/internal/storage"
 )
 
 // MaxResponseBytes 响应体上限（防止内存爆炸）。

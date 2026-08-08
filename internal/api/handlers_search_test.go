@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/model"
 )
 
 // TestSearchSource 单书源搜索：httptest 书源服务器 + legado CSS 规则解析。

@@ -33,7 +33,7 @@ func setupFileLog(dir string, maxSizeMB, maxFiles int) error {
 	}
 	w := &rotatingFileWriter{
 		dir:      dir,
-		prefix:   "reader-dev",
+		prefix:   "GoReader",
 		maxBytes: int64(maxSizeMB) * 1024 * 1024,
 		maxFiles: maxFiles,
 	}

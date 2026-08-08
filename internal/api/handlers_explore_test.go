@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Lvshujun0918/reader-dev/internal/model"
-	"github.com/Lvshujun0918/reader-dev/internal/parser/rule"
-	"github.com/Lvshujun0918/reader-dev/internal/service/bookfetch"
+	"github.com/Lvshujun0918/GoReader/internal/model"
+	"github.com/Lvshujun0918/GoReader/internal/parser/rule"
+	"github.com/Lvshujun0918/GoReader/internal/service/bookfetch"
 )
 
 // ---------- 辅助 ----------

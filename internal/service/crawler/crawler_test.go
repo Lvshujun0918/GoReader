@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Lvshujun0918/reader-dev/internal/service/solver"
+	"github.com/Lvshujun0918/GoReader/internal/service/solver"
 )
 
 func TestIsCloudflareChallenge(t *testing.T) {
