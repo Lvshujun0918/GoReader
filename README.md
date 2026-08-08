@@ -170,17 +170,9 @@ internal/
 └── util/          # password(argon2)/md5/登录限流/...
 web-ui/src/        # Vue3 + shadcn-vue 视图/组件/api/utils
 web-simple/        # Kindle 轻量页
-scripts/           # 测试工具（e2e-smoke/api-scan）
-docs/              # SECURITY/ARCHITECTURE/ROADMAP/FRONTEND
 ```
 
 ---
-
-## 📚 文档
-- `docs/SECURITY.md` —— 安全设计（argon2/SSRF/隔离/限流）
-- `docs/ARCHITECTURE.md` —— 架构（obscura 内嵌/分层）
-- `docs/ROADMAP.md` —— 路线图与待办
-- `docs/legado-ref/ruleHelp.md` —— 规则参考
 
 ## 📌 分支
 | 分支 | 说明 |
