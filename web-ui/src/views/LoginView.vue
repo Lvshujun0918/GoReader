@@ -14,6 +14,7 @@ import {
 import { login as loginApi } from '@/api/auth'
 import { useUserStore } from '@/stores/user'
 import { t } from '@/utils/i18n'
+import { APP_VERSION } from '@/version'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -190,7 +191,7 @@ async function submit() {
       </p>
     </main>
 
-    <footer class="login-footer">reader-dev · /reader3</footer>
+    <footer class="login-footer">reader-dev · /reader3 · v{{ APP_VERSION }}</footer>
   </div>
 </template>
 

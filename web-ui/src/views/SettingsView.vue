@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import TopNav from '@/components/TopNav.vue'
+import { APP_VERSION } from '@/version'
 import { deleteHttpTts, getHttpTtsList, saveHttpTts } from '@/api/httpTts'
 import { uploadFile, mkdir } from '@/api/file'
 import { loadCustomCss, saveCustomCss, applyCustomCss } from '@/utils/customCss'
@@ -1691,6 +1692,10 @@ async function runExportData() {
         <div class="row">
           <span class="row-label">版本</span>
           <span class="row-value">v{{ sysInfo?.version || VERSION }}</span>
+        </div>
+        <div class="row">
+          <span class="row-label">构建</span>
+          <span class="row-value mono">{{ APP_VERSION }}</span>
         </div>
         <template v-if="sysInfo">
           <div class="row">
