@@ -31,6 +31,71 @@ func TestEvalCSS(t *testing.T) {
 	}
 }
 
+// TestEvalCSSChain legado 链式选择器（69书吧等真实书源格式）。
+func TestEvalCSSChain(t *testing.T) {
+	html := `<html><body>
+		<ul class="newlistbox">
+			<li><h3><a href="/book/1/">书一</a></h3><label>作者一</label></li>
+			<li><h3><a href="/book/2/">书二</a></h3><label>作者二</label></li>
+		</ul>
+	</body></html>`
+	ctx := &Context{}
+
+	// bookList：class.newlistbox.0@tag.ul.0@tag.li（默认输出元素文本）
+	items := Parse(html, "class.newlistbox.0@tag.ul.0@tag.li", ctx)
+	if len(items) != 2 {
+		t.Fatalf("链式 bookList 期望 2 项，got %d: %v", len(items), items)
+	}
+	if !strings.Contains(items[0], "书一") {
+		t.Errorf("第 0 项=%q", items[0])
+	}
+
+	// 子规则需元素 HTML（handler 的 ensureListHTML 自动补 @html）
+	htmlItems := Parse(html, "class.newlistbox.0@tag.ul.0@tag.li@html", ctx)
+	if len(htmlItems) != 2 || !strings.Contains(htmlItems[0], `<h3><a href="/book/1/">书一</a></h3>`) {
+		t.Fatalf("链式 @html 输出失败: %v", htmlItems)
+	}
+
+	// 字段：tag.h3.0@tag.a.0@href（对 HTML item 提取 href）
+	hrefs := Parse(htmlItems[0], "tag.h3.0@tag.a.0@href", ctx)
+	if len(hrefs) != 1 || hrefs[0] != "/book/1/" {
+		t.Fatalf("链式 href 提取失败: %v", hrefs)
+	}
+	// 字段：tag.label.0@text
+	author := Parse(htmlItems[0], "tag.label.0@text", ctx)
+	if len(author) != 1 || author[0] != "作者一" {
+		t.Fatalf("链式 text 提取失败: %v", author)
+	}
+
+	// ChainNeedsHTML：末段为推进操作（tag.li）→ 需要补 @html
+	if !ChainNeedsHTML("class.newlistbox.0@tag.ul.0@tag.li") {
+		t.Errorf("ChainNeedsHTML 应为 true")
+	}
+	// 末段为输出操作（@href）→ 不需要
+	if ChainNeedsHTML("tag.h3.0@tag.a.0@href") {
+		t.Errorf("ChainNeedsHTML(@href) 应为 false")
+	}
+}
+
+// TestEvalCSSChainIndex 索引 .N 与多段推进。
+func TestEvalCSSChainIndex(t *testing.T) {
+	html := `<html><body>
+		<div class="a"><p class="x">A1</p><p class="x">A2</p></div>
+		<div class="a"><p class="x">B1</p></div>
+	</body></html>`
+	ctx := &Context{}
+	// class.a.0 → 第 0 个 div；css:p.x → 其下 p.x 全取
+	got := Parse(html, "class.a.0@css:p.x", ctx)
+	if len(got) != 2 || got[0] != "A1" || got[1] != "A2" {
+		t.Fatalf("链式多段失败: %v", got)
+	}
+	// class.a.1@css:p.x.0 → 第 1 个 div 的第 0 个 p
+	got2 := Parse(html, "class.a.1@css:p.x.0", ctx)
+	if len(got2) != 1 || got2[0] != "B1" {
+		t.Fatalf("链式索引失败: %v", got2)
+	}
+}
+
 func TestEvalXPath(t *testing.T) {
 	html := `<html><body><div class="content"><p>段落一</p><p>段落二</p></div></body></html>`
 	out := Parse(html, "@xpath://div[@class='content']/p", nil)
