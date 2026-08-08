@@ -239,6 +239,50 @@ func (c *Client) FetchWithHeaders(rawURL string, headers map[string]string) ([]b
 	return io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes))
 }
 
+// FetchPost POST 表单请求（legado searchUrl 的 ,{'method':'POST','body':...} 描述）。
+// formBody 为已替换占位符的表单串（keyword=%E6%96%97...&page=1），UTF-8 百分号编码。
+func (c *Client) FetchPost(rawURL, formBody string, source *model.BookSource) ([]byte, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if !ssrfAllowed(u.Hostname(), c.AllowPrivate) {
+		return nil, fmt.Errorf("%w: %s", ErrSSRF, u.Hostname())
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, rawURL, strings.NewReader(formBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// UA：书源自定义 header 优先，否则默认 Chrome Windows（与 GET 一致）
+	ua := solver.DefaultUA
+	if source != nil && source.BookSourceName != "" {
+		applySourceHeaders(req, source.Header)
+		if h := req.Header.Get("User-Agent"); h != "" {
+			ua = h
+		}
+	}
+	req.Header.Set("User-Agent", ua)
+	if source != nil {
+		if cookie, _, _ := c.sourceCookie(source.BookSourceURL); cookie != "" {
+			req.Header.Set("Cookie", cookie)
+		}
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return body, nil
+}
+
 func (c *Client) sourceCookie(sourceURL string) (string, string, error) {
 	if c.Storage == nil {
 		return "", "", nil
