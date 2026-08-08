@@ -365,14 +365,19 @@ func TestGBKPercentEncode(t *testing.T) {
 	}
 }
 
-// TestBuildSearchRequestPlaceholderOrder {{key}} 不被 {key} 部分命中。
+// TestBuildSearchRequestPlaceholderOrder {{key}} 不被 {key} 部分命中；相对路径 resolve。
 func TestBuildSearchRequestPlaceholderOrder(t *testing.T) {
-	req := buildSearchRequest("https://x.com/s?k={{key}}&q={key}", "斗破", 1, nil)
+	req := buildSearchRequest("https://x.com/s?k={{key}}&q={key}", "斗破", 1, nil, "https://x.com")
 	if !strings.Contains(req.URL, "k=%E6%96%97%E7%A0%B4&q=%E6%96%97%E7%A0%B4") {
 		t.Errorf("双/单花括号均应替换: %q", req.URL)
 	}
 	if strings.Contains(req.URL, "{{") || strings.Contains(req.URL, "{key}") {
 		t.Errorf("残留占位符: %q", req.URL)
+	}
+	// 相对 searchUrl resolve 到书源根
+	req2 := buildSearchRequest("/api/search?keyword={{key}}", "斗破", 1, nil, "https://src.com")
+	if req2.URL != "https://src.com/api/search?keyword=%E6%96%97%E7%A0%B4" {
+		t.Errorf("相对 resolve 失败: %q", req2.URL)
 	}
 }
 
@@ -404,5 +409,57 @@ func TestSearchSourceSingleBookJSON(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].Name != "单书" || results[0].Author != "作者" {
 		t.Fatalf("结果不符: %+v", results)
+	}
+}
+
+// TestSearchSourceRealKuwo 真实 XIU2 酷我书源格式：相对 searchUrl + {{key}}/{{page}}、
+// {{$.book_id}} 插值 bookUrl、kind 的 @js: 后缀后处理。
+func TestSearchSourceRealKuwo(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	var rawQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawQuery = r.URL.RawQuery
+		_, _ = fmt.Fprint(w, `{"data":[{"book_id":"123","title":"斗破苍穹","author_name":"天蚕土豆",
+			"intro":"三十年河东","category_name":"玄幻","status":"30","all_words":"100万","cover_url":"/c/1.jpg"}]}`)
+	}))
+	defer srv.Close()
+	// 真实酷我配置：searchUrl 相对路径，bookUrl 用 {{$.book_id}}，kind 用 @js: 后缀
+	src := &model.BookSource{
+		BookSourceURL:  srv.URL,
+		BookSourceName: "酷我小说",
+		SearchURL:      "/novels/api/book/search?keyword={{key}}&pi={{page}}&ps=30",
+		RuleSearch: `{"author":"$.author_name","bookList":"$.data",
+			"bookUrl":"/novels/api/book/{{$.book_id}}","coverUrl":"$.cover_url","intro":"$.intro",
+			"kind":"{{$.category_name}},{{$.status}}@js:result.replace(/30/,\"连载\").replace(/50/,\"完结\")",
+			"name":"$.title","wordCount":"$.all_words"}`,
+	}
+	results, err := SearchSource(src, "斗破")
+	if err != nil {
+		t.Fatalf("SearchSource 失败: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("期望 1 条，实际 %d", len(results))
+	}
+	r := results[0]
+	if r.Name != "斗破苍穹" || r.Author != "天蚕土豆" || r.Intro != "三十年河东" || r.WordCount != "100万" {
+		t.Errorf("基础字段不符: %+v", r)
+	}
+	// 相对 searchUrl resolve + {{key}} 编码 + {{page}}
+	exp := "keyword=%E6%96%97%E7%A0%B4&pi=1&ps=30"
+	if rawQuery != exp {
+		t.Errorf("query=%q 期望 %q", rawQuery, exp)
+	}
+	// {{$.book_id}} 插值 + resolve
+	expURL := srv.URL + "/novels/api/book/123"
+	if r.BookURL != expURL || r.TocURL != expURL {
+		t.Errorf("bookUrl=%q tocUrl=%q 期望 %q", r.BookURL, r.TocURL, expURL)
+	}
+	// @js: 后缀后处理（30 → 连载）
+	if r.Kind != "玄幻,连载" {
+		t.Errorf("kind=%q 期望 玄幻,连载", r.Kind)
+	}
+	// coverUrl resolve
+	if r.CoverURL != srv.URL+"/c/1.jpg" {
+		t.Errorf("coverUrl=%q", r.CoverURL)
 	}
 }
