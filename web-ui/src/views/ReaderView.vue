@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { getBookshelf, deleteBook } from '@/api/bookshelf'
+import { getBookshelf } from '@/api/bookshelf'
 import { getBookInfo, getBookToc, getBookContent } from '@/api/books'
 import { saveBook } from '@/api/bookshelf'
 import { getHttpTtsList } from '@/api/httpTts'
@@ -96,9 +96,10 @@ const isNonTextBook = computed(() => bookType.value !== 0)
 
 /* ---------------- 1. 主题（亮/暗/暖/跟随系统/自定义） ---------------- */
 
-type Theme = 'light' | 'dark' | 'warm' | 'system' | 'custom'
+type Theme = 'light' | 'warm' | 'green' | 'dark' | 'black' | 'system' | 'custom'
 const THEME_KEY = 'reader_theme'
-const THEME_ORDER: Theme[] = ['light', 'dark', 'warm', 'system', 'custom']
+// 主题预设：白 / 米黄 / 绿 / 黑夜（灰黑）/ 黑夜（全黑）
+const THEME_ORDER: Theme[] = ['light', 'warm', 'green', 'dark', 'black']
 const theme = ref<Theme>('light')
 /** 阅读页根元素（主题只作用于阅读页内，与界面主题 html[data-theme] 分离） */
 const pageRef = ref<HTMLElement | null>(null)
@@ -125,12 +126,6 @@ watch(theme, (t) => {
   applyTheme(t)
   saveSetting(THEME_KEY, t)
 })
-function cycleTheme() {
-  const i = THEME_ORDER.indexOf(theme.value)
-  theme.value = THEME_ORDER[(i + 1) % THEME_ORDER.length]
-  // 循环落到「自定义」：顺带打开颜色弹层（第 5 档需配置三色）
-  if (theme.value === 'custom') customOpen.value = true
-}
 
 /* ---------------- 1.1 自定义主题（第 5 档——背景色/文字色/强调色弹层；localStorage reader_theme_custom） ---------------- */
 
@@ -265,6 +260,59 @@ const textAlign = ref<'left' | 'justify'>('left')
 watch(textAlign, (v) => saveSetting('reader_text_align', v))
 
 const settingsOpen = ref(false)
+/** 打开设置：快照当前排版/主题设置（「取消」时回滚） */
+let settingsSnapshot: Record<string, unknown> | null = null
+function openSettings() {
+  settingsSnapshot = {
+    fontSize: fontSize.value,
+    lineHeight: lineHeight.value,
+    paraSpacing: paraSpacing.value,
+    fontWeight: fontWeight.value,
+    fontKind: fontKind.value,
+    letterSpacing: letterSpacing.value,
+    textIndent: textIndent.value,
+    textAlign: textAlign.value,
+    pageMode: pageMode.value,
+    contentWidth: contentWidth.value,
+    theme: theme.value,
+    hanMode: hanMode.value,
+    brightness: brightness.value,
+    autoSpeed: autoSpeed.value,
+  }
+  settingsOpen.value = true
+}
+/** 确认：直接关闭（设置即时生效，无需回滚） */
+function confirmSettings() {
+  settingsSnapshot = null
+  settingsOpen.value = false
+}
+/** 取消：还原打开时快照后关闭 */
+function cancelSettings() {
+  const s = settingsSnapshot
+  settingsSnapshot = null
+  if (s) {
+    fontSize.value = s.fontSize as number
+    lineHeight.value = s.lineHeight as number
+    paraSpacing.value = s.paraSpacing as number
+    fontWeight.value = s.fontWeight as number
+    fontKind.value = s.fontKind as FontKind
+    letterSpacing.value = s.letterSpacing as number
+    textIndent.value = s.textIndent as boolean
+    textAlign.value = s.textAlign as 'left' | 'justify'
+    pageMode.value = s.pageMode as PageMode
+    contentWidth.value = s.contentWidth as string
+    theme.value = s.theme as Theme
+    hanMode.value = s.hanMode as HanMode
+    brightness.value = s.brightness as number
+    autoSpeed.value = s.autoSpeed as number
+  }
+  settingsOpen.value = false
+}
+
+/** 底部工具栏：主题选择弹层 / 更多菜单 */
+const themeOpen = ref(false)
+const moreOpen = ref(false)
+
 function resetTypography() {
   fontSize.value = 18
   lineHeight.value = 1.9
@@ -489,6 +537,8 @@ function onSwipeTouchEnd(e: TouchEvent) {
     selOpen.value ||
     drawerOpen.value ||
     settingsOpen.value ||
+    themeOpen.value ||
+    moreOpen.value ||
     ttsPanelOpen.value ||
     bookmarksOpen.value ||
     jumpOpen.value ||
@@ -1011,6 +1061,8 @@ const BG_OVERLAY: Record<Theme, string> = {
   light: 'rgba(250, 250, 250, 0.86)',
   dark: 'rgba(17, 17, 20, 0.88)',
   warm: 'rgba(247, 240, 230, 0.88)',
+  green: 'rgba(233, 241, 227, 0.88)',
+  black: 'rgba(0, 0, 0, 0.88)',
   system: 'rgba(250, 250, 250, 0.86)',
   custom: 'rgba(250, 250, 250, 0.86)',
 }
@@ -2159,36 +2211,6 @@ function retry() {
   }
 }
 
-/* ---------------- B4 修复：阅读页移出书架入口 ---------------- */
-
-const removing = ref(false)
-let removeTimer: number | undefined
-
-async function removeFromShelf() {
-  if (!removing.value) {
-    removing.value = true
-    removeTimer = window.setTimeout(() => {
-      removing.value = false
-    }, 3000)
-    return
-  }
-  window.clearTimeout(removeTimer)
-  removing.value = false
-  try {
-    await deleteBook(bookUrl.value)
-    // request.ts 拦截器已处理失败提示；走到这里即成功
-    try {
-      localStorage.removeItem(progressKey())
-    } catch {
-      /* ignore */
-    }
-    ElMessage.success('已移出书架')
-    void router.replace('/')
-  } catch {
-    /* 已提示 */
-  }
-}
-
 /* ---------------- 非文本书渲染：音频/视频播放器 + 漫画逐页 + 文件下载 ---------------- */
 
 /* ---- 音频书 ---- */
@@ -2679,7 +2701,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('touchstart', onSwipeTouchStart)
   window.removeEventListener('touchend', onSwipeTouchEnd)
   window.clearTimeout(saveTimer)
-  window.clearTimeout(removeTimer)
   window.clearTimeout(flashTimer)
   prevHold.stop()
   nextHold.stop()
@@ -2724,38 +2745,6 @@ onBeforeUnmount(() => {
 
       <div class="top-actions">
         <button
-          v-if="isTextBook"
-          class="font-btn"
-          type="button"
-          :disabled="fontSize <= MIN_FONT"
-          :title="t('reader.fontDec')"
-          @click="fontSize = Math.max(MIN_FONT, fontSize - 1)"
-        >
-          A-
-        </button>
-        <button
-          v-if="isTextBook"
-          class="font-btn"
-          type="button"
-          :disabled="fontSize >= MAX_FONT"
-          :title="t('reader.fontInc')"
-          @click="fontSize = Math.min(MAX_FONT, fontSize + 1)"
-        >
-          A+
-        </button>
-        <button
-          v-if="isTextBook"
-          class="font-btn"
-          type="button"
-          :title="hanMode === 'auto' ? '自动检测（当前：' + (hanTrad ? '繁体→简体' : '简体') + '），点击切换' : hanMode === 'trad' ? '当前繁体，点击切换' : '当前简体，点击切换'"
-          @click="toggleHan"
-        >
-          {{ hanTargetLabel }}
-        </button>
-        <button class="font-btn" type="button" :title="t('reader.themeTip', { t: t('theme.' + theme) })" @click="cycleTheme">
-          {{ t('theme.' + theme) }}
-        </button>
-        <button
           class="font-btn"
           type="button"
           :class="{ active: brightness !== 1 }"
@@ -2780,40 +2769,12 @@ onBeforeUnmount(() => {
         >
           {{ ttsTopLabel }}
         </button>
-        <button v-if="isTextBook" class="font-btn" type="button" :title="t('reader.addBookmarkTip')" @click="addBookmark">
-          {{ t('reader.addBookmark') }}
-        </button>
-        <button v-if="isTextBook" class="font-btn" type="button" :title="t('reader.bookmarksTip')" @click="openBookmarks">
-          {{ t('reader.bookmarks') }}
-        </button>
-        <button v-if="isTextBook" class="font-btn" type="button" :title="t('reader.searchChapterTip')" @click="openChapterSearch">
-          {{ t('reader.searchChapter') }}
-        </button>
-        <button
-          v-if="isTextBook"
-          class="font-btn"
-          type="button"
-          :disabled="loading || loadError || paragraphs.length === 0"
-          :title="t('reader.copyChapterTip')"
-          @click="copyChapter"
-        >
-          {{ t('reader.copyChapter') }}
-        </button>
-        <button
-          v-if="isTextBook"
-          class="font-btn auto-btn"
-          type="button"
-          :class="{ active: autoPlaying }"
-          :title="autoPlaying ? t('reader.stopAutoTip') : t('reader.autoTip')"
-          @click="toggleAuto"
-        >
-          {{ autoPlaying ? t('reader.stop') : t('reader.auto') }}
-        </button>
-        <button class="font-btn" type="button" :title="t('reader.layoutTip')" @click="settingsOpen = true">
-          {{ t('reader.layout') }}
-        </button>
-        <button class="toc-btn" type="button" :title="t('reader.tocTip')" @click="drawerOpen = true">
-          {{ t('reader.toc') }}
+        <button class="font-btn more-btn" type="button" :title="t('reader.more')" @click="moreOpen = !moreOpen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <circle cx="12" cy="5" r="1.2" />
+            <circle cx="12" cy="12" r="1.2" />
+            <circle cx="12" cy="19" r="1.2" />
+          </svg>
         </button>
       </div>
     </header>
@@ -3083,6 +3044,58 @@ onBeforeUnmount(() => {
       </template>
     </main>
 
+    <!-- 底部工具栏（图标+文字上下布局：字号 / 主题 / 目录 / 设置） -->
+    <div
+      v-if="!loading && !loadError && !notFound && realChapters.length > 0"
+      class="reader-toolbar"
+    >
+      <button
+        v-if="isTextBook"
+        class="tb-btn"
+        type="button"
+        :disabled="fontSize <= MIN_FONT"
+        :title="t('reader.fontDec')"
+        @click="fontSize = Math.max(MIN_FONT, fontSize - 1)"
+      >
+        <span class="tb-icon">A−</span>
+        <span class="tb-label">{{ t('reader.fontDec') }}</span>
+      </button>
+      <button
+        v-if="isTextBook"
+        class="tb-btn"
+        type="button"
+        :disabled="fontSize >= MAX_FONT"
+        :title="t('reader.fontInc')"
+        @click="fontSize = Math.min(MAX_FONT, fontSize + 1)"
+      >
+        <span class="tb-icon">A+</span>
+        <span class="tb-label">{{ t('reader.fontInc') }}</span>
+      </button>
+      <button class="tb-btn" type="button" :title="t('reader.themeTip', { t: t('theme.' + theme) })" @click="themeOpen = true">
+        <span class="tb-icon tb-theme-dot" :class="'dot-' + theme"></span>
+        <span class="tb-label">{{ t('theme.' + theme) }}</span>
+      </button>
+      <button class="tb-btn" type="button" :title="t('reader.tocTip')" @click="drawerOpen = true">
+        <svg class="tb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6h16" />
+          <path d="M4 12h16" />
+          <path d="M4 18h10" />
+        </svg>
+        <span class="tb-label">{{ t('reader.toc') }}</span>
+      </button>
+      <button class="tb-btn" type="button" :title="t('reader.layoutTip')" @click="openSettings">
+        <svg class="tb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6h16" />
+          <path d="M4 12h16" />
+          <path d="M4 18h16" />
+          <circle cx="9" cy="6" r="2" />
+          <circle cx="15" cy="12" r="2" />
+          <circle cx="7" cy="18" r="2" />
+        </svg>
+        <span class="tb-label">{{ t('reader.layout') }}</span>
+      </button>
+    </div>
+
     <!-- 进度：底部细字 + 可点击跳章 -->
     <button
       v-if="!loading && !loadError && !notFound && realChapters.length > 0"
@@ -3180,11 +3193,11 @@ onBeforeUnmount(() => {
       </div>
     </transition>
 
-    <!-- 排版设置弹层（GAP 6：全局 / 本书 两个 tab——本书设置 12 项 per-book 覆盖，优先于全局） -->
+    <!-- 阅读设置弹层（GAP 6：全局 / 本书 两个 tab——本书设置 12 项 per-book 覆盖，优先于全局） -->
     <transition name="pop">
-      <div v-if="settingsOpen" class="pop-mask" @click="settingsOpen = false">
+      <div v-if="settingsOpen" class="pop-mask" @click="confirmSettings">
         <div class="pop-card settings-card" @click.stop>
-          <p class="pop-title">排版设置</p>
+          <p class="pop-title">阅读设置</p>
 
           <div class="cfg-tabs">
             <button
@@ -3580,13 +3593,83 @@ onBeforeUnmount(() => {
             <button v-else class="text-btn" type="button" title="清除本书设置，恢复使用全局阅读偏好" @click="restoreGlobalDefaults">
               恢复全局默认
             </button>
+            <span class="set-foot-spacer"></span>
+            <button class="text-btn" type="button" @click="cancelSettings">取消</button>
+            <button class="pop-btn" type="button" @click="confirmSettings">确认</button>
+          </div>
+        </div>
+      </div>
+    </transition>
+
+    <!-- 主题预设弹层（底部工具栏「主题」：白 / 米黄 / 绿 / 灰黑夜 / 纯黑夜） -->
+    <transition name="pop">
+      <div v-if="themeOpen" class="pop-mask" @click="themeOpen = false">
+        <div class="pop-card theme-card" @click.stop>
+          <p class="pop-title">{{ t('reader.theme') }}</p>
+          <div class="theme-grid">
             <button
-              class="text-btn danger"
+              v-for="th in THEME_ORDER"
+              :key="th"
+              class="theme-opt"
+              :class="{ active: theme === th }"
               type="button"
-              :title="removing ? '再次点击确认移出书架' : '将本书移出书架'"
-              @click="removeFromShelf"
+              @click="selectTheme(th); themeOpen = false"
             >
-              {{ removing ? '确认移出？' : '移出书架' }}
+              <span class="theme-swatch" :class="'swatch-' + th"></span>
+              <span class="theme-name">{{ t('theme.' + th) }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </transition>
+
+    <!-- 更多菜单（顶栏 ⋯：简繁 / 书签 / 书签列表 / 搜索本章 / 复制 / 自动阅读） -->
+    <transition name="pop">
+      <div v-if="moreOpen" class="pop-mask" @click="moreOpen = false">
+        <div class="pop-card more-card" @click.stop>
+          <p class="pop-title">{{ t('reader.more') }}</p>
+          <div class="more-grid">
+            <button v-if="isTextBook" class="more-item" type="button" @click="toggleHan; moreOpen = false">
+              <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 6h16" />
+                <path d="M8 6v12" />
+                <path d="M16 6v12" />
+                <path d="M4 18h8" />
+              </svg>
+              <span class="more-name">{{ t('reader.han') }} · {{ hanTargetLabel }}</span>
+            </button>
+            <button v-if="isTextBook" class="more-item" type="button" @click="addBookmark; moreOpen = false">
+              <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6 4h12v16l-6-4-6 4z" />
+              </svg>
+              <span class="more-name">{{ t('reader.addBookmark') }}</span>
+            </button>
+            <button v-if="isTextBook" class="more-item" type="button" @click="openBookmarks; moreOpen = false">
+              <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 4h6l-1 6 3 3v2H7v-2l3-3z" />
+                <path d="M12 15v5" />
+              </svg>
+              <span class="more-name">{{ t('reader.bookmarks') }}</span>
+            </button>
+            <button v-if="isTextBook" class="more-item" type="button" @click="openChapterSearch; moreOpen = false">
+              <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="7" />
+                <path d="M21 21l-4.35-4.35" />
+              </svg>
+              <span class="more-name">{{ t('reader.searchChapter') }}</span>
+            </button>
+            <button v-if="isTextBook" class="more-item" type="button" :disabled="loading || loadError || paragraphs.length === 0" @click="copyChapter; moreOpen = false">
+              <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="8" y="8" width="12" height="12" rx="2" />
+                <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+              </svg>
+              <span class="more-name">{{ t('reader.copyChapter') }}</span>
+            </button>
+            <button v-if="isTextBook" class="more-item" type="button" :class="{ active: autoPlaying }" @click="toggleAuto; moreOpen = false">
+              <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8 5v14l11-7z" />
+              </svg>
+              <span class="more-name">{{ autoPlaying ? t('reader.stop') : t('reader.auto') }}</span>
             </button>
           </div>
         </div>
@@ -4472,6 +4555,211 @@ onBeforeUnmount(() => {
 }
 
 /* ================= 进度条（底部细字） ================= */
+/* ================= 底部工具栏（图标+文字上下布局） ================= */
+.reader-toolbar {
+  position: fixed;
+  left: 50%;
+  bottom: calc(46px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 29;
+  width: min(680px, 100%);
+  display: flex;
+  align-items: stretch;
+  justify-content: space-around;
+  gap: 4px;
+  padding: 8px 16px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.04);
+}
+.tb-btn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 2px 4px;
+  border: none;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    background-color 0.2s ease;
+}
+.tb-btn:hover:not(:disabled) {
+  color: var(--text-1);
+  background: var(--hover);
+}
+.tb-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.tb-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--text-1);
+}
+.tb-icon svg {
+  width: 18px;
+  height: 18px;
+}
+.tb-label {
+  max-width: 100%;
+  font-size: 10.5px;
+  font-weight: 300;
+  letter-spacing: 0.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 0.2s ease;
+}
+.tb-btn:hover .tb-label {
+  color: var(--text-2);
+}
+.tb-theme-dot {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.04);
+}
+.dot-light {
+  background: #fafafa;
+}
+.dot-warm {
+  background: #f7f0e6;
+}
+.dot-green {
+  background: #3f8a4f;
+}
+.dot-dark {
+  background: #17171a;
+}
+.dot-black {
+  background: #000000;
+  border-color: #3a3a3a;
+}
+
+/* ================= 主题预设弹层 ================= */
+.theme-card {
+  width: min(360px, 100%);
+}
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+.theme-opt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 12px 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
+}
+.theme-opt:hover {
+  border-color: var(--border-strong);
+}
+.theme-opt.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.theme-swatch {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.05);
+}
+.theme-name {
+  font-size: 12px;
+}
+.theme-opt.active .theme-name {
+  color: var(--accent);
+}
+.swatch-light {
+  background: #fafafa;
+}
+.swatch-warm {
+  background: #f7f0e6;
+}
+.swatch-green {
+  background: #3f8a4f;
+}
+.swatch-dark {
+  background: #17171a;
+}
+.swatch-black {
+  background: #000000;
+}
+
+/* ================= 更多菜单 ================= */
+.more-card {
+  width: min(320px, 100%);
+}
+.more-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+.more-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    color 0.2s ease;
+}
+.more-item:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text-1);
+}
+.more-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.more-item.active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.more-icon {
+  width: 20px;
+  height: 20px;
+}
+.more-name {
+  font-size: 11.5px;
+}
+.set-foot-spacer {
+  flex: 1;
+}
+.more-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
 .progress-bar {
   position: fixed;
   left: 50%;

@@ -171,6 +171,42 @@ html[data-theme='dark'] {
   --on-accent: #ffffff;
 }
 
+.reader-page[data-reader-theme='green'] {
+  color-scheme: light;
+  --bg: #e9f1e3;
+  --bg-float: rgba(233, 241, 227, 0.9);
+  --hover: #deebd5;
+  --surface: #f1f7ec;
+  --card: #f1f7ec;
+  --border: #ccddc0;
+  --border-strong: #b3cba3;
+  --text-1: #2e3a29;
+  --text-2: #5a6b51;
+  --text-3: #8ea382;
+  --accent: #3f8a4f;
+  --accent-deep: #347243;
+  --accent-soft: rgba(63, 138, 79, 0.12);
+  --on-accent: #ffffff;
+}
+
+.reader-page[data-reader-theme='black'] {
+  color-scheme: dark;
+  --bg: #000000;
+  --bg-float: rgba(0, 0, 0, 0.86);
+  --hover: #151515;
+  --surface: #0d0d0d;
+  --card: #0d0d0d;
+  --border: #232323;
+  --border-strong: #333333;
+  --text-1: #d6d6d6;
+  --text-2: #8f8f8f;
+  --text-3: #555555;
+  --accent: #6f8bff;
+  --accent-deep: #8aa2ff;
+  --accent-soft: rgba(111, 139, 255, 0.14);
+  --on-accent: #0a0a0a;
+}
+
 * {
   box-sizing: border-box;
 }
