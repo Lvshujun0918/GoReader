@@ -41,6 +41,17 @@ func TestShelfBookProgress(t *testing.T) {
 	}
 }
 
+// TestSaveBookProgressEmptyURL 空 bookUrl 应静默成功（阅读页卸载时前端偶发空 url，不得报参数错误打扰）。
+func TestSaveBookProgressEmptyURL(t *testing.T) {
+	handler := newTestAPI(t)
+	w := perform(handler, "POST", "/reader3/saveBookProgress", map[string]any{
+		"bookUrl": "", "durChapterTitle": "第1章", "durChapterIndex": 0, "durChapterPos": 0,
+	})
+	if !parseReturn(t, w).IsSuccess {
+		t.Fatalf("空 bookUrl 应静默成功，实际: %s", parseReturn(t, w).ErrorMsg)
+	}
+}
+
 // TestGetShelfBookMissing 缺 url 应报错。
 func TestGetShelfBookMissing(t *testing.T) {
 	handler := newTestAPI(t)

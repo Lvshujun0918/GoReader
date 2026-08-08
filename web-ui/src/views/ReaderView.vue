@@ -1887,7 +1887,8 @@ function stopDailyTracker() {
 function syncServerProgress() {
   if (!shelfBook.value || !currentChapter.value) return
   void post('/saveBookProgress', {
-    bookUrl: bookUrl.value,
+    // 用书对象自身的 bookUrl（不依赖 route）——组件卸载时路由已切换，route.params 会变空
+    bookUrl: shelfBook.value.bookUrl || bookUrl.value,
     durChapterIndex: chapterIndex.value,
     durChapterPos: Math.round(currentPos()),
     durChapterTime: Date.now(),

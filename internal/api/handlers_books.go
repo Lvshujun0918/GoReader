@@ -135,7 +135,8 @@ func (a *API) handleSaveBookProgress(c *gin.Context) {
 		url = paramOf(params, "url")
 	}
 	if url == "" {
-		Fail(c, "参数错误")
+		// 进度同步属可忽略调用（阅读页卸载时前端偶发空 url）——静默成功，不打扰用户
+		OK(c, nil)
 		return
 	}
 	title := paramOf(params, "durChapterTitle")
