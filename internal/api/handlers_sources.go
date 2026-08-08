@@ -12,6 +12,18 @@ import (
 	"github.com/Lvshujun0918/reader-dev/internal/model"
 )
 
+// parseLooseJSON 宽松 JSON 解析（尾随逗号兼容）。标准解析失败且修复后仍失败时返回错误。
+func parseLooseJSON[T any](b []byte, out *T) error {
+	if err := json.Unmarshal(b, out); err == nil {
+		return nil
+	}
+	fixed := stripTrailingCommas(string(b))
+	if fixed == string(b) {
+		return json.Unmarshal(b, out)
+	}
+	return json.Unmarshal([]byte(fixed), out)
+}
+
 // handleGetBookSources GET/POST /reader3/getBookSources。
 func (a *API) handleGetBookSources(c *gin.Context) {
 	ns, ok := a.ResolveNamespace(c)
@@ -59,7 +71,8 @@ func (a *API) handleSaveBookSource(c *gin.Context) {
 		return
 	}
 	var raw map[string]any
-	if err := c.ShouldBindJSON(&raw); err != nil {
+	b, err := io.ReadAll(c.Request.Body)
+	if err != nil || parseLooseJSON(b, &raw) != nil {
 		Fail(c, "参数错误")
 		return
 	}
@@ -94,7 +107,8 @@ func (a *API) handleSaveBookSources(c *gin.Context) {
 		return
 	}
 	var raw []map[string]any
-	if err := c.ShouldBindJSON(&raw); err != nil {
+	b, err := io.ReadAll(c.Request.Body)
+	if err != nil || parseLooseJSON(b, &raw) != nil {
 		Fail(c, "参数错误")
 		return
 	}
@@ -219,7 +233,15 @@ func fetchRemoteSources(url string) ([]*model.BookSource, error) {
 	}
 	var raw []map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, err
+		// 宽松 JSON：用户粘贴书源合集可能带尾随逗号（[a,b,]）
+		fixed := stripTrailingCommas(string(body))
+		if fixed != string(body) {
+			if err2 := json.Unmarshal([]byte(fixed), &raw); err2 != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 	out := make([]*model.BookSource, 0, len(raw))
 	for _, m := range raw {
