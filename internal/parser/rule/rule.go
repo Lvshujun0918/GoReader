@@ -46,7 +46,7 @@ func Parse(input, rule string, ctx *Context) []string {
 	if ctx == nil {
 		ctx = &Context{}
 	}
-	rule = interpolateVars(rule, ctx)
+	rule = interpolateVars(input, rule, ctx)
 	if rule == "" {
 		return nil
 	}
@@ -79,14 +79,25 @@ func parseSingle(input, rule string, ctx *Context) []string {
 	if strings.HasPrefix(rule, "$") {
 		return evalJSON(input, rule, ctx)
 	}
-	// 纯文本规则（无 @ 前缀）：正则全文匹配或原样返回
+	// 文本后处理：value@js:code（先解析前缀，再对结果执行 JS，如 {{$.status}}@js:result.replace(...)）
+	if idx := strings.LastIndex(rule, "@js:"); idx > 0 {
+		prefix, code := rule[:idx], rule[idx+len("@js:"):]
+		base := parseSingle(input, prefix, ctx)
+		if len(base) > 0 {
+			if vs := evalJS(base[0], code, ctx); len(vs) > 0 {
+				return vs
+			}
+			return base
+		}
+	}
+	// 纯文本规则（无 @ 前缀）：正则全文匹配；无匹配时返回插值后的规则本身
+	// （URL 模板等，如 /novels/api/book/{{$.book_id}} —— 插值后原样输出）
 	if !strings.HasPrefix(rule, "@") {
-		// 常见：直接当正则匹配第一个匹配组
 		if out := regexMatchAll(input, rule); len(out) > 0 {
 			return out
 		}
-		if input != "" {
-			return []string{input}
+		if rule != "" {
+			return []string{rule}
 		}
 		return nil
 	}
@@ -390,19 +401,34 @@ func processTextOps(input, rule string, ctx *Context) []string {
 
 // ---------- 工具 ----------
 
-// interpolateVars {name} 变量插值。
-func interpolateVars(rule string, ctx *Context) string {
+// interpolateVars {name}/{{name}} 变量插值（legado：{{$.path}} 从输入 JSON 提取）。
+func interpolateVars(input, rule string, ctx *Context) string {
 	if !strings.Contains(rule, "{") || ctx == nil {
 		return rule
 	}
-	re := regexp.MustCompile(`\{([^{}]+)\}`)
-	return re.ReplaceAllStringFunc(rule, func(m string) string {
-		name := strings.TrimSuffix(strings.TrimPrefix(m, "{"), "}")
-		if v := ctx.Get(name); v != "" {
-			return v
-		}
-		return m
+	// 优先 {{name}}（legado 双花括号），再 {name}
+	re := regexp.MustCompile(`\{\{([^{}]+)\}\}`)
+	rule = re.ReplaceAllStringFunc(rule, func(m string) string {
+		return interpolateOne(input, strings.TrimSuffix(strings.TrimPrefix(m, "{{"), "}}"), ctx, m)
 	})
+	re2 := regexp.MustCompile(`\{([^{}]+)\}`)
+	return re2.ReplaceAllStringFunc(rule, func(m string) string {
+		return interpolateOne(input, strings.TrimSuffix(strings.TrimPrefix(m, "{"), "}"), ctx, m)
+	})
+}
+
+// interpolateOne 单变量插值：$. 前缀从输入 JSONPath 提取，否则查 ctx 变量。
+func interpolateOne(input, name string, ctx *Context, fallback string) string {
+	if strings.HasPrefix(name, "$") {
+		if vs := evalJSON(input, name, ctx); len(vs) > 0 {
+			return vs[0]
+		}
+		return ""
+	}
+	if v := ctx.Get(name); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // splitTopLevel 顶层分隔（不进入括号/引号）。

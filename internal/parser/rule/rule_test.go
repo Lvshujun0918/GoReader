@@ -66,9 +66,14 @@ func TestPlainRegexFallback(t *testing.T) {
 func TestInterpolateVars(t *testing.T) {
 	ctx := &Context{}
 	ctx.Set("key", "修真")
-	got := interpolateVars("@css:{key}.list", ctx)
+	got := interpolateVars("", "@css:{key}.list", ctx)
 	if got != "@css:修真.list" {
 		t.Fatalf("变量插值失败: %q", got)
+	}
+	// {{$.path}} 从输入 JSON 提取（legado 双花括号 JSONPath 插值）
+	got2 := interpolateVars(`{"book_id":"123","title":"书"}`, "/book/{{$.book_id}}", ctx)
+	if got2 != "/book/123" {
+		t.Fatalf("JSONPath 插值失败: %q", got2)
 	}
 }
 
