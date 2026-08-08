@@ -4,6 +4,7 @@ package rule
 import (
 	"bytes"
 	"encoding/json"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -307,7 +308,7 @@ func evalJS(input, code string, ctx *Context) []string {
 	}
 	// java 兼容 shim（最小子集）
 	_ = vm.Set("java", map[string]any{
-		"url":            map[string]any{"encode": func(s string) string { return strings.ReplaceAll(s, " ", "%20") }},
+		"url":            map[string]any{"encode": func(s string) string { return strings.ReplaceAll(url.QueryEscape(s), "+", "%20") }},
 		"base64Decode":   func(s string) string { return s },
 		"base64Encode":   func(s string) string { return s },
 	})

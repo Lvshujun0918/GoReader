@@ -3,6 +3,7 @@ package bookfetch
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/Lvshujun0918/reader-dev/internal/model"
@@ -326,7 +327,11 @@ func SplitSemicolon(s string) []string {
 	return splitSemicolon(s)
 }
 
-// URLEncode 关键词 URL 编码。
+// URLEncode 关键词 URL 编码：非 ASCII 与保留字符 → %XX（legado URLEncoder UTF-8 行为），
+// 空格 → %20。保证请求行合法（原始中文会触发服务器 400）。
 func URLEncode(kw string) string {
-	return strings.ReplaceAll(kw, " ", "%20")
+	if kw == "" {
+		return ""
+	}
+	return strings.ReplaceAll(url.QueryEscape(kw), "+", "%20")
 }
