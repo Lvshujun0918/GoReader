@@ -9,12 +9,14 @@ import {
   getBookGroups,
   getBookshelf,
   refreshLocalBook,
+  saveBook,
   saveBookGroup,
   saveBookGroupOrder,
   updateBookGroupId,
 } from '@/api/bookshelf'
 import { getBookmarks, deleteBookmark } from '@/api/bookmarks'
 import { uploadLocalBook, importBookPreview } from '@/api/upload'
+import { mkdir, uploadFile } from '@/api/file'
 import { searchBookContent } from '@/api/cache'
 import { exportBook, type ExportEncoding, type ExportFormat } from '@/api/export'
 import { downloadBlob } from '@/utils/download'
@@ -308,6 +310,107 @@ const menuBusy = ref(false)
 let longPressTimer: number | undefined
 let longPressFired = false
 let suppressClick = false
+
+/* ================= 编辑书信息（右键菜单 → 封面/书名/作者/简介） ================= */
+const editOpen = ref(false)
+const editBusy = ref(false)
+const editBook = ref<Book | null>(null)
+const editForm = ref({ name: '', author: '', intro: '', cover: '' })
+const coverBusy = ref(false)
+const coverInputRef = ref<HTMLInputElement | null>(null)
+const COVER_MAX_MB = 10
+
+/** 上传的封面经 file/download（stream=1 内联）展示，URL 存 customCoverUrl */
+function coverDownloadUrl(name: string): string {
+  const base = `/reader3/file/download?path=covers/${encodeURIComponent(name)}&home=__HOME__&stream=1`
+  return store.accessToken ? `${base}&accessToken=${encodeURIComponent(store.accessToken)}` : base
+}
+
+function openEditFor(book: Book) {
+  editBook.value = book
+  editForm.value = {
+    name: book.name || '',
+    author: book.author || '',
+    intro: book.intro || '',
+    cover: book.customCoverUrl || book.coverUrl || '',
+  }
+  coverBusy.value = false
+  closeMenu()
+  editOpen.value = true
+  document.body.style.overflow = 'hidden'
+}
+
+function closeEdit() {
+  if (editBusy.value) return
+  editOpen.value = false
+  document.body.style.overflow = ''
+}
+
+function openCoverPicker() {
+  if (coverBusy.value || !editBook.value) return
+  coverInputRef.value?.click()
+}
+
+/** 上传本地图片作为封面（存 __HOME__/covers，URL 写入 customCoverUrl） */
+async function onEditCoverPick(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = '' // 允许重复选择同一文件
+  if (!file || coverBusy.value) return
+  if (!file.type.startsWith('image/')) {
+    ElMessage.warning('请选择图片文件')
+    return
+  }
+  if (file.size > COVER_MAX_MB * 1024 * 1024) {
+    ElMessage.warning(`图片不能超过 ${COVER_MAX_MB} MB`)
+    return
+  }
+  coverBusy.value = true
+  try {
+    // 确保 __HOME__/covers 目录存在（后端 file/upload 要求目标目录已存在）
+    try {
+      await mkdir('', 'covers', '__HOME__', { silent: true })
+    } catch {
+      /* 目录已存在：继续 */
+    }
+    await uploadFile(file, 'covers', '__HOME__')
+    editForm.value.cover = coverDownloadUrl(file.name)
+    ElMessage.success('封面已上传')
+  } catch {
+    ElMessage.error('封面上传失败')
+  } finally {
+    coverBusy.value = false
+  }
+}
+
+/** 保存编辑：完整对象合并表单值（后端 upsert 全字段，避免覆盖丢失） */
+async function saveEdit() {
+  const b = editBook.value
+  if (!b || editBusy.value) return
+  const name = editForm.value.name.trim()
+  if (!name) {
+    ElMessage.warning('书名不能为空')
+    return
+  }
+  editBusy.value = true
+  try {
+    const patch: Book = { ...(b as Book), name }
+    patch.author = editForm.value.author.trim()
+    patch.intro = editForm.value.intro.trim()
+    // 封面：仅当用户改动时写 customCoverUrl（清空 = 清除自定义封面）
+    if (editForm.value.cover !== (b.customCoverUrl || b.coverUrl || '')) {
+      patch.customCoverUrl = editForm.value.cover
+    }
+    await saveBook(patch)
+    ElMessage.success('已保存')
+    closeEdit()
+    await load()
+  } catch {
+    // 拦截器已提示
+  } finally {
+    editBusy.value = false
+  }
+}
 
 /* ================= 导入本地书 ================= */
 interface ImportItem {
@@ -2226,6 +2329,14 @@ onMounted(() => {
                 </svg>
                 移动到分组
               </button>
+              <!-- 编辑信息：封面 / 书名 / 作者 / 简介 -->
+              <button class="ctx-item" type="button" @click="openEditFor(menuBook)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                  <path d="M15 5l4 4" />
+                </svg>
+                编辑信息
+              </button>
               <button class="ctx-item" type="button" @click="openExportFor(menuBook)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M12 15V4" />
@@ -2271,6 +2382,108 @@ onMounted(() => {
                 {{ g.name }}
               </button>
             </template>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- 编辑书信息弹窗（封面 / 书名 / 作者 / 简介） -->
+    <Teleport to="body">
+      <Transition name="dlg">
+        <div v-if="editOpen && editBook" class="dlg-overlay" @click.self="closeEdit">
+          <div
+            class="dlg dlg-edit"
+            role="dialog"
+            aria-modal="true"
+            aria-label="编辑书信息"
+            tabindex="-1"
+            @keydown.esc="closeEdit"
+          >
+            <div class="dlg-head">
+              <h2 class="dlg-title">编辑信息</h2>
+              <button class="dlg-close" type="button" title="关闭" :disabled="editBusy" @click="closeEdit">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <form class="dlg-form" @submit.prevent="saveEdit">
+              <!-- 封面：预览 + 上传 + URL 直填 -->
+              <div class="edit-cover-row">
+                <div class="edit-cover" :class="{ placeholder: !editForm.cover }">
+                  <img
+                    v-if="editForm.cover"
+                    class="edit-cover-img"
+                    :src="editForm.cover"
+                    alt="封面预览"
+                    loading="lazy"
+                  />
+                  <span v-else class="edit-cover-ph">无封面</span>
+                </div>
+                <div class="edit-cover-ops">
+                  <button class="ghost-btn" type="button" :disabled="coverBusy" @click="openCoverPicker">
+                    {{ coverBusy ? '上传中…' : '上传封面' }}
+                  </button>
+                  <input
+                    ref="coverInputRef"
+                    class="hidden-input"
+                    type="file"
+                    accept="image/*"
+                    @change="onEditCoverPick"
+                  />
+                  <p class="edit-cover-tip">上传到服务器，或粘贴图片 URL 到下方</p>
+                </div>
+              </div>
+              <label class="field">
+                <span class="field-label">封面 URL</span>
+                <input
+                  v-model="editForm.cover"
+                  class="field-input"
+                  type="url"
+                  placeholder="图片链接（http/https）"
+                  spellcheck="false"
+                  :disabled="editBusy"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">书名<em>*</em></span>
+                <input
+                  v-model="editForm.name"
+                  class="field-input"
+                  type="text"
+                  placeholder="书名"
+                  spellcheck="false"
+                  :disabled="editBusy"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">作者</span>
+                <input
+                  v-model="editForm.author"
+                  class="field-input"
+                  type="text"
+                  placeholder="作者"
+                  spellcheck="false"
+                  :disabled="editBusy"
+                />
+              </label>
+              <label class="field">
+                <span class="field-label">简介</span>
+                <textarea
+                  v-model="editForm.intro"
+                  class="field-input field-textarea"
+                  rows="3"
+                  placeholder="书籍简介"
+                  :disabled="editBusy"
+                ></textarea>
+              </label>
+              <div class="dlg-actions">
+                <button class="ghost-btn" type="button" :disabled="editBusy" @click="closeEdit">取消</button>
+                <button class="accent-btn" type="submit" :disabled="editBusy">
+                  {{ editBusy ? '保存中…' : '保存' }}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       </Transition>
@@ -3618,6 +3831,101 @@ onMounted(() => {
   display: flex;
   gap: 8px;
   margin-left: auto;
+}
+
+/* ================= 编辑书信息弹窗 ================= */
+.dlg-edit {
+  width: min(460px, 100%);
+}
+.dlg-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.edit-cover-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.edit-cover {
+  flex: none;
+  width: 88px;
+  height: 124px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-float);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.edit-cover-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.edit-cover-ph {
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.edit-cover-ops {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+.edit-cover-tip {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 300;
+  color: var(--text-3);
+}
+.hidden-input {
+  display: none;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.field-label {
+  font-size: 12.5px;
+  font-weight: 300;
+  letter-spacing: 1px;
+  color: var(--text-2);
+}
+.field-label em {
+  font-style: normal;
+  color: var(--danger);
+  margin-left: 2px;
+}
+.field-input {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13.5px;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+.field-input::placeholder {
+  color: var(--text-3);
+  font-weight: 300;
+}
+.field-input:focus {
+  border-color: var(--accent);
+}
+.field-textarea {
+  height: auto;
+  min-height: 72px;
+  padding: 10px 12px;
+  resize: vertical;
+  line-height: 1.6;
 }
 
 .ghost-btn {
