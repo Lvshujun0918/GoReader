@@ -82,15 +82,12 @@ func tokenMapContains(tokenMap, tok string) bool {
 // FormatUser 登录/注册返回结构（camelCase，兼容 legacy BaseController.formatUser）。
 func FormatUser(u *model.User) map[string]any {
 	return map[string]any{
-		"username":          u.Username,
-		"lastLoginAt":       u.LastLoginAt,
-		"accessToken":       u.Username + ":" + u.Token,
-		"enableWebdav":      u.EnableWebdav,
-		"enableLocalStore":  u.EnableLocalStore,
-		"enableBookSource":  u.EnableBookSource,
-
-		"bookSourceLimit":   u.BookSourceLimit,
-		"bookLimit":         u.BookLimit,
-		"createdAt":         u.CreatedAt,
+		"username":         u.Username,
+		"lastLoginAt":      u.LastLoginAt,
+		"accessToken":      u.Username + ":" + u.Token,
+		"enableWebdav":     u.EnableWebdav,
+		"enableLocalStore": u.EnableLocalStore,
+		"bookLimit":        u.BookLimit,
+		"createdAt":        u.CreatedAt,
 	}
 }

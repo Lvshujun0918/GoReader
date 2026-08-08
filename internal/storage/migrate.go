@@ -16,11 +16,7 @@ import (
 // nsCompositeTables 五类 (url 单列主键) 表 → (url, user_namespace) 复合主键。
 // 键为表名，值为 URL 列名——与 CREATE TABLE 的复合主键列序一致。
 var nsCompositeTables = map[string]string{
-	"book_sources":  "book_source_url",
-	"rss_sources":   "rss_source_url",
-	"rss_articles":  "url",
 	"http_tts_list": "url",
-	"source_subs":   "url",
 }
 
 // MigrateNSPrimaryKeys 旧库迁移：复合主键重建（幂等）。
@@ -177,9 +173,6 @@ func (s *Storage) migrateJSONNamespaceFiles(dataDir string) error {
 		ns := e.Name()
 		dir := filepath.Join(dataDir, ns)
 
-		if err := migrateNSFile(s, dir, "bookSource.json", &model.BookSource{}, func(v *model.BookSource) { v.UserNamespace = ns }); err != nil {
-			return err
-		}
 		if err := migrateNSFile(s, dir, "bookmark.json", &model.Bookmark{}, func(v *model.Bookmark) { v.UserNamespace = ns }); err != nil {
 			return err
 		}

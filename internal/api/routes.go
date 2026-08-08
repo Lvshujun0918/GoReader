@@ -38,47 +38,11 @@ func (a *API) registerReader3(r *gin.Engine) {
 	g.Any("/getBookToc", a.handleGetBookToc)
 	g.Any("/getChapterList", a.handleGetBookToc)
 	g.Any("/getBookContent", a.handleGetBookContent)
-	g.Any("/getChapterListByRule", a.handleGetChapterListByRule)
+	g.Any("/searchBookContent", a.handleSearchBookContent)
 	g.POST("/migrateLocBook", a.handleMigrateLocBook)
 	g.POST("/refreshLocalBook", a.handleRefreshLocalBook)
 	g.POST("/importBookPreview", a.handleImportBookPreview)
 	g.POST("/uploadLocalBook", a.handleUploadLocalBook)
-
-	// ---- 书源 ----
-	g.Any("/getBookSources", a.handleGetBookSources)
-	g.Any("/getBookSource", a.handleGetBookSource)
-	g.POST("/saveBookSource", a.handleSaveBookSource)
-	g.POST("/saveBookSources", a.handleSaveBookSources)
-	g.POST("/deleteBookSource", a.handleDeleteBookSource)
-	g.POST("/deleteBookSources", a.handleDeleteBookSources)
-	g.POST("/deleteAllBookSources", a.handleDeleteAllBookSources)
-	g.POST("/saveFromRemoteSource", a.handleSaveFromRemoteSource)
-	g.Any("/getAvailableBookSource", a.handleGetAvailableBookSource)
-	g.Any("/getInvalidBookSources", a.handleGetInvalidBookSources)
-	g.POST("/disableInvalidBookSources", a.handleDisableInvalidBookSources)
-	g.POST("/setAsDefaultBookSources", a.handleSetAsDefaultBookSources)
-	g.POST("/deleteUserBookSource", a.handleDeleteUserBookSource)
-	g.GET("/exportBookSources", a.handleExportBookSources)
-
-	// ---- 搜索 ----
-	g.Any("/searchBook", a.handleSearchBook)
-	g.Any("/searchBookMulti", a.handleSearchBookMulti)
-	g.Any("/searchBookMultiSSE", a.handleSearchBookMultiSSE)
-	g.Any("/searchBookSource", a.handleSearchBookSource)
-	g.Any("/searchBookSourceSSE", a.handleSearchBookSourceSSE)
-	g.Any("/searchBookContent", a.handleSearchBookContent)
-
-	// ---- 书源登录/验证码 ----
-	g.Any("/loginBookSource", a.handleLoginBookSource)
-	g.POST("/setBookSourceCookie", a.handleSetBookSourceCookie)
-	g.POST("/getCaptcha", a.handleGetCaptcha)
-	g.POST("/submitCaptcha", a.handleSubmitCaptcha)
-
-	// ---- 探索/订阅 ----
-	g.Any("/getSourceSubs", a.handleGetSourceSubs)
-	g.POST("/saveSourceSub", a.handleSaveSourceSub)
-	g.POST("/deleteSourceSub", a.handleDeleteSourceSub)
-	g.POST("/refreshSourceSub", a.handleRefreshSourceSub)
 
 	// ---- 书签/分组 ----
 	g.POST("/saveBookmark", a.handleSaveBookmark)
@@ -135,7 +99,6 @@ func (a *API) registerReader3(r *gin.Engine) {
 	g.Any("/getShelfBookWithCacheInfo", a.handleGetShelfBookWithCacheInfo)
 	g.Any("/getUserConfig", a.handleGetUserConfig)
 	g.Any("/saveUserConfig", a.handleSaveUserConfig)
-	g.Any("/bookSourceDebugSSE", a.handleBookSourceDebugSSE)
 	g.Any("/getReadingStats", a.handleGetReadingStats)
 	g.GET("/getSystemInfo", a.handleGetSystemInfo)
 	g.GET("/getServerStats", a.handleGetServerStats)

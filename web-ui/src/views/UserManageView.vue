@@ -20,13 +20,11 @@ import type { ReaderUser, UserUpdatePayload } from '@/types'
 
 const store = useUserStore()
 
-type PermField = 'enableWebdav' | 'enableLocalStore' | 'enableBookSource' | 'enableRssSource'
+type PermField = 'enableWebdav' | 'enableLocalStore'
 
 const PERM_LABEL: Record<PermField, string> = {
   enableWebdav: 'WebDAV',
   enableLocalStore: '本地书仓',
-  enableBookSource: '书源',
-  enableRssSource: 'RSS',
 }
 
 /* ================= 列表 ================= */
@@ -116,19 +114,15 @@ const addForm = ref<{
   password: string
   enableWebdav: boolean
   enableLocalStore: boolean
-  enableBookSource: boolean
-  enableRssSource: boolean
 }>({
   username: '',
   password: '',
   enableWebdav: false,
   enableLocalStore: true,
-  enableBookSource: true,
-  enableRssSource: false,
 })
 
 function openAdd() {
-  addForm.value = { username: '', password: '', enableWebdav: false, enableLocalStore: true, enableBookSource: true, enableRssSource: false }
+  addForm.value = { username: '', password: '', enableWebdav: false, enableLocalStore: true }
   addBusy.value = false
   adding.value = true
   document.body.style.overflow = 'hidden'
@@ -160,8 +154,6 @@ async function confirmAdd() {
       password,
       enableWebdav: addForm.value.enableWebdav,
       enableLocalStore: addForm.value.enableLocalStore,
-      enableBookSource: addForm.value.enableBookSource,
-      enableRssSource: addForm.value.enableRssSource,
     })
     ElMessage.success('已创建用户')
     closeAdd()
@@ -194,9 +186,6 @@ function permPayload(u: ReaderUser, field: PermField, value: boolean): UserUpdat
     username: u.username,
     enableWebdav: u.enableWebdav,
     enableLocalStore: u.enableLocalStore,
-    enableBookSource: u.enableBookSource,
-    enableRssSource: u.enableRssSource,
-    bookSourceLimit: u.bookSourceLimit,
     bookLimit: u.bookLimit,
     [field]: value,
   }
@@ -223,20 +212,14 @@ const editBusy = ref(false)
 const editForm = ref<{
   enableWebdav: boolean
   enableLocalStore: boolean
-  enableBookSource: boolean
-  enableRssSource: boolean
-  bookSourceLimit: number
   bookLimit: number
-}>({ enableWebdav: false, enableLocalStore: false, enableBookSource: false, enableRssSource: false, bookSourceLimit: 0, bookLimit: 0 })
+}>({ enableWebdav: false, enableLocalStore: false, bookLimit: 0 })
 
 function openEdit(u: ReaderUser) {
   editing.value = u
   editForm.value = {
     enableWebdav: u.enableWebdav,
     enableLocalStore: u.enableLocalStore,
-    enableBookSource: u.enableBookSource,
-    enableRssSource: u.enableRssSource,
-    bookSourceLimit: u.bookSourceLimit ?? 0,
     bookLimit: u.bookLimit ?? 0,
   }
   editBusy.value = false
@@ -257,9 +240,6 @@ async function saveEdit() {
     username: target.username,
     enableWebdav: f.enableWebdav,
     enableLocalStore: f.enableLocalStore,
-    enableBookSource: f.enableBookSource,
-    enableRssSource: f.enableRssSource,
-    bookSourceLimit: Math.max(0, Number(f.bookSourceLimit) || 0),
     bookLimit: Math.max(0, Number(f.bookLimit) || 0),
   }
   editBusy.value = true
@@ -448,7 +428,6 @@ onBeforeUnmount(() => {
             <tr>
               <th class="col-user">用户名</th>
               <th class="col-perm">权限</th>
-              <th class="col-num">书源上限</th>
               <th class="col-num">书籍上限</th>
               <th class="col-time">最后登录</th>
               <th class="col-ops">操作</th>
@@ -479,7 +458,6 @@ onBeforeUnmount(() => {
                   </template>
                 </div>
               </td>
-              <td class="col-num">{{ u.bookSourceLimit ?? 0 }}</td>
               <td class="col-num">{{ u.bookLimit ?? 0 }}</td>
               <td class="col-time">{{ fmtTime(u.lastLoginAt) }}</td>
               <td class="col-ops">
@@ -617,10 +595,6 @@ onBeforeUnmount(() => {
                 </div>
               </div>
               <div class="field-row">
-                <label class="field">
-                  <span class="field-label">书源上限</span>
-                  <input v-model.number="editForm.bookSourceLimit" class="field-input" type="number" min="0" step="1" />
-                </label>
                 <label class="field">
                   <span class="field-label">书籍上限</span>
                   <input v-model.number="editForm.bookLimit" class="field-input" type="number" min="0" step="1" />

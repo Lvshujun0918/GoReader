@@ -104,19 +104,13 @@ func (s *Storage) LogoutUser(username string) error {
 }
 
 // UpdateUserPermissions 更新用户权限（nil 字段不修改）。返回受影响行数。
-func (s *Storage) UpdateUserPermissions(username string, enableWebdav, enableLocalStore, enableBookSource *bool, bookSourceLimit, bookLimit *int64) (int64, error) {
+func (s *Storage) UpdateUserPermissions(username string, enableWebdav, enableLocalStore *bool, bookLimit *int64) (int64, error) {
 	updates := map[string]any{}
 	if enableWebdav != nil {
 		updates["enable_webdav"] = *enableWebdav
 	}
 	if enableLocalStore != nil {
-	updates["enable_local_store"] = *enableLocalStore
-	}
-	if enableBookSource != nil {
-		updates["enable_book_source"] = *enableBookSource
-	}
-	if bookSourceLimit != nil {
-		updates["book_source_limit"] = *bookSourceLimit
+		updates["enable_local_store"] = *enableLocalStore
 	}
 	if bookLimit != nil {
 		updates["book_limit"] = *bookLimit
@@ -145,9 +139,9 @@ func (s *Storage) DeleteUsers(usernames []string) (int64, error) {
 		n = res.RowsAffected
 		// 清理各命名空间数据
 		cleanup := []any{
-			&model.Book{}, &model.BookSource{}, &model.Bookmark{}, &model.BookGroup{},
+			&model.Book{}, &model.Bookmark{}, &model.BookGroup{},
 			&model.ReplaceRule{}, &model.TxtTocRule{}, &model.HttpTTS{},
-			&model.SourceSub{}, &model.UserConfig{},
+			&model.UserConfig{},
 		}
 		for _, m := range cleanup {
 			if err := tx.Where("user_namespace IN ?", usernames).Delete(m).Error; err != nil {

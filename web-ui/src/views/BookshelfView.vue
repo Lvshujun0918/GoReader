@@ -120,15 +120,7 @@ watch(keyword, (k) => {
   if (searchMode.value === 'full') triggerContentSearch(k)
 })
 
-/** 主页搜索框 = 全网搜书入口（回车跳搜索页） */
-function goSearchBooks() {
-  const kw = keyword.value.trim()
-  if (!kw) {
-    void router.push('/search')
-    return
-  }
-  void router.push(`/search?key=${encodeURIComponent(kw)}`)
-}
+/** 主页搜索框：本地书名/作者筛选（name 模式响应式）或全书内容搜索（full 模式）——无全网搜索 */
 const failedCovers = ref<Set<string>>(new Set())
 
 /* ================= 多选模式 ================= */
@@ -495,8 +487,11 @@ function isSupported(file: File): boolean {
   return (
     name.endsWith('.epub') ||
     name.endsWith('.txt') ||
+    name.endsWith('.html') ||
+    name.endsWith('.htm') ||
     file.type === 'application/epub+zip' ||
     file.type === 'text/plain' ||
+    file.type === 'text/html' ||
     file.type.startsWith('text/')
   )
 }
@@ -528,7 +523,7 @@ function addFiles(files: File[]) {
     importItems.value.push(item)
     added.push(item)
   }
-  acceptTip.value = ignored > 0 ? `已忽略 ${ignored} 个不支持的文件（仅支持 .txt / .epub）` : ''
+  acceptTip.value = ignored > 0 ? `已忽略 ${ignored} 个不支持的文件（仅支持 .txt / .epub / .html）` : ''
   if (valid.length > 0) {
     importDone.value = false
     importSummary.value = ''
@@ -1791,9 +1786,8 @@ onMounted(() => {
             v-model="keyword"
             class="search-input"
             type="text"
-            placeholder="搜书（全站书源）…"
+            placeholder="搜书（本地书名/作者/正文）…"
             spellcheck="false"
-            @keyup.enter="goSearchBooks"
           />
           <button
             v-if="keyword"
@@ -2215,12 +2209,12 @@ onMounted(() => {
                 <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
               </svg>
               <p class="dz-text">点击选择文件，或将文件拖拽到此处</p>
-              <p class="dz-sub">支持 .txt / .epub（自动识别 GBK / UTF-8 编码）· 可多选</p>
+              <p class="dz-sub">支持 .txt / .epub / .html（txt 自动识别 GBK / UTF-8 编码）· 可多选</p>
               <input
                 ref="fileInput"
                 class="file-input"
                 type="file"
-                accept=".epub,.txt,application/epub+zip,text/plain"
+                accept=".epub,.txt,.html,.htm,application/epub+zip,text/plain,text/html"
                 multiple
                 @change="onPick"
               />

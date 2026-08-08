@@ -1,4 +1,5 @@
-// Package localbook 本地书解析：txt（GBK/UTF-8/GB18030 编码检测 + 目录规则切章）与 epub（OPF/NCX 章节结构）。
+// Package localbook 本地书解析：txt（GBK/UTF-8/GB18030 编码检测 + 目录规则切章）、
+// epub（OPF/NCX 章节结构）与 html（标题切章）。
 package localbook
 
 import (
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	xhtml "golang.org/x/net/html"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
@@ -49,6 +51,8 @@ func Parse(data []byte, filename string, tocRules []string) (*Book, error) {
 		return parseTxt(data, filename, tocRules)
 	case ".epub":
 		return parseEpub(data)
+	case ".html", ".htm":
+		return parseHTML(data, filename)
 	default:
 		return nil, &UnsupportedError{Ext: ext}
 	}
@@ -58,7 +62,128 @@ func Parse(data []byte, filename string, tocRules []string) (*Book, error) {
 type UnsupportedError struct{ Ext string }
 
 func (e *UnsupportedError) Error() string {
-	return "不支持的格式：" + e.Ext + "（仅支持 .txt / .epub）"
+	return "不支持的格式：" + e.Ext + "（仅支持 .txt / .epub / .html）"
+}
+
+/* ------------------------------ HTML ------------------------------ */
+
+var (
+	htmlHeadingTags = map[string]bool{"h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true}
+	htmlBlockTags   = map[string]bool{
+		"p": true, "div": true, "br": true, "li": true, "tr": true, "td": true,
+		"section": true, "article": true, "blockquote": true, "pre": true,
+	}
+)
+
+// parseHTML 解析 html 文件：<title> 作书名，h1-h6 作章节标题切章；无标题则整书一章。
+func parseHTML(data []byte, filename string) (*Book, error) {
+	doc, err := xhtml.Parse(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	// 书名：<title> 优先，否则文件名
+	title := ""
+	var findTitle func(*xhtml.Node)
+	findTitle = func(n *xhtml.Node) {
+		if title != "" {
+			return
+		}
+		if n.Type == xhtml.ElementNode && strings.EqualFold(n.Data, "title") {
+			title = strings.TrimSpace(htmlText(n))
+			return
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			findTitle(ch)
+		}
+	}
+	findTitle(doc)
+	if title == "" {
+		title = strings.TrimSuffix(path.Base(filename), path.Ext(filename))
+	}
+
+	var body *xhtml.Node
+	var findBody func(*xhtml.Node)
+	findBody = func(n *xhtml.Node) {
+		if body != nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode && strings.EqualFold(n.Data, "body") {
+			body = n
+			return
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			findBody(ch)
+		}
+	}
+	findBody(doc)
+
+	var chapters []Chapter
+	cur := &Chapter{Title: "全文"}
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n.Type == xhtml.TextNode {
+			cur.Content += n.Data
+			return
+		}
+		if n.Type != xhtml.ElementNode {
+			return
+		}
+		tag := strings.ToLower(n.Data)
+		if htmlHeadingTags[tag] {
+			// 保存当前章，标题开新章（首个标题前的正文并入第一章）
+			if strings.TrimSpace(cur.Content) != "" || len(chapters) > 0 {
+				chapters = append(chapters, *cur)
+			}
+			cur = &Chapter{Title: strings.TrimSpace(htmlText(n))}
+			return
+		}
+		if htmlBlockTags[tag] {
+			cur.Content += "\n"
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+		if htmlBlockTags[tag] && tag != "br" {
+			cur.Content += "\n"
+		}
+	}
+	if body != nil {
+		walk(body)
+	}
+	if strings.TrimSpace(cur.Content) != "" {
+		chapters = append(chapters, *cur)
+	}
+	if len(chapters) == 0 {
+		chapters = append(chapters, Chapter{Title: "全文", Content: ""})
+	}
+	for i := range chapters {
+		chapters[i].Content = normalizeHTMLText(chapters[i].Content)
+	}
+	return &Book{Name: title, Author: "", Format: "html", Chapters: chapters}, nil
+}
+
+// htmlText 提取节点内全部文本（title / 标题用）。
+func htmlText(n *xhtml.Node) string {
+	var b strings.Builder
+	var walk func(*xhtml.Node)
+	walk = func(x *xhtml.Node) {
+		if x.Type == xhtml.TextNode {
+			b.WriteString(x.Data)
+		}
+		for ch := x.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+	}
+	walk(n)
+	return b.String()
+}
+
+// normalizeHTMLText 压缩空白/全角空格/空行，保留 \n 段落。
+func normalizeHTMLText(s string) string {
+	out := regexp.MustCompile(`[ \t]+`).ReplaceAllString(s, " ")
+	out = regexp.MustCompile(`\x{3000}+`).ReplaceAllString(out, "")
+	out = regexp.MustCompile(`\n\s*\n+`).ReplaceAllString(out, "\n")
+	return strings.TrimSpace(out)
 }
 
 /* ------------------------------ 编码检测 ------------------------------ */

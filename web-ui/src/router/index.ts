@@ -30,18 +30,6 @@ const router = createRouter({
       meta: { title: '阅读', titleKey: 'route.reader' },
     },
     {
-      path: '/search',
-      name: 'search',
-      component: () => import('@/views/SearchView.vue'),
-      meta: { title: '搜索', titleKey: 'route.search' },
-    },
-    {
-      path: '/sources',
-      name: 'sources',
-      component: () => import('@/views/SourceManageView.vue'),
-      meta: { title: '书源管理', titleKey: 'route.sources' },
-    },
-    {
       path: '/rules',
       name: 'rules',
       component: () => import('@/views/ReplaceRuleView.vue'),

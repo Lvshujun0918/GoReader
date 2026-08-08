@@ -7,7 +7,6 @@ import (
 
 	"github.com/Lvshujun0918/GoReader/internal/config"
 	"github.com/Lvshujun0918/GoReader/internal/middleware"
-	"github.com/Lvshujun0918/GoReader/internal/service/solver"
 	"github.com/Lvshujun0918/GoReader/internal/storage"
 )
 
@@ -16,7 +15,6 @@ type API struct {
 	Storage *storage.Storage
 	Config  *config.Config
 	Stats   *middleware.RequestStats
-	Solver  *solver.Solver // 全局 obscura 质询求解器（READER_OBSCURA_URL/BIN 配置）
 }
 
 // New 创建 API 处理器。
@@ -25,7 +23,6 @@ func New(st *storage.Storage, cfg *config.Config, stats *middleware.RequestStats
 		Storage: st,
 		Config:  cfg,
 		Stats:   stats,
-		Solver:  solver.New(cfg.ObscuraURL, cfg.ObscuraBin, cfg.ObscuraProxy),
 	}
 }
 

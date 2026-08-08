@@ -1546,10 +1546,6 @@ async function runExportData() {
             <span class="row-label">书籍数</span>
             <span class="row-value">{{ sysInfo.bookCount }}</span>
           </div>
-          <div class="row">
-            <span class="row-label">书源数</span>
-            <span class="row-value">{{ sysInfo.bookSourceCount }}</span>
-          </div>
         </template>
         <div class="row">
           <span class="row-label">交流</span>

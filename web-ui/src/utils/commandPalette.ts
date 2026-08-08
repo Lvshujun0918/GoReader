@@ -12,7 +12,6 @@ import type { Lang } from './i18n'
 /** 命令动作（声明式：组件按 kind 分发执行） */
 export type PaletteAction =
   | { kind: 'navigate'; path: string }
-  | { kind: 'search'; keyword?: string }
   | { kind: 'theme'; theme: UiTheme }
   | { kind: 'lang'; lang: Lang }
 
@@ -26,11 +25,9 @@ export interface PaletteCommand {
   action: PaletteAction
 }
 
-/** 页面跳转命令（书架/搜索/书源/规则/设置/监控/用户） */
+/** 页面跳转命令（书架/规则/设置/监控/用户） */
 const NAV_PAGES: { path: string; title: string; keywords: string[] }[] = [
   { path: '/', title: '书架', keywords: ['bookshelf', 'shelf', '首页', 'home'] },
-  { path: '/search', title: '搜索', keywords: ['search', '查找'] },
-  { path: '/sources', title: '书源管理', keywords: ['source', '书源', 'booksource'] },
   { path: '/rules', title: '替换规则', keywords: ['rule', 'replace', '规则'] },
   { path: '/settings', title: '设置', keywords: ['settings', 'config', '配置', '偏好'] },
   { path: '/users', title: '用户管理', keywords: ['user', '用户', '账号'] },
@@ -70,19 +67,9 @@ const SETTING_COMMANDS: Omit<PaletteCommand, 'group'>[] = [
   },
 ]
 
-/** 搜索书籍命令（跳搜索页；组件会按面板输入词追加「搜索：{kw}」动态命令） */
-export const SEARCH_COMMAND: PaletteCommand = {
-  id: 'search-books',
-  group: '搜索',
-  title: '搜索书籍',
-  keywords: ['search', '搜索', '找书', '书籍'],
-  action: { kind: 'search' },
-}
-
 /** 完整命令表（按分组顺序排列，过滤后保持此顺序） */
 export function paletteCommands(): PaletteCommand[] {
   return [
-    SEARCH_COMMAND,
     ...NAV_PAGES.map(
       (p): PaletteCommand => ({
         id: `nav-${p.path}`,
@@ -113,16 +100,4 @@ export function filterCommands(query: string, commands: PaletteCommand[] = palet
     const hay = `${c.title} ${c.keywords.join(' ')}`.toLowerCase()
     return terms.every((term) => hay.includes(term))
   })
-}
-
-/** 按面板输入词生成「搜索：{kw}」动态命令（跳搜索页并预填关键词） */
-export function searchCommandFor(keyword: string): PaletteCommand {
-  const kw = keyword.trim()
-  return {
-    id: `search-${kw}`,
-    group: '搜索',
-    title: `搜索：${kw}`,
-    keywords: ['search', '搜索', kw],
-    action: { kind: 'search', keyword: kw },
-  }
 }

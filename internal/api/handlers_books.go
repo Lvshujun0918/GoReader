@@ -8,7 +8,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/Lvshujun0918/GoReader/internal/model"
-	"github.com/Lvshujun0918/GoReader/internal/service/bookfetch"
 )
 
 // handleGetBookshelf GET /reader3/getBookshelf。
@@ -178,7 +177,7 @@ func (a *API) handleSaveBookContent(c *gin.Context) {
 	OK(c, nil)
 }
 
-// handleGetBookInfo GET/POST /reader3/getBookInfo：书源书籍详情。
+// handleGetBookInfo GET/POST /reader3/getBookInfo：书籍详情（书架书）。
 func (a *API) handleGetBookInfo(c *gin.Context) {
 	ns, ok := a.ResolveNamespace(c)
 	if !ok {
@@ -190,47 +189,23 @@ func (a *API) handleGetBookInfo(c *gin.Context) {
 	if url == "" {
 		url = paramOf(params, "bookUrl")
 	}
-	origin := paramOf(params, "origin")
-	if origin == "" {
-		origin = paramOf(params, "bookSource")
-	}
 	if url == "" {
 		Fail(c, "书源链接不能为空")
 		return
 	}
-	// 书架已有则直接返回（合并书架字段；tocUrl 实时用 ruleBookInfo 重算——
-	// 书架里可能是旧代码存错的详情 URL，直接返回会致目录只抓 1 章）
-	if book, err := a.Storage.FindBook(ns, url); err == nil && book != nil {
-		info := bookInfoFromBook(book)
-		if source, serr := a.Storage.FindBookSource(ns, book.Origin); serr == nil && source != nil {
-			if real, rerr := (bookfetch.New(a.Storage, ns, a.Solver)).BookInfo(source, url); rerr == nil {
-				if toc, ok := real["tocUrl"].(string); ok && toc != "" {
-					info["tocUrl"] = toc
-				}
-			}
-		}
-		OK(c, info)
-		return
-	}
-	source, err := a.Storage.FindBookSource(ns, origin)
+	book, err := a.Storage.FindBook(ns, url)
 	if err != nil {
 		Fail(c, "系统错误")
 		return
 	}
-	if source == nil {
-		Fail(c, "未找到书源")
+	if book == nil {
+		Fail(c, "书籍不存在")
 		return
 	}
-	fetcher := bookfetch.New(a.Storage, ns, a.Solver)
-	info, err := fetcher.BookInfo(source, url)
-	if err != nil {
-		Fail(c, "获取书籍信息失败："+err.Error())
-		return
-	}
-	OK(c, info)
+	OK(c, bookInfoFromBook(book))
 }
 
-// handleGetBookToc GET/POST /reader3/getBookToc：书源目录。
+// handleGetBookToc GET/POST /reader3/getBookToc：目录（本地书）。
 func (a *API) handleGetBookToc(c *gin.Context) {
 	ns, ok := a.ResolveNamespace(c)
 	if !ok {
@@ -245,10 +220,6 @@ func (a *API) handleGetBookToc(c *gin.Context) {
 	tocURL := paramOf(params, "tocUrl")
 	if tocURL == "" {
 		tocURL = url
-	}
-	origin := paramOf(params, "origin")
-	if origin == "" {
-		origin = paramOf(params, "bookSource")
 	}
 	if url == "" && tocURL == "" {
 		Fail(c, "书源链接不能为空")
@@ -272,37 +243,10 @@ func (a *API) handleGetBookToc(c *gin.Context) {
 		c.Data(200, "application/json; charset=utf-8", []byte(cache.ChaptersJSON))
 		return
 	}
-	source, err := a.Storage.FindBookSource(ns, origin)
-	if err != nil {
-		Fail(c, "系统错误")
-		return
-	}
-	if source == nil {
-		Fail(c, "未找到书源")
-		return
-	}
-	fetcher := bookfetch.New(a.Storage, ns, a.Solver)
-	chapters, _, err := fetcher.BookToc(source, tocURL)
-	if err != nil {
-		Fail(c, "获取目录失败："+err.Error())
-		return
-	}
-	// 构造兼容输出
-	type tocItem struct {
-		Title    string `json:"title"`
-		URL      string `json:"url"`
-		IsVolume bool   `json:"isVolume"`
-		Index    int    `json:"index"`
-	}
-	var items []tocItem
-	for _, ch := range chapters {
-		items = append(items, tocItem{Title: ch.Title, URL: ch.URL, IsVolume: ch.IsVolume, Index: ch.Index})
-	}
-	_ = a.Storage.SetTocCache(url, toAnySlice(items))
-	OK(c, items)
+	Fail(c, "未找到本地书")
 }
 
-// handleGetBookContent GET/POST /reader3/getBookContent：书源正文。
+// handleGetBookContent GET/POST /reader3/getBookContent：正文（本地书）。
 func (a *API) handleGetBookContent(c *gin.Context) {
 	ns, ok := a.ResolveNamespace(c)
 	if !ok {
@@ -315,10 +259,6 @@ func (a *API) handleGetBookContent(c *gin.Context) {
 		url = paramOf(params, "chapterUrl")
 	}
 	index, _ := intParam(params, "chapterIndex")
-	origin := paramOf(params, "origin")
-	if origin == "" {
-		origin = paramOf(params, "bookSource")
-	}
 	if url == "" {
 		Fail(c, "章节链接不能为空")
 		return
@@ -350,56 +290,60 @@ func (a *API) handleGetBookContent(c *gin.Context) {
 		Fail(c, "未找到本地书")
 		return
 	}
-	// 章节缓存优先
+	// 章节缓存优先（本地书非 loc:// 章节 URL）
 	if ch, err := a.Storage.GetChapter(url, index); err == nil && ch != nil && ch.Content != "" {
 		OK(c, map[string]any{"content": ch.Content, "chapterIndex": index, "title": ch.Title})
 		return
 	}
-	source, err := a.Storage.FindBookSource(ns, origin)
-	if err != nil {
-		Fail(c, "系统错误")
-		return
-	}
-	if source == nil {
-		Fail(c, "未找到书源")
-		return
-	}
-	fetcher := bookfetch.New(a.Storage, ns, a.Solver)
-	res, err := fetcher.BookContent(source, url, 10)
-	if err != nil {
-		Fail(c, "获取正文失败："+err.Error())
-		return
-	}
-	// 写入缓存
-	_ = a.Storage.SaveChapter(url, index, "", res.Content)
-	OK(c, map[string]any{"content": res.Content, "chapterIndex": index, "wordCount": res.WordCount})
+	Fail(c, "未找到本地书")
 }
 
-// handleGetChapterListByRule GET/POST /reader3/getChapterListByRule。
-func (a *API) handleGetChapterListByRule(c *gin.Context) {
+// handleSearchBookContent GET/POST /reader3/searchBookContent：全书搜索（缓存章节）。
+func (a *API) handleSearchBookContent(c *gin.Context) {
 	ns, ok := a.ResolveNamespace(c)
 	if !ok {
 		NeedLogin(c)
 		return
 	}
 	params := a.params(c)
-	url := paramOf(params, "url")
-	if url == "" {
+	bookURL := paramOf(params, "bookUrl")
+	key := paramOf(params, "key")
+	if bookURL == "" || key == "" {
 		Fail(c, "参数错误")
 		return
 	}
-	source, err := a.Storage.FindBookSource(ns, paramOf(params, "origin"))
-	if err != nil || source == nil {
-		Fail(c, "未找到书源")
-		return
-	}
-	fetcher := bookfetch.New(a.Storage, ns, a.Solver)
-	chapters, _, err := fetcher.BookToc(source, url)
+	_ = ns
+	chapters, err := a.Storage.ListChapters(bookURL)
 	if err != nil {
-		Fail(c, "获取目录失败："+err.Error())
+		Fail(c, "系统错误")
 		return
 	}
-	OK(c, chapters)
+	type hit struct {
+		ChapterIndex int64  `json:"chapterIndex"`
+		Title        string `json:"title"`
+		Snippet      string `json:"snippet"`
+	}
+	var hits []hit
+	keyLower := strings.ToLower(key)
+	for _, ch := range chapters {
+		lower := strings.ToLower(ch.Content)
+		idx := strings.Index(lower, keyLower)
+		if idx < 0 {
+			continue
+		}
+		start := idx - 30
+		if start < 0 {
+			start = 0
+		}
+		end := idx + len(key) + 30
+		if end > len(ch.Content) {
+			end = len(ch.Content)
+		}
+		snippet := ch.Content[start:end]
+		snippet = strings.ReplaceAll(snippet, "\n", " ")
+		hits = append(hits, hit{ChapterIndex: ch.ChapterIndex, Title: ch.Title, Snippet: snippet})
+	}
+	OK(c, hits)
 }
 
 // handleMigrateLocBook：legacy 本地书迁移（迭代实现）。

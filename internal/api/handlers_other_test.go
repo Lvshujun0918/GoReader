@@ -5,67 +5,6 @@ import (
 	"testing"
 )
 
-// ---------- 书源订阅（远程订阅流程） ----------
-
-// TestSourceSubCRUD 订阅 注册/列表/删除 全链路（真实订阅 URL 示例）。
-func TestSourceSubCRUD(t *testing.T) {
-	handler := newTestAPI(t)
-	const url = "https://ghfast.top/https://raw.githubusercontent.com/XIU2/Yuedu/master/shuyuan"
-
-	// 注册
-	w := perform(handler, "POST", "/reader3/saveSourceSub", map[string]any{"url": url, "name": "XIU2合集"})
-	rd := parseReturn(t, w)
-	if !rd.IsSuccess {
-		t.Fatalf("saveSourceSub 失败: %s", rd.ErrorMsg)
-	}
-	// 列表
-	w = perform(handler, "GET", "/reader3/getSourceSubs", nil)
-	rd = parseReturn(t, w)
-	if !rd.IsSuccess {
-		t.Fatalf("getSourceSubs 失败: %s", rd.ErrorMsg)
-	}
-	list, _ := rd.Data.([]any)
-	if len(list) != 1 {
-		t.Fatalf("订阅列表应 1 个，实际 %d", len(list))
-	}
-	item, _ := list[0].(map[string]any)
-	if item["url"] != url {
-		t.Errorf("订阅 url 不符: %v", item["url"])
-	}
-	if item["name"] != "XIU2合集" {
-		t.Errorf("订阅 name 不符: %v", item["name"])
-	}
-	// 重复注册（复合主键 upsert，仍 1 个）
-	w = perform(handler, "POST", "/reader3/saveSourceSub", map[string]any{"url": url, "name": "XIU2合集"})
-	if !parseReturn(t, w).IsSuccess {
-		t.Fatal("重复注册应成功（upsert）")
-	}
-	// 删除
-	w = perform(handler, "POST", "/reader3/deleteSourceSub", map[string]any{"url": url})
-	if !parseReturn(t, w).IsSuccess {
-		t.Fatal("deleteSourceSub 失败")
-	}
-	w = perform(handler, "GET", "/reader3/getSourceSubs", nil)
-	rd = parseReturn(t, w)
-	list, _ = rd.Data.([]any)
-	if len(list) != 0 {
-		t.Fatalf("删除后应 0 个，实际 %d", len(list))
-	}
-}
-
-// TestDeleteSourceSubMissingURL 缺 url 应返回参数错误。
-func TestDeleteSourceSubMissingURL(t *testing.T) {
-	handler := newTestAPI(t)
-	w := perform(handler, "POST", "/reader3/deleteSourceSub", map[string]any{})
-	rd := parseReturn(t, w)
-	if rd.IsSuccess {
-		t.Fatal("缺 url 应失败")
-	}
-	if !strings.Contains(rd.ErrorMsg, "参数错误") {
-		t.Errorf("错误信息不符: %s", rd.ErrorMsg)
-	}
-}
-
 // ---------- 用户 ----------
 
 // TestUserRegisterLogin 注册（未登录态自动注册）+ 登录 + 密码错误。

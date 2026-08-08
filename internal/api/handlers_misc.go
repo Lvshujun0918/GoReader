@@ -787,17 +787,15 @@ func (a *API) handleGetSystemInfo(c *gin.Context) {
 	_ = ns
 	userCount, _ := a.Storage.CountUsers()
 	bookCount, _ := a.Storage.CountBooks()
-	sourceCount, _ := a.Storage.CountBookSources("default")
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 	OK(c, map[string]any{
-		"version":         "go-5.0.0",
-		"port":            a.Config.Port,
-		"userCount":       userCount,
-		"bookCount":       bookCount,
-		"bookSourceCount": sourceCount,
-		"freeMemory":      fmt.Sprintf("%dMB", mem.Alloc/1024/1024),
-		"totalMemory":     fmt.Sprintf("%dMB", mem.Sys/1024/1024),
+		"version":     "go-5.0.0",
+		"port":        a.Config.Port,
+		"userCount":   userCount,
+		"bookCount":   bookCount,
+		"freeMemory":  fmt.Sprintf("%dMB", mem.Alloc/1024/1024),
+		"totalMemory": fmt.Sprintf("%dMB", mem.Sys/1024/1024),
 	})
 }
 
@@ -807,6 +805,7 @@ func (a *API) handleGetServerStats(c *gin.Context) {
 		NeedLogin(c)
 		return
 	}
+	_ = ns
 	top := a.Stats.Top(10)
 	paths := make([]map[string]any, 0, len(top))
 	for _, p := range top {
@@ -826,8 +825,6 @@ func (a *API) handleGetServerStats(c *gin.Context) {
 	}
 	// CPU（/proc/stat 两次采样，300ms 间隔）
 	cpuPct := cpuUsagePercent()
-	// 书源：总数（成功率统计未实现，占位）
-	totalSources, _ := a.Storage.CountBookSources(ns)
 	OK(c, map[string]any{
 		"version":       "GoReader",
 		"port":          a.Config.Port,
@@ -850,10 +847,6 @@ func (a *API) handleGetServerStats(c *gin.Context) {
 			"topEndpoints": paths,
 		},
 		"online": map[string]any{"sessions": 0},
-		"bookSource": map[string]any{
-			"ok": 0, "total": totalSources, "failed": 0,
-			"successRate": nil, "checkedAt": nil, "note": "暂无统计",
-		},
 	})
 }
 

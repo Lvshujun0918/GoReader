@@ -12,11 +12,9 @@ type User struct {
 	Salt                 string `gorm:"column:salt;not null" json:"-"`
 	Token                string `gorm:"column:token;default:''" json:"token"`
 	TokenMap             string `gorm:"column:token_map" json:"-"`
-	EnableWebdav         bool   `gorm:"column:enable_webdav;default:0" json:"enableWebdav"`
-	EnableLocalStore     bool   `gorm:"column:enable_local_store;default:0" json:"enableLocalStore"`
-	EnableBookSource     bool   `gorm:"column:enable_book_source;default:1" json:"enableBookSource"`
-	BookSourceLimit      int64  `gorm:"column:book_source_limit;default:0" json:"bookSourceLimit"`
-	BookLimit            int64  `gorm:"column:book_limit;default:0" json:"bookLimit"`
+	EnableWebdav     bool   `gorm:"column:enable_webdav;default:0" json:"enableWebdav"`
+	EnableLocalStore bool   `gorm:"column:enable_local_store;default:0" json:"enableLocalStore"`
+	BookLimit        int64  `gorm:"column:book_limit;default:0" json:"bookLimit"`
 	LastLoginAt          int64  `gorm:"column:last_login_at;default:0" json:"lastLoginAt"`
 	CreatedAt            int64  `gorm:"column:created_at;default:0" json:"createdAt"`
 	UserNamespace        string `gorm:"column:user_namespace;default:''" json:"-"`
@@ -83,54 +81,6 @@ type Book struct {
 }
 
 func (Book) TableName() string { return "books" }
-
-// BookSource 书源（复合主键 book_source_url + user_namespace）。
-type BookSource struct {
-	BookSourceURL     string `gorm:"column:book_source_url;primaryKey" json:"bookSourceUrl"`
-	BookSourceName    string `gorm:"column:book_source_name;default:''" json:"bookSourceName"`
-	BookSourceGroup   string `gorm:"column:book_source_group" json:"bookSourceGroup"`
-	BookSourceType    int    `gorm:"column:book_source_type;default:0" json:"bookSourceType"`
-	BookURLPattern    string `gorm:"column:book_url_pattern" json:"bookUrlPattern"`
-	CustomOrder       int    `gorm:"column:custom_order;default:0" json:"customOrder"`
-	Enabled           int    `gorm:"column:enabled" json:"enabled"`
-	EnabledExplore    int    `gorm:"column:enabled_explore" json:"enabledExplore"`
-	EnabledCookieJar  int    `gorm:"column:enabled_cookie_jar" json:"enabledCookieJar"`
-	ConcurrentRate    string `gorm:"column:concurrent_rate" json:"concurrentRate"`
-	Header            string `gorm:"column:header" json:"header"`
-	ProxyURL          string `gorm:"column:proxy_url" json:"proxyUrl"`
-	LoginURL          string `gorm:"column:login_url" json:"loginUrl"`
-	LoginUI           string `gorm:"column:login_ui" json:"loginUi"`
-	LoginCheckJS      string `gorm:"column:login_check_js" json:"loginCheckJs"`
-	LoginJS           string `gorm:"column:login_js" json:"loginJs"`
-	BookSourceComment string `gorm:"column:book_source_comment" json:"bookSourceComment"`
-	VariableComment   string `gorm:"column:variable_comment" json:"variableComment"`
-	LastUpdateTime    int64  `gorm:"column:last_update_time;default:0" json:"lastUpdateTime"`
-	RespondTime       int64  `gorm:"column:respond_time;default:0" json:"respondTime"`
-	Weight            int64  `gorm:"column:weight;default:0" json:"weight"`
-	UseCount          int64  `gorm:"column:use_count;default:0" json:"useCount"`
-	UseTs             int64  `gorm:"column:use_ts;default:0" json:"useTs"`
-	ExploreURL        string `gorm:"column:explore_url" json:"exploreUrl"`
-	SearchURL         string `gorm:"column:search_url" json:"searchUrl"`
-	RuleExplore       string `gorm:"column:rule_explore" json:"ruleExplore"`
-	RuleSearch        string `gorm:"column:rule_search" json:"ruleSearch"`
-	RuleBookInfo      string `gorm:"column:rule_book_info" json:"ruleBookInfo"`
-	RuleToc           string `gorm:"column:rule_toc" json:"ruleToc"`
-	RuleContent       string `gorm:"column:rule_content" json:"ruleContent"`
-	RuleRelated       string `gorm:"column:rule_related" json:"ruleRelated"`
-	SearchRule        string `gorm:"column:search_rule" json:"searchRule"`
-	ExploreRule       string `gorm:"column:explore_rule" json:"exploreRule"`
-	BookInfoRule      string `gorm:"column:book_info_rule" json:"bookInfoRule"`
-	TocRule           string `gorm:"column:toc_rule" json:"tocRule"`
-	ContentRule       string `gorm:"column:content_rule" json:"contentRule"`
-	Key               string `gorm:"column:key" json:"key"`
-	Tag               string `gorm:"column:tag" json:"tag"`
-	Logger            string `gorm:"column:logger" json:"logger"`
-	Variable          string `gorm:"column:variable" json:"variable"`
-	UserNamespace     string `gorm:"column:user_namespace;primaryKey;default:''" json:"-"`
-	RawJSON           string `gorm:"column:raw_json" json:"-"`
-}
-
-func (BookSource) TableName() string { return "book_sources" }
 
 // BookChapter 章节缓存（复合主键 book_url + chapter_index）。
 type BookChapter struct {
@@ -209,28 +159,6 @@ type HttpTTS struct {
 }
 
 func (HttpTTS) TableName() string { return "http_tts_list" }
-
-// SourceSub 订阅（复合主键 url + user_namespace）。
-type SourceSub struct {
-	URL           string `gorm:"column:url;primaryKey" json:"url"`
-	Name          string `gorm:"column:name;not null;default:''" json:"name"`
-	Enabled       int    `gorm:"column:enabled;default:1" json:"enabled"`
-	UserNamespace string `gorm:"column:user_namespace;primaryKey;default:''" json:"-"`
-	RawJSON       string `gorm:"column:raw_json" json:"-"`
-}
-
-func (SourceSub) TableName() string { return "source_subs" }
-
-// BookSourceCookie 书源 cookie（复合主键 user_namespace + source_url）。
-type BookSourceCookie struct {
-	UserNamespace string `gorm:"column:user_namespace;primaryKey" json:"-"`
-	SourceURL     string `gorm:"column:source_url;primaryKey" json:"sourceUrl"`
-	Cookie        string `gorm:"column:cookie" json:"cookie"`
-	UserAgent     string `gorm:"column:user_agent" json:"userAgent"`
-	UpdatedAt     int64  `gorm:"column:updated_at;default:0" json:"updatedAt"`
-}
-
-func (BookSourceCookie) TableName() string { return "book_source_cookies" }
 
 // SystemSetting 系统设置键值表（主键 key；OPDS 独立账号等）。
 type SystemSetting struct {

@@ -32,10 +32,8 @@
   <h1>书架</h1>
   <nav>
     <a href="index.html?accessToken=__TOKEN__">书架</a>
-    <a href="search.html?accessToken=__TOKEN__">搜索</a>
   </nav>
   <input id="searchbox" type="search" placeholder="过滤书架…" value="">
-  <a class="btn" id="goSearch" href="search.html?accessToken=__TOKEN__">全网搜索</a>
   <div id="status">加载中…</div>
   <ul id="list"></ul>
 </div>
@@ -94,7 +92,7 @@
               "</a></li>";
     }
     if (!books.length) {
-      status.innerHTML = "书架为空，去 <a href='search.html?accessToken=" + encodeURIComponent(TOKEN) + "'>搜索</a> 添加书籍";
+      status.innerHTML = "书架为空，请在书架页导入本地书籍";
       list.innerHTML = "";
     } else if (!shown) {
       list.innerHTML = "<li class='empty'>无匹配书籍</li>";
@@ -119,14 +117,6 @@
     });
 
   searchbox.addEventListener("input", function () { render(searchbox.value); });
-  document.getElementById("goSearch").addEventListener("click", function (ev) {
-    var key = searchbox.value.trim();
-    if (key) {
-      ev.preventDefault();
-      location.href = "search.html?key=" + encodeURIComponent(key) +
-                      "&accessToken=" + encodeURIComponent(TOKEN);
-    }
-  });
 })();
 </script>
 </body>

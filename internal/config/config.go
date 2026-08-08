@@ -33,11 +33,8 @@ type Config struct {
 	// SimpleWebRoot Kindle 轻量页目录
 	SimpleWebRoot string
 	// DefaultUserEnableWebdav 默认新用户权限
-	DefaultUserEnableWebdav bool
+	DefaultUserEnableWebdav     bool
 	DefaultUserEnableLocalStore bool
-	DefaultUserEnableBookSource bool
-	// DefaultUserBookSourceLimit 默认新用户书源上限
-	DefaultUserBookSourceLimit int64
 	// DefaultUserBookLimit 默认新用户书籍上限
 	DefaultUserBookLimit int64
 	// UploadMaxMB 上传大小上限（MB）
@@ -52,14 +49,6 @@ type Config struct {
 	LocalBookDir string
 	// AutoBackupHour 每日自动备份小时
 	AutoBackupHour int
-	// FlareSolverrURL 外部 FlareSolverr 服务地址（可选，未实现客户端）
-	FlareSolverrURL string
-	// ObscuraURL / Bin / Proxy 浏览器自动化后端（质询求解，见 internal/service/solver）
-	ObscuraURL   string
-	ObscuraBin   string
-	ObscuraProxy string
-	// CDPNoStealth 跳过 stealth JS 注入（测试钩子）
-	CDPNoStealth bool
 }
 
 // FromEnv 从环境变量构建配置。
@@ -76,22 +65,15 @@ func FromEnv() *Config {
 		TokenTTLDays:             envI64("READER_TOKEN_TTL_DAYS", 30),
 		WebRoot:                  envStr("READER_APP_WEB_ROOT", "web-ui/dist"),
 		SimpleWebRoot:            envStr("READER_APP_SIMPLE_WEB_ROOT", "web-simple"),
-		DefaultUserEnableWebdav:  envFlag("READER_APP_DEFAULTUSERENABLEWEBDAV"),
+		DefaultUserEnableWebdav:     envFlag("READER_APP_DEFAULTUSERENABLEWEBDAV"),
 		DefaultUserEnableLocalStore: envFlag("READER_APP_DEFAULTUSERENABLELOCALSTORE"),
-		DefaultUserEnableBookSource: envFlag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE"),
-		DefaultUserBookSourceLimit: envI64("READER_APP_DEFAULTUSERBOOKSOURCELIMIT", 100),
-		DefaultUserBookLimit:     envI64("READER_APP_DEFAULTUSERBOOKLIMIT", 200),
+		DefaultUserBookLimit:        envI64("READER_APP_DEFAULTUSERBOOKLIMIT", 200),
 		UploadMaxMB:              envI64("READER_UPLOAD_MAX_MB", 100),
 		ImageCacheMB:             envI64("READER_IMAGE_CACHE_MB", 512),
 		MongoURI:                 os.Getenv("READER_MONGODB_URI"),
 		TrustedProxies:           envList("READER_TRUSTED_PROXIES"),
 		LocalBookDir:             os.Getenv("READER_LOCAL_BOOK_DIR"),
 		AutoBackupHour:           envInt("READER_AUTO_BACKUP_HOUR", 3),
-		FlareSolverrURL:          os.Getenv("FLARESOLVERR_URL"),
-		ObscuraURL:               os.Getenv("READER_OBSCURA_URL"),
-		ObscuraBin:               os.Getenv("READER_OBSCURA_BIN"),
-		ObscuraProxy:             os.Getenv("READER_OBSCURA_PROXY"),
-		CDPNoStealth:             envFlag("READER_CDP_NO_STEALTH"),
 	}
 }
 

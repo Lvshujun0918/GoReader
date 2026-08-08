@@ -3,16 +3,12 @@
  * 全局命令面板（Ctrl+K）——任意页面可用：
  * - Ctrl+K / Ctrl+Shift+K 开关（Esc 关闭）
  * - ↑↓ 选择 / Enter 执行 / Esc 关闭（输入框内与面板级均生效）
- * - 输入即过滤命令；输入非空时追加「搜索：{kw}」动态命令（跳搜索页预填）
+ * - 输入即过滤命令
  * 挂载于 App.vue（全局单例），不依赖当前路由页面。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import {
-  filterCommands,
-  searchCommandFor,
-  type PaletteCommand,
-} from '@/utils/commandPalette'
+import { filterCommands, type PaletteCommand } from '@/utils/commandPalette'
 import { applyUiTheme } from '@/utils/uiTheme'
 import { setLang } from '@/utils/i18n'
 
@@ -24,13 +20,8 @@ const activeIndex = ref(0)
 const inputRef = ref<HTMLInputElement | null>(null)
 const listRef = ref<HTMLUListElement | null>(null)
 
-/** 过滤后的命令列表；输入非空时末尾追加「搜索：{kw}」动态命令 */
-const commands = computed<PaletteCommand[]>(() => {
-  const kw = query.value.trim()
-  const list = filterCommands(query.value)
-  if (kw) list.push(searchCommandFor(kw))
-  return list
-})
+/** 过滤后的命令列表 */
+const commands = computed<PaletteCommand[]>(() => filterCommands(query.value))
 
 watch(commands, () => {
   if (activeIndex.value >= commands.value.length) activeIndex.value = Math.max(0, commands.value.length - 1)
@@ -55,11 +46,6 @@ function runCommand(cmd: PaletteCommand) {
   switch (cmd.action.kind) {
     case 'navigate':
       void router.push(cmd.action.path)
-      break
-    case 'search':
-      void router.push(
-        cmd.action.keyword ? { path: '/search', query: { key: cmd.action.keyword } } : '/search',
-      )
       break
     case 'theme':
       applyUiTheme(cmd.action.theme)

@@ -100,26 +100,6 @@ export interface BookContent {
   [key: string]: unknown
 }
 
-/** 搜索结果（/reader3/searchBookMulti → SearchBook，全字段 camelCase） */
-export interface SearchBook {
-  bookUrl: string
-  origin: string
-  originName: string
-  type: number
-  name: string
-  author: string
-  kind?: string | null
-  coverUrl?: string | null
-  intro?: string | null
-  wordCount?: string | null
-  latestChapterTitle?: string | null
-  tocUrl: string
-  time?: number
-  variable?: string | null
-  originOrder?: number
-  [key: string]: unknown
-}
-
 /** 书架分组（/reader3/getBookGroups → BookGroup，camelCase；books.group 存分组 id，0=未分组）
  * 契约扩展：orderNum（=legacy order 排序）+ bookCount（组内书数，后端并行实现中——
  * 后端未返回时前端以本地书架统计兜底）。 */
@@ -131,28 +111,6 @@ export interface BookGroup {
   orderNum?: number
   /** 组内书数（契约字段，后端返回时优先使用，否则本地统计） */
   bookCount?: number
-  [key: string]: unknown
-}
-
-/** RSS 订阅源（/reader3/getRssSources → RssSource，legacy 兼容 camelCase） */
-export interface RssSource {
-  rssSourceUrl: string
-  rssSourceName: string
-  rssSourceGroup?: string | null
-  enabled: boolean
-  [key: string]: unknown
-}
-
-/** RSS 文章（/reader3/getRssArticles → data 数组；content 为正文 HTML，getRssArticle 单独拉取） */
-export interface RssArticle {
-  url: string
-  title: string
-  author?: string | null
-  time: number
-  content?: string | null
-  cover?: string | null
-  /** 已读标记（getRssArticles 返回 hasRead；点击文章后置 true） */
-  hasRead?: boolean
   [key: string]: unknown
 }
 
@@ -201,9 +159,6 @@ export interface ReaderUser {
   username: string
   enableWebdav: boolean
   enableLocalStore: boolean
-  enableBookSource: boolean
-  enableRssSource: boolean
-  bookSourceLimit: number
   bookLimit: number
   lastLoginAt: number
   [key: string]: unknown
@@ -214,19 +169,15 @@ export interface UserUpdatePayload {
   username: string
   enableWebdav?: boolean
   enableLocalStore?: boolean
-  enableBookSource?: boolean
-  enableRssSource?: boolean
-  bookSourceLimit?: number
   bookLimit?: number
 }
 
-/** 系统信息（/reader3/getSystemInfo：版本/端口/用户数/书数/书源数） */
+/** 系统信息（/reader3/getSystemInfo：版本/端口/用户数/书数） */
 export interface SystemInfo {
   version: string
   port: number
   userCount: number
   bookCount: number
-  bookSourceCount: number
   freeMemory?: string
   totalMemory?: string
   maxMemory?: string

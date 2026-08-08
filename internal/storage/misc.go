@@ -168,24 +168,6 @@ func (s *Storage) DeleteHttpTTS(ns, url string) error {
 	return s.DB.Where("user_namespace = ? AND url = ?", ns, url).Delete(&model.HttpTTS{}).Error
 }
 
-// ---------------- 订阅 ----------------
-
-func (s *Storage) ListSourceSubs(ns string) ([]model.SourceSub, error) {
-	var out []model.SourceSub
-	err := s.DB.Where("user_namespace = ?", ns).Find(&out).Error
-	return out, err
-}
-
-func (s *Storage) SaveSourceSub(ns string, sub *model.SourceSub) error {
-	sub.UserNamespace = ns
-	return s.DB.Clauses(clause.OnConflict{UpdateAll: true}).Create(sub).Error
-}
-
-func (s *Storage) DeleteSourceSub(ns, url string) error {
-	return s.DB.Where("user_namespace = ? AND url = ?", ns, url).Delete(&model.SourceSub{}).Error
-}
-
-
 func (s *Storage) GetUserConfig(ns, key string) (map[string]any, error) {
 	var c model.UserConfig
 	if err := s.DB.Where("user_namespace = ? AND ns = ?", ns, key).First(&c).Error; err != nil {

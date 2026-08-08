@@ -75,7 +75,6 @@ func (s *Storage) AutoMigrate() error {
 	return s.DB.AutoMigrate(
 		&model.User{},
 		&model.Book{},
-		&model.BookSource{},
 		&model.BookChapter{},
 		&model.TocCache{},
 		&model.Bookmark{},
@@ -83,8 +82,6 @@ func (s *Storage) AutoMigrate() error {
 		&model.ReplaceRule{},
 		&model.TxtTocRule{},
 		&model.HttpTTS{},
-		&model.SourceSub{},
-		&model.BookSourceCookie{},
 		&model.SystemSetting{},
 		&model.UserConfig{},
 		&model.ReadingStat{},

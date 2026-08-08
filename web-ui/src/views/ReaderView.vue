@@ -1667,14 +1667,6 @@ async function copySelection() {
   ElMessage.success('已复制')
 }
 
-function searchSelection() {
-  const text = selText.value
-  clearSelection()
-  hideSelBar()
-  if (!text) return
-  void router.push({ path: '/search', query: { key: text } })
-}
-
 /* ---------------- GAP 124：复制本章（navigator.clipboard 全文；失败回退 execCommand；提示字数） ---------------- */
 
 async function copyChapter() {
@@ -3984,11 +3976,10 @@ onBeforeUnmount(() => {
       </div>
     </transition>
 
-    <!-- 划词工具条（复制 / 搜索 / 朗读） -->
+    <!-- 划词工具条（复制 / 朗读） -->
     <transition name="pop">
       <div v-if="selOpen" class="sel-bar" :style="{ left: `${selX}px`, top: `${selY}px` }">
         <button type="button" class="sel-btn" @click="copySelection">复制</button>
-        <button type="button" class="sel-btn" @click="searchSelection">搜索</button>
         <button type="button" class="sel-btn" title="朗读选中文本" @click="speakSelection">朗读</button>
       </div>
     </transition>

@@ -134,8 +134,6 @@ func (a *API) register(c *gin.Context, username, passwordStr, code string) {
 		Token:            randomToken(),
 		EnableWebdav:     cfg.DefaultUserEnableWebdav,
 		EnableLocalStore: cfg.DefaultUserEnableLocalStore,
-		EnableBookSource: cfg.DefaultUserEnableBookSource,
-		BookSourceLimit:  cfg.DefaultUserBookSourceLimit,
 		BookLimit:        cfg.DefaultUserBookLimit,
 		LastLoginAt:      now,
 		CreatedAt:        now,
@@ -224,24 +222,18 @@ func (a *API) handleUpdateUser(c *gin.Context) {
 		Fail(c, "参数错误")
 		return
 	}
-	var eb, el, es *bool
+	var eb, el *bool
 	if v, ok := boolParam(params, "enableWebdav"); ok {
 		eb = &v
 	}
 	if v, ok := boolParam(params, "enableLocalStore"); ok {
 		el = &v
 	}
-	if v, ok := boolParam(params, "enableBookSource"); ok {
-		es = &v
-	}
-	var ib, il *int64
-	if v, ok := intParam(params, "bookSourceLimit"); ok {
-		ib = &v
-	}
+	var il *int64
 	if v, ok := intParam(params, "bookLimit"); ok {
 		il = &v
 	}
-	n, err := a.Storage.UpdateUserPermissions(username, eb, el, es, ib, il)
+	n, err := a.Storage.UpdateUserPermissions(username, eb, el, il)
 	if err != nil {
 		Fail(c, "系统错误")
 		return
@@ -411,8 +403,6 @@ func userAdminJSON(u *model.User) map[string]any {
 		"username":         u.Username,
 		"enableWebdav":     u.EnableWebdav,
 		"enableLocalStore": u.EnableLocalStore,
-		"enableBookSource": u.EnableBookSource,
-		"bookSourceLimit":  u.BookSourceLimit,
 		"bookLimit":        u.BookLimit,
 		"lastLoginAt":      u.LastLoginAt,
 		"createdAt":        u.CreatedAt,

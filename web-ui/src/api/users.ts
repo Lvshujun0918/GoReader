@@ -6,8 +6,7 @@ import type { ReaderUser, ReturnData, UserUpdatePayload } from '@/types'
  * 用户管理 API（后端并行实现中，接口可能 404——调用方需容错）
  *
  * GET  /reader3/getUsers         → ReturnData<ReaderUser[]>（secure 模式需 secure+secureKey query）
- * POST /reader3/updateUser       → body：username + enableWebdav/enableLocalStore/enableBookSource/
- *                                  enableRssSource/bookSourceLimit/bookLimit（缺省字段不修改）
+ * POST /reader3/updateUser       → body：username + enableWebdav/enableLocalStore/bookLimit（缺省字段不修改）
  * POST /reader3/deleteUser       → body：username（不能删除自己）
  * POST /reader3/resetUserPassword → body：username + newPassword
  *
@@ -60,8 +59,6 @@ export interface AddUserPayload {
   password: string
   enableWebdav?: boolean
   enableLocalStore?: boolean
-  enableBookSource?: boolean
-  enableRssSource?: boolean
 }
 
 /**

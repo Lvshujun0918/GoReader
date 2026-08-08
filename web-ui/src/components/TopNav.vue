@@ -28,9 +28,7 @@ import {
   ArrowLeft,
   BookMarked,
   ChevronDown,
-  Library,
   LogOut,
-  Search,
   Settings,
   SlidersHorizontal,
   Users,
@@ -61,8 +59,6 @@ const props = withDefaults(
     active: '',
     links: () => [
       'bookshelf',
-      'search',
-      'sources',
       'rules',
       'monitor',
       'users',
@@ -84,8 +80,6 @@ const store = useUserStore()
 /** 导航键 → 路由 / i18n 文案 / lucide 图标（键名与 i18n nav.* 对齐；缺失回退 zh/原文） */
 const NAV_LINKS: Record<string, { to: string; i18n: string; icon: Component }> = {
   bookshelf: { to: '/', i18n: 'nav.bookshelf', icon: BookMarked },
-  search: { to: '/search', i18n: 'nav.search', icon: Search },
-  sources: { to: '/sources', i18n: 'nav.sources', icon: Library },
   rules: { to: '/rules', i18n: 'nav.rules', icon: SlidersHorizontal },
   monitor: { to: '/server-stats', i18n: 'nav.serverStats', icon: Activity },
   users: { to: '/users', i18n: 'nav.users', icon: Users },
@@ -101,11 +95,11 @@ onMounted(() => {
 })
 
 /** 主菜单键（一级直接显示） */
-const PRIMARY_KEYS = ['bookshelf', 'search', 'settings']
+const PRIMARY_KEYS = ['bookshelf', 'settings']
 
 /** 二级分组：组 i18n → 菜单键 */
 const GROUPS: { i18n: string; keys: string[] }[] = [
-  { i18n: 'nav.groupSources', keys: ['sources', 'rules'] },
+  { i18n: 'nav.groupRules', keys: ['rules'] },
   { i18n: 'nav.groupManage', keys: ['monitor', 'users'] },
 ]
 

@@ -92,25 +92,6 @@ func TestBookCRUDAndNamespaceIsolation(t *testing.T) {
 	}
 }
 
-func TestBookSourceDefaultFallback(t *testing.T) {
-	s := testStorage(t)
-	// 只有 default 命名空间有书源
-	src := &model.BookSource{BookSourceURL: "https://src/1", BookSourceName: "源1"}
-	if err := s.SaveBookSource("default", src); err != nil {
-		t.Fatalf("SaveBookSource 失败: %v", err)
-	}
-	// 用户无书源 → 回退 default
-	list, err := s.ListBookSources("userX")
-	if err != nil || len(list) != 1 || list[0].BookSourceName != "源1" {
-		t.Fatalf("default 回退失败: %v / %v", list, err)
-	}
-	// 直接查找
-	found, err := s.FindBookSource("userX", "https://src/1")
-	if err != nil || found == nil {
-		t.Fatalf("FindBookSource 回退失败: %v / %v", found, err)
-	}
-}
-
 func TestCacheInfo(t *testing.T) {
 	s := testStorage(t)
 	_ = s.SaveChapter("https://b/1", 0, "t", "content123")
