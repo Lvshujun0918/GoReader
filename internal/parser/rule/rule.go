@@ -210,19 +210,41 @@ func extractText(n *html.Node) string {
 
 // ---------- legado 链式选择器 ----------
 
-// isChainSelector 是否为 legado 链式选择器（class./id./tag./text. 开头，无 @css: 前缀）。
+// chainTagNames 常见 HTML 标签（链式裸标签开头：td.0@text = tag.td 推进）。
+var chainTagNames = map[string]bool{
+	"div": true, "li": true, "ul": true, "ol": true, "td": true, "tr": true,
+	"table": true, "a": true, "span": true, "p": true, "em": true, "strong": true,
+	"b": true, "i": true, "u": true, "small": true, "h1": true, "h2": true,
+	"h3": true, "h4": true, "h5": true, "h6": true, "dl": true, "dt": true,
+	"dd": true, "img": true, "nav": true, "section": true, "article": true,
+	"header": true, "footer": true, "form": true, "input": true, "button": true,
+	"select": true, "option": true, "br": true, "blockquote": true, "figure": true,
+	"figcaption": true, "summary": true, "details": true, "main": true, "aside": true,
+	"time": true, "label": true, "font": true, "center": true,
+}
+
+// isChainSelector 是否为 legado 链式选择器（class./id./tag./text./.class 缩写/裸标签开头，无 @css: 前缀）。
 func isChainSelector(rule string) bool {
-	for _, p := range []string{"class.", "id.", "tag.", "text."} {
+	for _, p := range []string{"class.", "id.", "tag.", "text.", "."} {
 		if strings.HasPrefix(rule, p) {
 			return true
 		}
 	}
-	return false
+	// 裸标签开头：td.0@text / td@text / tr.odd@td.0@text（legado @td = tag.td）
+	m := regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9-]*)(?:\.[a-zA-Z_][a-zA-Z0-9_-]*)?(?:\.\d+)?([@]|$)`).FindStringSubmatch(rule)
+	return m != nil && chainTagNames[strings.ToLower(m[1])]
 }
 
 // IsChainSelector 导出：legado 链式选择器判断。
 func IsChainSelector(rule string) bool {
 	return isChainSelector(rule)
+}
+
+// chainAttrNames 常见属性名（链式裸段命中 → 属性输出，无需 @html）。
+var chainAttrNames = map[string]bool{
+	"href": true, "src": true, "data-src": true, "data-original": true,
+	"data-url": true, "data-href": true, "alt": true, "title": true,
+	"class": true, "id": true, "style": true, "onclick": true,
 }
 
 // ChainNeedsHTML 链式选择器作为 bookList 时是否需要补 @html 输出（末段为推进操作）。
@@ -234,12 +256,30 @@ func ChainNeedsHTML(val string) bool {
 	if len(segs) == 0 {
 		return false
 	}
-	return !chainIsOutput(segs[len(segs)-1])
+	last := segs[len(segs)-1]
+	base, _ := chainSplitIdx(last)
+	base = strings.TrimSpace(base)
+	// 输出操作（text/html/js:/json:/regex:/属性）→ 无需 @html
+	if base == "text" || base == "html" ||
+		strings.HasPrefix(base, "js:") ||
+		strings.HasPrefix(base, "json:") ||
+		strings.HasPrefix(base, "regex:") ||
+		chainAttrNames[base] {
+		return false
+	}
+	return true
 }
 
 // evalCSSChainFromInput 从 HTML 文本执行链式选择器。
 func evalCSSChainFromInput(input, selector string, ctx *Context) []string {
-	doc, err := htmlquery.Parse(strings.NewReader(input))
+	// 裸表元素片段（<tr>/<td>/<th>/<tbody> 等）会被 HTML5 解析器吞掉——包裹 <table> 保留结构
+	wrapped := input
+	if t := strings.TrimSpace(input); strings.HasPrefix(t, "<tr") ||
+		strings.HasPrefix(t, "<td") || strings.HasPrefix(t, "<th") ||
+		strings.HasPrefix(t, "<tbody") || strings.HasPrefix(t, "<table") {
+		wrapped = "<table>" + input + "</table>"
+	}
+	doc, err := htmlquery.Parse(strings.NewReader(wrapped))
 	if err != nil {
 		return nil
 	}
@@ -264,10 +304,15 @@ func evalCSSChain(doc *html.Node, selector string, ctx *Context) []string {
 		if chainIsOutput(seg) {
 			return chainOutput(nodes, seg, ctx)
 		}
-		nodes = chainAdvance(nodes, seg)
-		if len(nodes) == 0 {
+		advanced := chainAdvance(nodes, seg)
+		if len(advanced) == 0 {
+			// 裸段推进失败（如 @href 属性、@text 误判）→ 尝试属性输出；仍无则结束
+			if out := chainOutput(nodes, seg, ctx); len(out) > 0 {
+				return out
+			}
 			return nil
 		}
+		nodes = advanced
 	}
 	// 默认输出：元素文本
 	var out []string
@@ -375,14 +420,19 @@ func chainFindText(n *html.Node, name string) []*html.Node {
 	return out
 }
 
-// chainIsOutput 段是否为输出操作（text/html/属性/js:/json:/regex:；tag./css:/xpath: 为推进）。
+// chainIsOutput 段是否为输出操作（text/html/js:/json:/regex:）。
+// 其余（tag./class./id./css:/xpath:/裸标签/属性）先按推进处理；推进失败再回退属性输出。
 func chainIsOutput(seg string) bool {
 	base, _ := chainSplitIdx(seg)
 	base = strings.TrimSpace(base)
-	if strings.HasPrefix(base, "tag.") || strings.HasPrefix(base, "css:") || strings.HasPrefix(base, "xpath:") {
-		return false
+	// 拆分 ## 文本替换后缀（text##pattern = 输出 text 后替换）
+	if i := strings.Index(base, "##"); i >= 0 {
+		base = strings.TrimSpace(base[:i])
 	}
-	return true
+	return base == "text" || base == "html" ||
+		strings.HasPrefix(base, "js:") ||
+		strings.HasPrefix(base, "json:") ||
+		strings.HasPrefix(base, "regex:")
 }
 
 // chainAdvance 推进操作：tag.x / css:... / xpath:... 匹配子孙节点 + .N。
@@ -420,7 +470,14 @@ func chainAdvance(nodes []*html.Node, seg string) []*html.Node {
 			}
 		}
 	default:
-		return nil
+		// 裸段（无前缀）：当作标签名推进（legado @td = tag.td）
+		sel, err := cascadia.Compile(base)
+		if err != nil {
+			return nil
+		}
+		for _, n := range nodes {
+			out = append(out, sel.MatchAll(n)...)
+		}
 	}
 	if idx >= 0 && idx < len(out) {
 		return []*html.Node{out[idx]}
@@ -429,9 +486,16 @@ func chainAdvance(nodes []*html.Node, seg string) []*html.Node {
 }
 
 // chainOutput 输出操作：text / html / 属性 / js: / json: / regex:（对节点文本），+ .N。
+// 支持 ## 文本替换后缀（legado：text##pattern##replacement 或 text##pattern 删除匹配）。
 func chainOutput(nodes []*html.Node, seg string, ctx *Context) []string {
 	base, idx := chainSplitIdx(seg)
 	base = strings.TrimSpace(base)
+	// ## 后缀：取文本后正则替换（如 tag.a.0@text##《|》 → 去掉书名号/竖线）
+	replaceOp := ""
+	if i := strings.Index(base, "##"); i >= 0 {
+		replaceOp = base[i:]
+		base = strings.TrimSpace(base[:i])
+	}
 	ns := nodes
 	if idx >= 0 && idx < len(ns) {
 		ns = []*html.Node{ns[idx]}
@@ -454,6 +518,32 @@ func chainOutput(nodes []*html.Node, seg string, ctx *Context) []string {
 			if v := attrValue(n, base); v != "" {
 				out = append(out, v)
 			}
+		}
+	}
+	if replaceOp != "" && len(out) > 0 {
+		out = applyChainReplace(out, replaceOp)
+	}
+	return out
+}
+
+// applyChainReplace 链式输出后的 ## 正则替换：##pattern##replacement（replacement 缺省为空，即删除匹配）。
+func applyChainReplace(inputs []string, op string) []string {
+	parts := strings.Split(strings.TrimPrefix(op, "##"), "##")
+	pattern := parts[0]
+	replacement := ""
+	if len(parts) >= 2 {
+		replacement = parts[1]
+	}
+	re, err := regexp2.Compile(pattern, regexp2.None)
+	if err != nil {
+		return inputs
+	}
+	out := make([]string, 0, len(inputs))
+	for _, s := range inputs {
+		if r, err := re.Replace(s, replacement, -1, -1); err == nil {
+			out = append(out, r)
+		} else {
+			out = append(out, s)
 		}
 	}
 	return out

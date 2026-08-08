@@ -509,6 +509,42 @@ func daHuiLangRuleSearch() string {
 	return `{"author":"$.author","bookList":"$.data","bookUrl":"<js>let book_id = result.book_id; let url = result.toc_url || ''; ` + "`" + `data:;base64,${java.base64Encode(JSON.stringify({book_id:book_id,url:url}))}` + "`" + `</js>","coverUrl":"$.thumb_url","intro":"$.abstract","name":"$.book_name","wordCount":"$.word_number"}`
 }
 
+// TestSearchChainFieldRules 搜索结果字段链式规则（用户报告场景）：
+// bookList=.odd（class 缩写）+ 裸 tag 推进（td.0）+ ## 文本替换（##《|》）。
+func TestSearchChainFieldRules(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<table>
+			<tr class="odd"><td>《书名一》</td><td>作者一</td></tr>
+			<tr class="odd"><td>《书名二》</td><td>作者二</td></tr>
+		</table>`)
+	}))
+	defer srv.Close()
+
+	src := &model.BookSource{
+		BookSourceURL: srv.URL, BookSourceName: "链式规则源",
+		SearchURL:     srv.URL + "/search?key={key}",
+		RuleSearch:    `{"bookList":".odd","name":"td.0@text##《|》","author":"td.1@text"}`,
+	}
+	results, err := SearchSource(src, "测试")
+	if err != nil {
+		t.Fatalf("SearchSource 失败: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("应 2 条结果，实际 %d: %+v", len(results), results)
+	}
+	if results[0].Name != "书名一" {
+		t.Errorf("书名应解析为「书名一」（不含规则串），实际: %q", results[0].Name)
+	}
+	if results[0].Author != "作者一" {
+		t.Errorf("作者应解析为「作者一」，实际: %q", results[0].Author)
+	}
+	if results[1].Name != "书名二" {
+		t.Errorf("第 2 本书名: %q", results[1].Name)
+	}
+}
+
 /* ================= 大灰狼融合书源（goja JS 搜索 + SSE 格式 + 调试） ================= */
 
 // daHuiLangSource 加载大灰狼书源 fixture（bookSourceUrl 重定向到 mock server）。

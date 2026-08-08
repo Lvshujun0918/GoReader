@@ -165,3 +165,33 @@ func TestRegexReplace(t *testing.T) {
 		t.Fatalf("正则替换失败: %v", out)
 	}
 }
+
+// TestChainDotClass 链式选择器 .class 缩写（.odd.0@text）。
+func TestChainDotClass(t *testing.T) {
+	html := `<table><tr class="odd"><td>《书名》|作者</td></tr><tr><td>其它</td></tr></table>`
+	// .odd.0@td.0@text → 书名
+	out := Parse(html, ".odd.0@td.0@text", nil)
+	if len(out) != 1 || out[0] != "《书名》|作者" {
+		t.Fatalf(".odd 链式失败: %v", out)
+	}
+	// 无 .N：.odd 所有匹配行
+	out = Parse(html, ".odd@td.0@text", nil)
+	if len(out) != 1 || out[0] != "《书名》|作者" {
+		t.Fatalf(".odd 链式失败: %v", out)
+	}
+}
+
+// TestChainTextReplace 链式输出 + ## 替换后缀（tag.a.0@text##《|》）。
+func TestChainTextReplace(t *testing.T) {
+	html := `<ul><li><a>《斗破苍穹》</a></li></ul>`
+	// tag.li.0@tag.a.0@text##《|》 → 去掉《》（pattern 缺 replacement = 删除匹配）
+	out := Parse(html, "tag.li.0@tag.a.0@text##《|》", nil)
+	if len(out) != 1 || out[0] != "斗破苍穹" {
+		t.Fatalf("## 替换失败: %v", out)
+	}
+	// ##pattern##replacement 显式替换（《 → 〔）
+	out = Parse(html, "tag.li.0@tag.a.0@text##《##〔", nil)
+	if len(out) != 1 || out[0] != "〔斗破苍穹》" {
+		t.Fatalf("## 显式替换失败: %v", out)
+	}
+}
