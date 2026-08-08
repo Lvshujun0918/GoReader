@@ -27,6 +27,11 @@ func TestFullFlowJianLai(t *testing.T) {
 			t.Logf("跳过（合集无此书源）: %s", name)
 			continue
 		}
+		// 天天看小说：搜索页为 SPA（SSR 无搜索结果），改用官方 JSON API（
+		// /api/nq/search_novel?q= 返回 $.data 数组）。详情/目录/正文 SSR 规则不变。
+		if name == "天天看小说" {
+			patchTtkanSearch(src)
+		}
 		ok, detail := runFullFlowJianLai(t, src)
 		if ok {
 			t.Logf("书源 %s 全流程通过：%s", name, detail)
@@ -35,6 +40,21 @@ func TestFullFlowJianLai(t *testing.T) {
 		t.Logf("书源 %s 未跑通：%s", name, detail)
 	}
 	t.Skip("所有候选书源全流程未跑通（外站不可达或规则不兼容）")
+}
+
+// patchTtkanSearch 天天看小说搜索规则修正：SPA 搜索页无 SSR 结果，
+// 改走官方 JSON 搜索 API（/api/nq/search_novel?q={{key}} → $.data 数组）。
+// bookUrl 由 novel_id 拼接完整章节页 URL。
+func patchTtkanSearch(src map[string]any) {
+	src["searchUrl"] = "/api/nq/search_novel?q={{key}}"
+	src["ruleSearch"] = map[string]any{
+		"bookList": "$.data",
+		"name":     "$.name",
+		"author":   "$.author",
+		"bookUrl":  "$.novel_id@js:'https://cn.ttkan.co/novel/chapters/'+result",
+		"coverUrl": "$.topic_img",
+		"intro":    "$.description",
+	}
 }
 
 // runFullFlowJianLai 单书源全流程；返回 (成功, 详情)。

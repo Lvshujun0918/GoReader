@@ -77,11 +77,9 @@ func parseSingle(input, rule string, ctx *Context) []string {
 			return evalJS(input, rule[len("<js>"):end], ctx)
 		}
 	}
-	// 裸 JSONPath（$ 开头，如 $.data / $..book_data[0]）——legado 常用，无 @json: 前缀
-	if strings.HasPrefix(rule, "$") {
-		return evalJSON(input, rule, ctx)
-	}
-	// 文本后处理：value@js:code（先解析前缀，再对结果执行 JS，如 {{$.status}}@js:result.replace(...)）
+	// 文本后处理：value@js:code（先解析前缀，再对结果执行 JS，如
+	// {{$.status}}@js:result.replace(...) / $.novel_id@js:'https://...'+result）
+	// 必须在 $（JSONPath）分支之前——JSONPath 结果通常带 @js: 拼接。
 	if idx := strings.LastIndex(rule, "@js:"); idx > 0 {
 		prefix, code := rule[:idx], rule[idx+len("@js:"):]
 		var base []string
@@ -99,6 +97,10 @@ func parseSingle(input, rule string, ctx *Context) []string {
 			}
 			return base
 		}
+	}
+	// 裸 JSONPath（$ 开头，如 $.data / $..book_data[0]）——legado 常用，无 @json: 前缀
+	if strings.HasPrefix(rule, "$") {
+		return evalJSON(input, rule, ctx)
 	}
 	// legado 链式选择器（class.x.0@tag.ul / tag.h3.0@tag.a.0@href）——无 @css: 前缀
 	if isChainSelector(rule) {
@@ -533,12 +535,30 @@ func chainIsOutput(seg string) bool {
 		strings.HasPrefix(base, "regex:")
 }
 
-// chainAdvance 推进操作：tag.x / css:... / xpath:... 匹配子孙节点 + .N。
+// chainAdvance 推进操作：tag.x / css:... / xpath:... / children[N] 匹配子孙节点 + .N。
 func chainAdvance(nodes []*html.Node, seg string) []*html.Node {
 	base, idx := chainSplitIdx(seg)
 	base = strings.TrimSpace(base)
 	var out []*html.Node
 	switch {
+	case strings.HasPrefix(base, "children["):
+		// legado children[N]：取每个节点第 N 个元素子节点（如 class.full_chapters@children[0]@tag.a）
+		m := regexp.MustCompile(`^children\[(\d+)\]$`).FindStringSubmatch(base)
+		if m == nil {
+			return nil
+		}
+		n, _ := strconv.Atoi(m[1])
+		for _, nd := range nodes {
+			var kids []*html.Node
+			for ch := nd.FirstChild; ch != nil; ch = ch.NextSibling {
+				if ch.Type == html.ElementNode {
+					kids = append(kids, ch)
+				}
+			}
+			if n < len(kids) {
+				out = append(out, kids[n])
+			}
+		}
 	case strings.HasPrefix(base, "tag."):
 		name := strings.TrimSpace(base[4:])
 		if name == "" {

@@ -12,6 +12,7 @@ package solver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -168,7 +169,7 @@ func (s *Solver) Solve(ctx context.Context, targetURL string, cookies []Cookie, 
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	html, err := page.HTML()
+	html, err := evalOuterHTML(page)
 	if err != nil {
 		return nil, fmt.Errorf("提取 HTML 失败: %w", err)
 	}
@@ -186,6 +187,32 @@ func (s *Solver) Solve(ctx context.Context, targetURL string, cookies []Cookie, 
 		res.Cookies = append(res.Cookies, Cookie{Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path})
 	}
 	return res, nil
+}
+
+// evalOuterHTML 取页面 HTML（不用 rod page.HTML()——obscura 0.2.0 该接口有
+// "Cannot set properties of null (setting 'selectable')" 序列化 bug）。
+// evalOuterHTML 取页面 HTML。
+// 不能用 rod page.HTML()/page.Eval()——obscura 0.2.0 对 Runtime.callFunctionOn
+// 的返回值序列化有 bug（"Cannot set properties of null (setting 'selectable')"、
+// 返回值变空 map）。改发 Runtime.evaluate + returnByValue 解析 result.value。
+func evalOuterHTML(page *rod.Page) (string, error) {
+	sid := string(page.SessionID)
+	b, err := page.Call(context.Background(), sid, "Runtime.evaluate", map[string]any{
+		"expression":    `document.documentElement ? document.documentElement.outerHTML : ''`,
+		"returnByValue": true,
+	})
+	if err != nil {
+		return "", err
+	}
+	var r struct {
+		Result struct {
+			Value string `json:"value"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(b, &r) != nil {
+		return "", fmt.Errorf("evaluate 响应解析失败: %s", string(b)[:min(len(b), 200)])
+	}
+	return r.Result.Value, nil
 }
 
 // challengeSolved 判断质询是否已通过。
