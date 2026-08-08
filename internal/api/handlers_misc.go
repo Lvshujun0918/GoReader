@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -806,21 +807,168 @@ func (a *API) handleGetServerStats(c *gin.Context) {
 		NeedLogin(c)
 		return
 	}
-	_ = ns
 	top := a.Stats.Top(10)
-	type reqStat struct {
-		Path  string `json:"path"`
-		Count int64  `json:"count"`
-	}
-	paths := make([]reqStat, 0, len(top))
+	paths := make([]map[string]any, 0, len(top))
 	for _, p := range top {
-		paths = append(paths, reqStat{Path: p.Path, Count: p.Count})
+		paths = append(paths, map[string]any{"path": p.Path, "count": p.Count})
 	}
+	// 内存：系统（/proc/meminfo）+ 进程（runtime.MemStats）
+	sysTotal, sysAvail := systemMemoryMB()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	used := sysTotal - sysAvail
+	if used < 0 {
+		used = 0
+	}
+	memPct := 0.0
+	if sysTotal > 0 {
+		memPct = used / sysTotal * 100
+	}
+	// CPU（/proc/stat 两次采样，300ms 间隔）
+	cpuPct := cpuUsagePercent()
+	// 书源：总数（成功率统计未实现，占位）
+	totalSources, _ := a.Storage.CountBookSources(ns)
 	OK(c, map[string]any{
-		"totalRequests": a.Stats.Total(),
-		"todayRequests": a.Stats.Today(),
-		"topPaths":      paths,
+		"version":       "GoReader",
+		"port":          a.Config.Port,
+		"timestamp":     time.Now().UnixMilli(),
+		"uptimeSeconds": processUptimeSeconds(),
+		"memory": map[string]any{
+			"totalMb":     sysTotal,
+			"availableMb": sysAvail,
+			"usedMb":      used,
+			"processMb":   float64(ms.Sys) / 1024 / 1024,
+			"percent":     memPct,
+		},
+		"cpu": map[string]any{
+			"percent": cpuPct,
+			"cores":   runtime.NumCPU(),
+		},
+		"requests": map[string]any{
+			"total":        a.Stats.Total(),
+			"today":        a.Stats.Today(),
+			"topEndpoints": paths,
+		},
+		"online": map[string]any{"sessions": 0},
+		"bookSource": map[string]any{
+			"ok": 0, "total": totalSources, "failed": 0,
+			"successRate": nil, "checkedAt": nil, "note": "暂无统计",
+		},
 	})
+}
+
+// systemMemoryMB 系统内存（/proc/meminfo，Linux）。返回 (总 MB, 可用 MB)。
+func systemMemoryMB() (total, avail float64) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		switch {
+		case strings.HasPrefix(line, "MemTotal:"):
+			total = meminfoKbToMb(line)
+		case strings.HasPrefix(line, "MemAvailable:"):
+			avail = meminfoKbToMb(line)
+		}
+	}
+	return
+}
+
+// meminfoKbToMb 解析 "/proc/meminfo" 行中的 KB 值并转 MB。
+func meminfoKbToMb(line string) float64 {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return 0
+	}
+	v, err := strconv.ParseFloat(fields[1], 64)
+	if err != nil {
+		return 0
+	}
+	return v / 1024
+}
+
+// cpuUsagePercent 系统 CPU 使用率（/proc/stat 两次采样，300ms 间隔）。
+func cpuUsagePercent() float64 {
+	idle1, total1 := readCPUStat()
+	if total1 == 0 {
+		return 0
+	}
+	time.Sleep(300 * time.Millisecond)
+	idle2, total2 := readCPUStat()
+	if total2 <= total1 {
+		return 0
+	}
+	idleDelta := idle2 - idle1
+	totalDelta := total2 - total1
+	if totalDelta == 0 {
+		return 0
+	}
+	return (1 - float64(idleDelta)/float64(totalDelta)) * 100
+}
+
+// readCPUStat 读取 /proc/stat 首行 cpu 汇总（idle, total）。
+func readCPUStat() (idle, total uint64) {
+	b, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "cpu ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if i == 0 {
+				continue
+			}
+			v, _ := strconv.ParseUint(f, 10, 64)
+			total += v
+			if i == 4 { // idle
+				idle = v
+			}
+		}
+		return idle, total
+	}
+	return 0, 0
+}
+
+// processUptimeSeconds 进程已运行秒数（/proc/self/stat starttime + /proc/uptime）。
+func processUptimeSeconds() int64 {
+	b, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		return 0
+	}
+	// comm 字段可能含空格/括号——从最后一个 ')' 之后取字段
+	s := string(b)
+	idx := strings.LastIndexByte(s, ')')
+	if idx < 0 {
+		return 0
+	}
+	rest := strings.Fields(s[idx+1:])
+	// 字段 22 = starttime（rest[19]，因前两个字段 pid/comm 已跳过）
+	if len(rest) < 20 {
+		return 0
+	}
+	start, err := strconv.ParseInt(rest[19], 10, 64)
+	if err != nil {
+		return 0
+	}
+	hz := int64(100) // CLK_TCK 通常 100
+	startSec := start / hz
+	// 系统已运行秒数（/proc/uptime）− 进程启动距 boot 秒数 = 进程已运行秒
+	ub, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return startSec
+	}
+	fields := strings.Fields(string(ub))
+	if len(fields) == 0 {
+		return startSec
+	}
+	uptime, _ := strconv.ParseFloat(fields[0], 64)
+	if s := int64(uptime) - startSec; s >= 0 {
+		return s
+	}
+	return 0
 }
 
 // handleBookSourceDebugSSE 书源调试（SSE 占位）。

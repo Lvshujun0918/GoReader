@@ -88,11 +88,11 @@ function barWidth(pct: number): string {
 
 const memPercent = computed(() => stats.value?.memory.percent ?? 0)
 const cpuPercent = computed(() => stats.value?.cpu.percent ?? 0)
-const topEndpoints = computed(() => stats.value?.requests.topEndpoints.slice(0, 5) ?? [])
+const topEndpoints = computed(() => stats.value?.requests?.topEndpoints?.slice(0, 5) ?? [])
 
 /** 书源成功率（0..1）→ 百分比 */
 const sourceRate = computed(() => {
-  const r = stats.value?.bookSource.successRate
+  const r = stats.value?.bookSource?.successRate
   return r === null || r === undefined ? null : r * 100
 })
 
@@ -137,15 +137,15 @@ function sourceTimeText(): string {
         <!-- 内存 -->
         <div class="card">
           <div class="card-title">{{ t('monitor.memory') }}</div>
-          <div class="big-num">{{ fmtMb(stats.memory.usedMb) }} <span class="sub">/ {{ fmtMb(stats.memory.totalMb) }}</span></div>
+          <div class="big-num">{{ fmtMb(stats?.memory?.usedMb ?? 0) }} <span class="sub">/ {{ fmtMb(stats?.memory?.totalMb ?? 0) }}</span></div>
           <div class="bar">
             <div class="bar-fill mem" :style="{ width: barWidth(memPercent) }"></div>
           </div>
           <div class="bar-label">
             <span>{{ t('monitor.usedPct', { n: memPercent.toFixed(1) }) }}</span>
-            <span>{{ t('monitor.available') }} {{ fmtMb(stats.memory.availableMb) }}</span>
+            <span>{{ t('monitor.available') }} {{ fmtMb(stats?.memory?.availableMb ?? 0) }}</span>
           </div>
-          <div class="card-sub">{{ t('monitor.processMem') }} {{ fmtMb(stats.memory.processMb) }}</div>
+          <div class="card-sub">{{ t('monitor.processMem') }} {{ fmtMb(stats?.memory?.processMb ?? 0) }}</div>
         </div>
 
         <!-- CPU -->
@@ -157,7 +157,7 @@ function sourceTimeText(): string {
           </div>
           <div class="bar-label">
             <span>{{ t('monitor.cpuUsage') }}</span>
-            <span>{{ stats.cpu.cores }} {{ t('monitor.cores') }}</span>
+            <span>{{ stats?.cpu?.cores ?? 0 }} {{ t('monitor.cores') }}</span>
           </div>
           <div class="card-sub">{{ t('monitor.cpuSampleNote') }}</div>
         </div>
@@ -165,8 +165,8 @@ function sourceTimeText(): string {
         <!-- 请求量 -->
         <div class="card">
           <div class="card-title">{{ t('monitor.requests') }}</div>
-          <div class="big-num">{{ stats.requests.total.toLocaleString() }} <span class="sub">{{ t('monitor.requestsTotal') }}</span></div>
-          <div class="today-line">{{ t('monitor.requestsToday') }}：{{ stats.requests.today.toLocaleString() }}</div>
+          <div class="big-num">{{ (stats?.requests?.total ?? 0).toLocaleString() }} <span class="sub">{{ t('monitor.requestsTotal') }}</span></div>
+          <div class="today-line">{{ t('monitor.requestsToday') }}：{{ (stats?.requests?.today ?? 0).toLocaleString() }}</div>
           <div v-if="topEndpoints.length" class="endpoint-list">
             <div v-for="(ep, i) in topEndpoints" :key="ep.path" class="endpoint-row">
               <span class="ep-rank">{{ i + 1 }}</span>
@@ -180,7 +180,7 @@ function sourceTimeText(): string {
         <!-- 在线会话 -->
         <div class="card">
           <div class="card-title">{{ t('monitor.online') }}</div>
-          <div class="big-num">{{ stats.online.sessions }} <span class="sub">{{ t('monitor.sessions') }}</span></div>
+          <div class="big-num">{{ stats?.online?.sessions ?? 0 }} <span class="sub">{{ t('monitor.sessions') }}</span></div>
           <div class="card-sub">{{ t('monitor.onlineNote') }}</div>
         </div>
 
@@ -195,12 +195,12 @@ function sourceTimeText(): string {
               <div class="bar-fill" :class="sourceRateClass(sourceRate)" :style="{ width: barWidth(sourceRate) }"></div>
             </div>
             <div class="bar-label">
-              <span>{{ t('monitor.sourceOk', { ok: stats.bookSource.ok, total: stats.bookSource.total }) }}</span>
-              <span>{{ t('monitor.sourceFailed', { n: stats.bookSource.failed }) }}</span>
+              <span>{{ t('monitor.sourceOk', { ok: stats?.bookSource?.ok ?? 0, total: stats?.bookSource?.total ?? 0 }) }}</span>
+              <span>{{ t('monitor.sourceFailed', { n: stats?.bookSource?.failed ?? 0 }) }}</span>
             </div>
             <div class="card-sub">{{ sourceTimeText() }}</div>
           </template>
-          <div v-else class="empty-note">{{ stats.bookSource.note || t('monitor.sourceNeverChecked') }}</div>
+          <div v-else class="empty-note">{{ stats?.bookSource?.note || t('monitor.sourceNeverChecked') }}</div>
         </div>
 
         <!-- 运行信息 -->
