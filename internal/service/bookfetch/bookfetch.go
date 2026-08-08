@@ -290,7 +290,7 @@ func splitKeyVal(item string) (string, string) {
 	return strings.TrimSpace(item[:idx]), item[idx+1:]
 }
 
-// resolveURL 相对链接解析（含 // 协议相对）。
+// resolveURL 相对链接解析（含 // 协议相对）。base 无路径时视为根目录（https://host → https://host/）。
 func resolveURL(raw, base string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -305,11 +305,22 @@ func resolveURL(raw, base string) string {
 	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
 		return raw
 	}
-	idx := strings.LastIndex(base, "/")
-	if idx < 0 {
+	// base 无路径时补根斜杠（https://src.com → https://src.com/）
+	dir := base
+	if !strings.HasSuffix(dir, "/") {
+		if u, err := url.Parse(base); err == nil && u.Path == "" {
+			dir += "/"
+		}
+	}
+	bu, err := url.Parse(dir)
+	if err != nil {
 		return raw
 	}
-	return base[:idx+1] + strings.TrimPrefix(raw, "/")
+	ru, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return bu.ResolveReference(ru).String()
 }
 
 // Errorf 便捷错误。
