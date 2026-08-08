@@ -15,6 +15,9 @@ import (
 	"github.com/Lvshujun0918/reader-dev/internal/util/dbbackup"
 )
 
+// buildVersion 构建版本号（-ldflags "-X main.buildVersion=<git短SHA>" 注入；本地构建为 dev）。
+var buildVersion = "dev"
+
 func main() {
 	// .env 先加载——日志/配置 env 才能生效
 	_ = godotenv.Load()
@@ -23,11 +26,20 @@ func main() {
 
 	cfg := config.FromEnv()
 
+	// 启动配置摘要（镜像版本/端口/工作目录/鉴权等——docker logs 可直接定位构建）
+	log.Printf("===== reader-dev %s 启动 =====", buildVersion)
+	log.Printf("配置: 端口=%d workdir=%s secure=%v webRoot=%s", cfg.Port, cfg.StorageDir(), cfg.Secure, cfg.WebRoot)
+	log.Printf("配置: obscuraBin=%q obscuraURL=%q proxy=%q", cfg.ObscuraBin, cfg.ObscuraURL, cfg.ObscuraProxy)
+	log.Printf("配置: flareSolverr=%q", cfg.FlareSolverrURL)
+	log.Printf("配置: tokenTTLDays=%d uploadMaxMB=%d imageCacheMB=%d", cfg.TokenTTLDays, cfg.UploadMaxMB, cfg.ImageCacheMB)
+
 	// 启动前数据库备份（reader.db → reader.db.bak-{日期}，保留 5 份；env READER_DB_BACKUP=0 禁用）
 	if path, err := dbbackup.BackupReaderDB(cfg.StorageDir()); err != nil {
 		log.Printf("启动数据库备份失败（继续启动）: %v", err)
 	} else if path != "" {
 		log.Printf("启动备份完成: %s", path)
+	} else {
+		log.Printf("启动备份: 未启用（READER_DB_BACKUP=0 或数据库不存在）")
 	}
 
 	if err := app.Serve(cfg); err != nil {
