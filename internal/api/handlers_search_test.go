@@ -1,10 +1,13 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 
@@ -233,7 +236,8 @@ func TestSearchSourceLegacyBareJSONPath(t *testing.T) {
 // TestSearchSourceJSFormat legado <js> 规则格式（起点书源）。
 func TestSearchSourceJSFormat(t *testing.T) {
 	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
-	// <js> 返回书籍列表 JSON 字符串数组
+	// <js> 返回书籍列表 JSON 字符串数组（result 已解析为对象/数组——legado 语义，
+	// 直接返回数组即可由 evalJS 展开为字符串项）
 	body := `["{\"name\":\"js书一\"}","{\"name\":\"js书二\"}"]`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprint(w, body)
@@ -242,7 +246,7 @@ func TestSearchSourceJSFormat(t *testing.T) {
 	src := &model.BookSource{
 		BookSourceURL: srv.URL, BookSourceName: "JS格式源",
 		SearchURL:     srv.URL + "/?key={key}",
-		RuleSearch:    `{"bookList":"<js>JSON.parse(result)</js>","name":"$.name"}`,
+		RuleSearch:    `{"bookList":"<js>result</js>","name":"$.name"}`,
 	}
 	results, err := SearchSource(src, "js")
 	if err != nil {
@@ -461,5 +465,166 @@ func TestSearchSourceRealKuwo(t *testing.T) {
 	// coverUrl resolve
 	if r.CoverURL != srv.URL+"/c/1.jpg" {
 		t.Errorf("coverUrl=%q", r.CoverURL)
+	}
+}
+
+// TestSearchDaHuiLangSourceReal 真实网络单步测试：大灰狼书源 + 真实聚合 API。
+// 需要外网可达 api.langge.cf；失败/超时自动跳过（CI 无网场景不阻塞）。
+func TestSearchDaHuiLangSourceReal(t *testing.T) {
+	const server = "https://api.langge.cf"
+	if resp, err := http.Get(server + "/"); err != nil || resp.StatusCode != 200 {
+		t.Skipf("真实 API 不可达：%v", err)
+	}
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	src := &model.BookSource{
+		BookSourceURL: server, BookSourceName: "大灰狼真实",
+		Variable:      "server=" + server,
+		SearchURL:     daHuiLangSearchURL(),
+		RuleSearch:    daHuiLangRuleSearch(),
+	}
+	results, err := SearchSource(src, "斗破苍穹")
+	if err != nil {
+		t.Skipf("真实搜索失败（站点可能变动）：%v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("真实搜索无结果（应至少返回站点提示项）")
+	}
+	if results[0].Name == "" {
+		t.Errorf("首条结果 name 为空: %+v", results[0])
+	}
+}
+
+// daHuiLangSearchURL 大灰狼 searchUrl 模板（与 fixture 同构，server 走书源变量）。
+func daHuiLangSearchURL() string {
+	return "<js>\nlet base_url = getArguments(source.getVariable(), 'server');\n" +
+		"let media = '';\nlet sources = '0';\n" +
+		"let disabled_sources = getArguments(source.getVariable(), 'disabled_sources') || '0';\n" +
+		"let qtcookie = cookie.getCookie(base_url);\n" +
+		"let op = JSON.stringify({ method: 'GET', headers: { cookie: qtcookie } });\n" +
+		"`${base_url}/search?title=${key}&tab=${media}&source=${sources}&page=1&disabled_sources=${disabled_sources},${op}`\n</js>"
+}
+
+// daHuiLangRuleSearch 大灰狼 ruleSearch（与 fixture 同构）。
+func daHuiLangRuleSearch() string {
+	return `{"author":"$.author","bookList":"$.data","bookUrl":"<js>let book_id = result.book_id; let url = result.toc_url || ''; ` + "`" + `data:;base64,${java.base64Encode(JSON.stringify({book_id:book_id,url:url}))}` + "`" + `</js>","coverUrl":"$.thumb_url","intro":"$.abstract","name":"$.book_name","wordCount":"$.word_number"}`
+}
+
+/* ================= 大灰狼融合书源（goja JS 搜索 + SSE 格式 + 调试） ================= */
+
+// daHuiLangSource 加载大灰狼书源 fixture（bookSourceUrl 重定向到 mock server）。
+func daHuiLangSource(t *testing.T, serverURL string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile("testdata/dahuilang.json")
+	if err != nil {
+		t.Fatalf("缺少 dahuilang.json fixture: %v", err)
+	}
+	var list []map[string]any
+	if err := json.Unmarshal(b, &list); err != nil || len(list) == 0 {
+		t.Fatalf("fixture 解析失败: %v", err)
+	}
+	src := list[0]
+	src["bookSourceUrl"] = serverURL
+	// 书源变量注入 server（JS getArguments(source.getVariable(), 'server') 用）
+	src["variable"] = "server=" + serverURL
+	return src
+}
+
+// TestSearchDaHuiLangSource 大灰狼融合书源搜索：goja 执行 <js> searchUrl
+// （getArguments/source/key/cookie）+ ruleSearch JSON 对象（$.data bookList + <js> bookUrl）。
+func TestSearchDaHuiLangSource(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1") // 测试 mock server 为内网地址
+	mux := http.NewServeMux()
+	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		fmt.Fprint(w, `{"data":[
+			{"book_id":"123","source":"s1","tab":"小说","toc_url":"/toc/1",
+			 "thumb_url":"/cover/1.jpg","abstract":"这是一段简介",
+			 "book_name":"测试书名","word_number":"10000",
+			 "status":"连载","score":"9.5","tags":"玄幻",
+			 "last_chapter_title":"第1章","last_chapter_update_time":"2024-01-01"}
+		]}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	h := newTestAPI(t)
+	saveOneSource(t, h, daHuiLangSource(t, srv.URL))
+
+	w := perform(h, "GET", "/reader3/searchBook?key="+url.QueryEscape("测试")+"&origin="+srv.URL, nil)
+	rd := parseReturn(t, w)
+	if !rd.IsSuccess {
+		t.Fatalf("searchBook 失败: %s", rd.ErrorMsg)
+	}
+	list, _ := rd.Data.([]any)
+	if len(list) == 0 {
+		t.Fatal("搜索结果为空（大灰狼书源 JS 搜索未出结果）")
+	}
+	book, _ := list[0].(map[string]any)
+	if book["name"] != "测试书名" {
+		t.Errorf("书名不符: %v", book["name"])
+	}
+	if book["intro"] != "这是一段简介" {
+		t.Errorf("简介不符: %v", book["intro"])
+	}
+	if book["bookUrl"] == "" {
+		t.Error("bookUrl 为空（bookUrl 的 <js> 未执行成功）")
+	}
+}
+
+// TestSearchBookMultiSSEFormat SSE 流式搜索事件格式（前端契约：event: book + {lastIndex,data} + event: end）。
+func TestSearchBookMultiSSEFormat(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		fmt.Fprint(w, `{"data":[{"book_id":"1","book_name":"SSE书","abstract":"简介","source":"s"}]}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	h := newTestAPI(t)
+	saveOneSource(t, h, daHuiLangSource(t, srv.URL))
+
+	w := perform(h, "GET", "/reader3/searchBookMultiSSE?key="+url.QueryEscape("测试"), nil)
+	body := w.Body.String()
+	if !strings.Contains(body, "event: book") {
+		t.Fatalf("SSE 缺 event: book 帧:\n%s", body)
+	}
+	if !strings.Contains(body, "event: end") {
+		t.Fatalf("SSE 缺 event: end 帧:\n%s", body)
+	}
+	if !strings.Contains(body, `"lastIndex":0`) {
+		t.Errorf("book 帧缺 lastIndex=0:\n%s", body)
+	}
+	if !strings.Contains(body, "SSE书") {
+		t.Errorf("book 帧缺搜索结果:\n%s", body)
+	}
+}
+
+// TestDebugSSESearch 调试功能：search 动作应返回 step + result 事件。
+func TestDebugSSESearch(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		fmt.Fprint(w, `{"data":[{"book_id":"1","book_name":"调试书","abstract":"简介","source":"s"}]}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	h := newTestAPI(t)
+	saveOneSource(t, h, daHuiLangSource(t, srv.URL))
+
+	u := "/reader3/bookSourceDebugSSE?bookSource=" + srv.URL + "&action=search&key=" + url.QueryEscape("测试")
+	w := perform(h, "GET", u, nil)
+	body := w.Body.String()
+	if !strings.Contains(body, "event: step") {
+		t.Fatalf("调试缺 step 帧:\n%s", body)
+	}
+	if !strings.Contains(body, "event: result") {
+		t.Fatalf("调试缺 result 帧:\n%s", body)
+	}
+	if !strings.Contains(body, "调试书") {
+		t.Errorf("调试 result 缺结果:\n%s", body)
 	}
 }

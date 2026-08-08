@@ -971,18 +971,6 @@ func processUptimeSeconds() int64 {
 	return 0
 }
 
-// handleBookSourceDebugSSE 书源调试（SSE 占位）。
-func (a *API) handleBookSourceDebugSSE(c *gin.Context) {
-	ns, ok := a.ResolveNamespace(c)
-	if !ok {
-		NeedLogin(c)
-		return
-	}
-	_ = ns
-	c.Header("Content-Type", "text/event-stream")
-	fmt.Fprint(c.Writer, "data: [DONE]\n\n")
-}
-
 // handleReadSourceFile POST /reader3/readSourceFile。
 func (a *API) handleReadSourceFile(c *gin.Context) {
 	ns, ok := a.ResolveNamespace(c)

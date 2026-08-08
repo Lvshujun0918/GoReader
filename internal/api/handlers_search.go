@@ -50,9 +50,19 @@ func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.So
 	}
 	// 构造搜索请求（legado searchUrl：{{key}}/{{searchKey}}/{key} 占位符、{{page}} 分页、
 	// @js:/<js> 前缀 JS 构造、URL 后 ,{'method':'POST','body':...} 表单描述）
+	// 变量集贯穿 JS 环境（source.getVariable / getArguments / cookie.getCookie / key）
+	vars := map[string]string{
+		"baseUrl":        src.BookSourceURL,
+		"key":            keyword,
+		"page":           "1",
+		"sourceVariable": src.Variable,
+		"sourceName":     src.BookSourceName,
+		"sourceUrl":      src.BookSourceURL,
+		"cookie":         "",
+	}
 	ctx := &rule.Context{
 		BaseURL:   src.BookSourceURL,
-		Variables: map[string]string{"baseUrl": src.BookSourceURL, "key": keyword, "page": "1"},
+		Variables: vars,
 	}
 	req := buildSearchRequest(src.SearchURL, keyword, 1, ctx, src.BookSourceURL)
 
@@ -68,21 +78,22 @@ func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.So
 		return nil, err
 	}
 	htmlStr := string(body)
-	ctx = &rule.Context{BaseURL: req.URL}
+	// 解析上下文：注入书源变量集（bookUrl 等子规则的 <js> 依赖 source/key/result）
+	parseCtx := &rule.Context{BaseURL: req.URL, Variables: vars}
 
 	if bookList != "" {
 		// 列表规则：bookList 项（CSS 补 @html 供子规则解析；JSONPath/js 直接取项）
-		items := rule.Parse(htmlStr, ensureListHTML(bookList), ctx)
+		items := rule.Parse(htmlStr, ensureListHTML(bookList), parseCtx)
 		results := make([]*SearchResult, 0, len(items))
 		for range items {
 			results = append(results, &SearchResult{})
 		}
-		fillSearchResults(rules, items, results, ctx, src, req.URL)
+		fillSearchResults(rules, items, results, parseCtx, src, req.URL)
 		return results, nil
 	}
 	// 无列表规则：单书直达
 	res := &SearchResult{}
-	fillSearchResults(rules, []string{htmlStr}, []*SearchResult{res}, ctx, src, req.URL)
+	fillSearchResults(rules, []string{htmlStr}, []*SearchResult{res}, parseCtx, src, req.URL)
 	if res.Name != "" {
 		return []*SearchResult{res}, nil
 	}
@@ -226,7 +237,9 @@ func (a *API) handleSearchBookMulti(c *gin.Context) {
 		return
 	}
 	limit := 5
-	if v, ok := intParam(params, "limit"); ok && v > 0 {
+	if v, ok := intParam(params, "maxSources"); ok && v > 0 {
+		limit = int(v)
+	} else if v, ok := intParam(params, "limit"); ok && v > 0 {
 		limit = int(v)
 	}
 	var all []*SearchResult
@@ -247,6 +260,9 @@ func (a *API) handleSearchBookMulti(c *gin.Context) {
 }
 
 // handleSearchBookMultiSSE GET/POST /reader3/searchBookMultiSSE：SSE 流式搜索。
+// 事件契约（与 web-ui/src/api/sse.ts 对齐）：
+//   event: book + data {"lastIndex": n, "data": [SearchBook]}  每个参与搜索的书源一帧
+//   event: end  + data {"lastIndex": n, "isEnd": true}         流结束
 func (a *API) handleSearchBookMultiSSE(c *gin.Context) {
 	ns, ok := a.ResolveNamespace(c)
 	if !ok {
@@ -267,22 +283,35 @@ func (a *API) handleSearchBookMultiSSE(c *gin.Context) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
-	flusher, _ := c.Writer.(gin.ResponseWriter)
-	_ = flusher
 
+	idx := 0
 	for _, src := range sources {
 		if src.Enabled != 1 || src.SearchURL == "" {
 			continue
 		}
-		results, err := SearchSource(&src, keyword, a.Solver)
-		if err != nil {
-			continue
+		results, serr := SearchSource(&src, keyword, a.Solver)
+		payload := map[string]any{"lastIndex": idx, "data": results}
+		if serr != nil {
+			// 失败也推一帧（空结果 + 错误信息），让前端"已搜索 N 个书源"计数准确
+			payload["data"] = []*SearchResult{}
+			payload["error"] = serr.Error()
 		}
-		b, _ := json.Marshal(results)
-		fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+		b, _ := json.Marshal(payload)
+		fmt.Fprintf(c.Writer, "event: book\ndata: %s\n\n", b)
 		c.Writer.Flush()
+		idx++
 	}
-	fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+	fmt.Fprintf(c.Writer, "event: end\ndata: %s\n\n",
+		mustJSON(map[string]any{"lastIndex": idx - 1, "isEnd": true}))
+}
+
+// mustJSON 序列化（失败返回空对象，SSE 结束帧用）。
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 // handleSearchBookSource GET/POST /reader3/searchBookSource：书源内搜索（别名）。
@@ -366,9 +395,10 @@ type searchRequest struct {
 func buildSearchRequest(raw, keyword string, page int, ctx *rule.Context, baseURL string) *searchRequest {
 	r := &searchRequest{URL: raw, Method: "GET"}
 	encKey := urlEncodeKeyword(keyword)
-	// @js:/<js> 前缀：先替换占位符（{{key}} 在 JS 字符串里），再 evalJS 得 URL（或 URL + POST 描述）
+	// @js:/<js> 前缀：先替换双花括号占位符（{{key}}/{{page}}，JS 里 key 走裸变量注入，
+	// 不能替换单花括号 {key}——会破坏 JS 模板字符串 ${key}），再 evalJS 得 URL（或 URL + POST 描述）
 	if strings.HasPrefix(raw, "@js:") || strings.HasPrefix(raw, "<js>") {
-		raw = replacePlaceholders(raw, encKey, page)
+		raw = replaceDoubleBraces(raw, encKey, page)
 		if strings.HasPrefix(raw, "@js:") {
 			// 传完整 @js: 规则（parseSingle 识别前缀后 evalJS）
 			if vs := rule.Parse("", raw, ctx); len(vs) > 0 && vs[0] != "" {
@@ -429,6 +459,16 @@ func replacePlaceholders(s, encKey string, page int) string {
 	s = strings.ReplaceAll(s, "{key}", encKey)
 	s = strings.ReplaceAll(s, "{{page}}", pageStr)
 	s = strings.ReplaceAll(s, "{page}", pageStr)
+	return s
+}
+
+// replaceDoubleBraces 仅替换双花括号占位符（JS searchUrl 专用）：
+// 不替换 {key}/{page} 单花括号——避免破坏 JS 模板字符串 ${key} 等。
+func replaceDoubleBraces(s, encKey string, page int) string {
+	pageStr := strconv.Itoa(page)
+	s = strings.ReplaceAll(s, "{{searchKey}}", encKey)
+	s = strings.ReplaceAll(s, "{{key}}", encKey)
+	s = strings.ReplaceAll(s, "{{page}}", pageStr)
 	return s
 }
 

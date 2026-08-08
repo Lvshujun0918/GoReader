@@ -3,6 +3,7 @@ package rule
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/url"
 	"regexp"
@@ -611,17 +612,69 @@ func regexMatchAll(input, pattern string) []string {
 }
 
 // evalJS JS 求值：@js:code（输入绑定为 result）。
+// 兼容 legado 常用环境：
+//   - result：JSON 输入解析为对象/数组，否则字符串（result.book_id 等可直接访问）
+//   - key / 书源变量（sourceVariable/sourceName/sourceUrl/cookie 经 ctx.Variables 注入）
+//   - source.getVariable() / source.getName() / source.getUrl() / source.getKey()
+//   - getArguments(text, key)：解析 "a=b&&c=d" 式书源变量
+//   - cookie.getCookie(url)
+//   - java.url.encode / java.base64Encode / java.base64Decode / java.toJSONString
 func evalJS(input, code string, ctx *Context) []string {
 	vm := goja.New()
-	_ = vm.Set("result", input)
+	// result：合法 JSON 输入 → 对象/数组（legado result.book_id 等字段访问）
+	var resultVal any = input
+	trimmed := strings.TrimSpace(input)
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		var obj any
+		if json.Unmarshal([]byte(input), &obj) == nil {
+			resultVal = obj
+		}
+	}
+	_ = vm.Set("result", resultVal)
 	for k, v := range ctx.Variables {
 		_ = vm.Set(k, v)
 	}
-	// java 兼容 shim（最小子集）
+	// source 对象（书源变量 / 名称 / URL / 搜索词）
+	_ = vm.Set("source", map[string]any{
+		"getVariable": func() string { return ctx.Get("sourceVariable") },
+		"getName":     func() string { return ctx.Get("sourceName") },
+		"getUrl":      func() string { return ctx.Get("sourceUrl") },
+		"getKey":      func() string { return ctx.Get("key") },
+	})
+	// getArguments：解析 "k1=v1&&k2=v2"（或 ; 分隔）书源变量文本
+	_ = vm.Set("getArguments", func(text, key string) string {
+		if text == "" {
+			return ""
+		}
+		parts := regexp.MustCompile(`(?:&&|;;|;)`).Split(text, -1)
+		for _, seg := range parts {
+			kv := strings.SplitN(seg, "=", 2)
+			if len(kv) == 2 && strings.TrimSpace(kv[0]) == key {
+				return strings.TrimSpace(kv[1])
+			}
+		}
+		return ""
+	})
+	// cookie（书源 cookie 由调用方经 ctx 注入）
+	_ = vm.Set("cookie", map[string]any{
+		"getCookie": func(url string) string { return ctx.Get("cookie") },
+	})
+	// java 兼容 shim
 	_ = vm.Set("java", map[string]any{
-		"url":            map[string]any{"encode": func(s string) string { return strings.ReplaceAll(url.QueryEscape(s), "+", "%20") }},
-		"base64Decode":   func(s string) string { return s },
-		"base64Encode":   func(s string) string { return s },
+		"url": map[string]any{
+			"encode": func(s string) string { return strings.ReplaceAll(url.QueryEscape(s), "+", "%20") },
+			"decode": func(s string) string {
+				s2, _ := url.QueryUnescape(s)
+				return s2
+			},
+		},
+		"base64Encode":         func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) },
+		"base64EncodeToString": func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) },
+		"base64Decode":         func(s string) string { b, _ := base64.StdEncoding.DecodeString(s); return string(b) },
+		"toJSONString": func(v any) string {
+			b, _ := json.Marshal(v)
+			return string(b)
+		},
 	})
 	val, err := vm.RunString(code)
 	if err != nil {
@@ -712,9 +765,21 @@ func interpolateVars(input, rule string, ctx *Context) string {
 		return interpolateOne(input, strings.TrimSuffix(strings.TrimPrefix(m, "{{"), "}}"), ctx, m)
 	})
 	re2 := regexp.MustCompile(`\{([^{}]+)\}`)
-	return re2.ReplaceAllStringFunc(rule, func(m string) string {
-		return interpolateOne(input, strings.TrimSuffix(strings.TrimPrefix(m, "{"), "}"), ctx, m)
-	})
+	// 单花括号插值：跳过 JS 模板字符串 ${...}（RE2 无 lookbehind，按索引手动替换）
+	idxes := re2.FindAllStringIndex(rule, -1)
+	var b strings.Builder
+	last := 0
+	for _, idx := range idxes {
+		if idx[0] > 0 && rule[idx[0]-1] == '$' {
+			continue
+		}
+		m := rule[idx[0]:idx[1]]
+		b.WriteString(rule[last:idx[0]])
+		b.WriteString(interpolateOne(input, strings.TrimSuffix(strings.TrimPrefix(m, "{"), "}"), ctx, m))
+		last = idx[1]
+	}
+	b.WriteString(rule[last:])
+	return b.String()
 }
 
 // interpolateOne 单变量插值：$. 前缀从输入 JSONPath 提取，否则查 ctx 变量。
@@ -736,8 +801,32 @@ func splitTopLevel(s, sep string) []string {
 	var parts []string
 	start := 0
 	depth := 0
+	inQuote := byte(0) // ' " ` 内不切分
+	inJS := false      // <js>...</js> 块内不切分（JS 代码里的 || 不是规则分隔符）
 	for i := 0; i < len(s); i++ {
-		switch s[i] {
+		c := s[i]
+		if !inJS && i+4 <= len(s) && s[i:i+4] == "<js>" {
+			inJS = true
+		}
+		if inJS && i+5 <= len(s) && s[i:i+5] == "</js>" {
+			inJS = false
+		}
+		if inJS {
+			continue
+		}
+		if inQuote != 0 {
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"', '`':
+			inQuote = c
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
