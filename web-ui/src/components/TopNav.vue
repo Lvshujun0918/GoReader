@@ -28,7 +28,6 @@ import {
   ArrowLeft,
   BookMarked,
   ChevronDown,
-  Compass,
   Library,
   LogOut,
   Search,
@@ -63,7 +62,6 @@ const props = withDefaults(
     links: () => [
       'bookshelf',
       'search',
-      'explore',
       'sources',
       'rules',
       'monitor',
@@ -87,7 +85,6 @@ const store = useUserStore()
 const NAV_LINKS: Record<string, { to: string; i18n: string; icon: Component }> = {
   bookshelf: { to: '/', i18n: 'nav.bookshelf', icon: BookMarked },
   search: { to: '/search', i18n: 'nav.search', icon: Search },
-  explore: { to: '/explore', i18n: 'nav.explore', icon: Compass },
   sources: { to: '/sources', i18n: 'nav.sources', icon: Library },
   rules: { to: '/rules', i18n: 'nav.rules', icon: SlidersHorizontal },
   monitor: { to: '/server-stats', i18n: 'nav.serverStats', icon: Activity },
@@ -104,7 +101,7 @@ onMounted(() => {
 })
 
 /** 主菜单键（一级直接显示） */
-const PRIMARY_KEYS = ['bookshelf', 'search', 'explore', 'settings']
+const PRIMARY_KEYS = ['bookshelf', 'search', 'settings']
 
 /** 二级分组：组 i18n → 菜单键 */
 const GROUPS: { i18n: string; keys: string[] }[] = [

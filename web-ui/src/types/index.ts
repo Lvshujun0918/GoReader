@@ -120,19 +120,6 @@ export interface SearchBook {
   [key: string]: unknown
 }
 
-/** 探索分类（/reader3/getExploreUrls → string[]；视图层派生：url + 从 URL 尾部路径/参数提取的名称） */
-export interface ExploreSourceInfo {
-  bookSourceUrl: string
-  bookSourceName: string
-  categoryCount: number
-}
-
-export interface ExploreCategory {
-  title: string
-  url: string
-  type?: string
-}
-
 /** 书架分组（/reader3/getBookGroups → BookGroup，camelCase；books.group 存分组 id，0=未分组）
  * 契约扩展：orderNum（=legacy order 排序）+ bookCount（组内书数，后端并行实现中——
  * 后端未返回时前端以本地书架统计兜底）。 */

@@ -1,5 +1,5 @@
 /**
- * 搜索历史（localStorage，最近 10 条；ExploreView 下拉提示与 SearchView 历史共用）
+ * 搜索历史（localStorage，最近 10 条；SearchView 下拉提示与历史共用）
  */
 const HISTORY_KEY = 'reader_search_history'
 const HISTORY_MAX = 10

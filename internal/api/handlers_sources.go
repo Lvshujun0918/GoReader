@@ -5,12 +5,56 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/Lvshujun0918/GoReader/internal/model"
 )
+
+// stripTrailingCommas 删除 JSON 中的尾随逗号（legado 书源/探索 JSON 常带 ,] 与 ,}）。
+func stripTrailingCommas(s string) string {
+	if !strings.Contains(s, ",") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			b.WriteByte(c)
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+			b.WriteByte(c)
+		case ',':
+			// 逗号后（跳过空白）紧跟 ] 或 } → 尾随逗号，跳过
+			j := i + 1
+			for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+				j++
+			}
+			if j < len(s) && (s[j] == ']' || s[j] == '}') {
+				continue
+			}
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
 
 // parseLooseJSON 宽松 JSON 解析（尾随逗号兼容）。标准解析失败且修复后仍失败时返回错误。
 func parseLooseJSON[T any](b []byte, out *T) error {

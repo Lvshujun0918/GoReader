@@ -59,7 +59,6 @@ const zh: LangDict = {
   /* ============ 顶栏导航 ============ */
   'nav.bookshelf': '书架',
   'nav.search': '搜索',
-  'nav.explore': '探索',
   'nav.sources': '书源',
   'nav.rules': '替换规则',
   'nav.users': '用户',
@@ -77,7 +76,6 @@ const zh: LangDict = {
   'route.bookDetail': '书籍详情',
   'route.reader': '阅读',
   'route.search': '搜索',
-  'route.explore': '探索',
   'route.sources': '书源管理',
   'route.rules': '替换规则',
   'route.settings': '设置',
@@ -405,26 +403,6 @@ const zh: LangDict = {
   'sources.setDefaultTip': '设为默认书源',
   'sources.currentDefaultTip': '当前默认书源',
 
-  /* ============ 探索 ============ */
-  'explore.title': '探索',
-  'explore.hint': '书源探索',
-  'explore.favList': '收藏的书单',
-  'explore.searchPlaceholder': '搜索书籍…',
-  'explore.recent': '最近搜索',
-  'explore.noSources': '没有支持探索的书源',
-  'explore.goSources': '前往书源管理',
-  'explore.count': '{n} 个分类',
-  'explore.loadCats': '加载分类…',
-  'explore.searchInList': '在书单中搜索（书名 / 作者）…',
-  'explore.noContent': '此分类暂无内容',
-  'explore.noContentHint': '可能为外部链接/站点失效，或书源探索规则未配置完整',
-  'explore.noMatch': '没有匹配「{k}」的书籍',
-  'explore.unknownAuthor': '未知作者',
-  'explore.noMore': '没有更多了',
-  'explore.autoLoad': '滚动到底部自动加载下一页',
-  'explore.favTip': '收藏该书单',
-  'explore.unfavTip': '取消收藏该书单',
-
   /* ============ RSS ============ */
 }
 
@@ -469,7 +447,6 @@ const en: LangDict = {
   /* ============ Top nav ============ */
   'nav.bookshelf': 'Bookshelf',
   'nav.search': 'Search',
-  'nav.explore': 'Explore',
   'nav.sources': 'Sources',
   'nav.rules': 'Rules',
   'nav.users': 'Users',
@@ -487,7 +464,6 @@ const en: LangDict = {
   'route.bookDetail': 'Book Detail',
   'route.reader': 'Reading',
   'route.search': 'Search',
-  'route.explore': 'Explore',
   'route.sources': 'Source Manager',
   'route.rules': 'Replace Rules',
   'route.settings': 'Settings',
@@ -814,26 +790,6 @@ const en: LangDict = {
   'sources.noSubs': 'No subscriptions yet. Subscribed sources are batch-imported and can be re-imported anytime.',
   'sources.setDefaultTip': 'Set as default source',
   'sources.currentDefaultTip': 'Current default source',
-
-  /* ============ Explore ============ */
-  'explore.title': 'Explore',
-  'explore.hint': 'Source explore',
-  'explore.favList': 'Favorite Lists',
-  'explore.searchPlaceholder': 'Search books…',
-  'explore.recent': 'Recent Searches',
-  'explore.noSources': 'No sources support explore',
-  'explore.goSources': 'Go to Source Manager',
-  'explore.count': '{n} categories',
-  'explore.loadCats': 'Loading categories…',
-  'explore.searchInList': 'Search in list (title / author)…',
-  'explore.noContent': 'No content in this category',
-  'explore.noContentHint': 'May be broken external links or incomplete explore rules',
-  'explore.noMatch': 'No books match "{k}"',
-  'explore.unknownAuthor': 'Unknown Author',
-  'explore.noMore': 'No more',
-  'explore.autoLoad': 'Auto-loads next page at the bottom',
-  'explore.favTip': 'Favorite this list',
-  'explore.unfavTip': 'Unfavorite this list',
 
   /* ============ RSS ============ */
 }

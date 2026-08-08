@@ -26,18 +26,14 @@ export interface PaletteCommand {
   action: PaletteAction
 }
 
-/** 页面跳转命令（书架/书源/设置/探索/RSS/文件/用户 + 替换规则/书仓） */
+/** 页面跳转命令（书架/搜索/书源/规则/设置/监控/用户） */
 const NAV_PAGES: { path: string; title: string; keywords: string[] }[] = [
   { path: '/', title: '书架', keywords: ['bookshelf', 'shelf', '首页', 'home'] },
   { path: '/search', title: '搜索', keywords: ['search', '查找'] },
-  { path: '/explore', title: '探索', keywords: ['explore', '发现', 'discover'] },
   { path: '/sources', title: '书源管理', keywords: ['source', '书源', 'booksource'] },
   { path: '/rules', title: '替换规则', keywords: ['rule', 'replace', '规则'] },
-  { path: '/rss', title: 'RSS', keywords: ['rss', '订阅', 'feed'] },
   { path: '/settings', title: '设置', keywords: ['settings', 'config', '配置', '偏好'] },
-  { path: '/files', title: '文件', keywords: ['file', '文件', '本地'] },
   { path: '/users', title: '用户管理', keywords: ['user', '用户', '账号'] },
-  { path: '/store', title: '书仓', keywords: ['store', '书仓', '共享'] },
 ]
 
 /** 设置项快捷命令（深色 / 浅色 / 跟随系统 / 语言） */

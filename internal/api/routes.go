@@ -75,9 +75,6 @@ func (a *API) registerReader3(r *gin.Engine) {
 	g.POST("/submitCaptcha", a.handleSubmitCaptcha)
 
 	// ---- 探索/订阅 ----
-	g.Any("/getExploreSources", a.handleGetExploreSources)
-	g.Any("/getExploreUrls", a.handleGetExploreUrls)
-	g.Any("/exploreBook", a.handleExploreBook)
 	g.Any("/getSourceSubs", a.handleGetSourceSubs)
 	g.POST("/saveSourceSub", a.handleSaveSourceSub)
 	g.POST("/deleteSourceSub", a.handleDeleteSourceSub)

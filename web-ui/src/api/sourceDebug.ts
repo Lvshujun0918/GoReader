@@ -4,7 +4,7 @@ import { parseSSEBlock, consumeSSEStreamBlocks } from './sse'
 /**
  * 书源调试 —— 后端契约（并行实现中）
  *
- * GET /reader3/bookSourceDebugSSE?bookSource=<书源URL>&action=search|explore|toc|content&key=<关键词>&chapterUrl=<章节URL>
+ * GET /reader3/bookSourceDebugSSE?bookSource=<书源URL>&action=search|toc|content&key=<关键词>&chapterUrl=<章节URL>
  *   → text/event-stream，事件体（无名 data 帧，兼容 event: step/result 命名）：
  *       {type: 'start',  message: {action, bookSource}}        开始
  *       {type: 'step',   message: {ruleName,url,elapsedMs,resultLen,error,detail}}  逐步日志（每次一步）
@@ -17,12 +17,12 @@ import { parseSSEBlock, consumeSSEStreamBlocks } from './sse'
  * - 后端未就绪（网络错误 / HTTP 非 200）reject，由调用方 silent 降级提示，不弹全局 toast。
  */
 
-export type DebugAction = 'search' | 'explore' | 'toc' | 'content'
+export type DebugAction = 'search' | 'toc' | 'content'
 
 export interface DebugSSEParams {
   /** 被测书源 URL */
   bookSourceUrl: string
-  /** 动作：search=搜索 / explore=探索 / toc=目录 / content=正文 */
+  /** 动作：search=搜索 / toc=目录 / content=正文 */
   action: DebugAction
   /** action=search 时的关键词 */
   key?: string

@@ -7,13 +7,13 @@ import {
   SEARCH_COMMAND,
 } from './commandPalette.ts'
 
-test('命令表：搜索 + 跳转页面 + 设置项齐全（书架/书源/设置/探索/RSS/文件/用户/深色/语言）', () => {
+test('命令表：搜索 + 跳转页面 + 设置项齐全（书架/书源/设置/用户/深色/语言）', () => {
   const cmds = paletteCommands()
   const ids = cmds.map((c) => c.id)
   // 搜索书籍
   assert.ok(ids.includes('search-books'))
   // 跳转页面
-  for (const path of ['/', '/sources', '/settings', '/explore', '/rss', '/files', '/users']) {
+  for (const path of ['/', '/sources', '/settings', '/users']) {
     assert.ok(ids.includes(`nav-${path}`), `缺少导航命令 ${path}`)
   }
   // 设置项：深色 / 语言

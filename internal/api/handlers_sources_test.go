@@ -95,6 +95,16 @@ func loadRealShuyuan(t *testing.T) []map[string]any {
 	return list
 }
 
+// saveOneSource 通过 HTTP 保存单个书源。
+func saveOneSource(t *testing.T, h http.Handler, src map[string]any) {
+	t.Helper()
+	w := perform(h, "POST", "/reader3/saveBookSources", []map[string]any{src})
+	rd := parseReturn(t, w)
+	if !rd.IsSuccess {
+		t.Fatalf("保存书源失败: %v (%s)", rd.ErrorMsg, w.Body.String())
+	}
+}
+
 // sourceStrField 取 BookSource 指定 json 字段字符串值（测试断言用）。
 func sourceStrField(s *model.BookSource, jsonKey string) string {
 	switch jsonKey {
