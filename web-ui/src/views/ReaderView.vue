@@ -2481,19 +2481,24 @@ async function init() {
     // 替换规则：进入阅读页时读取一次（localStorage 占位；后端就绪后走 GET /reader3/getReplaceRules）
     if (replaceEnabled.value) refreshReplaceRules()
 
-    // 目录 + 详情并行拉取
-    const [tocRes, infoRes] = await Promise.allSettled([
-      getBookToc(shelfBook.value!.tocUrl, shelfBook.value!.origin),
-      getBookInfo(shelfBook.value!.bookUrl, shelfBook.value!.origin, { silent: true }),
-    ])
-    if (tocRes.status === 'fulfilled' && tocRes.value.isSuccess) {
-      chapters.value = tocRes.value.data ?? []
+    // 先取详情拿到真实 tocUrl（ruleBookInfo 计算的 /chapters?paging=0 等），
+    // 再取目录——临时书 tocUrl 默认是 bookUrl（详情页），直接请求目录会抓到详情导致"第 1/1 章"+正文 JSON
+    const infoRes = await getBookInfo(shelfBook.value!.bookUrl, shelfBook.value!.origin, {
+      silent: true,
+    }).catch(() => null)
+    const infoData = infoRes?.isSuccess ? (infoRes.data as { tocUrl?: string; name?: string } | null) : null
+    if (infoData?.tocUrl) {
+      shelfBook.value!.tocUrl = infoData.tocUrl
+    }
+    const tocRes = await getBookToc(shelfBook.value!.tocUrl, shelfBook.value!.origin)
+    if (tocRes.isSuccess) {
+      chapters.value = tocRes.data ?? []
     } else {
       loadError.value = true
       return
     }
-    if (infoRes.status === 'fulfilled' && infoRes.value.isSuccess && infoRes.value.data) {
-      bookName.value = infoRes.value.data.name || bookName.value
+    if (infoData?.name) {
+      bookName.value = infoData.name
     }
 
     // 起始章节：① 全书搜索跳转 ?chapter=index 显式指定（优先级最高）；
