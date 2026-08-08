@@ -196,9 +196,18 @@ func (a *API) handleGetBookInfo(c *gin.Context) {
 		Fail(c, "书源链接不能为空")
 		return
 	}
-	// 书架已有则直接返回
+	// 书架已有则直接返回（合并书架字段；tocUrl 实时用 ruleBookInfo 重算——
+	// 书架里可能是旧代码存错的详情 URL，直接返回会致目录只抓 1 章）
 	if book, err := a.Storage.FindBook(ns, url); err == nil && book != nil {
-		OK(c, bookInfoFromBook(book))
+		info := bookInfoFromBook(book)
+		if source, serr := a.Storage.FindBookSource(ns, book.Origin); serr == nil && source != nil {
+			if real, rerr := (bookfetch.New(a.Storage, ns, a.Solver)).BookInfo(source, url); rerr == nil {
+				if toc, ok := real["tocUrl"].(string); ok && toc != "" {
+					info["tocUrl"] = toc
+				}
+			}
+		}
+		OK(c, info)
 		return
 	}
 	source, err := a.Storage.FindBookSource(ns, origin)
