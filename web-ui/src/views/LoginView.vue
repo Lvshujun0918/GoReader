@@ -13,7 +13,6 @@ import {
 } from 'lucide-vue-next'
 import { login as loginApi } from '@/api/auth'
 import { useUserStore } from '@/stores/user'
-import { t } from '@/utils/i18n'
 import { APP_VERSION } from '@/version'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -39,15 +38,15 @@ function switchMode(m: 'login' | 'register') {
 async function submit() {
   const { username, password } = form
   if (!username.trim() || !password) {
-    ElMessage.warning(t('login.needBoth'))
+    ElMessage.warning('请输入用户名和密码')
     return
   }
   if (mode.value === 'register' && username.trim().length < 5) {
-    ElMessage.warning(t('login.usernameTooShort'))
+    ElMessage.warning('用户名不能低于 5 位（字母/数字）')
     return
   }
   if (mode.value === 'register' && password.length < 8) {
-    ElMessage.warning(t('login.passwordTooShort'))
+    ElMessage.warning('密码不能低于 8 位')
     return
   }
 
@@ -61,7 +60,7 @@ async function submit() {
       code: mode.value === 'register' && form.code.trim() ? form.code.trim() : undefined,
     })
     store.setSession(res.data.accessToken, res.data.username, remember.value)
-    ElMessage.success(mode.value === 'login' ? t('login.welcomeBack') : t('login.registered'))
+    ElMessage.success(mode.value === 'login' ? '欢迎回来' : '注册成功，已自动登录')
     // GAP 127：登录成功回跳 redirect query（仅限站内路径，防开放重定向）
     const q = route.query.redirect
     const redirect =
@@ -81,9 +80,9 @@ async function submit() {
       <!-- 徽标 + 字标 -->
       <div class="wordmark">
         <span class="login-logo-ring">
-          <img class="login-logo" src="/logo.svg" :alt="t('brand.name')" />
+          <img class="login-logo" src="/logo.svg" :alt="'夜读'" />
         </span>
-        <h1 class="wordmark-text">{{ t('brand.name') }}<span class="wordmark-dot">.</span></h1>
+        <h1 class="wordmark-text">{{ '夜读' }}<span class="wordmark-dot">.</span></h1>
         <p class="wordmark-sub">READER</p>
       </div>
 
@@ -93,13 +92,13 @@ async function submit() {
           <TabsTrigger value="login" @click="switchMode('login')">
             <span class="tab-label">
               <LogIn :size="14" aria-hidden="true" />
-              {{ t('login.title') }}
+              {{ '登录' }}
             </span>
           </TabsTrigger>
           <TabsTrigger value="register" @click="switchMode('register')">
             <span class="tab-label">
               <UserPlus :size="14" aria-hidden="true" />
-              {{ t('login.register') }}
+              {{ '注册' }}
             </span>
           </TabsTrigger>
         </TabsList>
@@ -110,7 +109,7 @@ async function submit() {
         <CardContent class="pt-6">
           <form class="grid gap-4" @submit.prevent="submit">
             <div class="grid gap-2">
-              <Label for="login-username">{{ t('login.username') }}</Label>
+              <Label for="login-username">{{ '用户名' }}</Label>
               <div class="input-wrap">
                 <User class="input-icon" :size="16" aria-hidden="true" />
                 <Input
@@ -118,7 +117,7 @@ async function submit() {
                   v-model="form.username"
                   type="text"
                   class="pl-9"
-                  :placeholder="t('login.placeholder.username')"
+                  :placeholder="'请输入用户名'"
                   maxlength="32"
                   autocomplete="username"
                   spellcheck="false"
@@ -127,7 +126,7 @@ async function submit() {
             </div>
 
             <div class="grid gap-2">
-              <Label for="login-password">{{ t('login.password') }}</Label>
+              <Label for="login-password">{{ '密码' }}</Label>
               <div class="input-wrap">
                 <Lock class="input-icon" :size="16" aria-hidden="true" />
                 <Input
@@ -135,7 +134,7 @@ async function submit() {
                   v-model="form.password"
                   type="password"
                   class="pl-9"
-                  :placeholder="t('login.placeholder.password')"
+                  :placeholder="'至少 8 位'"
                   maxlength="64"
                   autocomplete="current-password"
                 />
@@ -144,7 +143,7 @@ async function submit() {
 
             <!-- GAP 90：注册模式邀请码（后端开启邀请注册时必填；未开启可留空） -->
             <div v-if="mode === 'register'" class="grid gap-2">
-              <Label for="login-code">{{ t('login.inviteCode') }}</Label>
+              <Label for="login-code">{{ '邀请码' }}</Label>
               <div class="input-wrap">
                 <KeyRound class="input-icon" :size="16" aria-hidden="true" />
                 <Input
@@ -152,7 +151,7 @@ async function submit() {
                   v-model="form.code"
                   type="text"
                   class="pl-9"
-                  :placeholder="t('login.placeholder.code')"
+                  :placeholder="'邀请码（如后端未开启邀请注册可留空）'"
                   maxlength="64"
                   autocomplete="off"
                   spellcheck="false"
@@ -164,7 +163,7 @@ async function submit() {
             <div class="flex items-center gap-2">
               <Checkbox id="login-remember" v-model:checked="remember" />
               <Label for="login-remember" class="font-normal cursor-pointer">
-                {{ t('login.remember') }}
+                {{ '记住我' }}
               </Label>
             </div>
 
@@ -172,20 +171,20 @@ async function submit() {
               <LoaderCircle v-if="loading" class="animate-spin" :size="16" aria-hidden="true" />
               <LogIn v-else-if="mode === 'login'" :size="16" aria-hidden="true" />
               <UserPlus v-else :size="16" aria-hidden="true" />
-              <span>{{ mode === 'login' ? t('login.submit') : t('login.registerSubmit') }}</span>
+              <span>{{ mode === 'login' ? '登 录' : '注 册' }}</span>
             </Button>
           </form>
         </CardContent>
       </Card>
 
       <p class="login-foot">
-        {{ mode === 'login' ? t('login.noAccount') : t('login.hasAccount') }}
+        {{ mode === 'login' ? '还没有账号？' : '已有账号？' }}
         <button
           type="button"
           class="link-btn"
           @click="switchMode(mode === 'login' ? 'register' : 'login')"
         >
-          {{ mode === 'login' ? t('login.goRegister') : t('login.goLogin') }}
+          {{ mode === 'login' ? '立即注册' : '去登录' }}
           <ArrowRight :size="13" class="link-arrow" aria-hidden="true" />
         </button>
       </p>

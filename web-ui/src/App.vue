@@ -1,9 +1,7 @@
 <script setup lang="ts">
-import { getCurrentInstance, onMounted, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { getCurrentInstance, onMounted } from 'vue'
 import { applyUiTheme, loadUiTheme } from '@/utils/uiTheme'
 import { applyCustomCss } from '@/utils/customCss'
-import { applyDocLang, lang, t } from '@/utils/i18n'
 import ErrorBoundary from '@/components/ErrorBoundary.vue'
 import CommandPalette from '@/components/CommandPalette.vue'
 import GlobalConfirmDialog from '@/components/GlobalConfirmDialog.vue'
@@ -26,22 +24,11 @@ onMounted(() => {
   applyUiTheme(loadUiTheme())
   // GAP 5：自定义样式注入（reader_custom_css → 全局 <style>，阅读器/界面均可覆盖）
   applyCustomCss()
-  // i18n：<html lang> + 当前路由标题（语言切换时由下方 watch 重算）
-  applyDocLang()
   const mq = window.matchMedia('(prefers-color-scheme: dark)')
   const onSystemChange = () => {
     if (loadUiTheme() === 'system') applyUiTheme('system')
   }
   mq.addEventListener('change', onSystemChange)
-})
-
-// i18n：语言切换后重算 <html lang> 与当前路由标题
-const route = useRoute()
-watch(lang, () => {
-  applyDocLang()
-  const meta = route.meta
-  const title = t(String(meta.titleKey ?? meta.title ?? ''))
-  document.title = `${title} · ${t('brand.name')}`
 })
 </script>
 

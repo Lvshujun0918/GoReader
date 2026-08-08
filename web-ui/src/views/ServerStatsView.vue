@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { getServerStats } from '@/api/serverStats'
-import { t } from '@/utils/i18n'
 import TopNav from '@/components/TopNav.vue'
 import type { ServerStats } from '@/types'
 
 /**
  * 服务监控（GET /reader3/getServerStats）
- * 卡片：内存 / CPU / 请求量（总数·今日·Top 接口）/ 在线会话 / 书源成功率 + 运行信息
+ * 卡片：内存 / CPU / 请求量（总数·今日·Top 接口）/ 在线会话 + 运行信息
  * 纯 CSS 条形（无图表库）；10s 自动刷新（页面隐藏时暂停，恢复可见立即刷新）。
  */
 
@@ -30,7 +29,7 @@ async function refresh() {
     stats.value = res.data ?? null
     lastUpdated.value = Date.now()
   } catch (err) {
-    error.value = (err as { message?: string } | null | undefined)?.message ?? t('monitor.loadFailed')
+    error.value = (err as { message?: string } | null | undefined)?.message ?? '监控数据加载失败'
   } finally {
     loading.value = false
     countdown.value = REFRESH_MS / 1000
@@ -76,9 +75,9 @@ function fmtUptime(sec: number): string {
   const d = Math.floor(sec / 86_400)
   const h = Math.floor((sec % 86_400) / 3600)
   const m = Math.floor((sec % 3600) / 60)
-  if (d > 0) return `${d}${t('monitor.unitDay')} ${h}${t('monitor.unitHour')}`
-  if (h > 0) return `${h}${t('monitor.unitHour')} ${m}${t('monitor.unitMin')}`
-  return `${Math.max(m, 1)}${t('monitor.unitMin')}`
+  if (d > 0) return `${d}${'天'} ${h}${'时'}`
+  if (h > 0) return `${h}${'时'} ${m}${'分'}`
+  return `${Math.max(m, 1)}${'分'}`
 }
 
 /** 百分比条宽度（0..100 夹取） */
@@ -90,23 +89,7 @@ const memPercent = computed(() => stats.value?.memory.percent ?? 0)
 const cpuPercent = computed(() => stats.value?.cpu.percent ?? 0)
 const topEndpoints = computed(() => stats.value?.requests?.topEndpoints?.slice(0, 5) ?? [])
 
-/** 书源成功率（0..1）→ 百分比 */
-const sourceRate = computed(() => {
-  const r = stats.value?.bookSource?.successRate
-  return r === null || r === undefined ? null : r * 100
-})
-
-function sourceRateClass(rate: number): string {
-  if (rate >= 90) return 'good'
-  if (rate >= 60) return 'mid'
-  return 'bad'
-}
-
-function sourceTimeText(): string {
-  const s = stats.value?.bookSource
-  if (!s || s.checkedAt === null) return ''
-  return `${t('monitor.checkedAt')} ${fmtTime(s.checkedAt)}`
-}
+/* ---------------- 运行信息 ---------------- */
 </script>
 
 <template>
@@ -116,10 +99,10 @@ function sourceTimeText(): string {
 
     <main class="content">
       <div class="section-head">
-        <h1 class="section-title">{{ t('monitor.title') }}</h1>
-        <span class="count">{{ t('monitor.autoRefresh', { n: countdown }) }}</span>
+        <h1 class="section-title">{{ '服务监控' }}</h1>
+        <span class="count">{{ countdown }}s 后自动刷新</span>
         <button class="refresh-btn" type="button" :disabled="loading" @click="refresh">
-          {{ loading ? t('common.loading') : t('common.refresh') }}
+          {{ loading ? '加载中…' : '刷新' }}
         </button>
       </div>
 
@@ -136,37 +119,37 @@ function sourceTimeText(): string {
       <div v-else-if="stats" class="cards">
         <!-- 内存 -->
         <div class="card">
-          <div class="card-title">{{ t('monitor.memory') }}</div>
+          <div class="card-title">{{ '内存' }}</div>
           <div class="big-num">{{ fmtMb(stats?.memory?.usedMb ?? 0) }} <span class="sub">/ {{ fmtMb(stats?.memory?.totalMb ?? 0) }}</span></div>
           <div class="bar">
             <div class="bar-fill mem" :style="{ width: barWidth(memPercent) }"></div>
           </div>
           <div class="bar-label">
-            <span>{{ t('monitor.usedPct', { n: memPercent.toFixed(1) }) }}</span>
-            <span>{{ t('monitor.available') }} {{ fmtMb(stats?.memory?.availableMb ?? 0) }}</span>
+            <span>已用 {{ memPercent.toFixed(1) }}%</span>
+            <span>{{ '可用' }} {{ fmtMb(stats?.memory?.availableMb ?? 0) }}</span>
           </div>
-          <div class="card-sub">{{ t('monitor.processMem') }} {{ fmtMb(stats?.memory?.processMb ?? 0) }}</div>
+          <div class="card-sub">{{ '本进程内存' }} {{ fmtMb(stats?.memory?.processMb ?? 0) }}</div>
         </div>
 
         <!-- CPU -->
         <div class="card">
-          <div class="card-title">{{ t('monitor.cpu') }}</div>
+          <div class="card-title">{{ 'CPU' }}</div>
           <div class="big-num">{{ cpuPercent.toFixed(1) }}<span class="sub">%</span></div>
           <div class="bar">
             <div class="bar-fill cpu" :style="{ width: barWidth(cpuPercent) }"></div>
           </div>
           <div class="bar-label">
-            <span>{{ t('monitor.cpuUsage') }}</span>
-            <span>{{ stats?.cpu?.cores ?? 0 }} {{ t('monitor.cores') }}</span>
+            <span>{{ '使用率' }}</span>
+            <span>{{ stats?.cpu?.cores ?? 0 }} {{ '核心' }}</span>
           </div>
-          <div class="card-sub">{{ t('monitor.cpuSampleNote') }}</div>
+          <div class="card-sub">{{ '短采样（约 200ms）' }}</div>
         </div>
 
         <!-- 请求量 -->
         <div class="card">
-          <div class="card-title">{{ t('monitor.requests') }}</div>
-          <div class="big-num">{{ (stats?.requests?.total ?? 0).toLocaleString() }} <span class="sub">{{ t('monitor.requestsTotal') }}</span></div>
-          <div class="today-line">{{ t('monitor.requestsToday') }}：{{ (stats?.requests?.today ?? 0).toLocaleString() }}</div>
+          <div class="card-title">{{ '请求量' }}</div>
+          <div class="big-num">{{ (stats?.requests?.total ?? 0).toLocaleString() }} <span class="sub">{{ '累计' }}</span></div>
+          <div class="today-line">{{ '今日' }}：{{ (stats?.requests?.today ?? 0).toLocaleString() }}</div>
           <div v-if="topEndpoints.length" class="endpoint-list">
             <div v-for="(ep, i) in topEndpoints" :key="ep.path" class="endpoint-row">
               <span class="ep-rank">{{ i + 1 }}</span>
@@ -174,42 +157,23 @@ function sourceTimeText(): string {
               <span class="ep-count">{{ ep.count.toLocaleString() }}</span>
             </div>
           </div>
-          <div v-else class="card-sub">{{ t('monitor.noRequests') }}</div>
+          <div v-else class="card-sub">{{ '暂无请求' }}</div>
         </div>
 
         <!-- 在线会话 -->
         <div class="card">
-          <div class="card-title">{{ t('monitor.online') }}</div>
-          <div class="big-num">{{ stats?.online?.sessions ?? 0 }} <span class="sub">{{ t('monitor.sessions') }}</span></div>
-          <div class="card-sub">{{ t('monitor.onlineNote') }}</div>
-        </div>
-
-        <!-- 书源成功率 -->
-        <div class="card">
-          <div class="card-title">{{ t('monitor.sourceRate') }}</div>
-          <template v-if="sourceRate !== null">
-            <div class="big-num" :class="sourceRateClass(sourceRate)">
-              {{ sourceRate.toFixed(1) }}<span class="sub">%</span>
-            </div>
-            <div class="bar">
-              <div class="bar-fill" :class="sourceRateClass(sourceRate)" :style="{ width: barWidth(sourceRate) }"></div>
-            </div>
-            <div class="bar-label">
-              <span>{{ t('monitor.sourceOk', { ok: stats?.bookSource?.ok ?? 0, total: stats?.bookSource?.total ?? 0 }) }}</span>
-              <span>{{ t('monitor.sourceFailed', { n: stats?.bookSource?.failed ?? 0 }) }}</span>
-            </div>
-            <div class="card-sub">{{ sourceTimeText() }}</div>
-          </template>
-          <div v-else class="empty-note">{{ stats?.bookSource?.note || t('monitor.sourceNeverChecked') }}</div>
+          <div class="card-title">{{ '在线会话' }}</div>
+          <div class="big-num">{{ stats?.online?.sessions ?? 0 }} <span class="sub">{{ '个' }}</span></div>
+          <div class="card-sub">{{ '有效 token 数' }}</div>
         </div>
 
         <!-- 运行信息 -->
         <div class="card">
-          <div class="card-title">{{ t('monitor.runtime') }}</div>
-          <div class="kv-row"><span>{{ t('monitor.version') }}</span><span>v{{ stats.version }}</span></div>
-          <div class="kv-row"><span>{{ t('monitor.port') }}</span><span>{{ stats.port }}</span></div>
-          <div class="kv-row"><span>{{ t('monitor.uptime') }}</span><span>{{ fmtUptime(stats.uptimeSeconds) }}</span></div>
-          <div class="kv-row"><span>{{ t('monitor.lastUpdated') }}</span><span>{{ lastUpdated ? fmtTime(lastUpdated) : '—' }}</span></div>
+          <div class="card-title">{{ '运行信息' }}</div>
+          <div class="kv-row"><span>{{ '版本' }}</span><span>v{{ stats.version }}</span></div>
+          <div class="kv-row"><span>{{ '端口' }}</span><span>{{ stats.port }}</span></div>
+          <div class="kv-row"><span>{{ '运行时长' }}</span><span>{{ fmtUptime(stats.uptimeSeconds) }}</span></div>
+          <div class="kv-row"><span>{{ '最近刷新' }}</span><span>{{ lastUpdated ? fmtTime(lastUpdated) : '—' }}</span></div>
         </div>
       </div>
     </main>

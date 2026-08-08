@@ -35,7 +35,6 @@ import {
 } from 'lucide-vue-next'
 import { useUserStore } from '@/stores/user'
 import { probeSecureMode } from '@/api/users'
-import { t } from '@/utils/i18n'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -77,13 +76,13 @@ const emit = defineEmits<{ logout: []; back: [] }>()
 const router = useRouter()
 const store = useUserStore()
 
-/** 导航键 → 路由 / i18n 文案 / lucide 图标（键名与 i18n nav.* 对齐；缺失回退 zh/原文） */
-const NAV_LINKS: Record<string, { to: string; i18n: string; icon: Component }> = {
-  bookshelf: { to: '/', i18n: 'nav.bookshelf', icon: BookMarked },
-  rules: { to: '/rules', i18n: 'nav.rules', icon: SlidersHorizontal },
-  monitor: { to: '/server-stats', i18n: 'nav.serverStats', icon: Activity },
-  users: { to: '/users', i18n: 'nav.users', icon: Users },
-  settings: { to: '/settings', i18n: 'nav.settings', icon: Settings },
+/** 导航键 → 路由 / 中文文案 / lucide 图标 */
+const NAV_LINKS: Record<string, { to: string; label: string; icon: Component }> = {
+  bookshelf: { to: '/', label: '书架', icon: BookMarked },
+  rules: { to: '/rules', label: '替换规则', icon: SlidersHorizontal },
+  monitor: { to: '/server-stats', label: '监控', icon: Activity },
+  users: { to: '/users', label: '用户', icon: Users },
+  settings: { to: '/settings', label: '设置', icon: Settings },
 }
 
 /** secure 模式（统一探测；决定「用户」入口显隐——所有页面菜单一致） */
@@ -97,10 +96,10 @@ onMounted(() => {
 /** 主菜单键（一级直接显示） */
 const PRIMARY_KEYS = ['bookshelf', 'settings']
 
-/** 二级分组：组 i18n → 菜单键 */
-const GROUPS: { i18n: string; keys: string[] }[] = [
-  { i18n: 'nav.groupRules', keys: ['rules'] },
-  { i18n: 'nav.groupManage', keys: ['monitor', 'users'] },
+/** 二级分组：组名 → 菜单键 */
+const GROUPS: { label: string; keys: string[] }[] = [
+  { label: '规则', keys: ['rules'] },
+  { label: '管理', keys: ['monitor', 'users'] },
 ]
 
 interface NavItem {
@@ -111,7 +110,7 @@ interface NavItem {
 
 function navItem(key: string): NavItem | null {
   const def = NAV_LINKS[key]
-  return def ? { to: def.to, label: t(def.i18n), icon: def.icon } : null
+  return def ? { to: def.to, label: def.label, icon: def.icon } : null
 }
 
 function isNavItem(x: NavItem | null): x is NavItem {
@@ -124,8 +123,8 @@ const primaryLinks = computed(() => PRIMARY_KEYS.map(navItem).filter(isNavItem))
 /** 二级分组（过滤空组与「用户」门控——secure 模式才显示用户入口） */
 const visibleGroups = computed(() =>
   GROUPS.map((g) => ({
-    key: g.i18n,
-    label: t(g.i18n),
+    key: g.label,
+    label: g.label,
     items: g.keys
       .map(navItem)
       .filter(
@@ -146,7 +145,7 @@ const visibleGroups = computed(() =>
       </template>
       <div class="brand">
         <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand-name">{{ t('brand.name') }}<span class="brand-dot">.</span></span>
+        <span class="brand-name">{{ '夜读' }}<span class="brand-dot">.</span></span>
       </div>
     </slot>
 
@@ -190,7 +189,7 @@ const visibleGroups = computed(() =>
       <span v-if="showUser" class="user-chip">{{ store.username || '未登录' }}</span>
       <button v-if="showLogout" class="logout-btn" type="button" @click="emit('logout')">
         <LogOut :size="14" aria-hidden="true" />
-        <span>{{ t('nav.logout') }}</span>
+        <span>{{ '退出' }}</span>
       </button>
     </div>
     <slot v-else name="trailing" />

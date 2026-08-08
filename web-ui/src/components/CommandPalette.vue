@@ -10,7 +10,6 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { filterCommands, type PaletteCommand } from '@/utils/commandPalette'
 import { applyUiTheme } from '@/utils/uiTheme'
-import { setLang } from '@/utils/i18n'
 
 const router = useRouter()
 
@@ -49,9 +48,6 @@ function runCommand(cmd: PaletteCommand) {
       break
     case 'theme':
       applyUiTheme(cmd.action.theme)
-      break
-    case 'lang':
-      setLang(cmd.action.lang)
       break
   }
   closePalette()

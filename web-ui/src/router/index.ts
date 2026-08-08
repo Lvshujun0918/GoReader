@@ -1,6 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useUserStore } from '@/stores/user'
-import { t } from '@/utils/i18n'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -81,8 +80,8 @@ router.beforeEach((to) => {
 })
 
 router.afterEach((to) => {
-  const title = t(String(to.meta.titleKey ?? to.meta.title ?? ''))
-  document.title = `${title} · ${t('brand.name')}`
+  const title = String(to.meta.title ?? to.name ?? '')
+  document.title = `${title} · ${'夜读'}`
 })
 
 export default router

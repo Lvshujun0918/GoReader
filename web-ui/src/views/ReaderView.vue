@@ -14,7 +14,6 @@ import { setGlobalHanMode } from '@/utils/hanMode'
 import { DAILY_STATS_KEY, accumulateDaily, parseDailyStats } from '@/utils/dailyStats'
 import { useUserStore } from '@/stores/user'
 import { loadBookConfig, saveBookConfig, clearBookConfig } from '@/utils/bookConfig'
-import { t } from '@/utils/i18n'
 import { requestWakeLock, releaseWakeLock } from '@/utils/wakeLock'
 import { parsePageMode, type PageMode } from '@/utils/readerPageMode'
 import {
@@ -100,6 +99,19 @@ type Theme = 'light' | 'warm' | 'green' | 'dark' | 'black' | 'system' | 'custom'
 const THEME_KEY = 'reader_theme'
 // 主题预设：白 / 米黄 / 绿 / 黑夜（灰黑）/ 黑夜（全黑）
 const THEME_ORDER: Theme[] = ['light', 'warm', 'green', 'dark', 'black']
+// 主题名（中文固定文案）
+const THEME_NAMES: Record<string, string> = {
+  light: '白色',
+  warm: '米黄',
+  green: '绿色',
+  dark: '灰黑夜',
+  black: '纯黑夜',
+  system: '跟随系统',
+  custom: '自定义',
+}
+function themeName(t: string): string {
+  return THEME_NAMES[t] ?? t
+}
 const theme = ref<Theme>('light')
 /** 阅读页根元素（主题只作用于阅读页内，与界面主题 html[data-theme] 分离） */
 const pageRef = ref<HTMLElement | null>(null)
@@ -922,10 +934,10 @@ function toggleHan() {
 const hanConvert = (text: string) => applyHan(text, hanMode.value)
 const hanTargetLabel = computed(() =>
   hanMode.value === 'auto'
-    ? t('han.auto')
+    ? '自动'
     : hanMode.value === 'trad'
-      ? t('reader.hanToSimp')
-      : t('reader.hanToTrad'),
+      ? '简'
+      : '繁',
 )
 
 /* ---------------- GAP 6：本书设置（per-book 覆盖 12 项——localStorage reader_book_config_{bookUrl}，本书优先于全局） ---------------- */
@@ -1222,10 +1234,10 @@ function stopTtsParaTracking() {
 /** 顶栏按钮文案 */
 const ttsTopLabel = computed(() =>
   ttsState.value === 'playing' || ttsState.value === 'loading'
-    ? t('reader.stop')
+    ? '停止'
     : ttsState.value === 'paused'
-      ? t('reader.resumeShort')
-      : t('reader.ttsLabel'),
+      ? '继续'
+      : '听书',
 )
 
 /** 语速 0.5-2.0 → Edge 百分比（+0% / +10% / -50%） */
@@ -2815,7 +2827,7 @@ onBeforeUnmount(() => {
       v-show="chromeVisible"
       class="reading-progress"
       type="button"
-      :title="t('reader.jumpTip')"
+      :title="'跳转章节'"
       @click="jumpOpen = true"
     >
       <i class="reading-progress-fill" :style="{ width: `${progressPct}%` }"></i>
@@ -2823,24 +2835,24 @@ onBeforeUnmount(() => {
 
     <!-- 顶部极简栏 -->
     <header class="topbar" v-show="chromeVisible">
-      <button class="icon-btn" type="button" :title="t('reader.back')" @click="goBack">
+      <button class="icon-btn" type="button" :title="'返回'" @click="goBack">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
           <path d="M19 12H5" />
           <path d="M11 18l-6-6 6-6" />
         </svg>
       </button>
 
-      <span class="book-name" :title="displayBookName">{{ displayBookName || t('reader.title') }}</span>
+      <span class="book-name" :title="displayBookName">{{ displayBookName || '阅读' }}</span>
 
       <div class="top-actions">
         <button
           class="font-btn"
           type="button"
           :class="{ active: brightness !== 1 }"
-          :title="t('reader.brightnessTip')"
+          :title="'亮度（0.6-1.4 倍）'"
           @click="brightnessOpen = true"
         >
-          {{ t('reader.brightness') }}
+          {{ '亮度' }}
         </button>
         <button
           v-if="isTextBook"
@@ -2849,16 +2861,16 @@ onBeforeUnmount(() => {
           :class="{ active: ttsPlaying }"
           :title="
             ttsState === 'playing' || ttsState === 'loading'
-              ? t('reader.ttsStop')
+              ? '停止朗读'
               : ttsState === 'paused'
-                ? t('reader.ttsResume')
-                : t('reader.tts')
+                ? '继续朗读'
+                : '听书（后端语音合成，本章播完自动下一章）'
           "
           @click="toggleTts"
         >
           {{ ttsTopLabel }}
         </button>
-        <button class="font-btn more-btn" type="button" :title="t('reader.more')" @click="moreOpen = !moreOpen">
+        <button class="font-btn more-btn" type="button" :title="'更多'" @click="moreOpen = !moreOpen">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
             <circle cx="12" cy="5" r="1.2" />
             <circle cx="12" cy="12" r="1.2" />
@@ -2875,14 +2887,14 @@ onBeforeUnmount(() => {
     >
       <!-- 不在书架 -->
       <div v-if="notFound" class="state">
-        <p class="state-text">{{ t('reader.notFound') }}</p>
-        <button class="retry-btn" type="button" @click="router.replace('/')">{{ t('reader.backShelf') }}</button>
+        <p class="state-text">{{ '未找到这本书（可能不在书架中）' }}</p>
+        <button class="retry-btn" type="button" @click="router.replace('/')">{{ '返回书架' }}</button>
       </div>
 
       <!-- 目录为空 -->
       <div v-else-if="!loading && !loadError && chapters.length === 0" class="state">
-        <p class="state-text">{{ t('reader.noToc') }}</p>
-        <button class="retry-btn" type="button" @click="retry">{{ t('common.retry') }}</button>
+        <p class="state-text">{{ '未获取到章节目录' }}</p>
+        <button class="retry-btn" type="button" @click="retry">{{ '重试' }}</button>
       </div>
 
       <template v-else>
@@ -2892,18 +2904,18 @@ onBeforeUnmount(() => {
         <template v-if="isTextBook">
           <!-- 加载态：细字 -->
           <div v-if="loading" class="state">
-            <p class="state-text loading-text">{{ t('reader.loading') }}</p>
+            <p class="state-text loading-text">{{ '加载中…' }}</p>
           </div>
 
           <!-- 错误态 -->
           <div v-else-if="loadError" class="state">
-            <p class="state-text">{{ t('reader.loadError') }}</p>
-            <button class="retry-btn" type="button" @click="retry">{{ t('common.retry') }}</button>
+            <p class="state-text">{{ '正文获取失败，请稍后重试' }}</p>
+            <button class="retry-btn" type="button" @click="retry">{{ '重试' }}</button>
           </div>
 
           <!-- 空内容 -->
           <div v-else-if="paragraphs.length === 0" class="state">
-            <p class="state-text">{{ t('reader.emptyChapter') }}</p>
+            <p class="state-text">{{ '本章暂无内容' }}</p>
           </div>
 
           <!-- 正文（分页模式：横向分页容器；其余模式：普通纵向流） -->
@@ -2945,27 +2957,27 @@ onBeforeUnmount(() => {
               class="nav-btn"
               type="button"
               :disabled="!hasPrev"
-              :title="t('reader.prevTip')"
+              :title="'上一章（长按连续快退）'"
               @click="onPrevClick"
               @pointerdown="prevHold.start"
               @pointerup="prevHold.stop"
               @pointerleave="prevHold.stop"
               @pointercancel="prevHold.stop"
             >
-              {{ t('common.prevChapter') }}
+              {{ '上一章' }}
             </button>
             <button
               class="nav-btn"
               type="button"
               :disabled="!hasNext"
-              :title="t('reader.nextTip')"
+              :title="'下一章（长按连续快进）'"
               @click="onNextClick"
               @pointerdown="nextHold.start"
               @pointerup="nextHold.stop"
               @pointerleave="nextHold.stop"
               @pointercancel="nextHold.stop"
             >
-              {{ t('common.nextChapter') }}
+              {{ '下一章' }}
             </button>
           </nav>
         </template>
@@ -2974,13 +2986,13 @@ onBeforeUnmount(() => {
         <template v-else>
           <!-- 加载态 -->
           <div v-if="loading" class="state">
-            <p class="state-text loading-text">{{ t('reader.loading') }}</p>
+            <p class="state-text loading-text">{{ '加载中…' }}</p>
           </div>
 
           <!-- 错误态 -->
           <div v-else-if="loadError" class="state">
             <p class="state-text">内容获取失败，请稍后重试</p>
-            <button class="retry-btn" type="button" @click="retry">{{ t('common.retry') }}</button>
+            <button class="retry-btn" type="button" @click="retry">{{ '重试' }}</button>
           </div>
 
           <!-- 音频书：播放器（播放/暂停/进度/上一章下一章；m3u8 走 hls.js） -->
@@ -2990,25 +3002,25 @@ onBeforeUnmount(() => {
                 class="media-art"
                 :style="shelfBook?.coverUrl || shelfBook?.customCoverUrl ? { backgroundImage: `url(${shelfBook?.customCoverUrl || shelfBook?.coverUrl})` } : {}"
               >
-                <span class="media-badge">{{ t('reader.audioBook') }}</span>
-                <span v-if="audioBuffering" class="media-buffering">{{ t('reader.buffering') }}</span>
+                <span class="media-badge">{{ '音频书' }}</span>
+                <span v-if="audioBuffering" class="media-buffering">{{ '缓冲中…' }}</span>
               </div>
               <p class="media-chapter">{{ displayChapterTitle }}</p>
               <div class="media-controls">
-                <button class="media-nav" type="button" :disabled="!hasPrev" :title="t('common.prevChapter')" @click="prevChapter">
-                  {{ t('common.prevChapter') }}
+                <button class="media-nav" type="button" :disabled="!hasPrev" :title="'上一章'" @click="prevChapter">
+                  {{ '上一章' }}
                 </button>
                 <button
                   class="media-play"
                   type="button"
                   :disabled="!audioUrl"
-                  :title="audioPlaying ? t('reader.pause') : t('reader.play')"
+                  :title="audioPlaying ? '暂停' : '播放'"
                   @click="toggleAudioPlay"
                 >
                   {{ audioPlaying ? '❚❚' : '▶' }}
                 </button>
-                <button class="media-nav" type="button" :disabled="!hasNext" :title="t('common.nextChapter')" @click="nextChapter">
-                  {{ t('common.nextChapter') }}
+                <button class="media-nav" type="button" :disabled="!hasNext" :title="'下一章'" @click="nextChapter">
+                  {{ '下一章' }}
                 </button>
               </div>
               <div class="media-progress">
@@ -3026,16 +3038,16 @@ onBeforeUnmount(() => {
                 <span class="media-time">{{ fmtTime(audioDuration) }}</span>
               </div>
               <p v-if="hlsFailed" class="media-hint">
-                {{ t('reader.hlsFailed') }}
+                {{ 'm3u8 需要 HLS 支持：浏览器不支持且 hls.js 加载失败（请检查网络）' }}
               </p>
-              <p class="media-hint">{{ t('reader.autoNext') }}</p>
+              <p class="media-hint">{{ '本章播完自动连播下一章 · 空格键播放/暂停' }}</p>
             </div>
           </div>
 
           <!-- 漫画书：横向滑动 + 点击左右边缘翻页 + 懒加载占位 -->
           <div v-else-if="isComicBook" class="media-stage comic-stage">
             <div v-if="comicImages.length === 0" class="state">
-              <p class="state-text">{{ t('reader.noComic') }}</p>
+              <p class="state-text">{{ '本章暂无图片' }}</p>
             </div>
             <template v-else>
               <div ref="comicScrollRef" class="comic-scroll" @scroll="onComicScroll">
@@ -3046,7 +3058,7 @@ onBeforeUnmount(() => {
                   :class="{ active: i === comicPage }"
                 >
                   <!-- 加载中占位（懒加载完成前显示） -->
-                  <div class="comic-placeholder">{{ t('reader.loading') }}</div>
+                  <div class="comic-placeholder">{{ '加载中…' }}</div>
                   <img
                     v-lazy="img"
                     class="comic-img"
@@ -3057,8 +3069,8 @@ onBeforeUnmount(() => {
                 </div>
               </div>
               <div class="comic-foot">
-                <span class="comic-hint">{{ t('reader.comicTip') }}</span>
-                <span class="comic-page-indicator">{{ t('reader.comicPage', { c: comicPage + 1, t: comicImages.length }) }}</span>
+                <span class="comic-hint">{{ '← 点击左右边缘翻页 / 横向滑动浏览 →' }}</span>
+                <span class="comic-page-indicator">{{ `第 ${comicPage + 1} / ${comicImages.length} 页` }}</span>
               </div>
             </template>
           </div>
@@ -3066,7 +3078,7 @@ onBeforeUnmount(() => {
           <!-- 视频书：原生视频播放器 -->
           <div v-else-if="isVideoBook" class="media-stage video-stage">
             <div v-if="!videoUrl" class="state">
-              <p class="state-text">{{ t('reader.noVideo') }}</p>
+              <p class="state-text">{{ '未获取到视频地址' }}</p>
             </div>
             <video
               v-else
@@ -3085,7 +3097,7 @@ onBeforeUnmount(() => {
           <div v-else-if="isFileBook" class="media-stage file-stage">
             <div class="file-card">
               <p class="file-title">{{ displayBookName }}</p>
-              <p class="file-intro">{{ shelfBook?.customIntro || shelfBook?.intro || t('reader.fileIntro') }}</p>
+              <p class="file-intro">{{ shelfBook?.customIntro || shelfBook?.intro || '文件型书籍：点击下方按钮下载文件阅读。' }}</p>
               <a
                 v-if="fileUrl"
                 class="download-btn"
@@ -3094,9 +3106,9 @@ onBeforeUnmount(() => {
                 rel="noopener noreferrer"
                 :download="displayBookName || 'download'"
               >
-                {{ t('reader.download') }}
+                {{ '下载文件' }}
               </a>
-              <p v-else class="media-hint">{{ t('reader.noDownload') }}</p>
+              <p v-else class="media-hint">{{ '未获取到下载链接' }}</p>
             </div>
           </div>
 
@@ -3106,20 +3118,20 @@ onBeforeUnmount(() => {
               class="nav-btn"
               type="button"
               :disabled="!hasPrev"
-              :title="t('reader.prevTip')"
+              :title="'上一章（长按连续快退）'"
               @click="onPrevClick"
               @pointerdown="prevHold.start"
               @pointerup="prevHold.stop"
               @pointerleave="prevHold.stop"
               @pointercancel="prevHold.stop"
             >
-              {{ t('common.prevChapter') }}
+              {{ '上一章' }}
             </button>
             <button
               class="nav-btn"
               type="button"
               :disabled="!hasNext"
-              :title="t('reader.nextTip')"
+              :title="'下一章（长按连续快进）'"
               @click="onNextClick"
               @pointerdown="nextHold.start"
               @pointerup="nextHold.stop"
@@ -3144,36 +3156,36 @@ onBeforeUnmount(() => {
         class="tb-btn"
         type="button"
         :disabled="fontSize <= MIN_FONT"
-        :title="t('reader.fontDec')"
+        :title="'减小字号'"
         @click="fontSize = Math.max(MIN_FONT, fontSize - 1)"
       >
         <span class="tb-icon">A−</span>
-        <span class="tb-label">{{ t('reader.fontDec') }}</span>
+        <span class="tb-label">{{ '减小字号' }}</span>
       </button>
       <button
         v-if="isTextBook"
         class="tb-btn"
         type="button"
         :disabled="fontSize >= MAX_FONT"
-        :title="t('reader.fontInc')"
+        :title="'增大字号'"
         @click="fontSize = Math.min(MAX_FONT, fontSize + 1)"
       >
         <span class="tb-icon">A+</span>
-        <span class="tb-label">{{ t('reader.fontInc') }}</span>
+        <span class="tb-label">{{ '增大字号' }}</span>
       </button>
-      <button class="tb-btn" type="button" :title="t('reader.themeTip', { t: t('theme.' + theme) })" @click="themeOpen = true">
+      <button class="tb-btn" type="button" :title="`主题：${themeName(theme)}（点击切换）`" @click="themeOpen = true">
         <span class="tb-icon tb-theme-dot" :class="'dot-' + theme"></span>
-        <span class="tb-label">{{ t('theme.' + theme) }}</span>
+        <span class="tb-label">{{ themeName(theme) }}</span>
       </button>
-      <button class="tb-btn" type="button" :title="t('reader.tocTip')" @click="drawerOpen = true">
+      <button class="tb-btn" type="button" :title="'目录'" @click="drawerOpen = true">
         <svg class="tb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
           <path d="M4 6h16" />
           <path d="M4 12h16" />
           <path d="M4 18h10" />
         </svg>
-        <span class="tb-label">{{ t('reader.toc') }}</span>
+        <span class="tb-label">{{ '目录' }}</span>
       </button>
-      <button class="tb-btn" type="button" :title="t('reader.layoutTip')" @click="openSettings">
+      <button class="tb-btn" type="button" :title="'阅读设置'" @click="openSettings">
         <svg class="tb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
           <path d="M4 6h16" />
           <path d="M4 12h16" />
@@ -3182,7 +3194,7 @@ onBeforeUnmount(() => {
           <circle cx="15" cy="12" r="2" />
           <circle cx="7" cy="18" r="2" />
         </svg>
-        <span class="tb-label">{{ t('reader.layout') }}</span>
+        <span class="tb-label">{{ '设置' }}</span>
       </button>
     </div>
 
@@ -3324,7 +3336,7 @@ onBeforeUnmount(() => {
                 type="button"
                 @click="selectTheme(th)"
               >
-                {{ t('theme.' + th) }}
+                {{ themeName(th) }}
               </button>
             </div>
           </div>
@@ -3696,7 +3708,7 @@ onBeforeUnmount(() => {
     <transition name="pop">
       <div v-if="themeOpen" class="pop-mask" @click="themeOpen = false">
         <div class="pop-card theme-card" @click.stop>
-          <p class="pop-title">{{ t('reader.theme') }}</p>
+          <p class="pop-title">{{ '主题' }}</p>
           <div class="theme-grid">
             <button
               v-for="th in THEME_ORDER"
@@ -3707,7 +3719,7 @@ onBeforeUnmount(() => {
               @click="selectTheme(th); themeOpen = false"
             >
               <span class="theme-swatch" :class="'swatch-' + th"></span>
-              <span class="theme-name">{{ t('theme.' + th) }}</span>
+              <span class="theme-name">{{ themeName(th) }}</span>
             </button>
           </div>
         </div>
@@ -3718,7 +3730,7 @@ onBeforeUnmount(() => {
     <transition name="pop">
       <div v-if="moreOpen" class="pop-mask" @click="moreOpen = false">
         <div class="pop-card more-card" @click.stop>
-          <p class="pop-title">{{ t('reader.more') }}</p>
+          <p class="pop-title">{{ '更多' }}</p>
           <div class="more-grid">
             <button v-if="isTextBook" class="more-item" type="button" @click="toggleHan; moreOpen = false">
               <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
@@ -3727,40 +3739,40 @@ onBeforeUnmount(() => {
                 <path d="M16 6v12" />
                 <path d="M4 18h8" />
               </svg>
-              <span class="more-name">{{ t('reader.han') }} · {{ hanTargetLabel }}</span>
+              <span class="more-name">{{ '简繁' }} · {{ hanTargetLabel }}</span>
             </button>
             <button v-if="isTextBook" class="more-item" type="button" @click="addBookmark; moreOpen = false">
               <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M6 4h12v16l-6-4-6 4z" />
               </svg>
-              <span class="more-name">{{ t('reader.addBookmark') }}</span>
+              <span class="more-name">{{ '＋书签' }}</span>
             </button>
             <button v-if="isTextBook" class="more-item" type="button" @click="openBookmarks; moreOpen = false">
               <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M9 4h6l-1 6 3 3v2H7v-2l3-3z" />
                 <path d="M12 15v5" />
               </svg>
-              <span class="more-name">{{ t('reader.bookmarks') }}</span>
+              <span class="more-name">{{ '书签' }}</span>
             </button>
             <button v-if="isTextBook" class="more-item" type="button" @click="openChapterSearch; moreOpen = false">
               <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                 <circle cx="11" cy="11" r="7" />
                 <path d="M21 21l-4.35-4.35" />
               </svg>
-              <span class="more-name">{{ t('reader.searchChapter') }}</span>
+              <span class="more-name">{{ '搜索' }}</span>
             </button>
             <button v-if="isTextBook" class="more-item" type="button" :disabled="loading || loadError || paragraphs.length === 0" @click="copyChapter; moreOpen = false">
               <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                 <rect x="8" y="8" width="12" height="12" rx="2" />
                 <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
               </svg>
-              <span class="more-name">{{ t('reader.copyChapter') }}</span>
+              <span class="more-name">{{ '复制本章' }}</span>
             </button>
             <button v-if="isTextBook" class="more-item" type="button" :class="{ active: autoPlaying }" @click="toggleAuto; moreOpen = false">
               <svg class="more-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M8 5v14l11-7z" />
               </svg>
-              <span class="more-name">{{ autoPlaying ? t('reader.stop') : t('reader.auto') }}</span>
+              <span class="more-name">{{ autoPlaying ? '停止' : '自动' }}</span>
             </button>
           </div>
         </div>

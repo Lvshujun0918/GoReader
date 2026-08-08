@@ -3,17 +3,15 @@
  *
  * 组件 components/CommandPalette.vue 负责 UI / 键盘导航 / 快捷键监听；
  * 本模块只定义命令数据与匹配逻辑：动作以声明式 action 描述，
- * 组件统一执行（跳转 / 搜索 / 主题 / 语言），便于测试与后续扩展。
+ * 组件统一执行（跳转 / 主题），便于测试与后续扩展。
  */
 
 import type { UiTheme } from './uiTheme'
-import type { Lang } from './i18n'
 
 /** 命令动作（声明式：组件按 kind 分发执行） */
 export type PaletteAction =
   | { kind: 'navigate'; path: string }
   | { kind: 'theme'; theme: UiTheme }
-  | { kind: 'lang'; lang: Lang }
 
 export interface PaletteCommand {
   id: string
@@ -52,18 +50,6 @@ const SETTING_COMMANDS: Omit<PaletteCommand, 'group'>[] = [
     title: '跟随系统',
     keywords: ['system', '跟随系统', '自动', 'theme'],
     action: { kind: 'theme', theme: 'system' },
-  },
-  {
-    id: 'lang-zh',
-    title: '界面语言：中文',
-    keywords: ['language', '语言', '中文', 'zh'],
-    action: { kind: 'lang', lang: 'zh' },
-  },
-  {
-    id: 'lang-en',
-    title: '界面语言：English',
-    keywords: ['language', '语言', 'english', '英文', 'en'],
-    action: { kind: 'lang', lang: 'en' },
   },
 ]
 

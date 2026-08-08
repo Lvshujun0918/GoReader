@@ -184,7 +184,7 @@ export interface SystemInfo {
   [key: string]: unknown
 }
 
-/** 服务监控（GET /reader3/getServerStats → data；内存/CPU/请求量/在线/书源成功率） */
+/** 服务监控（GET /reader3/getServerStats → data；内存/CPU/请求量/在线/运行信息） */
 export interface ServerStats {
   version: string
   port: number
@@ -212,16 +212,6 @@ export interface ServerStats {
   online: {
     /** 活跃 token 会话数 */
     sessions: number
-  }
-  bookSource: {
-    total: number
-    ok: number
-    failed: number
-    /** 0..=1；从未检测时为 null */
-    successRate: number | null
-    checkedAt: number | null
-    namespace: string
-    note: string
   }
   [key: string]: unknown
 }
@@ -269,40 +259,5 @@ export interface CacheInfo {
   chapterCount: number
   chapterSize: number
   totalSize: number
-  [key: string]: unknown
-}
-
-/** 书源订阅（后端 /reader3/getSourceSubs 为主，localStorage: reader_source_subs 降级，见 api/sourceSubs.ts；enabled=启用订阅，启用/刷新时重新拉取并批量导入书源） */
-export interface SourceSub {
-  url: string
-  name: string
-  enabled: boolean
-  [key: string]: unknown
-}
-
-/** 书源（/reader3/getBookSources → BookSource，legado 兼容 camelCase） */
-export interface BookSource {
-  bookSourceUrl: string
-  bookSourceName: string
-  bookSourceGroup?: string | null
-  bookSourceType: number
-  bookUrlPattern?: string | null
-  customOrder: number
-  enabled: boolean
-  enabledExplore: boolean
-  enabledCookieJar?: boolean | null
-  concurrentRate?: string | null
-  header?: string | null
-  loginUrl?: string | null
-  loginUi?: string | null
-  loginCheckJs?: string | null
-  loginJs?: string | null
-  bookSourceComment?: string | null
-  variableComment?: string | null
-  lastUpdateTime: number
-  respondTime: number
-  weight: number
-  exploreUrl?: string | null
-  searchUrl?: string | null
   [key: string]: unknown
 }

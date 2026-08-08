@@ -5,19 +5,17 @@ import {
   paletteCommands,
 } from './commandPalette.ts'
 
-test('命令表：跳转页面 + 设置项齐全（书架/规则/设置/用户/深色/语言）', () => {
+test('命令表：跳转页面 + 设置项齐全（书架/规则/设置/用户/深色）', () => {
   const cmds = paletteCommands()
   const ids = cmds.map((c) => c.id)
   // 跳转页面
   for (const path of ['/', '/rules', '/settings', '/users']) {
     assert.ok(ids.includes(`nav-${path}`), `缺少导航命令 ${path}`)
   }
-  // 设置项：深色 / 语言
+  // 设置项：深色
   assert.ok(ids.includes('theme-dark'))
   assert.ok(ids.includes('theme-light'))
   assert.ok(ids.includes('theme-system'))
-  assert.ok(ids.includes('lang-zh'))
-  assert.ok(ids.includes('lang-en'))
   // 分组顺序：页面组在设置组前
   const groups = cmds.map((c) => c.group)
   assert.ok(groups.indexOf('跳转页面') < groups.indexOf('打开设置'))
@@ -32,9 +30,6 @@ test('按标题/关键词过滤（忽略大小写，空格分词 AND）', () => 
   const dark = filterCommands('深色')
   assert.ok(dark.length > 0)
   assert.ok(dark.some((c) => c.id === 'theme-dark'))
-
-  const en = filterCommands('english')
-  assert.ok(en.some((c) => c.id === 'lang-en'))
 
   const both = filterCommands('规则')
   assert.ok(both.length > 0)
