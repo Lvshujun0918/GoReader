@@ -180,9 +180,6 @@ func (s *Storage) migrateJSONNamespaceFiles(dataDir string) error {
 		if err := migrateNSFile(s, dir, "bookSource.json", &model.BookSource{}, func(v *model.BookSource) { v.UserNamespace = ns }); err != nil {
 			return err
 		}
-		if err := migrateNSFile(s, dir, "rssSource.json", &model.RssSource{}, func(v *model.RssSource) { v.UserNamespace = ns }); err != nil {
-			return err
-		}
 		if err := migrateNSFile(s, dir, "bookmark.json", &model.Bookmark{}, func(v *model.Bookmark) { v.UserNamespace = ns }); err != nil {
 			return err
 		}

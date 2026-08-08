@@ -10,19 +10,6 @@ import (
 	"testing"
 )
 
-// TestFetchRssRejectsPrivate RSS 抓取经 crawler：内网/回环 URL 应被 SSRF 拒绝。
-func TestFetchRssRejectsPrivate(t *testing.T) {
-	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "0")
-	// 未设 env（默认拒绝内网）
-	if _, err := fetchRss("http://127.0.0.1:9999/feed.xml"); err == nil {
-		t.Fatal("RSS 抓取应拒绝回环地址（SSRF 防护）")
-	}
-	// 相对 URL（无 hostname）同样拒绝
-	if _, err := fetchRss("/feed.xml"); err == nil {
-		t.Fatal("RSS 抓取应拒绝相对 URL")
-	}
-}
-
 // TestAssetsProxySSRF 图片代理经 crawler：内网 URL 应被拒绝（不再裸 http.Get）。
 func TestAssetsProxySSRF(t *testing.T) {
 	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "0")

@@ -54,12 +54,6 @@ const router = createRouter({
       meta: { title: '替换规则', titleKey: 'route.rules' },
     },
     {
-      path: '/rss',
-      name: 'rss',
-      component: () => import('@/views/RssView.vue'),
-      meta: { title: 'RSS', titleKey: 'route.rss' },
-    },
-    {
       path: '/settings',
       name: 'settings',
       component: () => import('@/views/SettingsView.vue'),
@@ -73,18 +67,6 @@ const router = createRouter({
       // 非 secure 或非管理员场景由后端拒绝即可（管理接口走 checkManagerAuth：
       // 非 secure → 不支持；secure 缺/错 secureKey → NEED_SECURE_KEY），无需额外前端守卫
       meta: { title: '服务监控', titleKey: 'route.serverStats', requiresLogin: true, requiresManager: true },
-    },
-    {
-      path: '/files',
-      name: 'files',
-      component: () => import('@/views/FileManageView.vue'),
-      meta: { title: '文件', titleKey: 'route.files' },
-    },
-    {
-      path: '/store',
-      name: 'store',
-      component: () => import('@/views/StoreView.vue'),
-      meta: { title: '书仓', titleKey: 'route.store' },
     },
     {
       path: '/users',

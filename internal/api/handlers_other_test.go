@@ -66,67 +66,6 @@ func TestDeleteSourceSubMissingURL(t *testing.T) {
 	}
 }
 
-// ---------- RSS 订阅源 ----------
-
-// TestRssSourceCRUD RSS 源 增/查/删（含 legado 布尔 enabled——验证宽松解析修复）。
-func TestRssSourceCRUD(t *testing.T) {
-	handler := newTestAPI(t)
-	const feed = "https://rss.example.com/feed.xml"
-
-	// 增（enabled 为布尔——legado 前端格式）
-	w := perform(handler, "POST", "/reader3/saveRssSource", map[string]any{
-		"rssSourceUrl": feed, "rssSourceName": "示例RSS", "rssSourceGroup": "新闻", "enabled": true,
-	})
-	rd := parseReturn(t, w)
-	if !rd.IsSuccess {
-		t.Fatalf("saveRssSource 失败: %s", rd.ErrorMsg)
-	}
-	// 查
-	w = perform(handler, "GET", "/reader3/getRssSources", nil)
-	rd = parseReturn(t, w)
-	list, _ := rd.Data.([]any)
-	if len(list) != 1 {
-		t.Fatalf("RSS 列表应 1 个，实际 %d", len(list))
-	}
-	item, _ := list[0].(map[string]any)
-	if item["rssSourceName"] != "示例RSS" {
-		t.Errorf("名称不符: %v", item["rssSourceName"])
-	}
-	if item["enabled"] != float64(1) {
-		t.Errorf("enabled 应归一化为 1: %v", item["enabled"])
-	}
-	// 删
-	w = perform(handler, "POST", "/reader3/deleteRssSource", map[string]any{"rssSourceUrl": feed})
-	if !parseReturn(t, w).IsSuccess {
-		t.Fatal("deleteRssSource 失败")
-	}
-	w = perform(handler, "GET", "/reader3/getRssSources", nil)
-	rd = parseReturn(t, w)
-	list, _ = rd.Data.([]any)
-	if len(list) != 0 {
-		t.Fatalf("删除后应 0 个，实际 %d", len(list))
-	}
-}
-
-// TestRssSourceBooleanEnabled 布尔 enabled 保存必须成功（回归：后端 int 列曾报参数错误）。
-func TestRssSourceBooleanEnabled(t *testing.T) {
-	handler := newTestAPI(t)
-	w := perform(handler, "POST", "/reader3/saveRssSource", map[string]any{
-		"rssSourceUrl": "https://bool.example.com/feed", "rssSourceName": "布尔开关", "enabled": false,
-	})
-	rd := parseReturn(t, w)
-	if !rd.IsSuccess {
-		t.Fatalf("布尔 enabled 保存失败: %s", rd.ErrorMsg)
-	}
-	w = perform(handler, "GET", "/reader3/getRssSources", nil)
-	rd = parseReturn(t, w)
-	list, _ := rd.Data.([]any)
-	item, _ := list[0].(map[string]any)
-	if item["enabled"] != float64(0) {
-		t.Errorf("enabled=false 应归一化为 0: %v", item["enabled"])
-	}
-}
-
 // ---------- 用户 ----------
 
 // TestUserRegisterLogin 注册（未登录态自动注册）+ 登录 + 密码错误。

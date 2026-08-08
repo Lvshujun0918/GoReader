@@ -1,32 +1,11 @@
 import request, { type RequestOptions } from './request'
-import type { ReturnData, FileItem } from '@/types'
+import type { ReturnData } from '@/types'
 
 /**
- * GET /reader3/file/list：文件列表
- * @param path 当前目录（根目录传空串）
- * @param home 可选：__LOCAL_STORE__=书仓 / __HOME__=用户数据 / __WEBDAV__=WebDAV / 空=用户根
+ * POST /reader3/file/mkdir：创建目录（书封/背景图上传前确保目录存在）。
+ * @param parent 父目录（根目录传空串）
+ * @param name 目录名
  */
-export function listFiles(path: string, home = ''): Promise<ReturnData<FileItem[]>> {
-  return request
-    .get('/file/list', { params: { path, ...(home ? { home } : {}) } })
-    .then((r) => r.data as ReturnData<FileItem[]>)
-}
-
-/** GET /reader3/file/get：读取文本文件内容（home 需与 list 一致，否则解析到不同根） */
-export function getFile(path: string, home = ''): Promise<ReturnData<string>> {
-  return request
-    .get('/file/get', { params: { path, ...(home ? { home } : {}) } })
-    .then((r) => r.data as ReturnData<string>)
-}
-
-/** POST /reader3/file/save：写入文本文件（body { path, content }） */
-export function saveFile(path: string, content: string, home = ''): Promise<ReturnData<null>> {
-  return request
-    .post('/file/save', { path, content, ...(home ? { home } : {}) })
-    .then((r) => r.data as ReturnData<null>)
-}
-
-/** POST /reader3/file/mkdir：新建文件夹（body { path: 父目录, name: 文件夹名 }） */
 export function mkdir(
   parent: string,
   name: string,
@@ -38,7 +17,7 @@ export function mkdir(
     .then((r) => r.data as ReturnData<null>)
 }
 
-/** GET /reader3/file/download：下载文件，返回 Blob（大文件放宽超时） */
+/** GET /reader3/file/download：下载文件，返回 Blob（大文件放宽超时；备份 zip 下载用） */
 export function downloadFile(path: string, home = ''): Promise<Blob> {
   return request
     .get('/file/download', {
@@ -50,7 +29,7 @@ export function downloadFile(path: string, home = ''): Promise<Blob> {
 }
 
 /**
- * POST /reader3/file/upload：multipart 上传（字段 file + path + home，FormData 交 axios 设 Content-Type）
+ * POST /reader3/file/upload：multipart 上传（字段 file + path，FormData 交 axios 设 Content-Type）
  * @param onProgress 上传进度回调（0-100）
  */
 export function uploadFile(
@@ -58,7 +37,7 @@ export function uploadFile(
   path: string,
   home = '',
   onProgress?: (percent: number) => void,
-): Promise<ReturnData<FileItem[]>> {
+): Promise<ReturnData<null>> {
   const form = new FormData()
   form.append('file', file)
   form.append('path', path)
@@ -72,12 +51,5 @@ export function uploadFile(
           }
         : undefined,
     })
-    .then((r) => r.data as ReturnData<FileItem[]>)
-}
-
-/** POST /reader3/file/delete：删除文件/目录（body { path }） */
-export function deleteFile(path: string, home = ''): Promise<ReturnData<null>> {
-  return request
-    .post('/file/delete', { path, ...(home ? { home } : {}) })
     .then((r) => r.data as ReturnData<null>)
 }

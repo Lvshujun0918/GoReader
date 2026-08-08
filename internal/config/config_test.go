@@ -19,13 +19,9 @@ func TestFlagFromStr(t *testing.T) {
 // TestFromEnvDefaultUserFlags 默认用户权限 env 正确读取。
 func TestFromEnvDefaultUserFlags(t *testing.T) {
 	t.Setenv("READER_APP_DEFAULTUSERENABLEBOOKSOURCE", "true")
-	t.Setenv("READER_APP_DEFAULTUSERENABLERSSSOURCE", "false")
 	cfg := FromEnv()
 	if !cfg.DefaultUserEnableBookSource {
 		t.Error("BOOKSOURCE 应为 true")
-	}
-	if cfg.DefaultUserEnableRssSource {
-		t.Error("RSSSOURCE 应为 false")
 	}
 }
 

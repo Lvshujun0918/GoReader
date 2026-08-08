@@ -18,7 +18,7 @@
  * Slots:
  * - leading: 覆盖最左侧内容（返回按钮/品牌；默认按 variant 渲染）
  * - default: 品牌与导航之间的内容（书架搜索框 / 探索页标题）
- * - extra: 导航行内的附加按钮（书架的书签/OPDS 等视图专属动作）
+ * - extra: 导航行内的附加按钮（书架的书签等视图专属动作）
  * - trailing: minimal 变体下导航行位置的附加内容（探索页 top-actions）
  */
 import { computed, onMounted, ref, type Component } from 'vue'
@@ -29,14 +29,11 @@ import {
   BookMarked,
   ChevronDown,
   Compass,
-  Folder,
   Library,
   LogOut,
-  Rss,
   Search,
   Settings,
   SlidersHorizontal,
-  Store,
   Users,
 } from 'lucide-vue-next'
 import { useUserStore } from '@/stores/user'
@@ -69,9 +66,6 @@ const props = withDefaults(
       'explore',
       'sources',
       'rules',
-      'rss',
-      'files',
-      'store',
       'monitor',
       'users',
       'settings',
@@ -96,9 +90,6 @@ const NAV_LINKS: Record<string, { to: string; i18n: string; icon: Component }> =
   explore: { to: '/explore', i18n: 'nav.explore', icon: Compass },
   sources: { to: '/sources', i18n: 'nav.sources', icon: Library },
   rules: { to: '/rules', i18n: 'nav.rules', icon: SlidersHorizontal },
-  rss: { to: '/rss', i18n: 'nav.rss', icon: Rss },
-  files: { to: '/files', i18n: 'nav.files', icon: Folder },
-  store: { to: '/store', i18n: 'nav.store', icon: Store },
   monitor: { to: '/server-stats', i18n: 'nav.serverStats', icon: Activity },
   users: { to: '/users', i18n: 'nav.users', icon: Users },
   settings: { to: '/settings', i18n: 'nav.settings', icon: Settings },
@@ -117,8 +108,8 @@ const PRIMARY_KEYS = ['bookshelf', 'search', 'explore', 'settings']
 
 /** 二级分组：组 i18n → 菜单键 */
 const GROUPS: { i18n: string; keys: string[] }[] = [
-  { i18n: 'nav.groupSources', keys: ['sources', 'rules', 'rss'] },
-  { i18n: 'nav.groupManage', keys: ['files', 'store', 'monitor', 'users'] },
+  { i18n: 'nav.groupSources', keys: ['sources', 'rules'] },
+  { i18n: 'nav.groupManage', keys: ['monitor', 'users'] },
 ]
 
 interface NavItem {

@@ -135,7 +135,6 @@ func (a *API) register(c *gin.Context, username, passwordStr, code string) {
 		EnableWebdav:     cfg.DefaultUserEnableWebdav,
 		EnableLocalStore: cfg.DefaultUserEnableLocalStore,
 		EnableBookSource: cfg.DefaultUserEnableBookSource,
-		EnableRssSource:  cfg.DefaultUserEnableRssSource,
 		BookSourceLimit:  cfg.DefaultUserBookSourceLimit,
 		BookLimit:        cfg.DefaultUserBookLimit,
 		LastLoginAt:      now,
@@ -225,7 +224,7 @@ func (a *API) handleUpdateUser(c *gin.Context) {
 		Fail(c, "参数错误")
 		return
 	}
-	var eb, el, es, er *bool
+	var eb, el, es *bool
 	if v, ok := boolParam(params, "enableWebdav"); ok {
 		eb = &v
 	}
@@ -235,9 +234,6 @@ func (a *API) handleUpdateUser(c *gin.Context) {
 	if v, ok := boolParam(params, "enableBookSource"); ok {
 		es = &v
 	}
-	if v, ok := boolParam(params, "enableRssSource"); ok {
-		er = &v
-	}
 	var ib, il *int64
 	if v, ok := intParam(params, "bookSourceLimit"); ok {
 		ib = &v
@@ -245,7 +241,7 @@ func (a *API) handleUpdateUser(c *gin.Context) {
 	if v, ok := intParam(params, "bookLimit"); ok {
 		il = &v
 	}
-	n, err := a.Storage.UpdateUserPermissions(username, eb, el, es, er, ib, il)
+	n, err := a.Storage.UpdateUserPermissions(username, eb, el, es, ib, il)
 	if err != nil {
 		Fail(c, "系统错误")
 		return
@@ -416,33 +412,11 @@ func userAdminJSON(u *model.User) map[string]any {
 		"enableWebdav":     u.EnableWebdav,
 		"enableLocalStore": u.EnableLocalStore,
 		"enableBookSource": u.EnableBookSource,
-		"enableRssSource":  u.EnableRssSource,
 		"bookSourceLimit":  u.BookSourceLimit,
 		"bookLimit":        u.BookLimit,
 		"lastLoginAt":      u.LastLoginAt,
 		"createdAt":        u.CreatedAt,
 	}
-}
-
-// handleGetOpdsSettings GET+POST /reader3/getOpdsSettings：OPDS 独立账号设置。
-func (a *API) handleGetOpdsSettings(c *gin.Context) {
-	// 无需登录：读取 system_settings 中 OPDS 账号配置
-	settings, err := a.Storage.GetOPDSSettings()
-	if err != nil {
-		Fail(c, "系统错误")
-		return
-	}
-	OK(c, settings)
-}
-
-// handleSaveOpdsSettings POST /reader3/saveOpdsSettings。
-func (a *API) handleSaveOpdsSettings(c *gin.Context) {
-	params := a.params(c)
-	if err := a.Storage.SaveOPDSSettings(params); err != nil {
-		Fail(c, "系统错误")
-		return
-	}
-	OK(c, nil)
 }
 
 // randomToken uuid v4 随机（hex，32 字符）。

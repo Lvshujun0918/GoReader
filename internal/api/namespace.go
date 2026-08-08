@@ -88,7 +88,7 @@ func FormatUser(u *model.User) map[string]any {
 		"enableWebdav":      u.EnableWebdav,
 		"enableLocalStore":  u.EnableLocalStore,
 		"enableBookSource":  u.EnableBookSource,
-		"enableRssSource":   u.EnableRssSource,
+
 		"bookSourceLimit":   u.BookSourceLimit,
 		"bookLimit":         u.BookLimit,
 		"createdAt":         u.CreatedAt,

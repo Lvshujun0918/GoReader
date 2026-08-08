@@ -49,11 +49,6 @@ func (a *API) Engine() *gin.Engine {
 	r.GET("/health", a.handleHealth)
 	r.GET("/assets/proxy", a.handleAssetsProxy)
 
-	// OPDS
-	r.Any("/opds", a.handleOpds)
-	r.Any("/opds/*rest", a.handleOpds)
-	r.Any("/opds-save", a.handleOpdsSave)
-
 	// WebDAV（任意方法）
 	r.Any("/reader3/webdav/*rest", a.handleWebDAV)
 

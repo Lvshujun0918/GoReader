@@ -15,6 +15,29 @@ import (
 	"github.com/Lvshujun0918/GoReader/internal/model"
 )
 
+// fileRoot WebDAV/本地文件根目录（storage 目录）。
+func (a *API) fileRoot() string {
+	return a.Config.StorageDir()
+}
+
+// safeFilePath 安全拼接（防路径穿越）。
+func (a *API) safeFilePath(rel string) (string, bool) {
+	if rel == "" {
+		rel = "."
+	}
+	root := a.fileRoot()
+	full := filepath.Join(root, rel)
+	absRoot, err1 := filepath.Abs(root)
+	absFull, err2 := filepath.Abs(full)
+	if err1 != nil || err2 != nil {
+		return "", false
+	}
+	if absFull != absRoot && !strings.HasPrefix(absFull, absRoot+string(filepath.Separator)) {
+		return "", false
+	}
+	return full, true
+}
+
 const (
 	davNS  = "DAV:"
 )

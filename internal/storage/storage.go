@@ -76,8 +76,6 @@ func (s *Storage) AutoMigrate() error {
 		&model.User{},
 		&model.Book{},
 		&model.BookSource{},
-		&model.RssSource{},
-		&model.RssArticle{},
 		&model.BookChapter{},
 		&model.TocCache{},
 		&model.Bookmark{},

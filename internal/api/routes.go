@@ -25,8 +25,6 @@ func (a *API) registerReader3(r *gin.Engine) {
 	g.POST("/resetUserPassword", a.handleResetUserPassword)
 	g.POST("/resetPassword", a.handleResetUserPassword)
 	g.POST("/clearInactiveUsers", a.handleClearInactiveUsers)
-	g.Any("/getOpdsSettings", a.handleGetOpdsSettings)
-	g.POST("/saveOpdsSettings", a.handleSaveOpdsSettings)
 
 	// ---- 书架/书籍 ----
 	g.GET("/getBookshelf", a.handleGetBookshelf)
@@ -84,16 +82,6 @@ func (a *API) registerReader3(r *gin.Engine) {
 	g.POST("/saveSourceSub", a.handleSaveSourceSub)
 	g.POST("/deleteSourceSub", a.handleDeleteSourceSub)
 	g.POST("/refreshSourceSub", a.handleRefreshSourceSub)
-
-	// ---- RSS ----
-	g.Any("/getRssSources", a.handleGetRssSources)
-	g.POST("/saveRssSource", a.handleSaveRssSource)
-	g.POST("/saveRssSources", a.handleSaveRssSources)
-	g.POST("/deleteRssSource", a.handleDeleteRssSource)
-	g.Any("/getRssArticles", a.handleGetRssArticles)
-	g.POST("/markRssArticleRead", a.handleMarkRssArticleRead)
-	g.Any("/getRssArticle", a.handleGetRssArticle)
-	g.Any("/getRssContent", a.handleGetRssArticle)
 
 	// ---- 书签/分组 ----
 	g.POST("/saveBookmark", a.handleSaveBookmark)
@@ -156,16 +144,10 @@ func (a *API) registerReader3(r *gin.Engine) {
 	g.GET("/getServerStats", a.handleGetServerStats)
 	g.POST("/readSourceFile", a.handleReadSourceFile)
 
-	// ---- 文件管理 ----
-	g.GET("/file/list", a.handleFileList)
-	g.GET("/file/get", a.handleFileGet)
-	g.POST("/file/save", a.handleFileSave)
+	// ---- 书封/背景图上传、备份下载（保留 file/mkdir + file/upload + file/download） ----
 	g.POST("/file/mkdir", a.handleFileMkdir)
-	g.GET("/file/download", a.handleFileDownload)
 	g.POST("/file/upload", a.handleFileUpload)
-	g.POST("/uploadFile", a.handleFileUpload)
-	g.POST("/file/delete", a.handleFileDelete)
-	g.POST("/file/deleteMulti", a.handleFileDeleteMulti)
+	g.GET("/file/download", a.handleFileDownload)
 
 	// 未匹配路由：/reader3 → JSON 404；静态资源（assets/simple/web-ui SPA）
 	r.NoRoute(func(c *gin.Context) {

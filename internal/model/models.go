@@ -15,7 +15,6 @@ type User struct {
 	EnableWebdav         bool   `gorm:"column:enable_webdav;default:0" json:"enableWebdav"`
 	EnableLocalStore     bool   `gorm:"column:enable_local_store;default:0" json:"enableLocalStore"`
 	EnableBookSource     bool   `gorm:"column:enable_book_source;default:1" json:"enableBookSource"`
-	EnableRssSource      bool   `gorm:"column:enable_rss_source;default:1" json:"enableRssSource"`
 	BookSourceLimit      int64  `gorm:"column:book_source_limit;default:0" json:"bookSourceLimit"`
 	BookLimit            int64  `gorm:"column:book_limit;default:0" json:"bookLimit"`
 	LastLoginAt          int64  `gorm:"column:last_login_at;default:0" json:"lastLoginAt"`
@@ -132,33 +131,6 @@ type BookSource struct {
 }
 
 func (BookSource) TableName() string { return "book_sources" }
-
-// RssSource RSS 订阅源（复合主键 rss_source_url + user_namespace）。
-type RssSource struct {
-	RssSourceURL  string `gorm:"column:rss_source_url;primaryKey" json:"rssSourceUrl"`
-	RssSourceName string `gorm:"column:rss_source_name;default:''" json:"rssSourceName"`
-	RssSourceGroup string `gorm:"column:rss_source_group" json:"rssSourceGroup"`
-	Enabled       int    `gorm:"column:enabled" json:"enabled"`
-	UserNamespace string `gorm:"column:user_namespace;primaryKey;default:''" json:"-"`
-	RawJSON       string `gorm:"column:raw_json" json:"-"`
-}
-
-func (RssSource) TableName() string { return "rss_sources" }
-
-// RssArticle RSS 文章（复合主键 url + user_namespace）。
-type RssArticle struct {
-	URL           string `gorm:"column:url;primaryKey" json:"url"`
-	SourceURL     string `gorm:"column:source_url" json:"sourceUrl"`
-	Title         string `gorm:"column:title" json:"title"`
-	Author        string `gorm:"column:author" json:"author"`
-	Time          int64  `gorm:"column:time;default:0" json:"time"`
-	Content       string `gorm:"column:content" json:"content"`
-	Cover         string `gorm:"column:cover" json:"cover"`
-	Read          int    `gorm:"column:read;default:0" json:"-"`
-	UserNamespace string `gorm:"column:user_namespace;primaryKey;default:''" json:"-"`
-}
-
-func (RssArticle) TableName() string { return "rss_articles" }
 
 // BookChapter 章节缓存（复合主键 book_url + chapter_index）。
 type BookChapter struct {

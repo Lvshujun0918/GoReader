@@ -535,46 +535,6 @@ async function startUpload() {
   if (failed === 0) window.setTimeout(() => closeImport(), 800)
 }
 
-/* ================= OPDS 服务器入口（外部阅读器：legado/静读等） ================= */
-const opdsOpen = ref(false)
-const opdsCopied = ref(false)
-
-/** OPDS 地址 = 当前 host + /opds（secure 模式附带 accessToken=用户名:token） */
-const opdsUrl = computed(() => {
-  const base = `${window.location.origin}/opds`
-  return store.accessToken ? `${base}?accessToken=${encodeURIComponent(store.accessToken)}` : base
-})
-
-function openOpds() {
-  opdsOpen.value = true
-  opdsCopied.value = false
-  document.body.style.overflow = 'hidden'
-}
-
-function closeOpds() {
-  opdsOpen.value = false
-  document.body.style.overflow = ''
-}
-
-async function copyOpdsUrl() {
-  const text = opdsUrl.value
-  try {
-    await navigator.clipboard.writeText(text)
-  } catch {
-    // 剪贴板 API 不可用（非 https 等）：textarea 降级
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    document.execCommand('copy')
-    document.body.removeChild(ta)
-  }
-  opdsCopied.value = true
-  window.setTimeout(() => (opdsCopied.value = false), 1600)
-}
-
 onBeforeUnmount(() => {
   if (longPressTimer) clearTimeout(longPressTimer)
   wrapObserver?.disconnect()
@@ -1777,7 +1737,6 @@ onMounted(() => {
 
       <template #extra>
         <button class="nav-link" type="button" title="全部书签（跨书）" @click="openBookmarks">书签</button>
-        <button class="nav-link" type="button" title="OPDS 服务器（外部阅读器连接）" @click="openOpds">OPDS</button>
       </template>
     </TopNav>
 
@@ -2247,38 +2206,6 @@ onMounted(() => {
                   {{ uploadBusy ? '导入中…' : hasPending ? `开始导入（${hasPendingCount}）` : '开始导入' }}
                 </button>
               </div>
-            </div>
-          </div>
-        </div>
-      </Transition>
-    </Teleport>
-
-    <!-- OPDS 服务器弹窗（外部阅读器连接地址 + 复制） -->
-    <Teleport to="body">
-      <Transition name="dlg">
-        <div v-if="opdsOpen" class="dlg-overlay" @click.self="closeOpds">
-          <div
-            class="dlg dlg-opds"
-            role="dialog"
-            aria-modal="true"
-            aria-label="OPDS 服务器"
-            tabindex="-1"
-            @keydown.esc="closeOpds"
-          >
-            <div class="dlg-head">
-              <h2 class="dlg-title">OPDS 服务器</h2>
-              <button class="dlg-close" type="button" title="关闭" @click="closeOpds">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
-                  <path d="M6 6l12 12M18 6L6 18" />
-                </svg>
-              </button>
-            </div>
-            <p class="opds-tip">将以下地址粘贴到外部阅读器（legado、静读天下等）的 OPDS 地址栏，即可同步书架与阅读。地址已附带登录凭证，请勿分享给他人。</p>
-            <div class="opds-row">
-              <span class="opds-url mono" :title="opdsUrl">{{ opdsUrl }}</span>
-              <button class="accent-btn" type="button" @click="copyOpdsUrl">
-                {{ opdsCopied ? '已复制' : '复制' }}
-              </button>
             </div>
           </div>
         </div>
@@ -3698,35 +3625,6 @@ onMounted(() => {
   margin-left: auto;
 }
 
-/* ================= OPDS 弹窗 ================= */
-.dlg-opds {
-  width: min(520px, 100%);
-}
-.opds-tip {
-  margin: 0 0 14px;
-  font-size: 12px;
-  font-weight: 300;
-  line-height: 1.8;
-  color: var(--text-3);
-}
-.opds-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-}
-.opds-url {
-  flex: 1;
-  min-width: 0;
-  font-size: 12px;
-  color: var(--text-1);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 .ghost-btn {
   padding: 7px 16px;
   border-radius: var(--radius);

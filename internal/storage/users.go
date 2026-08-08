@@ -104,19 +104,16 @@ func (s *Storage) LogoutUser(username string) error {
 }
 
 // UpdateUserPermissions 更新用户权限（nil 字段不修改）。返回受影响行数。
-func (s *Storage) UpdateUserPermissions(username string, enableWebdav, enableLocalStore, enableBookSource, enableRssSource *bool, bookSourceLimit, bookLimit *int64) (int64, error) {
+func (s *Storage) UpdateUserPermissions(username string, enableWebdav, enableLocalStore, enableBookSource *bool, bookSourceLimit, bookLimit *int64) (int64, error) {
 	updates := map[string]any{}
 	if enableWebdav != nil {
 		updates["enable_webdav"] = *enableWebdav
 	}
 	if enableLocalStore != nil {
-		updates["enable_local_store"] = *enableLocalStore
+	updates["enable_local_store"] = *enableLocalStore
 	}
 	if enableBookSource != nil {
 		updates["enable_book_source"] = *enableBookSource
-	}
-	if enableRssSource != nil {
-		updates["enable_rss_source"] = *enableRssSource
 	}
 	if bookSourceLimit != nil {
 		updates["book_source_limit"] = *bookSourceLimit
@@ -149,8 +146,8 @@ func (s *Storage) DeleteUsers(usernames []string) (int64, error) {
 		// 清理各命名空间数据
 		cleanup := []any{
 			&model.Book{}, &model.BookSource{}, &model.Bookmark{}, &model.BookGroup{},
-			&model.ReplaceRule{}, &model.TxtTocRule{}, &model.HttpTTS{}, &model.RssSource{},
-			&model.RssArticle{}, &model.SourceSub{}, &model.UserConfig{},
+			&model.ReplaceRule{}, &model.TxtTocRule{}, &model.HttpTTS{},
+			&model.SourceSub{}, &model.UserConfig{},
 		}
 		for _, m := range cleanup {
 			if err := tx.Where("user_namespace IN ?", usernames).Delete(m).Error; err != nil {

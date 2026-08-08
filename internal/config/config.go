@@ -36,7 +36,6 @@ type Config struct {
 	DefaultUserEnableWebdav bool
 	DefaultUserEnableLocalStore bool
 	DefaultUserEnableBookSource bool
-	DefaultUserEnableRssSource bool
 	// DefaultUserBookSourceLimit 默认新用户书源上限
 	DefaultUserBookSourceLimit int64
 	// DefaultUserBookLimit 默认新用户书籍上限
@@ -80,7 +79,6 @@ func FromEnv() *Config {
 		DefaultUserEnableWebdav:  envFlag("READER_APP_DEFAULTUSERENABLEWEBDAV"),
 		DefaultUserEnableLocalStore: envFlag("READER_APP_DEFAULTUSERENABLELOCALSTORE"),
 		DefaultUserEnableBookSource: envFlag("READER_APP_DEFAULTUSERENABLEBOOKSOURCE"),
-		DefaultUserEnableRssSource: envFlag("READER_APP_DEFAULTUSERENABLERSSSOURCE"),
 		DefaultUserBookSourceLimit: envI64("READER_APP_DEFAULTUSERBOOKSOURCELIMIT", 100),
 		DefaultUserBookLimit:     envI64("READER_APP_DEFAULTUSERBOOKLIMIT", 200),
 		UploadMaxMB:              envI64("READER_UPLOAD_MAX_MB", 100),
