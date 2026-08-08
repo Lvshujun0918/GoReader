@@ -2,6 +2,7 @@
 package bookfetch
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -37,42 +38,44 @@ func (f *Fetcher) BookInfo(source *model.BookSource, bookURL string) (map[string
 	ctx := &rule.Context{BaseURL: bookURL}
 	ctx.Set("bookUrl", bookURL)
 	info := map[string]any{
-		"bookUrl": bookURL,
-		"origin":  source.BookSourceURL,
+		"bookUrl":    bookURL,
+		"origin":     source.BookSourceURL,
 		"originName": source.BookSourceName,
-		"tocUrl":  bookURL,
+		"tocUrl":     bookURL,
 	}
-	// 各字段规则（legado 常见字段）
-	fields := map[string]string{
-		"name": "name", "author": "author", "kind": "kind",
-		"intro": "intro", "coverUrl": "coverUrl", "wordCount": "wordCount",
-		"latestChapterTitle": "latestChapterTitle", "tocUrl": "tocUrl",
-		"type": "type", "customTag": "customTag", "init": "init",
+	rules := parseRuleMap(ruleStr)
+	if len(rules) == 0 {
+		info["name"] = "未知书籍"
+		return info, nil
 	}
-	var parsed bool
-	for _, item := range splitSemicolon(ruleStr) {
-		key, val := splitKeyVal(item)
-		if key == "" {
+	// init 上下文（legado：init 规则先把响应转为新上下文，之后所有字段基于其解析）
+	initVal := ""
+	if v := rules["init"]; v != "" {
+		if res := rule.Parse(htmlStr, v, ctx); len(res) > 0 {
+			initVal = res[0]
+		}
+	}
+	for key, val := range rules {
+		if key == "init" {
 			continue
 		}
-		parsed = true
-		ruleKey, ok := fields[key]
-		if !ok {
-			ruleKey = key
+		input := htmlStr
+		if initVal != "" {
+			input = initVal
 		}
-		results := rule.Parse(htmlStr, val, ctx)
-		if len(results) > 0 {
-			if ruleKey == "coverUrl" {
-				info["coverUrl"] = resolveURL(results[0], bookURL)
-			} else if ruleKey == "tocUrl" {
-				info["tocUrl"] = resolveURL(results[0], bookURL)
-			} else {
-				info[ruleKey] = results[0]
-			}
+		results := rule.Parse(input, val, ctx)
+		if len(results) == 0 {
+			continue
+		}
+		if key == "coverUrl" {
+			info["coverUrl"] = resolveURL(results[0], bookURL)
+		} else if key == "tocUrl" {
+			info["tocUrl"] = resolveURL(results[0], bookURL)
+		} else {
+			info[key] = results[0]
 		}
 	}
-	if !parsed {
-		// 无规则：返回基础信息
+	if info["name"] == nil {
 		info["name"] = "未知书籍"
 	}
 	return info, nil
@@ -98,64 +101,16 @@ func (f *Fetcher) BookToc(source *model.BookSource, tocURL string) ([]Chapter, s
 		ruleStr = source.TocRule
 	}
 	ctx := &rule.Context{BaseURL: tocURL}
-
-	var chapters []Chapter
-	for _, item := range splitSemicolon(ruleStr) {
-		key, val := splitKeyVal(item)
-		switch key {
-		case "chapters", "chapterList", "tocList":
-			// 章节列表规则 → 循环每个元素
-			results := rule.Parse(htmlStr, val, ctx)
-			for i, chURL := range results {
-				ch := Chapter{URL: resolveURL(chURL, tocURL), Index: i}
-				chapters = append(chapters, ch)
-			}
-		case "chapterTitle", "title":
-			// 标题与 URL 成对规则（在列表规则后）
-		case "chapterUrl", "url":
-		case "nextTocUrl", "nextUrl":
-			results := rule.Parse(htmlStr, val, ctx)
-			if len(results) > 0 {
-				return chapters, resolveURL(results[0], tocURL), nil
-			}
-		}
-	}
-
-	// 无列表规则时的兜底：尝试通用列表 + 标题/URL 成对规则
-	if len(chapters) == 0 {
-		chapters = parsePairedToc(htmlStr, ruleStr, tocURL)
-	}
-	// 卷标题检测（isVolume）
-	for i := range chapters {
-		if strings.HasSuffix(chapters[i].Title, "卷") || strings.Contains(chapters[i].Title, "·") && len(chapters[i].Title) < 12 {
-			chapters[i].IsVolume = true
-		}
-	}
-	return chapters, "", nil
-}
-
-// parsePairedToc 成对规则解析（list | title | url 三段式）。
-func parsePairedToc(htmlStr, ruleStr, baseURL string) []Chapter {
-	parts := splitSemicolon(ruleStr)
-	var listRule, titleRule, urlRule string
-	for _, item := range parts {
-		key, val := splitKeyVal(item)
-		switch key {
-		case "chapters", "chapterList", "tocList", "list":
-			listRule = val
-		case "title", "chapterTitle":
-			titleRule = val
-		case "url", "chapterUrl":
-			urlRule = val
-		}
-	}
+	rules := parseRuleMap(ruleStr)
+	listRule := firstNonEmpty(rules, "chapters", "chapterList", "tocList", "list")
 	if listRule == "" {
-		return nil
+		return nil, "", nil
 	}
-	ctx := &rule.Context{BaseURL: baseURL}
-	listItems := rule.Parse(htmlStr, listRule, ctx)
-	var out []Chapter
-	for i, item := range listItems {
+	titleRule := firstNonEmpty(rules, "chapterTitle", "chapterName", "title")
+	urlRule := firstNonEmpty(rules, "chapterUrl", "url")
+	items := rule.Parse(htmlStr, listRule, ctx)
+	var chapters []Chapter
+	for i, item := range items {
 		ch := Chapter{Index: i}
 		if titleRule != "" {
 			if t := rule.Parse(item, titleRule, ctx); len(t) > 0 {
@@ -167,15 +122,28 @@ func parsePairedToc(htmlStr, ruleStr, baseURL string) []Chapter {
 		}
 		if urlRule != "" {
 			if u := rule.Parse(item, urlRule, ctx); len(u) > 0 {
-				ch.URL = resolveURL(u[0], baseURL)
+				ch.URL = resolveURL(u[0], tocURL)
 			}
 		}
 		if ch.URL == "" {
-			ch.URL = baseURL
+			ch.URL = tocURL
 		}
-		out = append(out, ch)
+		chapters = append(chapters, ch)
 	}
-	return out
+	// 卷标题检测（isVolume）
+	for i := range chapters {
+		if strings.HasSuffix(chapters[i].Title, "卷") || strings.Contains(chapters[i].Title, "·") && len(chapters[i].Title) < 12 {
+			chapters[i].IsVolume = true
+		}
+	}
+	// 分页目录：nextTocUrl/nextUrl
+	next := ""
+	if v := firstNonEmpty(rules, "nextTocUrl", "nextUrl"); v != "" {
+		if res := rule.Parse(htmlStr, v, ctx); len(res) > 0 {
+			next = resolveURL(res[0], tocURL)
+		}
+	}
+	return chapters, next, nil
 }
 
 // ContentResult 正文结果（含下一页/字数）。
@@ -194,6 +162,9 @@ func (f *Fetcher) BookContent(source *model.BookSource, chapterURL string, maxPa
 	if ruleStr == "" {
 		ruleStr = source.ContentRule
 	}
+	rules := parseRuleMap(ruleStr)
+	contentRule := firstNonEmpty(rules, "content", "bookContent")
+	nextRule := firstNonEmpty(rules, "nextContentUrl", "nextUrl")
 	var parts []string
 	curURL := chapterURL
 	for i := 0; i < maxPages; i++ {
@@ -204,17 +175,8 @@ func (f *Fetcher) BookContent(source *model.BookSource, chapterURL string, maxPa
 		htmlStr := string(body)
 		ctx := &rule.Context{BaseURL: curURL}
 		var contentParts []string
-		var nextURL string
-		for _, item := range splitSemicolon(ruleStr) {
-			key, val := splitKeyVal(item)
-			switch key {
-			case "content", "bookContent":
-				contentParts = append(contentParts, rule.Parse(htmlStr, val, ctx)...)
-			case "nextContentUrl", "nextUrl":
-				if res := rule.Parse(htmlStr, val, ctx); len(res) > 0 {
-					nextURL = resolveURL(res[0], curURL)
-				}
-			}
+		if contentRule != "" {
+			contentParts = append(contentParts, rule.Parse(htmlStr, contentRule, ctx)...)
 		}
 		if len(contentParts) == 0 {
 			// 兜底：正文直接取文本
@@ -223,6 +185,12 @@ func (f *Fetcher) BookContent(source *model.BookSource, chapterURL string, maxPa
 		joined := strings.Join(contentParts, "\n")
 		if joined != "" {
 			parts = append(parts, joined)
+		}
+		nextURL := ""
+		if nextRule != "" {
+			if res := rule.Parse(htmlStr, nextRule, ctx); len(res) > 0 {
+				nextURL = resolveURL(res[0], curURL)
+			}
 		}
 		if nextURL == "" || nextURL == curURL {
 			break
@@ -288,6 +256,38 @@ func splitKeyVal(item string) (string, string) {
 		return "", item
 	}
 	return strings.TrimSpace(item[:idx]), item[idx+1:]
+}
+
+// parseRuleMap 解析书源规则为 key→value map：legado JSON 对象
+// （{"content":"$.data.content","name":"$.title"}）或 legacy 分号串（content=...;name=...）。
+func parseRuleMap(ruleStr string) map[string]string {
+	out := map[string]string{}
+	var m map[string]any
+	if json.Unmarshal([]byte(ruleStr), &m) == nil {
+		for k, v := range m {
+			if s, ok := v.(string); ok && s != "" {
+				out[k] = s
+			}
+		}
+		return out
+	}
+	for _, item := range splitSemicolon(ruleStr) {
+		key, val := splitKeyVal(item)
+		if key != "" {
+			out[key] = val
+		}
+	}
+	return out
+}
+
+// firstNonEmpty 依次返回首个非空的规则值。
+func firstNonEmpty(m map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v := m[k]; v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // resolveURL 相对链接解析（含 // 协议相对）。base 无路径时视为根目录（https://host → https://host/）。
