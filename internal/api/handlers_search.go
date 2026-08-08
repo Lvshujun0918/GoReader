@@ -32,6 +32,7 @@ type SearchResult struct {
 }
 
 // SearchSource 单书源搜索。solverOpt 可选传入质询求解器（书源 cookie 自动附加 + 质询求解）。
+// 支持两种规则格式：legacy 分号串（bookList=...;name=...）与 legado JSON 对象（{"bookList":"...","name":"..."}）。
 func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.Solver) ([]*SearchResult, error) {
 	ruleStr := src.RuleSearch
 	if ruleStr == "" {
@@ -39,6 +40,11 @@ func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.So
 	}
 	if ruleStr == "" {
 		return nil, fmt.Errorf("书源无搜索规则")
+	}
+	rules := parseSearchRules(ruleStr)
+	bookList := rules["bookList"]
+	if bookList == "" {
+		bookList = rules["books"]
 	}
 	// 构造搜索 URL（{key} 变量替换）
 	searchURL := src.SearchURL
@@ -53,31 +59,97 @@ func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.So
 	htmlStr := string(body)
 	ctx := &rule.Context{BaseURL: searchURL}
 
-	var results []*SearchResult
-	// 尝试列表+字段成对规则
-	for _, item := range splitSemicolonRule(ruleStr) {
-		key, val := splitKeyVal(item)
-		switch key {
-		case "bookList", "books":
-			items := rule.Parse(htmlStr, ensureListHTML(val), ctx)
-			results = make([]*SearchResult, 0, len(items))
-			for range items {
-				results = append(results, &SearchResult{})
-			}
-			// 标题/作者/链接成对规则（第二次遍历填充）
-			fillSearchFields(htmlStr, ruleStr, results, ctx, src, searchURL)
-			return results, nil
-		case "name":
-			// 无列表规则：单书
-			res := &SearchResult{}
-			fillSearchFields(htmlStr, ruleStr, []*SearchResult{res}, ctx, src, searchURL)
-			if res.Name != "" {
-				return []*SearchResult{res}, nil
+	if bookList != "" {
+		// 列表规则：bookList 项（CSS 补 @html 供子规则解析；JSONPath/js 直接取项）
+		items := rule.Parse(htmlStr, ensureListHTML(bookList), ctx)
+		results := make([]*SearchResult, 0, len(items))
+		for range items {
+			results = append(results, &SearchResult{})
+		}
+		fillSearchResults(rules, items, results, ctx, src, searchURL)
+		return results, nil
+	}
+	// 无列表规则：单书直达
+	res := &SearchResult{}
+	fillSearchResults(rules, []string{htmlStr}, []*SearchResult{res}, ctx, src, searchURL)
+	if res.Name != "" {
+		return []*SearchResult{res}, nil
+	}
+	return nil, nil
+}
+
+// parseSearchRules 解析搜索规则为 key→规则值：legacy 分号串（bookList=...;name=...）
+// 或 legado JSON 对象（{"bookList":"...","name":"..."}）。
+func parseSearchRules(ruleStr string) map[string]string {
+	out := map[string]string{}
+	var m map[string]any
+	if json.Unmarshal([]byte(ruleStr), &m) == nil {
+		for k, v := range m {
+			if s, ok := v.(string); ok && s != "" {
+				out[k] = s
 			}
 		}
+		return out
 	}
-	// 无 ruleSearch 时的兜底
-	return nil, nil
+	for _, item := range splitSemicolonRule(ruleStr) {
+		key, val := splitKeyVal(item)
+		if key != "" {
+			out[key] = val
+		}
+	}
+	return out
+}
+
+// fillSearchResults 按规则 map 填充搜索结果字段。
+func fillSearchResults(rules map[string]string, items []string, results []*SearchResult, ctx *rule.Context, src *model.BookSource, baseURL string) {
+	for i, item := range items {
+		if i >= len(results) {
+			break
+		}
+		res := results[i]
+		if v := firstRule(rules, item, ctx, "name", "bookName"); v != "" {
+			res.Name = v
+		}
+		if v := firstRule(rules, item, ctx, "author", "bookAuthor"); v != "" {
+			res.Author = v
+		}
+		if v := firstRule(rules, item, ctx, "bookUrl", "detailUrl"); v != "" {
+			res.BookURL = resolveURL(v, baseURL)
+			res.TocURL = res.BookURL
+		}
+		if v := firstRule(rules, item, ctx, "coverUrl"); v != "" {
+			res.CoverURL = resolveURL(v, baseURL)
+		}
+		if v := firstRule(rules, item, ctx, "intro", "desc"); v != "" {
+			res.Intro = v
+		}
+		if v := firstRule(rules, item, ctx, "kind"); v != "" {
+			res.Kind = v
+		}
+		if v := firstRule(rules, item, ctx, "wordCount"); v != "" {
+			res.WordCount = v
+		}
+		if v := firstRule(rules, item, ctx, "latestChapterTitle"); v != "" {
+			res.LatestChapterTitle = v
+		}
+		res.Origin = src.BookSourceURL
+		res.OriginName = src.BookSourceName
+		res.Type = src.BookSourceType
+	}
+}
+
+// firstRule 依次尝试多个规则键，返回第一个非空解析结果。
+func firstRule(rules map[string]string, item string, ctx *rule.Context, keys ...string) string {
+	for _, k := range keys {
+		val := rules[k]
+		if val == "" {
+			continue
+		}
+		if v := rule.Parse(item, val, ctx); len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
 }
 
 // ensureListHTML bookList 的 CSS 规则需返回元素 HTML 供子规则再解析：
@@ -87,69 +159,6 @@ func ensureListHTML(val string) string {
 		return val + "@html"
 	}
 	return val
-}
-
-// fillSearchFields 填充搜索结果字段（列表规则或单书规则）。
-func fillSearchFields(htmlStr, ruleStr string, results []*SearchResult, ctx *rule.Context, src *model.BookSource, baseURL string) {
-	items := []string{}
-	if len(results) > 1 {
-		for _, item := range splitSemicolonRule(ruleStr) {
-			key, val := splitKeyVal(item)
-			if key == "bookList" || key == "books" {
-				items = rule.Parse(htmlStr, ensureListHTML(val), ctx)
-				break
-			}
-		}
-	} else {
-		items = []string{htmlStr}
-	}
-	for i, item := range items {
-		if i >= len(results) {
-			break
-		}
-		res := results[i]
-		for _, sub := range splitSemicolonRule(ruleStr) {
-			key, val := splitKeyVal(sub)
-			switch key {
-			case "name", "bookName":
-				if v := rule.Parse(item, val, ctx); len(v) > 0 {
-					res.Name = v[0]
-				}
-			case "author", "bookAuthor":
-				if v := rule.Parse(item, val, ctx); len(v) > 0 {
-					res.Author = v[0]
-				}
-			case "bookUrl", "detailUrl":
-				if v := rule.Parse(item, val, ctx); len(v) > 0 {
-					res.BookURL = resolveURL(v[0], baseURL)
-					res.TocURL = res.BookURL
-				}
-			case "coverUrl":
-				if v := rule.Parse(item, val, ctx); len(v) > 0 {
-					res.CoverURL = resolveURL(v[0], baseURL)
-				}
-			case "intro", "desc":
-				if v := rule.Parse(item, val, ctx); len(v) > 0 {
-					res.Intro = v[0]
-				}
-			case "kind":
-				if v := rule.Parse(item, val, ctx); len(v) > 0 {
-					res.Kind = v[0]
-				}
-			case "wordCount":
-				if v := rule.Parse(item, val, ctx); len(v) > 0 {
-					res.WordCount = v[0]
-				}
-			case "latestChapterTitle":
-				if v := rule.Parse(item, val, ctx); len(v) > 0 {
-					res.LatestChapterTitle = v[0]
-				}
-			}
-		}
-		res.Origin = src.BookSourceURL
-		res.OriginName = src.BookSourceName
-		res.Type = src.BookSourceType
-	}
 }
 
 // handleSearchBook GET/POST /reader3/searchBook：单书源搜索。
