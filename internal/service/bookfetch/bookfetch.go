@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/Lvshujun0918/GoReader/internal/service/crawler"
 	"github.com/Lvshujun0918/GoReader/internal/service/solver"
 	"github.com/Lvshujun0918/GoReader/internal/storage"
+	"github.com/antchfx/htmlquery"
+	"golang.org/x/net/html"
 )
 
 // Fetcher 书源抓取器。
@@ -102,6 +105,11 @@ func (f *Fetcher) BookToc(source *model.BookSource, tocURL string) ([]Chapter, s
 	listRule := firstNonEmpty(rules, "chapters", "chapterList", "tocList", "list")
 	if listRule == "" {
 		return nil, "", nil
+	}
+	// 链式 chapterList（.catalog_ls li a 等末段为选择器）→ 补 @html 输出元素 HTML，
+	// 供 chapterUrl/chapterName 子规则再解析（与搜索 bookList 的 ensureListHTML 一致）。
+	if rule.ChainNeedsHTML(listRule) {
+		listRule += "@html"
 	}
 	titleRule := firstNonEmpty(rules, "chapterTitle", "chapterName", "title")
 	urlRule := firstNonEmpty(rules, "chapterUrl", "url")
@@ -247,7 +255,45 @@ func (f *Fetcher) BookContent(source *model.BookSource, chapterURL string, maxPa
 	// 换行规范化：源站 CRLF → LF（前端按 \n 切段）
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 	content = strings.ReplaceAll(content, "\r", "\n")
+	// 正文规则返回 HTML（.con@html 等）→ 转纯文本段落（前端按 \n 渲染；含标签会显示标签）
+	if strings.Contains(content, "<") && strings.Contains(content, ">") {
+		content = htmlToText(content)
+	}
 	return &ContentResult{Content: content, WordCount: len([]rune(content))}, nil
+}
+
+// htmlToText HTML → 纯文本：块级元素/换行标签转为 \n，去其余标签，压缩空白。
+func htmlToText(s string) string {
+	doc, err := htmlquery.Parse(strings.NewReader(s))
+	if err != nil {
+		return s
+	}
+	block := map[string]bool{
+		"p": true, "div": true, "br": true, "li": true, "tr": true, "td": true,
+		"h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true,
+		"section": true, "article": true, "blockquote": true, "pre": true,
+	}
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			b.WriteString(n.Data)
+		}
+		if n.Type == html.ElementNode && block[strings.ToLower(n.Data)] {
+			b.WriteString("\n")
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+		if n.Type == html.ElementNode && block[strings.ToLower(n.Data)] {
+			b.WriteString("\n")
+		}
+	}
+	walk(doc)
+	out := regexp.MustCompile(`[ \t]+`).ReplaceAllString(b.String(), " ")
+	out = regexp.MustCompile(`\x{3000}+`).ReplaceAllString(out, "")
+	out = regexp.MustCompile(`\n\s*\n+`).ReplaceAllString(out, "\n")
+	return strings.TrimSpace(out)
 }
 
 // stripTags 简易 HTML 去标签。

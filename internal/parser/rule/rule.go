@@ -84,7 +84,15 @@ func parseSingle(input, rule string, ctx *Context) []string {
 	// 文本后处理：value@js:code（先解析前缀，再对结果执行 JS，如 {{$.status}}@js:result.replace(...)）
 	if idx := strings.LastIndex(rule, "@js:"); idx > 0 {
 		prefix, code := rule[:idx], rule[idx+len("@js:"):]
-		base := parseSingle(input, prefix, ctx)
+		var base []string
+		if strings.HasPrefix(prefix, "@") && !strings.Contains(prefix, ":") {
+			// @attr@js:code：@onclick 表示取输入 HTML 首元素该属性值（legado 常见）
+			if v := attrFromInput(input, strings.TrimPrefix(prefix, "@")); v != "" {
+				base = []string{v}
+			}
+		} else {
+			base = parseSingle(input, prefix, ctx)
+		}
 		if len(base) > 0 {
 			if vs := evalJS(base[0], code, ctx); len(vs) > 0 {
 				return vs
@@ -97,10 +105,38 @@ func parseSingle(input, rule string, ctx *Context) []string {
 		if vs := evalCSSChainFromInput(input, rule, ctx); len(vs) > 0 {
 			return vs
 		}
+		// 链式选择器匹配不到任何节点 = 无结果。
+		// 不能像纯文本规则那样降级返回字面量（否则会把 "tag.a.0@href" 当真实结果，
+		// 产生假书/假章节，见 真实书源《剑来》全流程测试）。
+		return nil
 	}
 	// 纯文本规则（无 @ 前缀）：正则全文匹配；无匹配时返回插值后的规则本身
 	// （URL 模板等，如 /novels/api/book/{{$.book_id}} —— 插值后原样输出）
 	if !strings.HasPrefix(rule, "@") {
+		// 裸属性/文本规则（legado ruleToc：chapterUrl=href / chapterName=text）：
+		// 输入为 HTML 时取首元素属性/文本，而非当正则全文匹配。
+		if chainAttrNames[rule] || rule == "text" || rule == "html" {
+			if strings.Contains(input, "<") {
+				switch rule {
+				case "text":
+					if el := firstElement(input); el != nil {
+						if t := extractText(el); t != "" {
+							return []string{t}
+						}
+					}
+				case "html":
+					if el := firstElement(input); el != nil {
+						if h := htmlquery.OutputHTML(el, true); h != "" {
+							return []string{h}
+						}
+					}
+				default:
+					if v := attrFromInput(input, rule); v != "" {
+						return []string{v}
+					}
+				}
+			}
+		}
 		if out := regexMatchAll(input, rule); len(out) > 0 {
 			return out
 		}
@@ -189,6 +225,68 @@ func attrValue(n *html.Node, key string) string {
 		if a.Key == key {
 			return strings.TrimSpace(a.Val)
 		}
+	}
+	return ""
+}
+
+// firstElement 取输入 HTML 首个真实元素（跳过 html/head/body 包裹层）。
+func firstElement(input string) *html.Node {
+	doc, err := htmlquery.Parse(strings.NewReader(input))
+	if err != nil {
+		return nil
+	}
+	var found *html.Node
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if found != nil {
+			return
+		}
+		if n.Type == html.ElementNode {
+			switch strings.ToLower(n.Data) {
+			case "html", "head", "body":
+				// 跳过解析器自动包裹层
+			default:
+				found = n
+				return
+			}
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+	}
+	walk(doc)
+	return found
+}
+
+// attrFromInput 从输入 HTML 取首个拥有该属性的元素的属性值（x/net/html 已解码实体）。
+func attrFromInput(input, key string) string {
+	doc, err := htmlquery.Parse(strings.NewReader(input))
+	if err != nil {
+		return ""
+	}
+	var first *html.Node
+	var walk func(*html.Node) string
+	walk = func(n *html.Node) string {
+		if n.Type == html.ElementNode {
+			if first == nil {
+				first = n
+			}
+			if v := attrValue(n, key); v != "" {
+				return v
+			}
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			if v := walk(ch); v != "" {
+				return v
+			}
+		}
+		return ""
+	}
+	if v := walk(doc); v != "" {
+		return v
+	}
+	if first != nil {
+		return attrValue(first, key)
 	}
 	return ""
 }
@@ -811,6 +909,12 @@ func evalGet(input, param string, ctx *Context) []string {
 
 // processTextOps 文本处理操作：## 正则替换、@@ 连接、! 取反、纯文本。
 func processTextOps(input, rule string, ctx *Context) []string {
+	// @attr 顶层：取输入 HTML 首元素该属性值（legado @onclick/@src）
+	if strings.HasPrefix(rule, "@") && !strings.Contains(rule, ":") {
+		if v := attrFromInput(input, strings.TrimPrefix(rule, "@")); v != "" {
+			return []string{v}
+		}
+	}
 	// 替换 ##pattern##replacement##flags
 	if strings.Contains(rule, "##") {
 		parts := strings.Split(rule, "##")
