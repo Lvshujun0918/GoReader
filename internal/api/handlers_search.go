@@ -3,9 +3,11 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/text/encoding/simplifiedchinese"
 
 	"github.com/Lvshujun0918/reader-dev/internal/model"
 	"github.com/Lvshujun0918/reader-dev/internal/parser/rule"
@@ -46,18 +48,27 @@ func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.So
 	if bookList == "" {
 		bookList = rules["books"]
 	}
-	// 构造搜索 URL（{key} 变量替换）
-	searchURL := src.SearchURL
-	searchURL = strings.ReplaceAll(searchURL, "{key}", urlEncodeKeyword(keyword))
-	searchURL = strings.ReplaceAll(searchURL, "{searchKey}", urlEncodeKeyword(keyword))
+	// 构造搜索请求（legado searchUrl：{{key}}/{{searchKey}}/{key} 占位符、{{page}} 分页、
+	// @js:/<js> 前缀 JS 构造、URL 后 ,{'method':'POST','body':...} 表单描述）
+	ctx := &rule.Context{
+		BaseURL:   src.BookSourceURL,
+		Variables: map[string]string{"baseUrl": src.BookSourceURL, "key": keyword, "page": "1"},
+	}
+	req := buildSearchRequest(src.SearchURL, keyword, 1, ctx)
 
 	client := crawler.New(nil, "", solverOpt...)
-	body, err := client.Fetch(searchURL, src)
+	var body []byte
+	var err error
+	if req.Method == "POST" {
+		body, err = client.FetchPost(req.URL, req.Body, src)
+	} else {
+		body, err = client.Fetch(req.URL, src)
+	}
 	if err != nil {
 		return nil, err
 	}
 	htmlStr := string(body)
-	ctx := &rule.Context{BaseURL: searchURL}
+	ctx = &rule.Context{BaseURL: req.URL}
 
 	if bookList != "" {
 		// 列表规则：bookList 项（CSS 补 @html 供子规则解析；JSONPath/js 直接取项）
@@ -66,12 +77,12 @@ func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.So
 		for range items {
 			results = append(results, &SearchResult{})
 		}
-		fillSearchResults(rules, items, results, ctx, src, searchURL)
+		fillSearchResults(rules, items, results, ctx, src, req.URL)
 		return results, nil
 	}
 	// 无列表规则：单书直达
 	res := &SearchResult{}
-	fillSearchResults(rules, []string{htmlStr}, []*SearchResult{res}, ctx, src, searchURL)
+	fillSearchResults(rules, []string{htmlStr}, []*SearchResult{res}, ctx, src, req.URL)
 	if res.Name != "" {
 		return []*SearchResult{res}, nil
 	}
@@ -333,6 +344,103 @@ func (a *API) handleSearchBookContent(c *gin.Context) {
 // helpers
 func urlEncodeKeyword(kw string) string {
 	return bookfetch.URLEncode(kw)
+}
+
+// searchRequest 一次搜索请求描述（legado searchUrl 解析结果）。
+type searchRequest struct {
+	URL     string // 最终请求 URL（占位符已替换）
+	Method  string // GET / POST
+	Body    string // POST 表单串（占位符已替换，UTF-8 百分号编码）
+	Charset string // 源站字符集（gbk/gb2312/utf-8）
+}
+
+// buildSearchRequest 解析书源 searchUrl 为具体请求。支持：
+//   - {{key}}/{{searchKey}}/{key} 关键词占位符、{{page}}/{page} 分页（legado 双花括号）
+//   - @js:/<js> 前缀：JS 构造 URL（result 变量）——先替换占位符再执行（{{key}} 在 JS 里否则语法错误）
+//   - URL 后 ,{'method':'POST','body':'...','charset':'gbk'} 表单描述
+func buildSearchRequest(raw, keyword string, page int, ctx *rule.Context) *searchRequest {
+	r := &searchRequest{URL: raw, Method: "GET"}
+	encKey := urlEncodeKeyword(keyword)
+	// @js:/<js> 前缀：先替换占位符（{{key}} 在 JS 字符串里），再 evalJS 得 URL（或 URL + POST 描述）
+	if strings.HasPrefix(raw, "@js:") || strings.HasPrefix(raw, "<js>") {
+		raw = replacePlaceholders(raw, encKey, page)
+		if strings.HasPrefix(raw, "@js:") {
+			// 传完整 @js: 规则（parseSingle 识别前缀后 evalJS）
+			if vs := rule.Parse("", raw, ctx); len(vs) > 0 && vs[0] != "" {
+				r.URL = vs[0]
+			}
+		} else if strings.HasPrefix(raw, "<js>") && strings.HasSuffix(raw, "</js>") {
+			if vs := rule.Parse("", raw, ctx); len(vs) > 0 && vs[0] != "" {
+				r.URL = vs[0]
+			}
+		}
+	}
+	// URL 后 ,{...} 请求描述（POST 表单等）
+	if idx := strings.Index(r.URL, ",{"); idx >= 0 {
+		desc := r.URL[idx+1:]
+		r.URL = r.URL[:idx]
+		parseRequestDesc(desc, r)
+	}
+	// 占位符替换（关键词编码随源站字符集）
+	if r.Charset == "gbk" || r.Charset == "gb2312" {
+		encKey = gbkPercentEncode(keyword)
+	}
+	r.URL = replacePlaceholders(r.URL, encKey, page)
+	if r.Body != "" {
+		r.Body = replacePlaceholders(r.Body, encKey, page)
+	}
+	return r
+}
+
+// parseRequestDesc 解析 ,{...} 请求描述（legado 单引号 JSON：method/body/charset）。
+func parseRequestDesc(desc string, r *searchRequest) {
+	// 单引号 → 双引号（legado 描述用单引号；值内单引号罕见，直接替换）
+	js := strings.ReplaceAll(desc, "'", `"`)
+	var m map[string]any
+	if json.Unmarshal([]byte(js), &m) != nil {
+		return
+	}
+	if v, ok := m["method"].(string); ok {
+		r.Method = strings.ToUpper(v)
+	}
+	if v, ok := m["body"].(string); ok {
+		r.Body = v
+	}
+	if v, ok := m["charset"].(string); ok {
+		r.Charset = strings.ToLower(v)
+	}
+}
+
+// replacePlaceholders 替换搜索占位符（先双花括号再单花括号，避免 {{key}} 被 {key} 部分命中）。
+func replacePlaceholders(s, encKey string, page int) string {
+	pageStr := strconv.Itoa(page)
+	s = strings.ReplaceAll(s, "{{searchKey}}", encKey)
+	s = strings.ReplaceAll(s, "{{key}}", encKey)
+	s = strings.ReplaceAll(s, "{searchKey}", encKey)
+	s = strings.ReplaceAll(s, "{key}", encKey)
+	s = strings.ReplaceAll(s, "{{page}}", pageStr)
+	s = strings.ReplaceAll(s, "{page}", pageStr)
+	return s
+}
+
+// gbkPercentEncode 关键词按 GBK 编码后百分号编码（legado charset=gbk 的 POST 表单）。
+func gbkPercentEncode(s string) string {
+	enc := simplifiedchinese.GBK.NewEncoder()
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x80 {
+			b.WriteRune(r)
+			continue
+		}
+		out, err := enc.String(string(r))
+		if err != nil {
+			continue
+		}
+		for i := 0; i < len(out); i++ {
+			fmt.Fprintf(&b, "%%%02X", out[i])
+		}
+	}
+	return b.String()
 }
 
 func splitSemicolonRule(s string) []string {
