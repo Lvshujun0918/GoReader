@@ -2034,9 +2034,15 @@ async function loadContent(chapterUrl: string) {
 }
 
 // 临时书（先读后入架）：离开时提醒加入书架
+let leavingConfirming = false
 onBeforeRouteLeave(async () => {
   const b = shelfBook.value
   if (!b || !(b as unknown as { isTemp?: boolean }).isTemp) return true
+  // 正文加载失败（书可能有问题）时离开不打扰——不弹加入书架确认框
+  if (loadError.value || notFound.value) return true
+  // 防重入：confirm 弹窗挂起期间若再次导航（刷新/连点），旧守卫直接放行，避免多次弹框/守卫悬挂
+  if (leavingConfirming) return true
+  leavingConfirming = true
   try {
     await ElMessageBox.confirm(`《${b.name || '本书'}》要加入书架吗？加入后可保存阅读进度、续读更方便。`, '加入书架', {
       confirmButtonText: '加入书架',

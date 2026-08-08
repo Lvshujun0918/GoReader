@@ -32,6 +32,10 @@ export function showConfirm(opts: {
   cancelText?: string
   type?: ConfirmState['type']
 }): Promise<boolean> {
+  // 防叠加：同一时刻已有挂起的确认框（如路由守卫重复触发）时，先结算旧的避免 Promise 悬挂
+  if (confirmState.resolve) {
+    settleConfirm(false)
+  }
   return new Promise((resolve) => {
     confirmState.visible = true
     confirmState.title = opts.title ?? '提示'
