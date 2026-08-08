@@ -54,7 +54,7 @@ func SearchSource(src *model.BookSource, keyword string, solverOpt ...*solver.So
 		BaseURL:   src.BookSourceURL,
 		Variables: map[string]string{"baseUrl": src.BookSourceURL, "key": keyword, "page": "1"},
 	}
-	req := buildSearchRequest(src.SearchURL, keyword, 1, ctx)
+	req := buildSearchRequest(src.SearchURL, keyword, 1, ctx, src.BookSourceURL)
 
 	client := crawler.New(nil, "", solverOpt...)
 	var body []byte
@@ -358,7 +358,8 @@ type searchRequest struct {
 //   - {{key}}/{{searchKey}}/{key} 关键词占位符、{{page}}/{page} 分页（legado 双花括号）
 //   - @js:/<js> 前缀：JS 构造 URL（result 变量）——先替换占位符再执行（{{key}} 在 JS 里否则语法错误）
 //   - URL 后 ,{'method':'POST','body':'...','charset':'gbk'} 表单描述
-func buildSearchRequest(raw, keyword string, page int, ctx *rule.Context) *searchRequest {
+//   - 相对路径 resolve 到书源根（baseURL）
+func buildSearchRequest(raw, keyword string, page int, ctx *rule.Context, baseURL string) *searchRequest {
 	r := &searchRequest{URL: raw, Method: "GET"}
 	encKey := urlEncodeKeyword(keyword)
 	// @js:/<js> 前缀：先替换占位符（{{key}} 在 JS 字符串里），再 evalJS 得 URL（或 URL + POST 描述）
@@ -380,6 +381,10 @@ func buildSearchRequest(raw, keyword string, page int, ctx *rule.Context) *searc
 		desc := r.URL[idx+1:]
 		r.URL = r.URL[:idx]
 		parseRequestDesc(desc, r)
+	}
+	// 相对路径 resolve 到书源根（真实书源 searchUrl 常为 /path?key=...）
+	if r.URL != "" && !strings.HasPrefix(r.URL, "http://") && !strings.HasPrefix(r.URL, "https://") {
+		r.URL = resolveURL(r.URL, baseURL)
 	}
 	// 占位符替换（关键词编码随源站字符集）
 	if r.Charset == "gbk" || r.Charset == "gb2312" {
