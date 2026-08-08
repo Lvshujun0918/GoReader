@@ -144,6 +144,7 @@ READER_APP_WORKDIR=/storage READER_APP_SECURE=true docker run ... ghcr.io/warpdo
 | `READER_AUTO_BACKUP_HOUR` | `3` | 每日自动备份小时 |
 | `READER_LOCAL_BOOK_DIR` | 空 | 本地书监听目录 |
 | `READER_LOG_DIR` | 空 | 日志目录（按大小轮转） |
+| `READER_ALLOW_PRIVATE_NETWORK` | 关 | `1` 时允许抓取/探索内网与回环地址（本地或局域网书源需要；公网部署建议保持关闭防 SSRF） |
 
 ---
 
