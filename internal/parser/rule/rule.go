@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/PaesslerAG/jsonpath"
@@ -90,6 +91,12 @@ func parseSingle(input, rule string, ctx *Context) []string {
 			return base
 		}
 	}
+	// legado 链式选择器（class.x.0@tag.ul / tag.h3.0@tag.a.0@href）——无 @css: 前缀
+	if isChainSelector(rule) {
+		if vs := evalCSSChainFromInput(input, rule, ctx); len(vs) > 0 {
+			return vs
+		}
+	}
 	// 纯文本规则（无 @ 前缀）：正则全文匹配；无匹配时返回插值后的规则本身
 	// （URL 模板等，如 /novels/api/book/{{$.book_id}} —— 插值后原样输出）
 	if !strings.HasPrefix(rule, "@") {
@@ -149,7 +156,8 @@ func evalCSS(input, param string, ctx *Context) []string {
 	}
 	sel, err := cascadia.Compile(selector)
 	if err != nil {
-		return nil
+		// legado 链式选择器（class.x.0@tag.ul.0@tag.li）——标准 CSS 编译失败时降级链式解析
+		return evalCSSChain(doc, param, ctx)
 	}
 	var out []string
 	for _, n := range sel.MatchAll(doc) {
@@ -197,6 +205,257 @@ func extractText(n *html.Node) string {
 	}
 	walk(n)
 	return strings.TrimSpace(buf.String())
+}
+
+// ---------- legado 链式选择器 ----------
+
+// isChainSelector 是否为 legado 链式选择器（class./id./tag./text. 开头，无 @css: 前缀）。
+func isChainSelector(rule string) bool {
+	for _, p := range []string{"class.", "id.", "tag.", "text."} {
+		if strings.HasPrefix(rule, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsChainSelector 导出：legado 链式选择器判断。
+func IsChainSelector(rule string) bool {
+	return isChainSelector(rule)
+}
+
+// ChainNeedsHTML 链式选择器作为 bookList 时是否需要补 @html 输出（末段为推进操作）。
+func ChainNeedsHTML(val string) bool {
+	if !isChainSelector(val) {
+		return false
+	}
+	segs := chainSegs(val)
+	if len(segs) == 0 {
+		return false
+	}
+	return !chainIsOutput(segs[len(segs)-1])
+}
+
+// evalCSSChainFromInput 从 HTML 文本执行链式选择器。
+func evalCSSChainFromInput(input, selector string, ctx *Context) []string {
+	doc, err := htmlquery.Parse(strings.NewReader(input))
+	if err != nil {
+		return nil
+	}
+	return evalCSSChain(doc, selector, ctx)
+}
+
+// evalCSSChain legado 链式选择器：class.x.0@tag.ul.0@tag.li / tag.h3.0@tag.a.0@href / text.x。
+// 基础选择器（class./id./tag./text.）匹配子孙节点 → .N 索引 → @操作
+// （tag.x / css: / xpath: 推进；text / html / 属性 / js: / json: / regex: 输出）。
+func evalCSSChain(doc *html.Node, selector string, ctx *Context) []string {
+	nodes := []*html.Node{doc}
+	segs := chainSegs(selector)
+	if len(segs) == 0 {
+		return nil
+	}
+	nodes = chainApplySel(nodes, segs[0])
+	if len(nodes) == 0 {
+		return nil
+	}
+	for i := 1; i < len(segs); i++ {
+		seg := segs[i]
+		if chainIsOutput(seg) {
+			return chainOutput(nodes, seg, ctx)
+		}
+		nodes = chainAdvance(nodes, seg)
+		if len(nodes) == 0 {
+			return nil
+		}
+	}
+	// 默认输出：元素文本
+	var out []string
+	for _, n := range nodes {
+		out = append(out, extractText(n))
+	}
+	return out
+}
+
+// chainSegs 拆分选择器段：["class.x.0","tag.ul.0","tag.li"]（第一段无 @）。
+func chainSegs(selector string) []string {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return nil
+	}
+	var segs []string
+	rest := selector
+	for rest != "" {
+		if strings.HasPrefix(rest, "@") {
+			rest = rest[1:]
+		}
+		i := strings.Index(rest, "@")
+		seg := rest
+		if i >= 0 {
+			seg = rest[:i]
+			rest = rest[i:]
+		} else {
+			rest = ""
+		}
+		seg = strings.TrimSpace(seg)
+		if seg != "" {
+			segs = append(segs, seg)
+		}
+	}
+	return segs
+}
+
+// chainSplitIdx 分离末尾 .N 索引（返回 base 与索引；无索引时 idx=-1）。
+func chainSplitIdx(seg string) (string, int) {
+	m := regexp.MustCompile(`^(.*)\.(\d+)$`).FindStringSubmatch(seg)
+	if m == nil {
+		return seg, -1
+	}
+	n, _ := strconv.Atoi(m[2])
+	return m[1], n
+}
+
+// chainApplySel 基础选择器（class./id./tag./text. 或标准 CSS）匹配子孙节点 + .N。
+func chainApplySel(nodes []*html.Node, seg string) []*html.Node {
+	base, idx := chainSplitIdx(seg)
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return nodes
+	}
+	var out []*html.Node
+	if m := regexp.MustCompile(`^(class|id|tag|text)\.(.+)$`).FindStringSubmatch(base); m != nil {
+		kind, name := m[1], m[2]
+		if kind == "text" {
+			for _, n := range nodes {
+				out = append(out, chainFindText(n, name)...)
+			}
+		} else {
+			selStr := name
+			if kind == "class" {
+				selStr = "." + name
+			} else if kind == "id" {
+				selStr = "#" + name
+			}
+			sel, err := cascadia.Compile(selStr)
+			if err != nil {
+				return nil
+			}
+			for _, n := range nodes {
+				out = append(out, sel.MatchAll(n)...)
+			}
+		}
+	} else {
+		sel, err := cascadia.Compile(base)
+		if err != nil {
+			return nil
+		}
+		for _, n := range nodes {
+			out = append(out, sel.MatchAll(n)...)
+		}
+	}
+	if idx >= 0 && idx < len(out) {
+		return []*html.Node{out[idx]}
+	}
+	return out
+}
+
+// chainFindText 找文本包含 name 的后代元素。
+func chainFindText(n *html.Node, name string) []*html.Node {
+	var out []*html.Node
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode && strings.Contains(extractText(node), name) {
+			out = append(out, node)
+		}
+		for ch := node.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// chainIsOutput 段是否为输出操作（text/html/属性/js:/json:/regex:；tag./css:/xpath: 为推进）。
+func chainIsOutput(seg string) bool {
+	base, _ := chainSplitIdx(seg)
+	base = strings.TrimSpace(base)
+	if strings.HasPrefix(base, "tag.") || strings.HasPrefix(base, "css:") || strings.HasPrefix(base, "xpath:") {
+		return false
+	}
+	return true
+}
+
+// chainAdvance 推进操作：tag.x / css:... / xpath:... 匹配子孙节点 + .N。
+func chainAdvance(nodes []*html.Node, seg string) []*html.Node {
+	base, idx := chainSplitIdx(seg)
+	base = strings.TrimSpace(base)
+	var out []*html.Node
+	switch {
+	case strings.HasPrefix(base, "tag."):
+		name := strings.TrimSpace(base[4:])
+		if name == "" {
+			return nil
+		}
+		sel, err := cascadia.Compile(name)
+		if err != nil {
+			return nil
+		}
+		for _, n := range nodes {
+			out = append(out, sel.MatchAll(n)...)
+		}
+	case strings.HasPrefix(base, "css:"):
+		param := strings.TrimSpace(base[4:])
+		sel, err := cascadia.Compile(param)
+		if err != nil {
+			return nil
+		}
+		for _, n := range nodes {
+			out = append(out, sel.MatchAll(n)...)
+		}
+	case strings.HasPrefix(base, "xpath:"):
+		expr := strings.TrimSpace(base[6:])
+		for _, n := range nodes {
+			if ns, err := htmlquery.QueryAll(n, expr); err == nil {
+				out = append(out, ns...)
+			}
+		}
+	default:
+		return nil
+	}
+	if idx >= 0 && idx < len(out) {
+		return []*html.Node{out[idx]}
+	}
+	return out
+}
+
+// chainOutput 输出操作：text / html / 属性 / js: / json: / regex:（对节点文本），+ .N。
+func chainOutput(nodes []*html.Node, seg string, ctx *Context) []string {
+	base, idx := chainSplitIdx(seg)
+	base = strings.TrimSpace(base)
+	ns := nodes
+	if idx >= 0 && idx < len(ns) {
+		ns = []*html.Node{ns[idx]}
+	}
+	var out []string
+	for _, n := range ns {
+		switch {
+		case base == "text":
+			out = append(out, extractText(n))
+		case base == "html":
+			out = append(out, htmlquery.OutputHTML(n, true))
+		case strings.HasPrefix(base, "js:"):
+			out = append(out, evalJS(extractText(n), strings.TrimSpace(base[3:]), ctx)...)
+		case strings.HasPrefix(base, "json:"):
+			out = append(out, evalJSON(extractText(n), strings.TrimSpace(base[5:]), ctx)...)
+		case strings.HasPrefix(base, "regex:"):
+			out = append(out, regexMatchAll(extractText(n), strings.TrimSpace(base[6:]))...)
+		default:
+			// 属性（href/src/data-x...）
+			if v := attrValue(n, base); v != "" {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
 }
 
 // evalXPath XPath：@xpath:expr。
