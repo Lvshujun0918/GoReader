@@ -165,8 +165,12 @@ func firstRule(rules map[string]string, item string, ctx *rule.Context, keys ...
 
 // ensureListHTML bookList 的 CSS 规则需返回元素 HTML 供子规则再解析：
 // 无属性后缀时补 @html（legado 默认返回元素文本，无法作为子规则输入）。
+// 链式选择器（class.x.0@tag.ul）同理补 @html。
 func ensureListHTML(val string) string {
 	if strings.HasPrefix(val, "@css:") && !strings.Contains(val[5:], "@") {
+		return val + "@html"
+	}
+	if rule.ChainNeedsHTML(val) {
 		return val + "@html"
 	}
 	return val
