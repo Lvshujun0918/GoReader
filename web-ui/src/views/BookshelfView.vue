@@ -2156,8 +2156,9 @@ onMounted(() => {
             <div class="book-meta">
               <p class="book-name" :title="book.name">{{ book.name }}</p>
               <p class="book-author">{{ book.author || '佚名' }}</p>
-              <p v-if="book.latestChapterTitle" class="book-chapter" :title="book.latestChapterTitle">
-                {{ book.latestChapterTitle }}
+              <!-- 当前读到章节优先；未读显示最新章 -->
+              <p v-if="book.durChapterTitle || book.latestChapterTitle" class="book-chapter" :title="book.durChapterTitle || book.latestChapterTitle || ''">
+                {{ book.durChapterTitle || book.latestChapterTitle }}
               </p>
             </div>
             <!-- 悬浮简介预览（桌面 hover：卡片上方浮层，鼠标移出关闭；touch 无 hover 不启用） -->

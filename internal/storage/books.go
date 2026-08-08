@@ -83,16 +83,20 @@ func (s *Storage) CountBooks() (int64, error) {
 	return n, err
 }
 
-// UpdateBookProgress 保存阅读进度（durChapter* 字段）。
-func (s *Storage) UpdateBookProgress(ns, bookURL string, title string, index, pos, ts int64) error {
+// UpdateBookProgress 保存阅读进度（durChapter* 字段；totalNum>0 时一并更新总章数）。
+func (s *Storage) UpdateBookProgress(ns, bookURL string, title string, index, pos, ts, totalNum int64) error {
+	updates := map[string]any{
+		"dur_chapter_title": title,
+		"dur_chapter_index": index,
+		"dur_chapter_pos":   pos,
+		"dur_chapter_time":  ts,
+	}
+	if totalNum > 0 {
+		updates["total_chapter_num"] = totalNum
+	}
 	return s.DB.Model(&model.Book{}).
 		Where("user_namespace = ? AND book_url = ?", ns, bookURL).
-		Updates(map[string]any{
-			"dur_chapter_title": title,
-			"dur_chapter_index": index,
-			"dur_chapter_pos":   pos,
-			"dur_chapter_time":  ts,
-		}).Error
+		Updates(updates).Error
 }
 
 // SaveChapter 缓存章节正文（复合主键 upsert）。

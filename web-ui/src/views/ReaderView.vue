@@ -1963,6 +1963,8 @@ function syncServerProgress() {
     durChapterPos: Math.round(currentPos()),
     durChapterTime: Date.now(),
     durChapterTitle: currentChapter.value.title,
+    // 同步总章数（书源书入架时可能缺——书架进度百分比依赖它）
+    totalChapterNum: realChapters.value.length,
   }).catch(() => {
     /* 静默失败 */
   })

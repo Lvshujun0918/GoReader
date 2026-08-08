@@ -16,9 +16,10 @@ func TestShelfBookProgress(t *testing.T) {
 	if !parseReturn(t, w).IsSuccess {
 		t.Fatalf("saveBook 失败: %s", parseReturn(t, w).ErrorMsg)
 	}
-	// 更新进度
+	// 更新进度（含总章数——书架进度百分比依赖）
 	w = perform(handler, "POST", "/reader3/saveBookProgress", map[string]any{
 		"bookUrl": url, "durChapterTitle": "第5章", "durChapterIndex": 4, "durChapterPos": 120,
+		"totalChapterNum": 100,
 	})
 	if !parseReturn(t, w).IsSuccess {
 		t.Fatal("saveBookProgress 失败")
@@ -38,6 +39,9 @@ func TestShelfBookProgress(t *testing.T) {
 	}
 	if book["durChapterPos"] != float64(120) {
 		t.Errorf("阅读位置=%v", book["durChapterPos"])
+	}
+	if book["totalChapterNum"] != float64(100) {
+		t.Errorf("总章数=%v", book["totalChapterNum"])
 	}
 }
 

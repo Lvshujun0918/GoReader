@@ -143,10 +143,11 @@ func (a *API) handleSaveBookProgress(c *gin.Context) {
 	index, _ := intParam(params, "durChapterIndex")
 	pos, _ := intParam(params, "durChapterPos")
 	ts, _ := intParam(params, "durChapterTime")
+	totalNum, _ := intParam(params, "totalChapterNum")
 	if ts == 0 {
 		ts = int64(0)
 	}
-	if err := a.Storage.UpdateBookProgress(ns, url, title, index, pos, ts); err != nil {
+	if err := a.Storage.UpdateBookProgress(ns, url, title, index, pos, ts, totalNum); err != nil {
 		Fail(c, "系统错误")
 		return
 	}
