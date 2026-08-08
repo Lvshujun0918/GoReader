@@ -142,22 +142,5 @@ web-ui/src/        # Vue3 + shadcn-vue 视图/组件/api/utils
 web-simple/        # Kindle 轻量页
 ```
 
----
-
-## 📌 分支
-| 分支 | 说明 |
-|---|---|
-| `master` | **Go 版（当前）——本地书阅读器** |
-| `legacy` | Kotlin 稳定版（ghcr v4.x） |
-
-## 💝 赞助
-| 网络 | 币种 | 地址 |
-|---|---|---|
-| Arbitrum | USDC | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
-| Ethereum | USDT | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
-| Arbitrum | USDC.e | `0x0B704AcC2EdD28DdaE80e03f1a98e2cD00B0B5ae` |
-
-> 地址已通过 EIP-55 校验。转账前请核对网络与币种。
-
 ## 📄 License
 [GNU General Public License v3.0](LICENSE) (GPL-3.0)
