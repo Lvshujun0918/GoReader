@@ -67,6 +67,17 @@ func Parse(input, rule string, ctx *Context) []string {
 
 // parseSingle 执行单条规则。
 func parseSingle(input, rule string, ctx *Context) []string {
+	// legado <js>code</js> 格式（如起点书源：<js>path='...';...</js>）
+	if strings.HasPrefix(rule, "<js>") {
+		end := strings.Index(rule, "</js>")
+		if end > 0 {
+			return evalJS(input, rule[len("<js>"):end], ctx)
+		}
+	}
+	// 裸 JSONPath（$ 开头，如 $.data / $..book_data[0]）——legado 常用，无 @json: 前缀
+	if strings.HasPrefix(rule, "$") {
+		return evalJSON(input, rule, ctx)
+	}
 	// 纯文本规则（无 @ 前缀）：正则全文匹配或原样返回
 	if !strings.HasPrefix(rule, "@") {
 		// 常见：直接当正则匹配第一个匹配组
@@ -195,6 +206,14 @@ func evalXPath(input, expr string, ctx *Context) []string {
 
 // evalJSON JSONPath：@json:$.a.b[0]。
 func evalJSON(input, expr string, ctx *Context) []string {
+	// legado：&& 连接多个 JSONPath 表达式（结果合并，如 $..book_data[0]&&$.data[*]）
+	if strings.Contains(expr, "&&") {
+		var out []string
+		for _, part := range strings.Split(expr, "&&") {
+			out = append(out, evalJSON(input, strings.TrimSpace(part), ctx)...)
+		}
+		return out
+	}
 	var v any
 	if err := json.Unmarshal([]byte(input), &v); err != nil {
 		return nil
