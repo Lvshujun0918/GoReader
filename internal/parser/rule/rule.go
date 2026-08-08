@@ -771,12 +771,8 @@ func boolToStr(b bool) string {
 }
 
 func floatToStr(f float64) string {
-	return strings.TrimRight(strings.TrimRight(json.Number(jsonFmt(f)).String(), "0"), ".")
-}
-
-func jsonFmt(f float64) string {
-	b, _ := json.Marshal(f)
-	return string(b)
+	// 不能用 TrimRight 去零：50 → "5"（bug）。'f' 格式直接输出，无科学计数
+	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
 func toStr(v any) string {

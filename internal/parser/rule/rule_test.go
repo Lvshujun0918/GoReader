@@ -96,6 +96,16 @@ func TestEvalCSSChainIndex(t *testing.T) {
 	}
 }
 
+// TestFloatToStr 整数/小数转字符串（曾因 TrimRight 去零导致 50→"5"）。
+func TestFloatToStr(t *testing.T) {
+	cases := map[float64]string{50: "50", 30: "30", 0.5: "0.5", 100: "100", 0: "0"}
+	for f, want := range cases {
+		if got := floatToStr(f); got != want {
+			t.Errorf("floatToStr(%v)=%q 期望 %q", f, got, want)
+		}
+	}
+}
+
 func TestEvalXPath(t *testing.T) {
 	html := `<html><body><div class="content"><p>段落一</p><p>段落二</p></div></body></html>`
 	out := Parse(html, "@xpath://div[@class='content']/p", nil)
