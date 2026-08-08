@@ -1,13 +1,12 @@
 package api
 
 import (
-	"fmt"
-	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/Lvshujun0918/reader-dev/internal/service/crawler"
 )
 
 // handleHealth GET /health。
@@ -27,34 +26,17 @@ func (a *API) handleAssetsProxy(c *gin.Context) {
 		Fail(c, "图片地址非法")
 		return
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		Fail(c, "图片加载失败："+err.Error())
-		return
-	}
+	// 经 crawler 客户端：SSRF 防护（内网/回环拒绝）+ 统一 UA + 响应限制
+	client := crawler.New(nil, "")
+	headers := map[string]string{}
 	if referer := c.Query("referer"); referer != "" {
-		req.Header.Set("Referer", referer)
+		headers["Referer"] = referer
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0")
-	resp, err := client.Do(req)
+	body, err := client.FetchWithHeaders(url, headers)
 	if err != nil {
 		Fail(c, "图片加载失败："+err.Error())
 		return
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		Fail(c, fmt.Sprintf("图片加载失败：HTTP %d", resp.StatusCode))
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if err != nil {
-		Fail(c, "图片加载失败："+err.Error())
-		return
-	}
-	contentType := resp.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = http.DetectContentType(body)
-	}
+	contentType := http.DetectContentType(body)
 	c.Data(http.StatusOK, contentType, body)
 }

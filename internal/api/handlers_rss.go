@@ -4,14 +4,13 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/Lvshujun0918/reader-dev/internal/model"
+	"github.com/Lvshujun0918/reader-dev/internal/service/crawler"
 )
 
 // ---------------- RSS 解析（RSS 2.0 / Atom） ----------------
@@ -114,23 +113,9 @@ func parseRSSDate(s string) int64 {
 	return 0
 }
 
-// fetchRss 抓取 RSS 源。
+// fetchRss 抓取 RSS 源（经 crawler 客户端：SSRF 防护 + 统一 UA + 响应限制）。
 func fetchRss(url string) ([]byte, error) {
-	client := &http.Client{Timeout: 20 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	return crawler.New(nil, "").Fetch(url, nil)
 }
 
 // ---------------- 处理器 ----------------

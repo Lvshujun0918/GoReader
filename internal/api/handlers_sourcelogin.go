@@ -1,8 +1,11 @@
 package api
 
 import (
+	"strings"
+
 	"github.com/gin-gonic/gin"
 
+	"github.com/Lvshujun0918/reader-dev/internal/service/bookfetch"
 	"github.com/Lvshujun0918/reader-dev/internal/service/crawler"
 )
 
@@ -39,6 +42,11 @@ func (a *API) handleLoginBookSource(c *gin.Context) {
 	if loginURL == "" {
 		Fail(c, "书源未配置登录地址")
 		return
+	}
+	// 相对路径 resolve 到书源根（书源 LoginURL 常为 /login.php——不 resolve 则
+	// hostname 为空，crawler SSRF 会误判"禁止访问内网地址"）
+	if !strings.HasPrefix(loginURL, "http://") && !strings.HasPrefix(loginURL, "https://") {
+		loginURL = bookfetch.ResolveURL(loginURL, src.BookSourceURL)
 	}
 	// HTTP 直连登录（GET/POST 表单）
 	client := a.crawlerClient(ns)
