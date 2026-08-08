@@ -2,8 +2,10 @@ package api
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Lvshujun0918/reader-dev/internal/model"
@@ -252,5 +254,155 @@ func TestSearchSourceJSFormat(t *testing.T) {
 	}
 	if results[0].Name == "" {
 		t.Errorf("js 列表项 name 未填充: %+v", results[0])
+	}
+}
+
+// TestSearchSourceDoubleBraces 真实书源 searchUrl 用 {{key}}（legado 双花括号），
+// 关键词应被完整 URL 编码（请求行合法，标准 HTTP 服务器可接受）。
+func TestSearchSourceDoubleBraces(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	var rawQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawQuery = r.URL.RawQuery
+		_, _ = fmt.Fprint(w, `{"data":[{"title":"斗破苍穹","author_name":"天蚕土豆"}]}`)
+	}))
+	defer srv.Close()
+	src := &model.BookSource{
+		BookSourceURL:  srv.URL,
+		BookSourceName: "双花括号源",
+		SearchURL:      srv.URL + "/api/search?keyword={{key}}&page={{page}}",
+		RuleSearch:     `{"bookList":"$.data","name":"$.title","author":"$.author_name"}`,
+	}
+	results, err := SearchSource(src, "斗破 玄幻")
+	if err != nil {
+		t.Fatalf("SearchSource 失败: %v", err)
+	}
+	if len(results) != 1 || results[0].Name != "斗破苍穹" {
+		t.Fatalf("结果不符: %+v", results)
+	}
+	// 占位符应被替换且完整编码（含中文 + 空格 %20）
+	expected := "keyword=%E6%96%97%E7%A0%B4%20%E7%8E%84%E5%B9%BB&page=1"
+	if rawQuery != expected {
+		t.Errorf("query=%q 期望 %q", rawQuery, expected)
+	}
+}
+
+// TestSearchSourceJSURLPrefix @js: 前缀构造搜索 URL（起点/大文学等）。
+func TestSearchSourceJSURLPrefix(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.EscapedPath()
+		_, _ = fmt.Fprint(w, `<div class="book"><a class="nm" href="/b/1">JS书</a></div>`)
+	}))
+	defer srv.Close()
+	// JS：baseUrl 来自 ctx 变量，拼路径 + {{key}} 占位符（JS 字符串里，解析后替换）
+	ruleURL := `@js:url=baseUrl+"/so/{{key}}.html"`
+	src := &model.BookSource{
+		BookSourceURL:  srv.URL,
+		BookSourceName: "JS构造源",
+		SearchURL:      ruleURL,
+		RuleSearch:     "bookList=@css:.book;name=@css:.nm@text",
+	}
+	results, err := SearchSource(src, "斗破")
+	if err != nil {
+		t.Fatalf("SearchSource 失败: %v", err)
+	}
+	if len(results) != 1 || results[0].Name != "JS书" {
+		t.Fatalf("结果不符: %+v", results)
+	}
+	if path != "/so/%E6%96%97%E7%A0%B4.html" {
+		t.Errorf("JS 构造路径=%q", path)
+	}
+}
+
+// TestSearchSourcePOSTForm searchUrl 带 ,{'method':'POST','body':...} 表单描述（69书吧等）。
+func TestSearchSourcePOSTForm(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	var gotMethod, gotCT, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotCT = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = fmt.Fprint(w, `<div class="item"><a class="t" href="/x">POST书</a></div>`)
+	}))
+	defer srv.Close()
+	src := &model.BookSource{
+		BookSourceURL:  srv.URL,
+		BookSourceName: "POST源",
+		SearchURL:      srv.URL + "/search.php,{'method':'POST','body':'searchkey={{key}}&searchtype=all'}",
+		RuleSearch:     "bookList=@css:.item;name=@css:.t@text",
+	}
+	results, err := SearchSource(src, "修仙")
+	if err != nil {
+		t.Fatalf("SearchSource 失败: %v", err)
+	}
+	if len(results) != 1 || results[0].Name != "POST书" {
+		t.Fatalf("结果不符: %+v", results)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method=%s 期望 POST", gotMethod)
+	}
+	if !strings.HasPrefix(gotCT, "application/x-www-form-urlencoded") {
+		t.Errorf("Content-Type=%q", gotCT)
+	}
+	if gotBody != "searchkey=%E4%BF%AE%E4%BB%99&searchtype=all" {
+		t.Errorf("POST body=%q", gotBody)
+	}
+}
+
+// TestGBKPercentEncode 关键词 GBK 编码（charset=gbk 书源）。
+func TestGBKPercentEncode(t *testing.T) {
+	// "修仙" UTF-8: E4 BF AE E4 BB 99；GBK: D0 DE CF C9
+	got := gbkPercentEncode("修仙")
+	want := "%D0%DE%CF%C9"
+	if got != want {
+		t.Errorf("gbkPercentEncode=%q 期望 %q", got, want)
+	}
+	if gbkPercentEncode("abc123") != "abc123" {
+		t.Errorf("ASCII 不应被编码")
+	}
+}
+
+// TestBuildSearchRequestPlaceholderOrder {{key}} 不被 {key} 部分命中。
+func TestBuildSearchRequestPlaceholderOrder(t *testing.T) {
+	req := buildSearchRequest("https://x.com/s?k={{key}}&q={key}", "斗破", 1, nil)
+	if !strings.Contains(req.URL, "k=%E6%96%97%E7%A0%B4&q=%E6%96%97%E7%A0%B4") {
+		t.Errorf("双/单花括号均应替换: %q", req.URL)
+	}
+	if strings.Contains(req.URL, "{{") || strings.Contains(req.URL, "{key}") {
+		t.Errorf("残留占位符: %q", req.URL)
+	}
+}
+
+// TestParseRequestDesc 单引号 JSON 描述解析。
+func TestParseRequestDesc(t *testing.T) {
+	r := &searchRequest{}
+	parseRequestDesc(`{'method':'POST','body':'a={{key}}','charset':'gbk'}`, r)
+	if r.Method != "POST" || r.Body != "a={{key}}" || r.Charset != "gbk" {
+		t.Errorf("解析失败: %+v", r)
+	}
+}
+
+// TestSearchSourceSingleBookJSON 单书规则（无 bookList）JSONPath 直达。
+func TestSearchSourceSingleBookJSON(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"title":"单书","author":"作者"}`)
+	}))
+	defer srv.Close()
+	src := &model.BookSource{
+		BookSourceURL:  srv.URL,
+		BookSourceName: "单书JSON",
+		SearchURL:      srv.URL + "/?k={key}",
+		RuleSearch:     `{"name":"$.title","author":"$.author"}`,
+	}
+	results, err := SearchSource(src, "单书")
+	if err != nil {
+		t.Fatalf("SearchSource 失败: %v", err)
+	}
+	if len(results) != 1 || results[0].Name != "单书" || results[0].Author != "作者" {
+		t.Fatalf("结果不符: %+v", results)
 	}
 }
