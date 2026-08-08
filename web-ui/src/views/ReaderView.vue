@@ -3718,6 +3718,7 @@ onBeforeUnmount(() => {
               type="button"
               @click="selectTheme(th); themeOpen = false"
             >
+              <span class="theme-check" aria-hidden="true">✓</span>
               <span class="theme-swatch" :class="'swatch-' + th"></span>
               <span class="theme-name">{{ themeName(th) }}</span>
             </button>
@@ -4131,17 +4132,19 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   border: 1px solid transparent;
-  border-radius: var(--radius);
+  border-radius: 10px;
   background: none;
   color: var(--text-2);
   cursor: pointer;
   transition:
     color 0.2s ease,
-    border-color 0.2s ease;
+    border-color 0.2s ease,
+    background-color 0.2s ease;
 }
 .icon-btn:hover {
   color: var(--text-1);
   border-color: var(--border);
+  background: var(--hover);
 }
 .icon-btn svg {
   width: 16px;
@@ -4151,8 +4154,8 @@ onBeforeUnmount(() => {
   flex: 1;
   min-width: 0;
   font-size: 14px;
-  font-weight: 300;
-  letter-spacing: 1px;
+  font-weight: 400;
+  letter-spacing: 2px;
   color: var(--text-1);
   white-space: nowrap;
   overflow: hidden;
@@ -4170,7 +4173,7 @@ onBeforeUnmount(() => {
   height: 30px;
   padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: 8px;
   background: var(--surface);
   color: var(--text-2);
   font-family: inherit;
@@ -4179,11 +4182,17 @@ onBeforeUnmount(() => {
   cursor: pointer;
   transition:
     color 0.2s ease,
-    border-color 0.2s ease;
+    border-color 0.2s ease,
+    background-color 0.2s ease,
+    transform 0.12s ease;
 }
 .font-btn:hover:not(:disabled) {
-  color: var(--accent);
-  border-color: var(--accent);
+  color: var(--text-1);
+  border-color: var(--border-strong);
+  background: var(--hover);
+}
+.font-btn:active:not(:disabled) {
+  transform: scale(0.96);
 }
 .font-btn.tts-btn.active,
 .font-btn.auto-btn.active,
@@ -4220,25 +4229,59 @@ onBeforeUnmount(() => {
 .reader-main {
   width: 100%;
   margin: 0 auto;
-  padding: 48px 24px 150px;
+  /* 顶部章标题留白 56px，底部 180px 给悬浮工具栏/进度条让位 */
+  padding: 56px 28px 180px;
 }
 
+/* 章标题：居中 + 字距 + 下方细装饰线（圆点点缀） */
 .chapter-title {
-  margin: 0 0 36px;
-  font-size: 20px;
-  font-weight: 300;
-  letter-spacing: 2px;
+  position: relative;
+  margin: 0 0 48px;
+  padding-bottom: 24px;
+  font-size: 22px;
+  font-weight: 400;
+  letter-spacing: 5px;
   text-align: center;
   color: var(--text-1);
+}
+.chapter-title::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 2px;
+  transform: translateX(-50%);
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.85;
+}
+.chapter-title::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  transform: translateX(-50%) translateX(10px);
+  width: 46px;
+  height: 1px;
+  background: var(--border-strong);
 }
 
 .reader-content {
   color: var(--text-1);
 }
 .reader-para {
-  margin: 0 0 1em;
+  margin: 0 0 1.05em;
   text-indent: 2em;
+  overflow-wrap: break-word;
   word-break: break-word;
+  /* 中文排版：避免段落首尾孤立行（翻页/滚动均生效） */
+  orphans: 3;
+  widows: 3;
+}
+/* 正文选中态：暖色半透明（搜索/复制时视觉柔和） */
+.reader-content ::selection {
+  background: rgba(255, 176, 66, 0.38);
 }
 /* 搜索跳转后的短暂高亮 */
 .reader-para.flash {
@@ -4384,29 +4427,36 @@ onBeforeUnmount(() => {
 .chapter-nav {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  margin-top: 64px;
-  padding-top: 32px;
+  gap: 12px;
+  margin-top: 56px;
+  padding-top: 28px;
   border-top: 1px solid var(--border);
 }
 .nav-btn {
-  height: 42px;
+  height: 44px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: 12px;
   background: var(--surface);
   color: var(--text-2);
   font-family: inherit;
   font-size: 13px;
   font-weight: 400;
-  letter-spacing: 3px;
+  letter-spacing: 4px;
   cursor: pointer;
   transition:
     color 0.2s ease,
-    border-color 0.2s ease;
+    border-color 0.2s ease,
+    transform 0.15s ease,
+    box-shadow 0.2s ease;
 }
 .nav-btn:hover:not(:disabled) {
   color: var(--accent);
   border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.06);
+}
+.nav-btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
 }
 .nav-btn:disabled {
   opacity: 0.35;
@@ -4655,23 +4705,26 @@ onBeforeUnmount(() => {
   transform: scale(1.04);
 }
 
-/* ================= 进度条（底部细字） ================= */
-/* ================= 底部工具栏（图标+文字上下布局） ================= */
+/* ================= 底部工具栏（悬浮胶囊：图标+文字上下布局，毛玻璃） ================= */
 .reader-toolbar {
   position: fixed;
   left: 50%;
-  bottom: calc(46px + env(safe-area-inset-bottom));
+  bottom: calc(62px + env(safe-area-inset-bottom));
   transform: translateX(-50%);
   z-index: 29;
-  width: min(680px, 100%);
+  width: min(560px, calc(100% - 28px));
   display: flex;
-  align-items: stretch;
-  justify-content: space-around;
-  gap: 4px;
-  padding: 8px 16px 10px;
-  border-top: 1px solid var(--border);
-  background: var(--bg);
-  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.04);
+  align-items: center;
+  gap: 2px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  backdrop-filter: blur(18px) saturate(1.5);
+  -webkit-backdrop-filter: blur(18px) saturate(1.5);
+  box-shadow:
+    0 10px 36px rgba(0, 0, 0, 0.14),
+    0 2px 8px rgba(0, 0, 0, 0.06);
 }
 .tb-btn {
   flex: 1;
@@ -4679,20 +4732,24 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
-  padding: 6px 2px 4px;
+  gap: 2px;
+  padding: 8px 4px 6px;
   border: none;
-  border-radius: var(--radius);
+  border-radius: 16px;
   background: none;
   color: var(--text-2);
   cursor: pointer;
   transition:
-    color 0.2s ease,
-    background-color 0.2s ease;
+    color 0.18s ease,
+    background-color 0.18s ease,
+    transform 0.12s ease;
 }
 .tb-btn:hover:not(:disabled) {
   color: var(--text-1);
   background: var(--hover);
+}
+.tb-btn:active:not(:disabled) {
+  transform: scale(0.94);
 }
 .tb-btn:disabled {
   opacity: 0.35;
@@ -4702,7 +4759,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 20px;
+  width: 22px;
+  height: 22px;
   font-size: 13px;
   font-weight: 500;
   line-height: 1;
@@ -4714,9 +4772,9 @@ onBeforeUnmount(() => {
 }
 .tb-label {
   max-width: 100%;
-  font-size: 10.5px;
-  font-weight: 300;
-  letter-spacing: 0.5px;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.6px;
   color: var(--text-3);
   white-space: nowrap;
   overflow: hidden;
@@ -4727,8 +4785,8 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 .tb-theme-dot {
-  width: 16px;
-  height: 16px;
+  width: 17px;
+  height: 17px;
   border-radius: 50%;
   border: 1px solid var(--border-strong);
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.04);
@@ -4757,36 +4815,60 @@ onBeforeUnmount(() => {
 .theme-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
+  gap: 10px;
 }
 .theme-opt {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 7px;
-  padding: 12px 4px 10px;
+  gap: 8px;
+  padding: 14px 4px 12px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: 14px;
   background: var(--surface);
   color: var(--text-2);
   cursor: pointer;
   transition:
     border-color 0.2s ease,
-    box-shadow 0.2s ease;
+    box-shadow 0.2s ease,
+    transform 0.15s ease;
 }
 .theme-opt:hover {
   border-color: var(--border-strong);
+  transform: translateY(-1px);
 }
 .theme-opt.active {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
 }
+/* 选中对勾徽标（右上角） */
+.theme-check {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  display: none;
+  width: 15px;
+  height: 15px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 10px;
+  line-height: 1;
+}
+.theme-opt.active .theme-check {
+  display: flex;
+}
 .theme-swatch {
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   border: 1px solid var(--border-strong);
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.05);
+  box-shadow:
+    inset 0 0 0 2px rgba(255, 255, 255, 0.25),
+    inset 0 0 0 3px rgba(0, 0, 0, 0.03);
 }
 .theme-name {
   font-size: 12px;
@@ -4868,34 +4950,37 @@ onBeforeUnmount(() => {
   transform: translateX(-50%);
   z-index: 30;
   width: min(680px, 100%);
-  padding: 10px 24px 10px;
+  padding: 12px 24px 10px;
   border: none;
   border-top: 1px solid var(--border);
-  background: var(--bg);
-  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.04);
+  background: color-mix(in srgb, var(--bg) 90%, transparent);
+  backdrop-filter: blur(14px) saturate(1.4);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
   cursor: pointer;
   font-family: inherit;
   text-align: center;
 }
 .progress-track {
   display: block;
-  height: 2px;
+  height: 3px;
   background: var(--border);
-  border-radius: 1px;
+  border-radius: 2px;
   overflow: hidden;
 }
 .progress-fill {
   display: block;
   height: 100%;
-  background: var(--accent);
+  background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 70%, #fff));
+  border-radius: 2px;
   transition: width 0.2s ease;
 }
 .progress-text {
   display: block;
-  margin-top: 7px;
+  margin-top: 8px;
   font-size: 11px;
-  font-weight: 300;
-  letter-spacing: 1.5px;
+  font-weight: 400;
+  letter-spacing: 2px;
+  font-variant-numeric: tabular-nums;
   color: var(--text-3);
   transition: color 0.2s ease;
 }
@@ -5037,22 +5122,25 @@ onBeforeUnmount(() => {
   opacity: 0;
 }
 .pop-card {
-  width: min(320px, 86vw);
-  padding: 26px 26px 20px;
+  width: min(340px, 88vw);
+  padding: 26px 26px 22px;
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 16px;
   background: var(--surface);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.18);
   /* GAP 6：本书设置 12 行较高——弹层超高时内部滚动 */
   max-height: 84vh;
   overflow-y: auto;
 }
 .pop-title {
-  margin: 0;
+  margin: 0 0 18px;
+  padding-bottom: 14px;
   font-size: 14px;
-  font-weight: 300;
-  letter-spacing: 3px;
+  font-weight: 400;
+  letter-spacing: 4px;
   color: var(--text-1);
   text-align: center;
+  border-bottom: 1px solid var(--border);
 }
 .pop-hint {
   margin: 10px 0 0;
@@ -5856,13 +5944,32 @@ onBeforeUnmount(() => {
     margin-left: 0;
   }
   .reader-main {
-    padding: 32px 16px 130px;
+    padding: 32px 16px 150px;
   }
   .chapter-nav {
-    gap: 12px;
+    gap: 10px;
+  }
+  /* 悬浮工具栏移动端：更窄、更贴近底部 */
+  .reader-toolbar {
+    bottom: calc(56px + env(safe-area-inset-bottom));
+    width: min(560px, calc(100% - 16px));
+    padding: 5px;
+    border-radius: 18px;
+  }
+  .tb-icon {
+    width: 20px;
+    height: 20px;
+  }
+  .tb-icon svg {
+    width: 17px;
+    height: 17px;
+  }
+  .tb-label {
+    font-size: 9.5px;
+    letter-spacing: 0.3px;
   }
   .progress-bar {
-    padding: 0 12px 10px;
+    padding: 10px 14px 10px;
     padding-bottom: max(10px, env(safe-area-inset-bottom));
   }
 }
