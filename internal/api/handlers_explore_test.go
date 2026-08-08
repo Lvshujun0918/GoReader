@@ -3,10 +3,16 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+
+	"github.com/Lvshujun0918/reader-dev/internal/model"
+	"github.com/Lvshujun0918/reader-dev/internal/parser/rule"
+	"github.com/Lvshujun0918/reader-dev/internal/service/bookfetch"
 )
 
 // ---------- 辅助 ----------
@@ -285,5 +291,102 @@ func TestExploreCategoryTitleFromURL(t *testing.T) {
 		t.Errorf("根路径应默认: %q", got)
 	}
 }
+
+// isPrivateURL 判断 URL 是否内网/回环/空 hostname（与 crawler SSRF 防护同规则——
+// 相对 URL 未 resolve 时 hostname 为空即触发"禁止访问内网地址"）。
+func isPrivateURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return true
+	}
+	ip := net.ParseIP(u.Hostname())
+	if ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+	}
+	return false
+}
+
+// TestExploreXIU2URLsNoPrivate 用 XIU2/Yuedu 官方书源合集（fixture 原样）：
+// 解析所有书源的 exploreUrl 为分类，resolve 相对路径到书源根后，
+// 不应含内网地址或空 hostname（即不应触发"禁止访问内网地址"）。
+func TestExploreXIU2URLsNoPrivate(t *testing.T) {
+	list := loadRealShuyuan(t)
+	checked := 0
+	for _, m := range list {
+		eu, _ := m["exploreUrl"].(string)
+		if strings.TrimSpace(eu) == "" {
+			continue
+		}
+		bookSourceURL, _ := m["bookSourceUrl"].(string)
+		name, _ := m["bookSourceName"].(string)
+		ctx := &rule.Context{BaseURL: bookSourceURL, Variables: map[string]string{"baseUrl": bookSourceURL}}
+		cats := parseExploreURLs(eu, ctx)
+		if len(cats) == 0 {
+			// @js: 依赖外部环境的跳过（不视为失败）
+			continue
+		}
+		for _, c := range cats {
+			if c.URL == "" || c.Type == "link" {
+				continue
+			}
+			checked++
+			u := c.URL
+			if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+				u = bookfetch.ResolveURL(u, bookSourceURL)
+			}
+			if isPrivateURL(u) {
+				t.Errorf("书源 %s 探索 URL 触发 SSRF（内网/空 hostname）: %q", name, u)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("无任何可检查的探索 URL")
+	}
+	t.Logf("已校验 %d 个探索分类 URL（XIU2 合集原样，resolve 后均非内网）", checked)
+}
+
+// TestExploreBookRelativeURL 前端传相对分类 URL（getExploreUrls 返回的相对 exploreUrl，
+// 如 /blist/class/0/1.htm）→ 后端应 resolve 到书源根后抓取，不报"禁止访问内网地址"。
+func TestExploreBookRelativeURL(t *testing.T) {
+	t.Setenv("READER_ALLOW_PRIVATE_NETWORK", "1")
+	h := newTestAPI(t)
+	html := `<ul class="newlistbox"><li><h3><a href="/book/1/">书一</a></h3><label>作者一</label></li></ul>`
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path + "?" + r.URL.RawQuery
+		_, _ = fmt.Fprint(w, html)
+	}))
+	defer srv.Close()
+	src := sourceBase(srv.URL, "69书吧")
+	src["exploreUrl"] = "全部分类::/blist/class/0/{{page}}.htm"
+	src["ruleExplore"] = map[string]any{
+		"author": "tag.label.0@text", "bookList": "class.newlistbox.0@tag.ul.0@tag.li",
+		"bookUrl": "tag.h3.0@tag.a.0@href", "name": "tag.h3.0@tag.a.0@text",
+	}
+	saveOneSource(t, h, src)
+
+	// 分类 URL：相对路径 + {{page}} 占位符（前端 getExploreUrls 返回原样）
+	relURL := "/blist/class/0/{{page}}.htm"
+	w := perform(h, "GET", "/reader3/exploreBook?url="+url.QueryEscape(relURL)+"&bookSource="+srv.URL+"&page=1", nil)
+	rd := parseReturn(t, w)
+	if !rd.IsSuccess {
+		t.Fatalf("相对 URL 探索应成功（resolve 到书源根）: %v", rd.ErrorMsg)
+	}
+	// mock 应收到 resolve + {{page}} 替换后的完整路径
+	if gotPath != "/blist/class/0/1.htm?" {
+		t.Errorf("mock 收到路径=%q 期望 /blist/class/0/1.htm", gotPath)
+	}
+	arr, _ := rd.Data.([]any)
+	if len(arr) != 1 {
+		t.Fatalf("期望 1 本书，实际 %d", len(arr))
+	}
+	book, _ := arr[0].(map[string]any)
+	if book["name"] != "书一" || book["bookUrl"] != srv.URL+"/book/1/" {
+		t.Errorf("探索结果不符: %+v", book)
+	}
+}
+
+var _ = model.BookSource{}
 
 var _ = json.Marshal

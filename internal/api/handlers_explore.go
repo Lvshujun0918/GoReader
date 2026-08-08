@@ -85,15 +85,23 @@ func parseExploreURLs(raw string, ctx *rule.Context) []ExploreCategory {
 	if raw == "" {
 		return nil
 	}
-	// @js:/<js> 前缀：evalJS 得结果（JSON 数组或分隔文本）
+	// @js:/<js> 前缀：evalJS 得结果（JSON 数组或分隔文本）——执行失败则返回空
+	// （避免把 JS 源码当分类 URL；笔阅读器等依赖模板字符串/java.ajax 的书源本实现无法解析）
 	if strings.HasPrefix(raw, "@js:") || strings.HasPrefix(raw, "<js>") {
 		if vs := rule.Parse("", raw, ctx); len(vs) > 0 && vs[0] != "" {
 			raw = vs[0]
+		} else {
+			return nil
 		}
 	}
-	// JSON 数组格式
+	// JSON 数组格式（legado 允许尾随逗号，如 [{"title":..},]——标准 Unmarshal 失败后宽松修复）
 	var arr []map[string]any
-	if json.Unmarshal([]byte(raw), &arr) == nil && len(arr) > 0 {
+	if json.Unmarshal([]byte(raw), &arr) != nil {
+		if fixed := stripTrailingCommas(raw); fixed != raw {
+			_ = json.Unmarshal([]byte(fixed), &arr)
+		}
+	}
+	if len(arr) > 0 {
 		var out []ExploreCategory
 		for _, m := range arr {
 			title, _ := m["title"].(string)
@@ -133,8 +141,7 @@ func parseExploreURLs(raw string, ctx *rule.Context) []ExploreCategory {
 }
 
 // categoryTitleFromURL 纯 URL 分类名：取 URL 路径最后一段（域名段/占位符/纯数字时用"默认"）。
-func categoryTitleFromURL(u string) string {
-	p := u
+func categoryTitleFromURL(u string) string {	p := u
 	if i := strings.IndexAny(p, "?#"); i >= 0 {
 		p = p[:i]
 	}
@@ -148,6 +155,50 @@ func categoryTitleFromURL(u string) string {
 		}
 	}
 	return "默认"
+}
+
+// stripTrailingCommas 移除 JSON 尾随逗号（legado exploreUrl 数组常用 [a,b,] 形式，
+// 标准 json.Unmarshal 会失败）。逐字符扫描并跳过字符串/转义。
+func stripTrailingCommas(s string) string {
+	if !strings.Contains(s, ",") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			b.WriteByte(c)
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+			b.WriteByte(c)
+		case ',':
+			// 逗号后（跳过空白）紧跟 ] 或 } → 尾随逗号，跳过
+			j := i + 1
+			for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+				j++
+			}
+			if j < len(s) && (s[j] == ']' || s[j] == '}') {
+				continue
+			}
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // handleExploreBook GET/POST /reader3/exploreBook：探索书单。
@@ -183,6 +234,11 @@ func (a *API) handleExploreBook(c *gin.Context) {
 	}
 	// {{page}}/{page} 占位符（分类 URL 常含分页）
 	url = replaceExplorePage(url, page)
+	// 相对路径 resolve 到书源根（getExploreUrls 返回的相对 exploreUrl，如 /blist/class/0/1.htm——
+	// 不 resolve 则 hostname 为空，crawler SSRF 会误判"禁止访问内网地址"）
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		url = bookfetch.ResolveURL(url, src.BookSourceURL)
+	}
 	client := a.crawlerClient(ns)
 	body, err := client.Fetch(url, src)
 	if err != nil {
