@@ -568,7 +568,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="file-page">
     <!-- 顶部导航（P3-A：共享 TopNav） -->
-    <TopNav active="/files" :links="['bookshelf', 'search', 'sources', 'files']" />
+    <TopNav active="/files" />
 
     <main class="content" :class="{ 'with-multi-bar': multiMode }">
       <div class="section-head">

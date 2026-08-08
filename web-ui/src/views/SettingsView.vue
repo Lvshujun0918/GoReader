@@ -1151,7 +1151,7 @@ async function runExportData() {
 <template>
   <div class="settings-page">
     <!-- 顶部导航（P3-A：共享 TopNav） -->
-    <TopNav active="/settings" :links="['bookshelf', 'search', 'sources', 'rules', 'settings']" />
+    <TopNav active="/settings" />
 
     <main class="content">
       <div class="section-head">

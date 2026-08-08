@@ -1,11 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { useUserStore } from '@/stores/user'
 import { listFiles } from '@/api/file'
 import { getBookshelf, saveBook } from '@/api/bookshelf'
 import { probeSecureMode } from '@/api/users'
+import TopNav from '@/components/TopNav.vue'
 import type { Book, FileItem } from '@/types'
 
 /**
@@ -14,9 +13,6 @@ import type { Book, FileItem } from '@/types'
  * 路径型文件书，后端无批量导入接口——后端就绪后可替换为批量契约）。
  * secure 模式需用户开启「本地书仓」权限（后端返回「未开启本地书仓功能」）。
  */
-
-const router = useRouter()
-const store = useUserStore()
 
 const path = ref('')
 const files = ref<FileItem[]>([])
@@ -174,22 +170,8 @@ onMounted(async () => {
 
 <template>
   <div class="store-page">
-    <!-- 极简导航：字标 + 页面入口 -->
-    <header class="topbar">
-      <div class="brand">
-        <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand-name">夜读<span class="brand-dot">.</span></span>
-      </div>
-
-      <div class="user-area">
-        <button class="nav-link" type="button" @click="router.push('/')">书架</button>
-        <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
-        <button class="nav-link" type="button" @click="router.push('/files')">文件</button>
-        <button class="nav-link active" type="button" @click="router.push('/store')">书仓</button>
-        <button class="nav-link" type="button" @click="router.push('/settings')">设置</button>
-        <span class="user-chip">{{ store.username || '未登录' }}</span>
-      </div>
-    </header>
+    <!-- 统一顶栏菜单（P3-A：TopNav nav + 二级菜单） -->
+    <TopNav active="/store" />
 
     <main class="content">
       <div class="section-head">

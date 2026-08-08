@@ -520,8 +520,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="search-page">
-    <!-- 极简顶栏：返回书架（P3-A：共享 TopNav minimal） -->
-    <TopNav variant="minimal" :back-label="t('nav.backShelf')" @back="router.push('/')" />
+    <!-- 统一顶栏菜单（P3-A：TopNav nav + 二级菜单） -->
+    <TopNav active="/search" />
 
     <main class="content">
       <h1 class="page-title">{{ t('search.title') }}</h1>

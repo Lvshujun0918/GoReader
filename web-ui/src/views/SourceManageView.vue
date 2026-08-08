@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   ArrowUpDown,
@@ -30,8 +29,6 @@ import TopNav from '@/components/TopNav.vue'
 import { hanText, syncHanMode } from '@/utils/hanMode'
 import { isNotImplemented } from '@/utils/errors'
 import type { BookSource, SourceSub } from '@/types'
-
-const router = useRouter()
 
 /* ================= 列表 ================= */
 const sources = ref<BookSource[]>([])
@@ -1614,8 +1611,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="sources-page">
-    <!-- 极简顶栏：返回书架（P3-A：共享 TopNav minimal） -->
-    <TopNav variant="minimal" back-label="书架" @back="router.push('/')" />
+    <!-- 统一顶栏菜单（P3-A：TopNav nav + 二级菜单） -->
+    <TopNav active="/sources" />
 
     <main class="content">
       <div class="section-head">

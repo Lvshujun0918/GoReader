@@ -1,15 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { deleteReplaceRule, getReplaceRules, saveReplaceRule } from '@/api/replaceRules'
 import { deleteTxtTocRule, getTxtTocRules, importDefaultTxtTocRules, saveTxtTocRule } from '@/api/txtTocRules'
-import { useUserStore } from '@/stores/user'
 import { checkTestRegex } from '@/utils/regexGuard'
+import TopNav from '@/components/TopNav.vue'
 import type { ReplaceRule, TxtTocRule } from '@/types'
-
-const router = useRouter()
-const store = useUserStore()
 
 /* ================= 列表（localStorage: reader_replace_rules，见 api/replaceRules.ts 契约注释） ================= */
 const rules = ref<ReplaceRule[]>([])
@@ -377,22 +373,8 @@ onMounted(() => {
 
 <template>
   <div class="rules-page">
-    <!-- 极简导航：字标 + 页面入口 -->
-    <header class="topbar">
-      <div class="brand">
-        <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand-name">夜读<span class="brand-dot">.</span></span>
-      </div>
-
-      <div class="user-area">
-        <button class="nav-link" type="button" @click="router.push('/')">书架</button>
-        <button class="nav-link" type="button" @click="router.push('/search')">搜索</button>
-        <button class="nav-link" type="button" @click="router.push('/sources')">书源</button>
-        <button class="nav-link active" type="button" @click="router.push('/rules')">替换规则</button>
-        <button class="nav-link" type="button" @click="router.push('/settings')">设置</button>
-        <span class="user-chip">{{ store.username || '未登录' }}</span>
-      </div>
-    </header>
+    <!-- 统一顶栏菜单（P3-A：TopNav nav + 二级菜单） -->
+    <TopNav active="/rules" />
 
     <main class="content">
       <div class="section-head">

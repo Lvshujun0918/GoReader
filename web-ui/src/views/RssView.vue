@@ -316,7 +316,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="rss-page">
     <!-- 顶部导航（P3-A：共享 TopNav） -->
-    <TopNav active="/rss" :links="['bookshelf', 'search', 'sources', 'rss']" />
+    <TopNav active="/rss" />
 
     <main class="rss-main">
       <!-- 左栏：订阅源（分组胶囊 + 列表） -->

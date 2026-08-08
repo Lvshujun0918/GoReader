@@ -1,9 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { useUserStore } from '@/stores/user'
 import { getServerStats } from '@/api/serverStats'
 import { t } from '@/utils/i18n'
+import TopNav from '@/components/TopNav.vue'
 import type { ServerStats } from '@/types'
 
 /**
@@ -11,9 +10,6 @@ import type { ServerStats } from '@/types'
  * 卡片：内存 / CPU / 请求量（总数·今日·Top 接口）/ 在线会话 / 书源成功率 + 运行信息
  * 纯 CSS 条形（无图表库）；10s 自动刷新（页面隐藏时暂停，恢复可见立即刷新）。
  */
-
-const router = useRouter()
-const store = useUserStore()
 
 const REFRESH_MS = 10_000
 
@@ -115,18 +111,8 @@ function sourceTimeText(): string {
 
 <template>
   <div class="monitor-page">
-    <header class="topbar">
-      <div class="brand">
-        <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand-name">夜读<span class="brand-dot">.</span></span>
-      </div>
-      <div class="user-area">
-        <button class="nav-link" type="button" @click="router.push('/')">{{ t('nav.bookshelf') }}</button>
-        <button class="nav-link" type="button" @click="router.push('/settings')">{{ t('nav.settings') }}</button>
-        <button class="nav-link active" type="button" @click="router.push('/server-stats')">{{ t('nav.serverStats') }}</button>
-        <span class="user-chip">{{ store.username || t('common.notLoggedIn') }}</span>
-      </div>
-    </header>
+    <!-- 统一顶栏菜单（P3-A：TopNav nav + 二级菜单） -->
+    <TopNav active="/server-stats" show-users-link />
 
     <main class="content">
       <div class="section-head">

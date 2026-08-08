@@ -14,6 +14,7 @@ import { post } from '@/api/request'
 import { downloadBlob } from '@/utils/download'
 import { relocateChapterIndex } from '@/utils/progressRelocate'
 import { buildTocEntries } from '@/utils/tocPreview'
+import TopNav from '@/components/TopNav.vue'
 import { useUserStore } from '@/stores/user'
 import { isNotImplemented } from '@/utils/errors'
 import type { Book, BookChapter, BookInfo, ContentSearchHit, SearchBook } from '@/types'
@@ -1091,18 +1092,8 @@ watch(bookUrl, () => {
 
 <template>
   <div class="detail-page">
-    <!-- 极简顶栏：返回书架 -->
-    <header class="topbar">
-      <button class="back-btn" type="button" @click="router.push('/')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M19 12H5" />
-          <path d="M11 18l-6-6 6-6" />
-        </svg>
-        <span>书架</span>
-      </button>
-      <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand">夜读<span class="brand-dot">.</span></span>
-    </header>
+    <!-- 统一顶栏菜单（P3-A：TopNav nav + 二级菜单） -->
+    <TopNav />
 
     <main class="content">
       <!-- GAP 18：详情 / 目录 tab -->

@@ -72,6 +72,8 @@ const zh: LangDict = {
   'nav.opds': 'OPDS',
   'nav.backShelf': '书架',
   'nav.serverStats': '监控',
+  'nav.groupSources': '书源',
+  'nav.groupManage': '管理',
 
   /* ============ 路由标题 ============ */
   'route.login': '登录',
@@ -507,6 +509,8 @@ const en: LangDict = {
   'nav.opds': 'OPDS',
   'nav.backShelf': 'Bookshelf',
   'nav.serverStats': 'Monitor',
+  'nav.groupSources': 'Sources',
+  'nav.groupManage': 'Manage',
 
   /* ============ Route titles ============ */
   'route.login': 'Log In',

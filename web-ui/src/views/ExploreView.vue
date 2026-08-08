@@ -1,18 +1,16 @@
 <template>
   <div class="page">
-    <!-- 顶栏（P3-A：共享 TopNav——dense 紧凑变体；探索页保留自身按钮/标题样式） -->
-    <TopNav variant="minimal" dense>
-      <template #leading>
-        <button class="back-btn" type="button" @click="source ? backToSources() : router.push('/')">
+    <!-- 顶栏（P3-A：统一 TopNav nav + 二级菜单；探索页保留标题/返回/操作） -->
+    <TopNav active="/explore" dense>
+      <template #default>
+        <button class="back-btn" type="button" title="返回" @click="source ? backToSources() : router.push('/')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
             <path d="M19 12H5" /><path d="M11 18l-6-6 6-6" />
           </svg>
         </button>
-        <img class="brand-logo" src="/logo.svg" alt="夜读" />
-        <span class="brand">夜读<em>.</em></span>
+        <span class="title">{{ source ? applyHan(source.bookSourceName, hanMode) : '探索' }}</span>
       </template>
-      <span class="title">{{ source ? applyHan(source.bookSourceName, hanMode) : '探索' }}</span>
-      <template #trailing>
+      <template #extra>
         <div class="top-actions">
           <button class="han-btn" type="button" :title="'简繁转换（当前：' + hanLabel + '）'" @click="toggleHan()">
             {{ hanLabel }}

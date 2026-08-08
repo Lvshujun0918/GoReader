@@ -27,6 +27,7 @@ import {
   Activity,
   ArrowLeft,
   BookMarked,
+  ChevronDown,
   Compass,
   Folder,
   Library,
@@ -41,6 +42,12 @@ import {
 import { useUserStore } from '@/stores/user'
 import { probeSecureMode } from '@/api/users'
 import { t } from '@/utils/i18n'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 
 const props = withDefaults(
   defineProps<{
@@ -97,26 +104,53 @@ const NAV_LINKS: Record<string, { to: string; i18n: string; icon: Component }> =
   settings: { to: '/settings', i18n: 'nav.settings', icon: Settings },
 }
 
-/** secure 模式（仅 showUsersLink 时探测；决定「用户」入口显隐） */
+/** secure 模式（统一探测；决定「用户」入口显隐——所有页面菜单一致） */
 const secureMode = ref(false)
 onMounted(() => {
-  if (props.showUsersLink) {
-    void probeSecureMode().then((v) => {
-      secureMode.value = v
-    })
-  }
+  void probeSecureMode().then((v) => {
+    secureMode.value = v
+  })
 })
 
-const visibleLinks = computed(() => {
-  const out: { to: string; label: string; icon: Component }[] = []
-  for (const key of props.links) {
-    if (key === 'users' && !(props.showUsersLink && secureMode.value)) continue
-    const def = NAV_LINKS[key]
-    if (!def) continue
-    out.push({ to: def.to, label: t(def.i18n), icon: def.icon })
-  }
-  return out
-})
+/** 主菜单键（一级直接显示） */
+const PRIMARY_KEYS = ['bookshelf', 'search', 'explore', 'settings']
+
+/** 二级分组：组 i18n → 菜单键 */
+const GROUPS: { i18n: string; keys: string[] }[] = [
+  { i18n: 'nav.groupSources', keys: ['sources', 'rules', 'rss'] },
+  { i18n: 'nav.groupManage', keys: ['files', 'store', 'monitor', 'users'] },
+]
+
+interface NavItem {
+  to: string
+  label: string
+  icon: Component
+}
+
+function navItem(key: string): NavItem | null {
+  const def = NAV_LINKS[key]
+  return def ? { to: def.to, label: t(def.i18n), icon: def.icon } : null
+}
+
+function isNavItem(x: NavItem | null): x is NavItem {
+  return x !== null
+}
+
+/** 一级菜单 */
+const primaryLinks = computed(() => PRIMARY_KEYS.map(navItem).filter(isNavItem))
+
+/** 二级分组（过滤空组与「用户」门控——secure 模式才显示用户入口） */
+const visibleGroups = computed(() =>
+  GROUPS.map((g) => ({
+    key: g.i18n,
+    label: t(g.i18n),
+    items: g.keys
+      .map(navItem)
+      .filter(
+        (x): x is NavItem => isNavItem(x) && !(x.to === '/users' && !secureMode.value),
+      ),
+  })).filter((g) => g.items.length > 0),
+)
 </script>
 
 <template>
@@ -138,7 +172,7 @@ const visibleLinks = computed(() => {
 
     <div v-if="variant === 'nav'" class="user-area">
       <button
-        v-for="link in visibleLinks"
+        v-for="link in primaryLinks"
         :key="link.to"
         class="nav-link"
         :class="{ active: link.to === active }"
@@ -148,6 +182,28 @@ const visibleLinks = computed(() => {
         <component :is="link.icon" :size="14" aria-hidden="true" />
         <span>{{ link.label }}</span>
       </button>
+
+      <!-- 二级分组菜单 -->
+      <DropdownMenu v-for="g in visibleGroups" :key="g.key">
+        <DropdownMenuTrigger as-child>
+          <button class="nav-link group-trigger" type="button">
+            <span>{{ g.label }}</span>
+            <ChevronDown :size="14" aria-hidden="true" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem
+            v-for="item in g.items"
+            :key="item.to"
+            class="nav-dropdown-item"
+            @click="router.push(item.to)"
+          >
+            <component :is="item.icon" :size="14" aria-hidden="true" />
+            <span>{{ item.label }}</span>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
       <slot name="extra" />
       <span v-if="showUser" class="user-chip">{{ store.username || '未登录' }}</span>
       <button v-if="showLogout" class="logout-btn" type="button" @click="emit('logout')">

@@ -378,7 +378,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="users-page">
     <!-- 顶部导航（P3-A：共享 TopNav） -->
-    <TopNav active="/users" :links="['bookshelf', 'search', 'sources', 'rules', 'files', 'users', 'settings']" />
+    <TopNav active="/users" show-users-link />
 
     <main class="content">
       <!-- 标题区 -->
